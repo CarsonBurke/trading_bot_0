@@ -57,7 +57,7 @@
 //! equities drift up and moment-correct Kelly sizing of a drifting asset is profitable
 //! without any forecasting at all. So the number that matters is never the model's Sharpe;
 //! it is the model's growth MINUS the growth of the same reduction driven by the fitted
-//! unconditional marginal. Six policies, identical windows and costs:
+//! unconditional marginal. Seven policies, identical windows and costs:
 //!
 //! * [`POLICY_MODEL`] — the conditional predictive law. The thing under test.
 //! * [`POLICY_HALF`], [`POLICY_QUARTER`] — the same law at half and quarter Kelly. Not
@@ -69,6 +69,12 @@
 //!   so a run that cannot beat it has bought nothing with its +5.5 nats.
 //! * [`POLICY_BUY_HOLD`] — `f = 1` every bar. Not a Kelly policy; it is the market, and
 //!   it is what fixes the units of [`LEVERAGE_CAP`].
+//! * [`POLICY_VOL_TARGET`] — `f_t = sigma_target / sigma_hat_t` on a CAUSAL trailing
+//!   Garman-Klass sigma. Also not a Kelly policy and also model-free, but unlike flat
+//!   `f = 1` it removes the one thing volatility timing is known to be worth on its own:
+//!   a book that leans out of high-vol regimes earns a higher log growth than the same
+//!   book at constant leverage without predicting a single return. A model whose edge
+//!   over `f = 1` is really vol timing has to beat this row too.
 //! * [`POLICY_ORACLE`] — perfect foresight on the REALIZED return. It is intentionally a
 //!   separate realized-return ceiling, capped by the same leverage limit rather than
 //!   pretending its point mass is the model's moment-reduced law.
@@ -87,6 +93,18 @@
 //! [`TradeBench::free_kelly`], the distribution of `|f*|` with the share of bars at the
 //! cap. An edge that grows with the cap while saturation stays near one was bought with
 //! leverage; an edge that is flat in the cap once the cap stops binding is the model's.
+//!
+//! # Volatility is the highest-SNR half of the forecast, and it needs its own null
+//!
+//! Everything above scores the conditional MEAN. Direction carries `R^2 ~ 1e-3`, while the
+//! bar's own variance is the one quantity in this corpus a forecaster can genuinely predict —
+//! so a run can post a respectable NLL, a respectable growth edge, and still be WORSE than a
+//! three-parameter regression at the thing it is best at, with nothing anywhere saying so.
+//! [`vol_bench`] closes that: [`VOL_FORECAST_NAMES`] scores the model's own `Var[r | past]`
+//! and a causal HAR-RV baseline under the SAME [`qlike`] loss against the SAME realized
+//! proxy, and [`VolBench::versus_har`] is the paired difference. Negative is the model
+//! winning. See [`vol_bench`] for the proxy, the variance derivation and why the baseline
+//! is handed an in-window causal fit rather than a weaker declared one.
 //!
 //! # The tail is where a leveraged bettor actually dies
 //!
@@ -127,14 +145,15 @@
 
 use std::collections::BTreeMap;
 
-use anyhow::{ensure, Result};
+use anyhow::{ensure, Context, Result};
 use rand::seq::IndexedRandom;
 use rand::SeedableRng;
 use rand_chacha::ChaCha12Rng;
 use tch::{Device, Kind, Tensor};
 
 use crate::torch::bar_dist::{
-    BarEmissionHead, BarSupports, BAR_CHAIN, BAR_DOF, DOF_R, NUM_BAR_BINS,
+    BarEmissionHead, BarSupports, DofScaling, TradedZLaw, BAR_CHAIN, BAR_DOF, DOF_R, DOF_S, DOF_U,
+    DOF_V, NUM_BAR_BINS,
 };
 use crate::torch::dataset::mix64;
 
@@ -149,6 +168,14 @@ const _: () = assert!(
     BAR_CHAIN[0] == DOF_R,
     "trade_bench reads p(r|h) directly off the head's r row, which is p(r|past) only while \
      r is BAR_CHAIN[0]; a reorder that gives r a prefix must marginalize it out again"
+);
+
+/// The realized-variance proxy is sliced as ONE contiguous `narrow` of the DOF axis, so
+/// `(s, u, v)` must sit adjacent and in that order. A DOF reorder that broke this would
+/// silently feed the Garman-Klass estimator three unrelated columns.
+const _: () = assert!(
+    DOF_U == DOF_S + 1 && DOF_V == DOF_S + 2,
+    "garman_klass reads (s, u, v) as one contiguous slice of the DOF axis"
 );
 
 /// Hard bound on `|f|`, in units of wealth.
@@ -315,7 +342,10 @@ pub const POLICY_QUARTER: usize = 2;
 pub const POLICY_MARGINAL: usize = 3;
 pub const POLICY_BUY_HOLD: usize = 4;
 pub const POLICY_ORACLE: usize = 5;
-pub const POLICY_COUNT: usize = 6;
+/// Appended AFTER the oracle so every pre-existing policy index is unchanged: a persisted
+/// artifact or a report series keyed on an index still means what it meant.
+pub const POLICY_VOL_TARGET: usize = 6;
+pub const POLICY_COUNT: usize = 7;
 /// Series names, in policy-index order.
 pub const POLICY_NAMES: [&str; POLICY_COUNT] = [
     "model",
@@ -324,6 +354,7 @@ pub const POLICY_NAMES: [&str; POLICY_COUNT] = [
     "marginal null",
     "buy&hold",
     "oracle",
+    "vol-targeted buy&hold",
 ];
 /// Kelly multiple each policy stakes, `NAN` for the ones that are not Kelly on the model.
 ///
@@ -333,7 +364,106 @@ pub const POLICY_NAMES: [&str; POLICY_COUNT] = [
 /// Halves and quarters expose how much of the realized growth survives materially smaller
 /// variance and ruin exposure, so this bench reports them as first-class policies.
 pub const POLICY_KELLY_MULTIPLE: [f64; POLICY_COUNT] =
-    [1.0, 0.5, 0.25, f64::NAN, f64::NAN, f64::NAN];
+    [1.0, 0.5, 0.25, f64::NAN, f64::NAN, f64::NAN, f64::NAN];
+
+/// Annualized volatility the vol-targeted baseline sizes to.
+///
+/// `0.15` is the conventional risk-parity target for a single-name equity book and it is
+/// deliberately BELOW the panel's own realized vol, so the baseline runs at `f < 1` on a
+/// typical bar and the row is a genuine policy rather than a constant pinned to
+/// [`LEVERAGE_CAP`]. Nothing is tuned to the model: this is a declared risk preference, the
+/// same status [`LEVERAGE_CAP`] has, and [`PolicyStats::clamped_fraction`] reports how often
+/// the cap took the decision instead.
+pub const VOL_TARGET_ANNUAL: f64 = 0.15;
+
+/// Half-life, in bars, of the causal EWMA of realized variance.
+///
+/// One trading day. Short enough that the estimate tracks a regime change inside a
+/// 2048-bar window, long enough that its own sampling error is small next to the variance
+/// it is estimating: a Garman-Klass proxy has roughly `1/7` the variance of a squared
+/// return, so ~93 effective observations put the estimator's relative error near 5%.
+pub const VOL_EWMA_HALF_LIFE_BARS: f64 = BARS_PER_TRADING_DAY;
+
+/// Trailing windows of the HAR-RV components, in bars: one day, one week, one month.
+///
+/// Corsi's three components verbatim, translated onto this corpus's bar clock rather than
+/// onto a daily one. A 2048-bar window is ~22 trading days, so the monthly leg is the
+/// longest component the window can carry at all, which is why there is no fourth.
+pub const VOL_HAR_LAGS_BARS: [usize; 3] = [93, 465, 1953];
+const _: () = assert!(
+    BARS_PER_TRADING_DAY == 93.0,
+    "the HAR component lags are 1, 5 and 21 trading days at the measured bars/day"
+);
+
+/// Bars at the head of every window that no volatility forecast is SCORED on.
+///
+/// Four trading days. Every forecaster in [`VOL_FORECAST_NAMES`] needs some strictly past
+/// history before it says anything, and they need different amounts, so scoring them over
+/// their own available ranges would compare four different populations. This is the single
+/// warmup all of them share, chosen so that [`VOL_HAR_MIN_ROWS`] is already satisfied at the
+/// FIRST scored bar and no forecaster is ever scored while still in a fallback regime.
+pub const VOL_WARMUP_BARS: usize = 4 * 93;
+
+/// Fitted rows the recursive HAR regression requires before its coefficients are used.
+///
+/// Two trading days of rows against four parameters. Below it the trailing daily component
+/// is used directly, which is a valid causal variance forecast rather than a placeholder —
+/// and by construction of [`VOL_WARMUP_BARS`] that regime is never inside the scored range.
+pub const VOL_HAR_MIN_ROWS: usize = 2 * 93;
+const _: () = assert!(
+    VOL_WARMUP_BARS > VOL_HAR_MIN_ROWS,
+    "the first scored bar must already have a fitted HAR, or the scored range mixes two \
+     different baselines under one label"
+);
+
+/// Relative diagonal loading of the HAR normal equations.
+///
+/// Conditioning, not shrinkage — but conditioning against a NEARLY singular design rather
+/// than against rounding. The three components are nested trailing means of one series and
+/// correlate above `0.99` on real per-bar RV, so the smallest eigenvalue of the `4x4` Gram
+/// runs at `1e-3` to `1e-4` of its largest and the OLS answer in that direction is a pair of
+/// large offsetting coefficients that reprice wildly on the next bar's features. `1e-8` is
+/// below the accumulated f64 error of a few thousand heavy-tailed rows and so loads nothing
+/// at all; `1e-6` bounds the coefficient norm two orders of magnitude harder while still
+/// sitting far below the weakest genuinely identified direction, which is what keeps a
+/// well-posed fit unmoved through its sixth significant digit.
+const VOL_HAR_RIDGE: f64 = 1e-6;
+
+/// Smallest share of the trailing DAILY component a FITTED HAR forecast is allowed to claim.
+///
+/// The sign check this replaces caught a solve that had broken through zero and missed every
+/// solve that broke to `1e-3` of the level, which QLIKE charges linearly through `E[z]` and
+/// which is what a near-singular fit actually produces. A positive combination of nested
+/// trailing means cannot honestly forecast a twentieth of the trailing daily variance: to get
+/// there the coefficients must be large and offsetting, which is the signature of the broken
+/// solve and not of a calm regime. Loose on purpose — the guard exists to stop a baseline
+/// from being straw-manned, not to strengthen it, and clipping a genuine low forecast would
+/// cost the baseline only the bounded `ln` side of QLIKE while flattering it.
+const VOL_HAR_FLOOR_FRACTION: f64 = 0.05;
+
+/// Rows that must DISCRIMINATE two adjacent HAR components before the longer one is admitted
+/// to the fit.
+///
+/// `component(bar, lag)` clamps its window to the bars available, so components `k - 1` and
+/// `k` are the SAME expanding mean on every row at or below `VOL_HAR_LAGS_BARS[k - 1]`: below
+/// bar 93 all three columns are identical and below bar 465 two are. An OLS over those rows
+/// is not ill-conditioned, it is exactly singular, and the only thing separating the
+/// coefficients is the ridge. Two trading days of rows on which the columns genuinely differ
+/// is the same rows-per-parameter bar [`VOL_HAR_MIN_ROWS`] sets for the fit as a whole.
+const VOL_HAR_LEG_MIN_ROWS: usize = VOL_HAR_MIN_ROWS;
+
+/// Multiple of the best model row's QLIKE above which the HAR baseline is DEGENERATE and the
+/// verdict is withheld.
+///
+/// HAR is an average of the same proxy it is scored against, so on any corpus where it is
+/// working its loss sits within a small factor of a good forecaster's. Several times worse is
+/// not a weak baseline, it is a broken one, and a model cannot be credited with beating a
+/// forecaster that is not forecasting. The synthetic fixture asserts the same bound at the
+/// same constant, which is the check that never saw real data.
+pub const VOL_HAR_STRAW_MULTIPLE: f64 = 2.0;
+
+/// `2 ln 2 - 1`, the Garman-Klass weight on the squared open-to-close move.
+const GK_OPEN_CLOSE: f64 = 2.0 * std::f64::consts::LN_2 - 1.0;
 
 // ---------------------------------------------------------------------------
 // The predictive object
@@ -382,32 +512,140 @@ pub fn expected_log_growth(probs: &[f64], returns: &[f64], fraction: f64) -> f64
         .sum()
 }
 
-/// `[rows]` quadratic Kelly fractions for `[rows, outcomes]` categorical probabilities.
+/// Which reduction of the predictive law chooses the position.
+///
+/// The default is the CONTROL rule every published number of this bench was measured under:
+/// the global quadratic `f = E[R]/E[R²]` on the raw conditional mean. Both departures are
+/// opt-in and independent, because the only way to price a decision-side fix is to measure it
+/// against a control that is bit-identical without it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SizingRule {
+    /// Maximize a second-cumulant approximation to `E[ln(1 + f R)]` instead of the CONTROL's
+    /// global quadratic.
+    ///
+    /// This is an OBJECTIVE correction, not a de-levering knob, but it is not an exact
+    /// expected-log solve. The support artifact stores only `E[R | b]` and `E[R² | b]`; laws
+    /// with the same two conditional moments can have different expected log growth. The
+    /// approximation keeps `ln(1 + f E[R | b])` between bins and applies the second-cumulant
+    /// correction `-0.5 f² Var[R | b] / (1 + f E[R | b])²` within each bin.
+    ///
+    /// Which way a given bar moves relative to the CONTROL is a property of that bar's fitted
+    /// two-moment law, so the signed difference is MEASURED — see
+    /// [`SizingComparison::free_mean_signed_gap`] — rather than assumed.
+    ///
+    /// # Measured worth, on frozen weights
+    ///
+    /// Priced on three frozen control checkpoints, unretrained and paired on identical bars —
+    /// so the comparison carries no training noise at all — this arm beat the CONTROL at the
+    /// 4.0x deployed cap on every one:
+    ///
+    /// ```text
+    /// s24301  +0.2683 bps/bar  (95% CI +0.1915..+0.3542, se 0.0417)  19.755% ruin-domain bars
+    /// s24302  +0.2384 bps/bar  (95% CI +0.1587..+0.3349, se 0.0442)  22.903% ruin-domain bars
+    /// s24303  +0.2036 bps/bar  (95% CI +0.1396..+0.2732, se 0.0340)  20.213% ruin-domain bars
+    /// ```
+    ///
+    /// The cap sweep is evidence about the recovered approximation, not evidence that two
+    /// moments identify true expected log: not significant at `0.25x` (`-0.0001`) or `1.0x`
+    /// (`-0.0030`), significant at `2.0x` (`+0.0543`), largest at `4-8x`
+    /// (`+0.268 / +0.269`), and back to insignificant uncapped (`-0.1504` at `16-32x`).
+    ///
+    /// # What it does not fix
+    ///
+    /// The book's absolute scale is miscalibrated in two directions at once. Fully annealed the
+    /// measured mean slope is `0.6653 ± 0.0286` (`mu` too large, which over-sizes) while the
+    /// predicted variance is `1.63x` the realized one (which under-sizes), for a net implied
+    /// Kelly scale of `~0.63x` the growth optimum. So the law is under-levered in absolute
+    /// terms even while `free_kelly_saturated` sits at `0.69-0.85` — both are true, because the
+    /// uncapped optimum can exceed a 4x cap on most bars and still be below what a correctly
+    /// calibrated law would ask for. Cap saturation is a statement about the per-bar ratio of
+    /// `E[R]` to `E[R²]`, not about scale.
+    pub cumulant_log: bool,
+    /// Size on the out-of-sample recalibrated conditional mean rather than the raw one.
+    ///
+    /// Requires a fitted [`MeanShrink`] on the traded law; [`window_paths`] refuses rather
+    /// than silently sizing on the raw mean under a recalibrated label.
+    ///
+    /// # Its effect is a function of the LEARNING-RATE SCHEDULE, not of the architecture
+    ///
+    /// The slope this corrects moves with annealing, so where it is measured decides whether
+    /// it exists. Fully annealed on a full-length one-epoch run the measured slope is
+    /// `0.6653 ± 0.0286`, excluding `1.0` by twelve standard errors. At the peak learning rate
+    /// it is `1.0058 ± 0.0355`, i.e. perfectly calibrated, and on a 3000-step screen budget a
+    /// control measured `0.9734` — a `-2.7%` reprice at the median `|mu|`, which is a NO-OP
+    /// this arm cannot be judged on. Since [`super::pretrain::LR_PLATEAU_FRACTION`] puts
+    /// production at the annealed end, the fix matters exactly where it ships and is invisible
+    /// exactly where it is cheap to test. A screen-budget arm that reads flat is evidence about
+    /// the screen budget, not about the rule.
+    ///
+    /// What it corrects is also not primarily absolute scale — see [`Self::cumulant_log`] for
+    /// why the mean and variance miscalibrations partly cancel there. It is the CROSS-BAR
+    /// dispersion of the mean, measured `1.03x` too variable, which is what decides the
+    /// allocation once a cap binds and level stops mattering. Read
+    /// [`SizingComparison::free_sd_active`] against its control, not the level shift.
+    pub recalibrated: bool,
+}
+
+impl SizingRule {
+    /// The historical global-quadratic rule every published control number used.
+    pub const CONTROL: Self = Self {
+        cumulant_log: false,
+        recalibrated: false,
+    };
+    /// The second-cumulant expected-log approximation on the raw fitted mean.
+    pub const CUMULANT_LOG: Self = Self {
+        cumulant_log: true,
+        recalibrated: false,
+    };
+    pub const RECALIBRATED: Self = Self {
+        cumulant_log: false,
+        recalibrated: true,
+    };
+    pub const BOTH: Self = Self {
+        cumulant_log: true,
+        recalibrated: true,
+    };
+
+    /// True when this rule IS the control, so there is nothing to price it against.
+    pub fn is_control(self) -> bool {
+        self == Self::CONTROL
+    }
+
+    pub fn label(self) -> &'static str {
+        match (self.cumulant_log, self.recalibrated) {
+            (false, false) => "global quadratic on the raw mean (control)",
+            (true, false) => "second-cumulant expected-log approximation on the raw mean",
+            (false, true) => "global quadratic on the recalibrated mean",
+            (true, true) => "second-cumulant expected-log approximation on the recalibrated mean",
+        }
+    }
+}
+
+/// Bisection steps of the second-cumulant expected-log approximation.
+///
+/// The bracket is at most `2 * MAX_LEVERAGE = 24` wide, so 60 halvings resolve `f` to
+/// `~2e-17` — below the double-precision resolution of the bracket's own endpoints. Newton
+/// would converge in five to ten steps, but it needs a safeguard against the one region
+/// where the objective's within-bin correction stops being concave (`2 f E[R|b] > 1`,
+/// reachable only at double-digit leverage against a positive outer bin), while bisection on
+/// the SIGN of `G'` needs no safeguard at all: it is branch-free, it handles both boundary
+/// cases without a special case — a bracket on which `G'` never changes sign converges onto
+/// the endpoint the derivative points at — and one step is two elementwise passes plus a
+/// reduction over `[rows, NUM_BAR_BINS]`, so the whole solve is dwarfed by the transformer
+/// forward that produced the probabilities.
+const CUMULANT_KELLY_ITERATIONS: usize = 60;
+
+/// Validate and shape the three `[rows, outcomes]` inputs every sizing reduction shares.
 ///
 /// `returns` and `return_seconds` are the train-fitted within-bin `E[R | bin]` and
 /// `E[R² | bin]`. Each may be `[outcomes]`, `[1, outcomes]` (shared by every row), or
-/// `[rows, outcomes]`. Reducing both tables gives
-///
-/// ```text
-/// mu = E[R]
-/// m2 = E[R²]
-/// f* = mu / m2
-/// ```
-///
-/// which maximizes the declared second-order growth approximation
-/// `q(f) = f E[R] - 0.5 f² E[R²]`. This is deliberately not an exact expected-log solve:
-/// treating each bin's conditional mean as a deterministic payoff would erase its
-/// within-bin variance and systematically over-size the position.
-///
-/// The fraction retains the previous hard leverage ceiling and ruin-domain bracket derived
-/// from the live bin payoffs. The returned fraction is exactly zero unless the quadratic
-/// growth at the constrained optimum is strictly positive.
-pub fn kelly_fractions(
+/// `[rows, outcomes]` — the last is what a per-bar mean recalibration produces.
+fn sizing_inputs(
     probs: &Tensor,
     returns: &Tensor,
     return_seconds: &Tensor,
     cap: f64,
-) -> Tensor {
+) -> (Tensor, Tensor, Tensor) {
     assert!(
         cap > 0.0 && cap.is_finite(),
         "the leverage cap must be positive and finite"
@@ -432,8 +670,35 @@ pub fn kelly_fractions(
     };
     let returns = expand_moments(returns, "returns");
     let return_seconds = expand_moments(return_seconds, "return_seconds");
+    (probs, returns, return_seconds)
+}
 
-    tch::no_grad(|| {
+/// The normalized law, its dead-bin-masked moments and the open ruin-domain bracket.
+///
+/// The ONE construction shared by the global-quadratic reduction, the second-cumulant
+/// expected-log approximation and the ruin-domain diagnostic, so the three cannot disagree
+/// about which sizes are feasible on the same law.
+struct LiveLaw {
+    /// `[rows, outcomes]` probabilities, renormalized to unit mass per row.
+    probs: Tensor,
+    /// `[rows, outcomes]` `E[R | bin]`, zeroed on dead bins.
+    returns: Tensor,
+    /// `[rows, outcomes]` `E[R² | bin]`, zeroed on dead bins.
+    return_seconds: Tensor,
+    /// `[-cap, cap]` intersected with the open domain `1 + f R_b > 0` over the LIVE bins.
+    lo: Tensor,
+    hi: Tensor,
+    /// The same bracket BEFORE the caller's cap and [`MAX_LEVERAGE`] were applied.
+    ///
+    /// What says whether a clamp was a risk decision or the ruin domain: a fraction outside
+    /// this is a size at which the cumulant objective diverges, which is precisely the
+    /// information the global quadratic discards.
+    ruin_lo: Tensor,
+    ruin_hi: Tensor,
+}
+
+impl LiveLaw {
+    fn new(probs: &Tensor, returns: &Tensor, return_seconds: &Tensor, cap: f64) -> Self {
         let mass = probs
             .sum_dim_intlist([-1i64].as_slice(), true, Kind::Double)
             .clamp_min(f64::MIN_POSITIVE);
@@ -453,15 +718,127 @@ pub fn kelly_fractions(
             .masked_fill(&shorts.logical_not(), f64::INFINITY)
             .amin([-1i64].as_slice(), false);
         let cap = cap.min(MAX_LEVERAGE);
-        let lo = (lower * (1.0 - FEASIBLE_MARGIN)).clamp_min(-cap);
-        let hi = (upper * (1.0 - FEASIBLE_MARGIN)).clamp_max(cap);
+        let ruin_lo = lower * (1.0 - FEASIBLE_MARGIN);
+        let ruin_hi = upper * (1.0 - FEASIBLE_MARGIN);
+        let lo = ruin_lo.clamp_min(-cap);
+        let hi = ruin_hi.clamp_max(cap);
+        Self {
+            probs,
+            returns,
+            return_seconds,
+            lo,
+            hi,
+            ruin_lo,
+            ruin_hi,
+        }
+    }
 
-        let mean = (&probs * &returns).sum_dim_intlist([-1i64].as_slice(), false, Kind::Double);
-        let second = (&probs * &return_seconds)
+    /// `[rows]` `E[R]` and `E[R²]` under the normalized law.
+    fn moments(&self) -> (Tensor, Tensor) {
+        let mean =
+            (&self.probs * &self.returns).sum_dim_intlist([-1i64].as_slice(), false, Kind::Double);
+        let second = (&self.probs * &self.return_seconds)
             .sum_dim_intlist([-1i64].as_slice(), false, Kind::Double)
             .clamp_min(0.0);
+        (mean, second)
+    }
+
+    /// `[rows, outcomes]` within-bin variance `E[R² | b] - E[R | b]²`.
+    ///
+    /// The dispersion a per-bin point mass erases. It is not negligible: on the live support
+    /// the two open-tail bins of `r` hold 1.45% of the mass and 92.38% of the central second
+    /// moment. Treating each bin's conditional mean as a deterministic payoff would be
+    /// systematically optimistic by Jensen exactly where the left tail lives; retaining the
+    /// second cumulant corrects that identified part without claiming to know higher cumulants.
+    fn within_variance(&self) -> Tensor {
+        (&self.return_seconds - &self.returns * &self.returns).clamp_min(0.0)
+    }
+
+    /// `[rows, outcomes]` wealth multiplier `1 + f R_b`, floored so a size at the fitted
+    /// support's ruin boundary remains finite during the reduction.
+    ///
+    /// Uses the same [`WEALTH_FLOOR`] as host-side [`expected_log_growth`]. The objectives
+    /// coincide only when every bin is deterministic; the cumulant correction is otherwise
+    /// explicit in [`Self::growth`].
+    fn wealth(&self, fraction: &Tensor) -> Tensor {
+        (fraction.unsqueeze(-1) * &self.returns + 1.0).clamp_min(WEALTH_FLOOR)
+    }
+
+    /// `[rows]` `G(f)`, the second-cumulant approximation to expected-log growth under the
+    /// fitted within-bin moments.
+    ///
+    /// ```text
+    /// G(f) = sum_b p_b [ ln(x_b) - 0.5 f² v_b / x_b² ],   x_b = 1 + f E[R | b]
+    /// ```
+    ///
+    /// The between-bin log term is evaluated directly. The second term is the
+    /// second-cumulant treatment of the within-bin dispersion `v_b`, which is the most the
+    /// two-moment bin table can support and keeps this from being the point-mass over-sizing
+    /// bug. Higher within-bin cumulants remain unidentified. The pair agrees with the declared
+    /// quadratic through second order at the origin: `G(0) = 0`, `G'(0) = E[R]` and
+    /// `G''(0) = -E[R²]`.
+    fn growth(&self, within: &Tensor, fraction: &Tensor) -> Tensor {
+        let x = self.wealth(fraction);
+        let f = fraction.unsqueeze(-1);
+        let curvature = (&f * &f * within * 0.5) / (&x * &x);
+        (&self.probs * (x.log() - curvature)).sum_dim_intlist(
+            [-1i64].as_slice(),
+            false,
+            Kind::Double,
+        )
+    }
+
+    /// `[rows]` `dG/df`.
+    ///
+    /// ```text
+    /// G'(f) = sum_b p_b [ E[R | b] / x_b - v_b f / x_b³ ]
+    /// ```
+    ///
+    /// The second term is exact rather than an approximation of the derivative: with
+    /// `x = 1 + f m` and `c(f) = -0.5 v f² x^-2`, `c'(f) = -v f x^-3` identically, because
+    /// `x - f m = 1`. Both terms diverge to `-inf` as `f` approaches the upper ruin bound and
+    /// to `+inf` at the lower one, so the bracket's endpoint signs are structural and
+    /// bisection on this sign is well posed.
+    fn slope(&self, within: &Tensor, fraction: &Tensor) -> Tensor {
+        let x = self.wealth(fraction);
+        let f = fraction.unsqueeze(-1);
+        let cube = &x * &x * &x;
+        let slope = &self.returns / &x - (within * &f) / &cube;
+        (&self.probs * slope).sum_dim_intlist([-1i64].as_slice(), false, Kind::Double)
+    }
+}
+
+/// `[rows]` second-order Kelly fractions for `[rows, outcomes]` categorical probabilities.
+///
+/// Reducing both fitted moment tables gives
+///
+/// ```text
+/// mu = E[R]
+/// m2 = E[R²]
+/// f* = mu / m2
+/// ```
+///
+/// which maximizes the declared global-quadratic growth approximation
+/// `q(f) = f E[R] - 0.5 f² E[R²]`. The alternative that retains the identified within-bin
+/// variance is [`cumulant_kelly_fractions`], reached by [`SizingRule::cumulant_log`]; it is a
+/// second-cumulant expected-log approximation, not an exact expected-log solve.
+///
+/// The fraction retains the previous hard leverage ceiling and ruin-domain bracket derived
+/// from the live bin payoffs. The returned fraction is exactly zero unless the quadratic
+/// growth at the constrained optimum is strictly positive.
+pub fn kelly_fractions(
+    probs: &Tensor,
+    returns: &Tensor,
+    return_seconds: &Tensor,
+    cap: f64,
+) -> Tensor {
+    let (probs, returns, return_seconds) = sizing_inputs(probs, returns, return_seconds, cap);
+
+    tch::no_grad(|| {
+        let law = LiveLaw::new(&probs, &returns, &return_seconds, cap);
+        let (mean, second) = law.moments();
         let raw = &mean / second.clamp_min(f64::MIN_POSITIVE);
-        let fraction = raw.maximum(&lo).minimum(&hi);
+        let fraction = raw.maximum(&law.lo).minimum(&law.hi);
         let growth: Tensor = &fraction * &mean - 0.5 * &fraction * &fraction * &second;
         fraction.where_self(
             &second.gt(0.0).logical_and(&growth.gt(0.0)),
@@ -470,8 +847,108 @@ pub fn kelly_fractions(
     })
 }
 
+/// `[rows]` second-cumulant expected-log Kelly fractions for the same
+/// `[rows, outcomes]` two-moment law.
+///
+/// Maximizes [`LiveLaw::growth`] over the same `[-cap, cap]`-intersected ruin bracket
+/// [`kelly_fractions`] projects onto, by [`CUMULANT_KELLY_ITERATIONS`] bisections on the sign
+/// of `G'`.
+///
+/// The log term prices the between-bin left tail, while the curvature term retains within-bin
+/// variance. It cannot price within-bin skew or any higher cumulant because the persisted
+/// support artifact does not contain them. Zero unless `G` at the returned fraction is
+/// strictly positive — the same no-trade gate [`kelly_fractions`] applies to its own
+/// objective.
+pub fn cumulant_kelly_fractions(
+    probs: &Tensor,
+    returns: &Tensor,
+    return_seconds: &Tensor,
+    cap: f64,
+) -> Tensor {
+    let (probs, returns, return_seconds) = sizing_inputs(probs, returns, return_seconds, cap);
+
+    tch::no_grad(|| {
+        let law = LiveLaw::new(&probs, &returns, &return_seconds, cap);
+        let within = law.within_variance();
+        let mut low = law.lo.shallow_clone();
+        let mut high = law.hi.shallow_clone();
+        for _ in 0..CUMULANT_KELLY_ITERATIONS {
+            let mid = (&low + &high) * 0.5;
+            let rising = law.slope(&within, &mid).gt(0.0);
+            low = mid.where_self(&rising, &low);
+            high = high.where_self(&rising, &mid);
+        }
+        let mut best = (&low + &high) * 0.5;
+        let mut best_growth = law.growth(&within, &best);
+        for endpoint in [&law.lo, &law.hi] {
+            let growth = law.growth(&within, endpoint);
+            let better = growth.gt_tensor(&best_growth);
+            best = endpoint.where_self(&better, &best);
+            best_growth = growth.where_self(&better, &best_growth);
+        }
+        best.where_self(&best_growth.gt(0.0), &best_growth.zeros_like())
+    })
+}
+
+/// `[rows]` indicator of the bars whose SURROGATE optimum leaves the open ruin domain.
+///
+/// `1.0` where the unprojected `E[R]/E[R²]` falls outside `[ruin_lo, ruin_hi]`, i.e. where
+/// the cumulant objective diverges at the size the global quadratic asked for and only the
+/// declared clamp stood between the book and the fitted support's ruin boundary. This is
+/// information `q(f)` structurally cannot carry: a parabola remains finite beyond that bound.
+///
+/// Measured against the PRE-cap bracket on purpose, so a breach is a statement about the
+/// ruin domain of the fitted support rather than about [`MAX_LEVERAGE`] or the headline cap.
+pub fn surrogate_ruin_breaches(
+    probs: &Tensor,
+    returns: &Tensor,
+    return_seconds: &Tensor,
+) -> Tensor {
+    let (probs, returns, return_seconds) =
+        sizing_inputs(probs, returns, return_seconds, FREE_LEVERAGE);
+
+    tch::no_grad(|| {
+        let law = LiveLaw::new(&probs, &returns, &return_seconds, FREE_LEVERAGE);
+        let (mean, second) = law.moments();
+        let raw = &mean / second.clamp_min(f64::MIN_POSITIVE);
+        raw.lt_tensor(&law.ruin_lo)
+            .logical_or(&raw.gt_tensor(&law.ruin_hi))
+            .to_kind(Kind::Double)
+    })
+}
+
 /// Scalar host convenience over [`kelly_fractions`].
 pub fn kelly_fraction(probs: &[f64], returns: &[f64], return_seconds: &[f64], cap: f64) -> f64 {
+    one_row(probs, returns, return_seconds, |probs, returns, seconds| {
+        kelly_fractions(probs, returns, seconds, cap)
+    })
+}
+
+/// Scalar host convenience over [`cumulant_kelly_fractions`].
+pub fn cumulant_kelly_fraction(
+    probs: &[f64],
+    returns: &[f64],
+    return_seconds: &[f64],
+    cap: f64,
+) -> f64 {
+    one_row(probs, returns, return_seconds, |probs, returns, seconds| {
+        cumulant_kelly_fractions(probs, returns, seconds, cap)
+    })
+}
+
+/// Scalar host convenience over [`surrogate_ruin_breaches`]: true when the surrogate's
+/// optimum for this one law leaves the ruin domain.
+pub fn surrogate_ruin_breach(probs: &[f64], returns: &[f64], return_seconds: &[f64]) -> bool {
+    one_row(probs, returns, return_seconds, surrogate_ruin_breaches) > 0.0
+}
+
+/// Run one of the `[rows, outcomes]` reductions on a single host-side law.
+fn one_row(
+    probs: &[f64],
+    returns: &[f64],
+    return_seconds: &[f64],
+    reduce: impl Fn(&Tensor, &Tensor, &Tensor) -> Tensor,
+) -> f64 {
     assert_eq!(probs.len(), returns.len(), "one first moment per outcome");
     assert_eq!(
         probs.len(),
@@ -482,7 +959,7 @@ pub fn kelly_fraction(probs: &[f64], returns: &[f64], return_seconds: &[f64], ca
     let probs = Tensor::from_slice(probs).view([1, outcomes]);
     let returns = Tensor::from_slice(returns).view([1, outcomes]);
     let return_seconds = Tensor::from_slice(return_seconds).view([1, outcomes]);
-    kelly_fractions(&probs, &returns, &return_seconds, cap).double_value(&[0])
+    reduce(&probs, &returns, &return_seconds).double_value(&[0])
 }
 
 /// The NULL policy's constant quadratic Kelly position under the train-fitted
@@ -501,6 +978,37 @@ pub fn marginal_position(supports: &BarSupports, cap: f64) -> f64 {
 // ---------------------------------------------------------------------------
 // Positions over held-out windows
 // ---------------------------------------------------------------------------
+
+/// The per-bar evidence a non-control [`SizingRule`] leaves behind, so the arm can be priced
+/// against the control it replaced on the SAME bars.
+///
+/// Present only when the pass sized on something other than [`SizingRule::CONTROL`]: on an
+/// ordinary bench there is no alternative rule to compare against and the control fraction is
+/// [`WindowPaths::free`] itself. One optional struct rather than three optional columns
+/// because the three are produced together or not at all, and a window carrying two of them
+/// is not a state this comparison can be in.
+#[derive(Clone, Debug)]
+pub struct SizingEvidence {
+    /// The rule that chose [`WindowPaths::free`].
+    pub rule: SizingRule,
+    /// The recalibration the rule sized on. [`MeanShrink::identity`] when it did not
+    /// recalibrate, so the applied slope is always readable off the window.
+    pub shrink: MeanShrink,
+    /// The uncapped fraction [`SizingRule::CONTROL`] would have chosen on the same bar, from
+    /// the same probabilities and the same fitted moments.
+    pub free_control: Vec<f64>,
+    /// `1.0` on bars where the CONTROL's unprojected optimum left the open ruin domain, i.e.
+    /// where the cumulant objective diverges at the size the global quadratic asked for. See
+    /// [`surrogate_ruin_breaches`].
+    pub ruin_breach: Vec<f64>,
+}
+
+impl SizingEvidence {
+    /// True when both columns cover every bar of a `bars`-bar window.
+    pub fn covers(&self, bars: usize) -> bool {
+        self.free_control.len() == bars && self.ruin_breach.len() == bars
+    }
+}
 
 /// One held-out window: the realized simple returns, the UNCAPPED optimum, and every
 /// policy's position path at the headline cap.
@@ -543,6 +1051,18 @@ pub struct WindowPaths {
     /// center or a hard-coded replacement.
     pub trimmed_mean: Vec<f64>,
     pub trimmed_var: Vec<f64>,
+    /// Garman-Klass realized variance of the bar each decision is paid on, per bar.
+    ///
+    /// The one piece of the REALIZED bar geometry this module keeps beyond the close-to-close
+    /// return. It reaches no decision: the vol-targeted baseline reads it only through
+    /// [`trailing_vol`], whose forecast for bar `t` is a function of bars strictly before
+    /// `t`. Empty on windows built by the accounting-only constructor, which is what
+    /// [`Self::has_realized_variance`] refuses on.
+    pub realized_variance: Vec<f64>,
+    /// What the CONTROL sizing rule would have done on these same bars, when this pass did
+    /// not use it. `None` on every control bench and on every derived window set whose `free`
+    /// was replaced by a different fraction, where the comparison would be meaningless.
+    pub sizing: Option<SizingEvidence>,
 }
 
 impl WindowPaths {
@@ -572,6 +1092,8 @@ impl WindowPaths {
             outer_signed: Vec::new(),
             trimmed_mean: Vec::new(),
             trimmed_var: Vec::new(),
+            realized_variance: Vec::new(),
+            sizing: None,
         }
     }
 
@@ -593,6 +1115,11 @@ impl WindowPaths {
             && self.outer_signed.len() == self.realized.len()
             && self.trimmed_mean.len() == self.realized.len()
             && self.trimmed_var.len() == self.realized.len()
+    }
+
+    /// True when the realized-variance proxy was formed for every bar of this window.
+    pub fn has_realized_variance(&self) -> bool {
+        self.realized_variance.len() == self.realized.len()
     }
 }
 
@@ -660,22 +1187,36 @@ pub struct TradeSetup {
     returns: Tensor,
     /// `[1, NUM_BAR_BINS]` train-fitted `E[R² | bin]`, paired with `returns`.
     return_seconds: Tensor,
-    /// `[1, NUM_BAR_BINS]` train-fitted `E[r | bin]` for predictive calibration.
+    /// `[1, NUM_BAR_BINS]` train-fitted first moment of the predictive `r` target: raw log
+    /// return under [`DofScaling::Raw`], standardized `z` otherwise.
     log_means: Tensor,
-    /// `[1, NUM_BAR_BINS]` train-fitted `E[r² | bin]`, including within-bin dispersion.
+    /// Paired train-fitted second moment, including within-bin dispersion.
     log_seconds: Tensor,
-    /// `[1, NUM_BAR_BINS]` value bounds of each `r` bin, in LOG-return space, for the
-    /// tail quantiles. Atoms have `lo == hi`, which makes their quantile the atom itself.
+    /// `[1, NUM_BAR_BINS]` bounds in the predictive target's coordinate system, for tail
+    /// quantiles. Standardized bounds are mapped to raw `r` per row before comparison.
     lo: Tensor,
     hi: Tensor,
     /// The null's UNCAPPED fraction, so the null can be re-clamped at every cap on the
     /// curve instead of being frozen at the headline cap.
     free_marginal: f64,
     cap: f64,
-    /// The optional out-of-sample mean recalibration to ALSO reduce.
-    ///
-    /// Existing policy rows never read the recalibrated result.
+    /// The optional out-of-sample mean recalibration to ALSO reduce, and — when
+    /// [`Self::rule`] asks for it — to SIZE on.
     shrink: Option<MeanShrink>,
+    /// Which reduction of the predictive law chooses the position.
+    rule: SizingRule,
+    /// The target parametrization this artifact's predictive bins tile.
+    ///
+    /// Realized DOF handed to [`Self::paths`] are always raw economic targets. Scaling controls
+    /// only how the predictive `z` law is integrated at decision-time `sigma_t`; it never
+    /// changes a realized `r` or `s` a second time.
+    scaling: DofScaling,
+    /// The measured within-bin law of `z`, present exactly when `scaling` is standardized.
+    ///
+    /// The sigma-conditional Kelly input: `returns` and `return_seconds` are the fit sample's
+    /// simple-return moments MARGINALIZED over its own sigma distribution, which is the right
+    /// table for a constant null and the wrong one for a bet placed at a known `sigma_t`.
+    z_law: Option<TradedZLaw>,
 }
 
 impl TradeSetup {
@@ -697,6 +1238,14 @@ impl TradeSetup {
                 .view([1, NUM_BAR_BINS])
                 .to_device(device)
         };
+        let scaling = supports.dof_scaling();
+        let z_law = supports.traded_z_law();
+        assert!(
+            !scaling.is_standardized() || z_law.is_some(),
+            "these {scaling} supports carry no measured sub-bin law of z, so no bet can be \
+             sized at the decision-time volatility its targets were divided by; refit with \
+             BarSupports::fit_standardized"
+        );
         Self {
             returns: row(returns),
             return_seconds: row(return_seconds),
@@ -714,6 +1263,9 @@ impl TradeSetup {
             ),
             cap,
             shrink: None,
+            rule: SizingRule::CONTROL,
+            scaling,
+            z_law,
         }
     }
 
@@ -725,6 +1277,20 @@ impl TradeSetup {
     pub fn with_shrink(mut self, shrink: Option<MeanShrink>) -> Self {
         self.shrink = shrink;
         self
+    }
+
+    /// Size on something other than the historical global quadratic on the raw mean.
+    ///
+    /// A builder for the same reason [`Self::with_shrink`] is one: [`SizingRule::recalibrated`]
+    /// is only meaningful beside a recalibration fitted on a disjoint slice, so the two arrive
+    /// together and after the artifact-level table exists.
+    pub fn with_sizing_rule(mut self, rule: SizingRule) -> Self {
+        self.rule = rule;
+        self
+    }
+
+    pub fn sizing_rule(&self) -> SizingRule {
+        self.rule
     }
 
     /// The null policy's constant position at the headline cap.
@@ -741,18 +1307,27 @@ impl TradeSetup {
         self.cap
     }
 
-    /// Positions and tail exceedances over the first `windows` windows of one
-    /// teacher-forced chunk.
+    /// Positions, the realized-variance proxy and tail exceedances over the first `windows`
+    /// windows of one teacher-forced chunk.
     ///
-    /// `realized_dof` is the `[windows, bars, BAR_DOF]` realized continuation the beliefs
-    /// predict. Its `r` column is selected HERE rather than by the caller, so no call site
-    /// can hand the bench the wrong degree of freedom, and no other column is ever read.
+    /// `realized_dof` is the `[windows, bars, BAR_DOF]` RAW economic continuation the beliefs
+    /// predict, before any target standardization or `z` clamp. Its `r` column and its
+    /// `(s, u, v)` geometry are selected HERE rather than by the caller, so no call site can
+    /// hand the bench the wrong degree of freedom. They are outcomes only: `r` reaches realized
+    /// payoff and calibration, while geometry reaches [`WindowPaths::realized_variance`].
+    ///
+    /// `sigma` is the `[windows, bars]` causal `sigma_t` used to integrate a standardized
+    /// predictive law back into raw economic moments. It is REQUIRED under
+    /// [`DofScaling::VolStandardized`] for sizing, predictive calibration and tail quantiles,
+    /// but it never multiplies `realized_dof`: those outcomes are already raw. Ignored on the
+    /// raw predictive path.
     pub fn paths(
         &self,
         head: &BarEmissionHead,
         beliefs: &Tensor,
         conditioning: &Tensor,
         realized_dof: &Tensor,
+        sigma: Option<&Tensor>,
         windows: usize,
     ) -> Result<ChunkPaths> {
         let available = beliefs.size()[0];
@@ -760,11 +1335,33 @@ impl TradeSetup {
         if take <= 0 {
             return Ok(ChunkPaths::empty());
         }
+        let taken_sigma = match self.scaling {
+            DofScaling::Raw => None,
+            DofScaling::VolStandardized => Some(
+                sigma
+                    .with_context(|| {
+                        format!(
+                            "a {} bench needs per-bar sigma_t to integrate its predictive z \
+                             law into raw Kelly moments, calibration moments and quantiles",
+                            DofScaling::VolStandardized
+                        )
+                    })?
+                    .narrow(0, 0, take),
+            ),
+        };
+        let standardized = taken_sigma.as_ref().map(|sigma| StandardizedTargets {
+            sigma,
+            z_law: self
+                .z_law
+                .as_ref()
+                .expect("a standardized setup carries the sub-bin law of z; asserted in new"),
+        });
         window_paths(
             head,
             &beliefs.narrow(0, 0, take),
             &conditioning.narrow(0, 0, take),
             &realized_dof.narrow(0, 0, take).select(-1, DOF_R as i64),
+            Some(&realized_dof.narrow(0, 0, take).narrow(-1, DOF_S as i64, 3)),
             &TradedLaw {
                 returns: &self.returns,
                 return_seconds: &self.return_seconds,
@@ -772,6 +1369,8 @@ impl TradeSetup {
                 log_seconds: &self.log_seconds,
                 bounds: Some((&self.lo, &self.hi)),
                 shrink: self.shrink,
+                rule: self.rule,
+                standardized,
             },
             self.free_marginal,
             self.cap,
@@ -790,14 +1389,36 @@ pub struct TradedLaw<'a> {
     pub returns: &'a Tensor,
     /// `[1, NUM_BAR_BINS]` train-fitted `E[R² | bin]`.
     pub return_seconds: &'a Tensor,
-    /// `[1, NUM_BAR_BINS]` train-fitted `E[r | bin]`.
+    /// `[1, NUM_BAR_BINS]` train-fitted first and second moments of the predictive target:
+    /// raw `r`, or standardized `z`.
     pub log_means: &'a Tensor,
-    /// `[1, NUM_BAR_BINS]` train-fitted `E[r² | bin]`.
     pub log_seconds: &'a Tensor,
-    /// `[1, NUM_BAR_BINS]` log-space value bounds for tail quantiles.
+    /// Bounds in that same predictive coordinate system for tail quantiles.
     pub bounds: Option<(&'a Tensor, &'a Tensor)>,
-    /// A post-hoc mean recalibration to reduce into a second moment-correct fraction.
+    /// A post-hoc mean recalibration to reduce into a second moment-correct fraction, and to
+    /// SIZE on when `rule` asks for it.
     pub shrink: Option<MeanShrink>,
+    /// Which reduction of this law chooses the position. [`SizingRule::CONTROL`] on every
+    /// ordinary bench.
+    pub rule: SizingRule,
+    /// The volatility the targets were standardized by, and the within-bin law of `z` its
+    /// payoff moments are integrated through. `None` on the raw path.
+    pub standardized: Option<StandardizedTargets<'a>>,
+}
+
+/// Predictive information a standardized target set needs beyond its fitted marginal
+/// moments: the decision-time divisor and the measured within-bin law it is integrated
+/// against.
+///
+/// This struct never applies to realized outcomes. [`TradeSetup::paths`] receives separate
+/// raw pre-standardization DOF for payoff, calibration targets and Garman-Klass.
+#[derive(Debug)]
+pub struct StandardizedTargets<'a> {
+    /// `[windows, bars]` causal `sigma_t`, measurable on bars strictly before its own.
+    pub sigma: &'a Tensor,
+    /// The support's measured sub-bin law of `z`, which turns `sigma_t` into
+    /// `E[expm1(sigma_t z) | bin]`.
+    pub z_law: &'a TradedZLaw,
 }
 
 impl<'a> TradedLaw<'a> {
@@ -815,6 +1436,8 @@ impl<'a> TradedLaw<'a> {
             log_seconds,
             bounds: None,
             shrink: None,
+            rule: SizingRule::CONTROL,
+            standardized: None,
         }
     }
 
@@ -825,6 +1448,11 @@ impl<'a> TradedLaw<'a> {
 
     pub fn with_shrink(mut self, shrink: MeanShrink) -> Self {
         self.shrink = Some(shrink);
+        self
+    }
+
+    pub fn with_sizing_rule(mut self, rule: SizingRule) -> Self {
+        self.rule = rule;
         self
     }
 }
@@ -877,16 +1505,32 @@ impl ChunkPaths {
 
 /// Positions, conditional moments and tail exceedances for one chunk of pinned windows.
 ///
-/// `beliefs` and `conditioning` are `[windows, bars, latent_dim]`; `realized_r`
-/// is `[windows, bars]`, the realized return each pair predicts. The decision is
-/// computed only from the causal belief and forecast-safe conditioner. `realized_r`
-/// reaches the payoff, perfect-foresight oracle and tail-calibration count only.
+/// `beliefs` and `conditioning` are `[windows, bars, latent_dim]`; `realized_r` is the RAW
+/// economic log return `[windows, bars]`, and `realized_geometry`, when supplied, is RAW
+/// `(s, u, v)` with shape `[windows, bars, 3]`. The decision is computed only from the causal
+/// belief and forecast-safe conditioner. Realized values reach outcomes and diagnostics only.
 ///
-/// The Kelly solve runs ONCE per bar, uncapped. Every policy is then a clamp of that one
+/// # This function is the UNIT BOUNDARY
+///
+/// Every realized column arrives and leaves in raw economic units. When
+/// [`TradedLaw::standardized`] is set, only the PREDICTIVE law needs `sigma_t`: Kelly moments
+/// integrate `E[expm1(sigma_t z) | bin]`, calibration moments are mapped by
+/// `E[r] = sigma_t E[z]` and `Var[r] = sigma_t² Var[z]`, and predictive tail quantiles are
+/// mapped from `z` to `r`. The realized payoff remains `expm1(realized_r)` and Garman-Klass is
+/// computed directly from the raw realized geometry; multiplying either outcome by `sigma_t`
+/// again would double de-standardize it.
+///
+/// The sizing solve runs ONCE per bar, uncapped. Every policy is then a clamp of that one
 /// number, which is exact by concavity and is what makes the cap curve free. When
 /// [`TradedLaw::shrink`] is set a SECOND uncapped optimum is solved, under the same
 /// probabilities with the conditional mean recalibrated — see [`MeanShrink`] for why that is
 /// a shift of the support rather than a scaling of the fraction.
+///
+/// [`TradedLaw::rule`] decides which of those reductions IS the position. Off the control
+/// rule the pass also keeps the control's own fraction and its ruin-domain breaches per bar
+/// ([`SizingEvidence`]), because the only honest way to price a sizing change is against what
+/// the rule it replaced would have done on the same bars — and the alternative fraction is
+/// already in hand, so the comparison costs one host vector rather than a second pass.
 ///
 /// The conditional mean and variance of `r` come out of the same probabilities, at the cost
 /// of two reductions over an object that is already materialized. They are what
@@ -897,6 +1541,7 @@ pub fn window_paths(
     beliefs: &Tensor,
     conditioning: &Tensor,
     realized_r: &Tensor,
+    realized_geometry: Option<&Tensor>,
     law: &TradedLaw<'_>,
     free_marginal: f64,
     cap: f64,
@@ -923,17 +1568,61 @@ pub fn window_paths(
          [{windows}, {bars}]",
         realized_r.size()
     );
+    if let Some(geometry) = realized_geometry {
+        ensure!(
+            geometry.size() == [windows, bars, 3],
+            "the realized bar geometry must carry (s, u, v) for every bar the beliefs \
+             predict: {:?} vs [{windows}, {bars}, 3]",
+            geometry.size()
+        );
+    }
+    if let Some(standardized) = law.standardized.as_ref() {
+        ensure!(
+            standardized.sigma.size() == [windows, bars],
+            "the standardizing volatility must carry sigma_t for every bar the beliefs \
+             predict: {:?} vs [{windows}, {bars}]",
+            standardized.sigma.size()
+        );
+    }
+    // An in-sample or absent calibration is worse than none, so the recalibrated rule refuses
+    // rather than silently sizing on the raw mean under a recalibrated label. The caller fits
+    // the slope on a slice that is block-disjoint from these windows; this is the last place
+    // that contract can be enforced from.
+    ensure!(
+        !law.rule.recalibrated || law.shrink.is_some(),
+        "SizingRule::recalibrated needs a fitted MeanShrink on the traded law; sizing on the \
+         raw conditional mean under a recalibrated label would be a silent control run"
+    );
 
     let rows = windows * bars;
     let flat_beliefs = beliefs.reshape([rows, latent]);
     let flat_conditioning = conditioning.reshape([rows, latent]);
     let flat_r = realized_r.reshape([rows]).to_kind(Kind::Double);
+    // Realized targets are already raw, even when the predictive supports tile z. Sigma is
+    // retained only for integrating that predictive law below; applying it here would double
+    // de-standardize the outcome and corrupt both payoff and calibration.
     let realized = flat_r.expm1();
-    let mut free = Vec::with_capacity(rows as usize);
-    let mut free_shrunk = Vec::with_capacity(if law.shrink.is_some() {
+    let flat_sigma = law
+        .standardized
+        .as_ref()
+        .map(|standardized| standardized.sigma.reshape([rows]).to_kind(Kind::Double));
+    // The CONTROL reduction is always solved: it is the position under
+    // `SizingRule::CONTROL`, and it is the comparison under every other rule.
+    let mut control = Vec::with_capacity(rows as usize);
+    let mut shrunk = Vec::with_capacity(if law.shrink.is_some() {
         rows as usize
     } else {
         0
+    });
+    let mut cumulant = Vec::with_capacity(if law.rule.cumulant_log {
+        rows as usize
+    } else {
+        0
+    });
+    let mut breach = Vec::with_capacity(if law.rule.is_control() {
+        0
+    } else {
+        rows as usize
     });
     let mut predicted_mean = Vec::with_capacity(rows as usize);
     let mut predicted_var = Vec::with_capacity(rows as usize);
@@ -967,12 +1656,36 @@ pub fn window_paths(
         let chunk = flat_beliefs.narrow(0, start, len);
         let chunk_conditioning = flat_conditioning.narrow(0, start, len);
         let probs = forecast_r_probs(head, &chunk, &chunk_conditioning);
-        free.extend(host_vec(&kelly_fractions(
+        // The payoff moments the bet is actually sized on. `sigma_t` is measurable on bars
+        // strictly before `t`, so a standardized target can use the row-specific within-bin
+        // law of `z` integrated at THIS row's volatility:
+        // `E[expm1(sigma_t z) | bin]`. The artifact-level table is that same integral
+        // marginalized over the fit sample's own sigma distribution, which is the right table
+        // for a constant null and the wrong one for a bet placed at a known level.
+        let sigma_chunk = flat_sigma.as_ref().map(|sigma| sigma.narrow(0, start, len));
+        let conditional = match (law.standardized.as_ref(), sigma_chunk.as_ref()) {
+            (Some(standardized), Some(sigma)) => {
+                Some(standardized.z_law.simple_return_moments_at(sigma)?)
+            }
+            _ => None,
+        };
+        let (returns, return_seconds) = match &conditional {
+            Some((first, second)) => (first, second),
+            None => (law.returns, law.return_seconds),
+        };
+        control.extend(host_vec(&kelly_fractions(
             &probs,
-            law.returns,
-            law.return_seconds,
+            returns,
+            return_seconds,
             FREE_LEVERAGE,
         )));
+        if !law.rule.is_control() {
+            breach.extend(host_vec(&surrogate_ruin_breaches(
+                &probs,
+                returns,
+                return_seconds,
+            )));
+        }
         // Calibration reduces the persisted within-bin log moments. Geometric centers are
         // support geometry for sampling/CRPS, not representatives of a catch-all (or any other
         // bin) in a predictive moment.
@@ -985,6 +1698,16 @@ pub fn window_paths(
         let second =
             (&normalized * &log_seconds).sum_dim_intlist([-1i64].as_slice(), true, Kind::Double);
         let var = (second - &mu * &mu).clamp_min(0.0).reshape([-1]);
+        // Both conditional moments in RAW log-return units on either path. `r = sigma_t z`
+        // with `sigma_t` known at decision time, so `E[r] = sigma_t E[z]` and
+        // `Var[r] = sigma_t^2 Var[z]` are exact — and doing it here spares every consumer a
+        // second parametrization: the calibration regression, the recalibration shift below
+        // and the volatility bench all read one unit system.
+        let level = sigma_chunk.as_ref().map(|sigma| sigma.reshape([len, 1]));
+        let (mu, var) = match &level {
+            Some(level) => (&mu * level, var * (level * level).reshape([-1])),
+            None => (mu, var),
+        };
         predicted_mean.extend(host_vec(&mu.reshape([-1])));
         predicted_var.extend(host_vec(&var));
         let lower_outer = normalized.select(-1, 0);
@@ -1006,9 +1729,19 @@ pub fn window_paths(
         let interior_variance = (interior_second - &interior_mu * &interior_mu)
             .clamp_min(0.0)
             .reshape([-1]);
+        let (interior_mu, interior_variance) = match &level {
+            Some(level) => (
+                &interior_mu * level,
+                interior_variance * (level * level).reshape([-1]),
+            ),
+            None => (interior_mu, interior_variance),
+        };
         trimmed_mean.extend(host_vec(&interior_mu.reshape([-1])));
         trimmed_var.extend(host_vec(&interior_variance));
-        if let Some(shrink) = law.shrink {
+        // The moments the ACTIVE rule sizes on: the raw fitted table, or the same table
+        // shifted in log space by the out-of-sample recalibration. Formed once and shared by
+        // the global quadratic and cumulant columns so they cannot disagree about the law.
+        let recalibrated = law.shrink.map(|shrink| {
             // A log-space shift `d` transforms the simple return as `R' = a R + b`, where
             // `a = exp(d)` and `b = expm1(d)`. Transform BOTH fitted moments: replacing the
             // second moment by the square of the shifted conditional mean would reintroduce
@@ -1016,14 +1749,28 @@ pub fn window_paths(
             let d = &mu * (shrink.beta - 1.0) + shrink.alpha;
             let a = d.exp();
             let b = d.expm1();
-            let returns = law.returns.to_kind(Kind::Double);
-            let return_seconds = law.return_seconds.to_kind(Kind::Double);
-            let shifted = &returns * &a + &b;
+            let returns = returns.to_kind(Kind::Double);
+            let return_seconds = return_seconds.to_kind(Kind::Double);
             let shifted_seconds = &return_seconds * &a * &a + 2.0 * &returns * &a * &b + &b * &b;
-            free_shrunk.extend(host_vec(&kelly_fractions(
+            (&returns * &a + &b, shifted_seconds)
+        });
+        if let Some((shifted, shifted_seconds)) = recalibrated.as_ref() {
+            shrunk.extend(host_vec(&kelly_fractions(
                 &probs,
-                &shifted,
-                &shifted_seconds,
+                shifted,
+                shifted_seconds,
+                FREE_LEVERAGE,
+            )));
+        }
+        if law.rule.cumulant_log {
+            let (returns, return_seconds) = match (law.rule.recalibrated, recalibrated.as_ref()) {
+                (true, Some((shifted, shifted_seconds))) => (shifted, shifted_seconds),
+                _ => (returns, return_seconds),
+            };
+            cumulant.extend(host_vec(&cumulant_kelly_fractions(
+                &probs,
+                returns,
+                return_seconds,
                 FREE_LEVERAGE,
             )));
         }
@@ -1032,6 +1779,10 @@ pub fn window_paths(
             for (level, q) in TAIL_LEVELS.iter().enumerate() {
                 let below = predicted_quantile(&probs, lo, hi, *q);
                 let above = predicted_quantile(&probs, lo, hi, 1.0 - *q);
+                let (below, above) = match sigma_chunk.as_ref() {
+                    Some(sigma) => (below * sigma, above * sigma),
+                    None => (below, above),
+                };
                 exceed_lower[level].extend(host_vec(
                     &realized_chunk.lt_tensor(&below).to_kind(Kind::Double),
                 ));
@@ -1043,10 +1794,50 @@ pub fn window_paths(
         start += len;
     }
     let realized = host_vec(&realized);
+    // Garman-Klass is computed directly from RAW `(s, u, v)`: `s = ln H - ln L`,
+    // `u = (ln C - ln L)/s`, `v = (ln O - ln L)/s`, hence
+    // `ln C - ln O = (u - v) s`. Standardized predictive supports do not change this
+    // realized outcome, and sigma must never multiply its raw range a second time.
+    let realized_variance = realized_geometry.map(|geometry| {
+        let flat = geometry.reshape([rows, 3]).to_kind(Kind::Double);
+        let range = flat.select(1, 0);
+        let close = flat.select(1, 1);
+        let open = flat.select(1, 2);
+        let body = (close - open) * &range;
+        let squared_range = &range * &range;
+        let squared_body = &body * &body;
+        host_vec(&(squared_range * 0.5 - squared_body * GK_OPEN_CLOSE))
+    });
 
     let bars = bars as usize;
     let measured_tail = law.bounds.is_some();
-    let shrunk = law.shrink.is_some();
+    let rule = law.rule;
+    // The recalibration the position was actually formed under, so the applied slope is
+    // readable off any window rather than only off the pass that fitted it.
+    let applied_shrink = if rule.recalibrated {
+        law.shrink
+            .expect("a recalibrated sizing rule is refused above without a fitted shrink")
+    } else {
+        MeanShrink::identity()
+    };
+    let shrunk = law.shrink.is_some().then_some(shrunk);
+    // Exactly one reduction becomes the position. `free_shrunk` keeps the meaning it has
+    // always had — the alternative fraction this pass did NOT size on — so it is dropped the
+    // moment the recalibrated fraction IS the position, rather than left as a duplicate column
+    // whose paired difference against itself would read as a measurement.
+    let (free, free_shrunk, evidence) = if rule.is_control() {
+        (control, shrunk, None)
+    } else {
+        let (free, free_shrunk) = if rule.cumulant_log {
+            (cumulant, if rule.recalibrated { None } else { shrunk })
+        } else {
+            (
+                shrunk.expect("a recalibrated sizing rule carries a fitted shrink"),
+                None,
+            )
+        };
+        (free, free_shrunk, Some((control, breach)))
+    };
     let mut tail = TailCounts::empty();
     let paths = (0..windows as usize)
         .map(|window| {
@@ -1081,15 +1872,37 @@ pub fn window_paths(
                         .iter()
                         .map(|r| cap * r.signum() * f64::from(*r != 0.0))
                         .collect(),
+                    // Model-free and causal: the trailing sigma at bar `t` is a function of
+                    // bars strictly before `t`, and the clamp is the same [`clamp_fraction`]
+                    // every other row is projected by.
+                    vol_target_positions(
+                        realized_variance
+                            .as_ref()
+                            .map_or(&[][..], |proxy| &proxy[span.clone()]),
+                        bars,
+                        cap,
+                    ),
                 ],
                 free: free_window,
                 predicted_mean: predicted_mean[span.clone()].to_vec(),
                 predicted_var: predicted_var[span.clone()].to_vec(),
-                free_shrunk: shrunk.then(|| free_shrunk[span.clone()].to_vec()),
+                free_shrunk: free_shrunk
+                    .as_ref()
+                    .map(|shrunk| shrunk[span.clone()].to_vec()),
                 outer_mass: outer_mass[span.clone()].to_vec(),
                 outer_signed: outer_signed[span.clone()].to_vec(),
                 trimmed_mean: trimmed_mean[span.clone()].to_vec(),
-                trimmed_var: trimmed_var[span].to_vec(),
+                trimmed_var: trimmed_var[span.clone()].to_vec(),
+                realized_variance: realized_variance
+                    .as_ref()
+                    .map(|proxy| proxy[span.clone()].to_vec())
+                    .unwrap_or_default(),
+                sizing: evidence.as_ref().map(|(control, breach)| SizingEvidence {
+                    rule,
+                    shrink: applied_shrink,
+                    free_control: control[span.clone()].to_vec(),
+                    ruin_breach: breach[span].to_vec(),
+                }),
             }
         })
         .collect();
@@ -1148,6 +1961,719 @@ pub fn predicted_quantile(probs: &Tensor, lo: &Tensor, hi: &Tensor, q: f64) -> T
 fn host_vec(tensor: &Tensor) -> Vec<f64> {
     Vec::<f64>::try_from(tensor.to_kind(Kind::Double).contiguous().view([-1]))
         .expect("a 1-D f64 tensor converts to a host vector")
+}
+
+// ---------------------------------------------------------------------------
+// Causal volatility: the proxy, the trailing baselines, and the vol-targeted row
+// ---------------------------------------------------------------------------
+
+/// Garman-Klass realized variance of one bar, from its modelled `(s, u, v)` geometry.
+///
+/// # Why Garman-Klass and not Parkinson or Rogers-Satchell
+///
+/// All three are exactly expressible in this module's coordinates, because
+/// `s = ln H - ln L`, `u = (ln C - ln L)/s` and `v = (ln O - ln L)/s` give every log price
+/// ratio of the bar. The choice is therefore purely about the estimator:
+///
+/// * Parkinson uses the range alone, `s^2 / (4 ln 2)`, and throws the open and close away.
+/// * Rogers-Satchell, `s^2 [(1-u)(1-v) + u v]`, is unbiased under a DRIFT, which is its one
+///   advantage and it is worthless here: over a 300-second bar the drift contributes
+///   `(mu dt)^2` against `sigma^2 dt`, eleven orders of magnitude smaller.
+/// * Garman-Klass, `0.5 s^2 - (2 ln 2 - 1)(ln C - ln O)^2`, is the minimum-variance
+///   combination of the range and the body under zero drift — roughly `7x` the efficiency of
+///   a squared return against Parkinson's `5x`. Since the scored quantity is a per-bar
+///   variance whose only competitor is estimator noise, efficiency is the whole game.
+///
+/// Strictly positive whenever the bar moved: `|u - v| <= 1` bounds the subtracted term at
+/// `(2 ln 2 - 1) s^2 ~ 0.386 s^2`, so the result never falls below `0.114 s^2`. A flat bar
+/// (`s == 0`) returns exactly zero, which is why [`vol_bench`] drops those bars rather than
+/// taking `ln 0`.
+pub fn garman_klass(range: f64, close: f64, open: f64) -> f64 {
+    let body = (close - open) * range;
+    0.5 * range * range - GK_OPEN_CLOSE * body * body
+}
+
+/// One window's causal trailing volatility forecasts.
+///
+/// **The causality contract, and it is structural rather than asserted.** The single forward
+/// loop reads its state, writes both forecasts for bar `t`, and only THEN folds bar `t`'s
+/// realized proxy into that state. So no forecast can see its own bar or any later one, and
+/// the ordering is a property of the loop body rather than of an offset a refactor could
+/// slide. `the_trailing_forecasts_cannot_see_their_own_bar` perturbs one bar and checks
+/// every earlier forecast is bit-identical.
+struct TrailingVol {
+    /// Bias-corrected EWMA of the proxy over strictly past bars, at
+    /// [`VOL_EWMA_HALF_LIFE_BARS`]. `NAN` at bar 0.
+    ///
+    /// Bias-corrected — `num / den` with both decayed — rather than seeded at the first
+    /// observation, so the early bars are the expanding MEAN of what is available instead of
+    /// a near-copy of bar 0.
+    ewma: Vec<f64>,
+    /// The HAR-RV regression's forecast over strictly past bars, floored and refused as
+    /// [`HarSource`] records. `NAN` before the first component exists at all.
+    har: Vec<f64>,
+    /// Where `har[t]` came from, one entry per bar.
+    ///
+    /// Carried out of the loop rather than recomputed because it is the only thing that
+    /// distinguishes a baseline that is FORECASTING from one that is being rescued on most
+    /// bars, and the composite QLIKE cannot show the difference.
+    har_source: Vec<HarSource>,
+}
+
+/// Where one bar's HAR forecast came from, in ascending order of trust.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HarSource {
+    /// No usable fit — too few rows, or a solve still singular under [`VOL_HAR_RIDGE`] — so
+    /// the trailing daily component stands in.
+    Refused,
+    /// A fit was solved and REJECTED against [`VOL_HAR_FLOOR_FRACTION`] of that component.
+    Floored,
+    /// Fitted, on fewer than the three declared legs: see [`VOL_HAR_LEG_MIN_ROWS`].
+    Reduced,
+    /// Fitted on all three legs.
+    Full,
+}
+
+/// Build [`TrailingVol`] for one window's realized-variance proxy.
+///
+/// # The HAR baseline is fitted, and on which bars
+///
+/// Corsi's HAR-RV is `RV_t = c + b_d RV^d_{t-1} + b_w RV^w_{t-1} + b_m RV^m_{t-1}`, three
+/// slopes and an intercept on nested trailing means at [`VOL_HAR_LAGS_BARS`]. The
+/// coefficients used to forecast bar `t` are the OLS solution over rows `1..t` OF THIS
+/// WINDOW — every one of them strictly before `t`, none of them from any other window, and
+/// none of them from the split the model was trained on. There is no full-sample fit
+/// anywhere: the normal equations are accumulated INSIDE the same forward loop, after the
+/// forecast for the bar has already been emitted.
+///
+/// # Why the baseline is handed an in-window fit rather than declared weights
+///
+/// Declared equal weights would need no fit at all and would be trivially causal, but they
+/// would also make the baseline WEAKER than the HAR a real desk runs, and a model that only
+/// beats a hobbled null has been told nothing. Recursive least squares inside the evaluation
+/// window is what a trader could actually have run in real time, so it is the honest bar.
+///
+/// A linear fit on variance levels can return a forecast that is non-positive, or positive
+/// and orders of magnitude too small. Neither is a variance forecast, and QLIKE charges the
+/// second one LINEARLY through `E[z]` while charging the first nothing at all because the row
+/// is dropped. Both fall back to the trailing DAILY component, which is itself a valid causal
+/// RV forecast — the `b_d = 1` corner of the same model — and never to a constant. Which bars
+/// took which route is reported: see [`HarSource`] and [`VolBench::har_floored`].
+fn trailing_vol(proxy: &[f64]) -> TrailingVol {
+    let bars = proxy.len();
+    let mut ewma = Vec::with_capacity(bars);
+    let mut har = Vec::with_capacity(bars);
+    let mut har_source = Vec::with_capacity(bars);
+    let decay = 0.5f64.powf(1.0 / VOL_EWMA_HALF_LIFE_BARS);
+    // Prefix sums of the proxy, so a trailing mean over any of the three lags is one
+    // subtraction per bar instead of a scan.
+    let mut prefix = Vec::with_capacity(bars + 1);
+    let mut running = 0.0f64;
+    prefix.push(0.0);
+    for value in proxy {
+        running += if value.is_finite() { *value } else { 0.0 };
+        prefix.push(running);
+    }
+    let component = |bar: usize, lag: usize| -> f64 {
+        if bar == 0 {
+            return f64::NAN;
+        }
+        let from = bar.saturating_sub(lag);
+        (prefix[bar] - prefix[from]) / (bar - from) as f64
+    };
+
+    let (mut ewma_num, mut ewma_den) = (0.0f64, 0.0f64);
+    let mut gram = [[0.0f64; 4]; 4];
+    let mut moment = [0.0f64; 4];
+    let mut rows = 0usize;
+    for bar in 0..bars {
+        ewma.push(if ewma_den > 0.0 {
+            ewma_num / ewma_den
+        } else {
+            f64::NAN
+        });
+        let features = [
+            1.0,
+            component(bar, VOL_HAR_LAGS_BARS[0]),
+            component(bar, VOL_HAR_LAGS_BARS[1]),
+            component(bar, VOL_HAR_LAGS_BARS[2]),
+        ];
+        // Legs the accrued rows can actually tell apart. `component` clamps its window, so
+        // component `k` equals component `k - 1` on every row at or below
+        // `VOL_HAR_LAGS_BARS[k - 1]`; admitting the longer leg before
+        // `VOL_HAR_LEG_MIN_ROWS` rows past that lag hands the solve a duplicated column and
+        // lets the ridge, not the data, choose between two offsetting coefficients. Dropping
+        // the unsupported legs and fitting the reduced regression keeps a real forecast on
+        // every scored bar, which gating the whole fit until bar 651 would not.
+        let legs = 1 + VOL_HAR_LAGS_BARS[..VOL_HAR_LAGS_BARS.len() - 1]
+            .iter()
+            .take_while(|lag| rows > **lag + VOL_HAR_LEG_MIN_ROWS)
+            .count();
+        let terms = 1 + legs;
+        let fitted = (rows >= VOL_HAR_MIN_ROWS)
+            .then(|| solve_ridge(&gram, &moment, terms))
+            .flatten()
+            .map(|beta| {
+                (0..terms)
+                    .map(|term| beta[term] * features[term])
+                    .sum::<f64>()
+            });
+        let (value, source) = accept_har_fit(fitted, features[1], legs);
+        har.push(value);
+        har_source.push(source);
+
+        // EVERY read of the state is above this line and every write is below it. That is
+        // the whole no-lookahead argument.
+        let realized = proxy[bar];
+        if realized.is_finite() {
+            ewma_num = decay * ewma_num + realized;
+            ewma_den = decay * ewma_den + 1.0;
+            if features.iter().all(|value| value.is_finite()) {
+                for (row, left) in features.iter().enumerate() {
+                    moment[row] += left * realized;
+                    for (column, right) in features.iter().enumerate() {
+                        gram[row][column] += left * right;
+                    }
+                }
+                rows += 1;
+            }
+        }
+    }
+    TrailingVol {
+        ewma,
+        har,
+        har_source,
+    }
+}
+
+/// Whether a solved HAR value is a variance forecast, and where the bar's forecast came from.
+///
+/// `daily` is the trailing DAILY component: both the fallback and the yardstick. A fitted
+/// value below [`VOL_HAR_FLOOR_FRACTION`] of it is rejected — which subsumes the sign check,
+/// since any non-positive value fails a strictly positive floor, and catches what the sign
+/// check missed: a solve that broke to a thousandth of the level rather than through zero.
+/// QLIKE charges the first case nothing (the row is dropped as non-positive) and the second
+/// LINEARLY through `E[z]`, so the unfloored version of this function is how a baseline gets
+/// straw-manned without anything in the report saying so.
+///
+/// A genuinely low forecast is NOT clipped: a positive combination of nested trailing means
+/// cannot reach a twentieth of the trailing daily variance without large offsetting
+/// coefficients, which is the signature of the broken solve rather than of a calm regime.
+fn accept_har_fit(fitted: Option<f64>, daily: f64, legs: usize) -> (f64, HarSource) {
+    match fitted {
+        Some(value) if value > VOL_HAR_FLOOR_FRACTION * daily => (
+            value,
+            if legs == VOL_HAR_LAGS_BARS.len() {
+                HarSource::Full
+            } else {
+                HarSource::Reduced
+            },
+        ),
+        Some(_) => (daily, HarSource::Floored),
+        None => (daily, HarSource::Refused),
+    }
+}
+
+/// Solve `(A + ridge) x = b` over the LEADING `terms x terms` block of a symmetric
+/// positive-semidefinite `4x4` by Gaussian elimination with partial pivoting, with the
+/// dropped legs' coefficients coming back exactly zero. `None` when the system is numerically
+/// singular or the back-substitution leaves a non-finite coefficient.
+///
+/// The leading block IS the admitted leg set because the features are ordered
+/// `[intercept, daily, weekly, monthly]` and a leg is only ever dropped from the long end —
+/// see [`VOL_HAR_LEG_MIN_ROWS`] for why one is dropped at all.
+fn solve_ridge(gram: &[[f64; 4]; 4], moment: &[f64; 4], terms: usize) -> Option<[f64; 4]> {
+    let mut a = [[0.0f64; 5]; 4];
+    for row in 0..terms {
+        a[row][..terms].copy_from_slice(&gram[row][..terms]);
+        a[row][row] += VOL_HAR_RIDGE * gram[row][row].abs();
+        a[row][4] = moment[row];
+    }
+    for pivot in 0..terms {
+        let (best, magnitude) = (pivot..terms).fold((pivot, 0.0f64), |(best, magnitude), row| {
+            let candidate = a[row][pivot].abs();
+            if candidate > magnitude {
+                (row, candidate)
+            } else {
+                (best, magnitude)
+            }
+        });
+        if !(magnitude > 0.0) || !magnitude.is_finite() {
+            return None;
+        }
+        a.swap(pivot, best);
+        for row in pivot + 1..terms {
+            let factor = a[row][pivot] / a[pivot][pivot];
+            for column in pivot..terms {
+                a[row][column] -= factor * a[pivot][column];
+            }
+            a[row][4] -= factor * a[pivot][4];
+        }
+    }
+    let mut beta = [0.0f64; 4];
+    for row in (0..terms).rev() {
+        let mut value = a[row][4];
+        for column in row + 1..terms {
+            value -= a[row][column] * beta[column];
+        }
+        beta[row] = value / a[row][row];
+    }
+    beta.iter().all(|value| value.is_finite()).then_some(beta)
+}
+
+/// The vol-targeted buy&hold position path: `f_t = sigma_target / sigma_hat_t`.
+///
+/// A baseline and not a special case. It reads no model weight, no belief and no predictive
+/// law — only the trailing realized variance of bars strictly before `t` — and its position
+/// is projected onto `[-cap, cap]` by the same [`clamp_fraction`] every other row uses, then
+/// scored by the same [`Ledger`], charged the same cost on the same turnover, and
+/// re-clamped at every point of [`CAP_GRID`] by the same [`recap`].
+///
+/// Always long, like [`POLICY_BUY_HOLD`]: it times the SIZE of the market exposure and never
+/// its sign, which is exactly the half of the decision volatility can inform.
+///
+/// `vec![0.0; bars]` — a book that never trades — when the window carries no proxy, which is
+/// every window built by [`WindowPaths::unmeasured`]. A flat row is honest there; inventing
+/// a sigma would put a fabricated policy in the reported set.
+fn vol_target_positions(proxy: &[f64], bars: usize, cap: f64) -> Vec<f64> {
+    if proxy.len() != bars {
+        return vec![0.0; bars];
+    }
+    let target = VOL_TARGET_ANNUAL / BARS_PER_YEAR.sqrt();
+    trailing_vol(proxy)
+        .ewma
+        .iter()
+        .map(|variance| {
+            if variance.is_finite() && *variance > 0.0 {
+                clamp_fraction(target / variance.sqrt(), cap)
+            } else {
+                0.0
+            }
+        })
+        .collect()
+}
+
+/// QLIKE: `z - ln z - 1` at `z = realized / predicted`, the standard robust loss for a
+/// VARIANCE forecast.
+///
+/// Zero at a perfect forecast, positive everywhere else, and asymmetric in the direction that
+/// matters for a leveraged bettor: under-forecasting variance by a factor `k` costs
+/// `k - ln k - 1`, which diverges linearly, while over-forecasting by the same factor costs
+/// only `1/k + ln k - 1`, which is bounded by `ln k`. That asymmetry is why QLIKE and not MSE
+/// on variances: squared error is dominated by the highest-variance bars, which is exactly
+/// where the proxy is noisiest, and it prices an understated sigma the same as an overstated
+/// one.
+///
+/// The other property this rule is chosen for: QLIKE's expected minimizer is unchanged by
+/// replacing the true variance with a CONDITIONALLY UNBIASED noisy proxy (Patton 2011), which
+/// is the whole reason a bar-internal estimator can stand in for an unobservable `sigma_t^2`.
+pub fn qlike(realized: f64, predicted: f64) -> f64 {
+    let ratio = realized / predicted;
+    ratio - ratio.ln() - 1.0
+}
+
+/// The model's own conditional variance of `r`, straight off [`WindowPaths::predicted_var`].
+pub const VOL_MODEL: usize = 0;
+/// The same forecast after a CAUSAL running scale correction. See [`vol_bench`].
+pub const VOL_MODEL_SCALED: usize = 1;
+/// The EWMA baseline: [`VOL_EWMA_HALF_LIFE_BARS`] on the realized proxy, no fit at all.
+pub const VOL_EWMA: usize = 2;
+/// The HAR-RV baseline: three components, recursively refitted, strictly causal.
+pub const VOL_HAR: usize = 3;
+pub const VOL_FORECASTS: usize = 4;
+
+/// Series names, in forecast-index order.
+pub const VOL_FORECAST_NAMES: [&str; VOL_FORECASTS] = [
+    "model Var[r|past]",
+    "model, causal scale",
+    "ewma rv",
+    "har-rv",
+];
+
+/// One volatility forecast's score against the realized proxy.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct VolForecastScore {
+    /// Per-window mean [`qlike`], with a block-bootstrap interval. Lower is better and zero
+    /// is unattainable, so only DIFFERENCES between rows are interpretable as levels.
+    pub qlike: Dispersion,
+    /// `mean(realized) / mean(predicted)` over the scored bars. `1.0` is level-unbiased,
+    /// above one says the forecast is systematically too small.
+    ///
+    /// Reported because QLIKE is NOT invariant to a level bias, so a row's loss mixes the
+    /// quality of its conditional variation with the accuracy of its units. This column is
+    /// what tells the two apart, and it is why [`VOL_MODEL_SCALED`] exists.
+    pub level_ratio: f64,
+    /// `mean ln(realized / predicted)`, the same bias in log space and therefore in the units
+    /// QLIKE's second term actually charges.
+    pub log_bias: f64,
+    /// `mean(realized / predicted)`, QLIKE's FIRST term, pooled over the same bars.
+    ///
+    /// Not a duplicate of `level_ratio`: that is a ratio of means and this is a mean of
+    /// ratios, and the gap between them is exactly what a handful of catastrophically small
+    /// predictions produces. Reported because the pooled loss is identically
+    /// `mean_ratio - log_bias - 1`, so a row whose loss is carried by `mean_ratio` while its
+    /// `level_ratio` sits at one is a row with a few broken bars rather than a uniformly poor
+    /// fit — a distinction no composite figure can make, and the one that exposed an unfloored
+    /// HAR baseline being reported as a straw man.
+    pub mean_ratio: f64,
+}
+
+impl VolForecastScore {
+    pub fn nan() -> Self {
+        Self {
+            qlike: Dispersion::nan(),
+            level_ratio: f64::NAN,
+            log_bias: f64::NAN,
+            mean_ratio: f64::NAN,
+        }
+    }
+}
+
+/// Whether the model beats a three-parameter regression at forecasting the bar's variance.
+#[derive(Clone, Copy, Debug)]
+pub struct VolBench {
+    pub scores: [VolForecastScore; VOL_FORECASTS],
+    /// `qlike[forecast] - qlike[VOL_HAR]`, differenced WITHIN each window and then
+    /// bootstrapped over the same blocks at the same seed. NEGATIVE is the forecast beating
+    /// HAR. Every dispersion is [`Dispersion::nan`] when [`Self::har_degenerate`] is true:
+    /// degeneration withholds the estimand itself, not merely the printed verdict.
+    pub versus_har: [Dispersion; VOL_FORECASTS],
+    /// Scored bars, per forecast row. Identical across rows by construction.
+    pub bars: usize,
+    pub windows: usize,
+    pub blocks: usize,
+    /// Bars inside the scored range dropped because the bar never moved, so the proxy is
+    /// exactly zero and `ln(realized / predicted)` is undefined. Reported rather than
+    /// silently absorbed: a corpus where this is a large share is one where the proxy, not
+    /// the forecast, is the thing being measured.
+    pub flat_bars: usize,
+    /// Scored bars where the HAR fit was REJECTED by [`VOL_HAR_FLOOR_FRACTION`] and the
+    /// trailing daily component stood in, and scored bars where no fit was usable at all.
+    ///
+    /// A baseline being rescued on most of its bars is not a baseline, and neither its QLIKE
+    /// nor the paired difference against it says so. These two counts do.
+    pub har_floored: usize,
+    pub har_refused: usize,
+    /// Scored bars forecast by a REDUCED HAR — fewer than three legs, because the window
+    /// could not yet discriminate them. See [`VOL_HAR_LEG_MIN_ROWS`].
+    pub har_reduced: usize,
+    /// The baseline's QLIKE exceeds [`VOL_HAR_STRAW_MULTIPLE`] times the best model row's, so
+    /// it is not functioning as a forecaster and the verdict is WITHHELD.
+    pub har_degenerate: bool,
+}
+
+impl VolBench {
+    pub fn nan() -> Self {
+        Self {
+            scores: [VolForecastScore::nan(); VOL_FORECASTS],
+            versus_har: [Dispersion::nan(); VOL_FORECASTS],
+            bars: 0,
+            windows: 0,
+            blocks: 0,
+            flat_bars: 0,
+            har_floored: 0,
+            har_refused: 0,
+            har_reduced: 0,
+            har_degenerate: false,
+        }
+    }
+
+    pub fn measured(&self) -> bool {
+        self.bars > 0 && self.scores[VOL_HAR].qlike.mean.is_finite()
+    }
+
+    /// The headline: the RAW model variance against HAR. Negative is the model winning.
+    ///
+    /// The raw row is the model's actual predictive estimand. Causal scale correction remains
+    /// a separately named diagnostic rather than silently replacing that headline.
+    pub fn model_versus_har(&self) -> Dispersion {
+        self.versus_har[VOL_MODEL]
+    }
+
+    /// The causally scale-corrected model against HAR, separate from the raw headline.
+    pub fn causal_scaled_model_versus_har(&self) -> Dispersion {
+        self.versus_har[VOL_MODEL_SCALED]
+    }
+
+    /// The lower model-row QLIKE, used only to diagnose whether HAR is functioning.
+    pub fn best_model_qlike(&self) -> f64 {
+        self.scores[VOL_MODEL]
+            .qlike
+            .mean
+            .min(self.scores[VOL_MODEL_SCALED].qlike.mean)
+    }
+
+    /// Share of scored bars whose HAR forecast was a floored fit, and whose HAR forecast had
+    /// no usable fit at all. `NAN` before anything is scored, which the report series drops.
+    pub fn har_floor_rate(&self) -> f64 {
+        self.har_floored as f64 / self.bars as f64
+    }
+
+    pub fn har_refusal_rate(&self) -> f64 {
+        self.har_refused as f64 / self.bars as f64
+    }
+
+    pub fn report_lines(&self) -> Vec<String> {
+        if !self.measured() {
+            return vec!["volatility qlike: not measured".to_owned()];
+        }
+        let mut lines = vec![
+            format!(
+                "volatility qlike on a Garman-Klass proxy: {} windows / {} scored bars / {} \
+                 blocks, {} flat bars dropped, warmup {} bars",
+                self.windows, self.bars, self.blocks, self.flat_bars, VOL_WARMUP_BARS,
+            ),
+            format!(
+                "  {:<20}{:>26}{:>28}{:>10}{:>10}{:>10}",
+                "forecast",
+                "qlike (95% CI)",
+                "minus har-rv (95% CI)",
+                "E[rv]/E[p]",
+                "E[z]",
+                "log bias",
+            ),
+        ];
+        for (forecast, name) in VOL_FORECAST_NAMES.iter().enumerate() {
+            let score = &self.scores[forecast];
+            let paired = &self.versus_har[forecast];
+            lines.push(format!(
+                "  {:<20}{:>10.5} ({:.5}..{:.5}){:>+12.5} ({:+.5}..{:+.5}){:>10.4}{:>10.4}\
+                 {:>+10.4}",
+                name,
+                score.qlike.mean,
+                score.qlike.ci_low,
+                score.qlike.ci_high,
+                paired.mean,
+                paired.ci_low,
+                paired.ci_high,
+                score.level_ratio,
+                score.mean_ratio,
+                score.log_bias,
+            ));
+        }
+        lines.push(format!(
+            "  har-rv provenance over the scored bars: {} floored ({:.4}), {} refused \
+             ({:.4}), {} reduced-leg, {} full",
+            self.har_floored,
+            self.har_floor_rate(),
+            self.har_refused,
+            self.har_refusal_rate(),
+            self.har_reduced,
+            self.bars
+                .saturating_sub(self.har_floored + self.har_refused + self.har_reduced),
+        ));
+        let paired = self.model_versus_har();
+        // A numeric verdict exists only when HAR is functioning. On degeneration every
+        // versus-HAR dispersion above is NaN, so downstream consumers observe the same gate.
+        lines.push(if self.har_degenerate {
+            format!(
+                "  the causal HAR-RV BASELINE IS DEGENERATE at {:.5} qlike against the best \
+                 model row's {:.5} (over {:.1}x) — the verdict is WITHHELD: a model cannot be \
+                 credited with beating a forecaster that is not forecasting",
+                self.scores[VOL_HAR].qlike.mean,
+                self.best_model_qlike(),
+                VOL_HAR_STRAW_MULTIPLE,
+            )
+        } else if paired.ci_high < 0.0 {
+            format!(
+                "  the raw model variance BEATS the causal HAR-RV baseline by {:.5} qlike \
+                 ({:.5}..{:.5})",
+                -paired.mean, -paired.ci_high, -paired.ci_low,
+            )
+        } else if paired.ci_low > 0.0 {
+            format!(
+                "  the raw model variance LOSES to the causal HAR-RV baseline by {:.5} qlike \
+                 ({:.5}..{:.5})",
+                paired.mean, paired.ci_low, paired.ci_high,
+            )
+        } else {
+            "  the raw model variance and causal HAR-RV are not separated on these blocks"
+                .to_owned()
+        });
+        lines
+    }
+}
+
+/// Score every volatility forecast against the same realized proxy on the same bars.
+///
+/// # The realized target
+///
+/// [`garman_klass`] on the bar's own `(s, u, v)`, which is a bar-INTERNAL estimator of the
+/// latent per-bar variance `sigma_t^2`. It is not the squared return: `r_t^2` is unbiased for
+/// `sigma_t^2` but carries a `2 sigma^4` variance, so scoring against it measures mostly the
+/// proxy's own noise, and `ln(r_t^2)` diverges whenever a bar closes flat.
+///
+/// # Where the model's predicted variance comes from, derived
+///
+/// The traded law is `p(r | strictly past bars)` over the 128-bin `r` support, and
+/// [`window_paths`] already reduces its first two moments under the train-fitted within-bin
+/// `E[r | b]` and `E[r^2 | b]`:
+///
+/// ```text
+/// mu_t     = sum_b p_b(t) E[r | b]
+/// sigma2_t = sum_b p_b(t) E[r^2 | b] - mu_t^2      = WindowPaths::predicted_var
+/// ```
+///
+/// That is `Var[r_t | past]`, the variance of the bar's CLOSE-TO-CLOSE log return. The link to
+/// the proxy is the bar's own generative geometry: for a driftless Brownian log price observed
+/// over the bar, the close-to-close variance is `sigma_t^2` and both the range and the body
+/// are functionals of the same Brownian bridge, with `E[garman_klass] = sigma_t^2`. So the two
+/// quantities estimate the SAME `sigma_t^2` and QLIKE between them is well posed. Note what
+/// this does NOT use: the `s` head is at chain position 1 and conditions on the realized `r`
+/// bin, so `p(s | past)` alone would cost a 128-term marginalization per bar. Nothing here
+/// touches the `s` head, and nothing here reads a same-bar factor.
+///
+/// # Both sides are TOTAL variance, on either predictive parametrization
+///
+/// Under `--vol-standardize-targets` the predictive law is over `z = r / sigma_hat_t`, so
+/// [`window_paths`] maps its predicted variance back as `sigma_hat_t² Var[z]`. The realized
+/// Garman-Klass proxy comes independently from the batch's raw pre-standardization geometry;
+/// it is already in economic units and is never multiplied by `sigma_hat_t` again. Thus both
+/// sides reach this bench as estimates of total raw return variance.
+///
+/// That conversion is not only about units. `sigma_hat_t` is itself a causal HAR-EWMA of
+/// range volatility, so scoring the standardized quantities would ask whether the model beats
+/// HAR-RV on the RESIDUAL left after a HAR volatility forecast has already been divided out —
+/// a question whose answer says nothing about whether the model is a good volatility model.
+/// The comparison worth making is on the TOTAL, which is what this scores.
+///
+/// # Raw headline and a separate causal scale diagnostic
+///
+/// The raw `Var[r | past]` row is the model's predictive estimand and therefore the headline.
+/// The identity above is exact in continuous time but the finite-trade Garman-Klass proxy can
+/// carry a level mismatch: observed extremes miss the continuous extremes and the inter-bar
+/// gap. The two trailing baselines are averages of that proxy and inherit its units.
+///
+/// [`VOL_MODEL_SCALED`] diagnoses that level effect separately with
+/// `c_t = sum_{j<t} proxy_j / sum_{j<t} sigma2_j`, a running ratio over strictly past bars of
+/// the same window. It is causal, not fitted to the scored bar, and leaves conditional
+/// variation untouched. Reporting it beside the raw row separates level from shape without
+/// silently replacing the model's own variance in [`VolBench::model_versus_har`].
+///
+/// # Refuses rather than guesses
+///
+/// Unmeasured unless every window carries the proxy, the conditional moments, and more than
+/// [`VOL_WARMUP_BARS`] bars. A window set from the accounting-only constructor has no proxy,
+/// and a short fixture window would score the baselines while they were still warming up.
+pub fn vol_bench(windows: &[WindowPaths], blocks: &[u64]) -> VolBench {
+    if windows.is_empty() || blocks.len() < windows.len() {
+        return VolBench::nan();
+    }
+    if windows.iter().any(|window| {
+        !window.has_realized_variance() || !window.has_moments() || window.bars() <= VOL_WARMUP_BARS
+    }) {
+        return VolBench::nan();
+    }
+    let blocks = &blocks[..windows.len()];
+    let mut by_window: [Vec<f64>; VOL_FORECASTS] =
+        std::array::from_fn(|_| Vec::with_capacity(windows.len()));
+    let mut realized_total = [0.0f64; VOL_FORECASTS];
+    let mut predicted_total = [0.0f64; VOL_FORECASTS];
+    let mut log_total = [0.0f64; VOL_FORECASTS];
+    let mut ratio_total = [0.0f64; VOL_FORECASTS];
+    let mut scored = [0usize; VOL_FORECASTS];
+    let mut flat_bars = 0usize;
+    let mut har_floored = 0usize;
+    let mut har_refused = 0usize;
+    let mut har_reduced = 0usize;
+
+    for window in windows {
+        let proxy = &window.realized_variance;
+        let trailing = trailing_vol(proxy);
+        let mut window_loss = [0.0f64; VOL_FORECASTS];
+        let mut window_bars = [0usize; VOL_FORECASTS];
+        let (mut proxy_running, mut model_running) = (0.0f64, 0.0f64);
+        for bar in 0..window.bars() {
+            let model = window.predicted_var[bar];
+            let realized = proxy[bar];
+            // Read the running scale BEFORE folding this bar into it, for the same reason
+            // `trailing_vol` orders its loop body that way.
+            let scale = if proxy_running > 0.0 && model_running > 0.0 {
+                proxy_running / model_running
+            } else {
+                f64::NAN
+            };
+            let forecasts = [model, scale * model, trailing.ewma[bar], trailing.har[bar]];
+            if bar >= VOL_WARMUP_BARS {
+                if realized > 0.0 && realized.is_finite() {
+                    for (forecast, predicted) in forecasts.iter().enumerate() {
+                        if predicted.is_finite() && *predicted > 0.0 {
+                            let ratio = realized / predicted;
+                            window_loss[forecast] += qlike(realized, *predicted);
+                            window_bars[forecast] += 1;
+                            realized_total[forecast] += realized;
+                            predicted_total[forecast] += predicted;
+                            log_total[forecast] += ratio.ln();
+                            ratio_total[forecast] += ratio;
+                            scored[forecast] += 1;
+                        }
+                    }
+                    // Counted over exactly the bars the printed HAR qlike is computed on, so
+                    // the rates and the loss describe the same population.
+                    if forecasts[VOL_HAR].is_finite() && forecasts[VOL_HAR] > 0.0 {
+                        match trailing.har_source[bar] {
+                            HarSource::Refused => har_refused += 1,
+                            HarSource::Floored => har_floored += 1,
+                            HarSource::Reduced => har_reduced += 1,
+                            HarSource::Full => {}
+                        }
+                    }
+                } else {
+                    flat_bars += 1;
+                }
+            }
+            if model.is_finite() && model > 0.0 && realized > 0.0 && realized.is_finite() {
+                proxy_running += realized;
+                model_running += model;
+            }
+        }
+        for forecast in 0..VOL_FORECASTS {
+            by_window[forecast].push(if window_bars[forecast] > 0 {
+                window_loss[forecast] / window_bars[forecast] as f64
+            } else {
+                f64::NAN
+            });
+        }
+    }
+
+    let mut result = VolBench::nan();
+    for forecast in 0..VOL_FORECASTS {
+        result.scores[forecast] = VolForecastScore {
+            qlike: block_bootstrap(
+                &by_window[forecast],
+                blocks,
+                BOOTSTRAP_DRAWS,
+                BOOTSTRAP_SEED,
+            ),
+            level_ratio: realized_total[forecast] / predicted_total[forecast],
+            log_bias: log_total[forecast] / scored[forecast] as f64,
+            mean_ratio: ratio_total[forecast] / scored[forecast] as f64,
+        };
+        let paired: Vec<f64> = by_window[forecast]
+            .iter()
+            .zip(&by_window[VOL_HAR])
+            .map(|(loss, har)| loss - har)
+            .collect();
+        result.versus_har[forecast] =
+            block_bootstrap(&paired, blocks, BOOTSTRAP_DRAWS, BOOTSTRAP_SEED);
+    }
+    result.bars = scored[VOL_HAR];
+    result.windows = windows.len();
+    result.blocks = result.scores[VOL_HAR].qlike.blocks;
+    result.flat_bars = flat_bars;
+    result.har_floored = har_floored;
+    result.har_refused = har_refused;
+    result.har_reduced = har_reduced;
+    // HAR averages the same proxy it is scored against, so wherever it is working its loss
+    // sits within a small factor of a good forecaster's; several times worse is a broken
+    // baseline, and a comparison against one is not an estimand consumers may quote.
+    // NAN-safe by comparison order: an unmeasured model row leaves this false.
+    result.har_degenerate =
+        result.scores[VOL_HAR].qlike.mean > VOL_HAR_STRAW_MULTIPLE * result.best_model_qlike();
+    if result.har_degenerate {
+        result.versus_har = [Dispersion::nan(); VOL_FORECASTS];
+    }
+    result
 }
 
 // ---------------------------------------------------------------------------
@@ -1600,6 +3126,16 @@ pub struct TradeBench {
     /// the predicted conditional mean, and a slope below one is a directly priced statement
     /// that the traded mean is inflated by `1 / beta`.
     pub calibration: MeanCalibration,
+    /// Whether the model's VARIANCE forecast beats a causal HAR-RV regression, under
+    /// [`qlike`] on a Garman-Klass proxy.
+    ///
+    /// Every other field of this struct scores the conditional MEAN, which carries almost no
+    /// signal by construction. This is the only one that scores the half of the forecast the
+    /// data can actually support, and it carries its own null.
+    pub vol: VolBench,
+    /// What the pass's [`SizingRule`] was worth against the rule it replaced, on these same
+    /// windows. `None` on every control bench, which is the default.
+    pub sizing: Option<SizingComparison>,
     /// Cost the headline net figures were charged at.
     pub cost_bps: f64,
     pub leverage_cap: f64,
@@ -1620,6 +3156,8 @@ impl TradeBench {
             free_kelly: FreeKelly::nan(),
             tail: TailCalibration::nan(),
             calibration: MeanCalibration::nan(),
+            vol: VolBench::nan(),
+            sizing: None,
             cost_bps: f64::NAN,
             leverage_cap: LEVERAGE_CAP,
             bars: 0,
@@ -1801,6 +3339,10 @@ impl TradeBench {
             },
         ));
         lines.extend(self.calibration.report_lines());
+        lines.extend(self.vol.report_lines());
+        if let Some(sizing) = self.sizing.as_ref() {
+            lines.extend(sizing.report_lines());
+        }
         lines
     }
 }
@@ -1910,6 +3452,10 @@ pub fn bench(
     }
     result.tail = tail_calibration(tail, blocks);
     result.calibration = mean_calibration(windows, blocks);
+    result.vol = vol_bench(windows, blocks);
+    // Absent on every control bench: there is no alternative rule to compare against when the
+    // control's own reduction IS the position.
+    result.sizing = sizing_comparison(windows, blocks, config);
     result
 }
 
@@ -1942,6 +3488,8 @@ pub fn recap(windows: &[WindowPaths], cap: f64, free_marginal: f64) -> Vec<Windo
                     vec![clamp_fraction(free_marginal, cap); window.bars()]
                 } else if policy == POLICY_BUY_HOLD {
                     vec![1.0; window.bars()]
+                } else if policy == POLICY_VOL_TARGET {
+                    vol_target_positions(&window.realized_variance, window.bars(), cap)
                 } else {
                     window
                         .realized
@@ -1957,6 +3505,8 @@ pub fn recap(windows: &[WindowPaths], cap: f64, free_marginal: f64) -> Vec<Windo
             outer_signed: window.outer_signed.clone(),
             trimmed_mean: window.trimmed_mean.clone(),
             trimmed_var: window.trimmed_var.clone(),
+            realized_variance: window.realized_variance.clone(),
+            sizing: window.sizing.clone(),
         })
         .collect()
 }
@@ -2045,6 +3595,411 @@ fn free_kelly(windows: &[WindowPaths], cap: f64) -> FreeKelly {
         p95: quantile(0.95),
         mean_signed,
     }
+}
+
+// ---------------------------------------------------------------------------
+// What the sizing rule was worth, against the rule it replaced, on the same bars
+// ---------------------------------------------------------------------------
+
+/// One leverage cap's comparison of the ACTIVE sizing rule against the CONTROL's.
+///
+/// Both sides are the same windows, the same bars, the same null and the same [`Ledger`]; they
+/// differ only in which reduction of the same predictive law chose the position. So the
+/// difference is the sizing rule and nothing else.
+#[derive(Clone, Copy, Debug)]
+pub struct SizingPoint {
+    pub cap: f64,
+    /// The rule the pass sized on, re-clamped at this cap.
+    pub active: PolicyStats,
+    /// [`SizingRule::CONTROL`] on the same bars, re-clamped at the same cap.
+    pub control: PolicyStats,
+    /// `active - control` net log growth per bar, PAIRED window by window and intervalled
+    /// over the same blocks. POSITIVE means the rule the pass sized on earned MORE than the
+    /// control.
+    ///
+    /// The subtrahend is pinned to [`SizingRule::CONTROL`] rather than to "whatever the
+    /// default is", so a later default change cannot silently invert this sign.
+    ///
+    /// THE number that decides whether a change helped. The two levels cannot answer it:
+    /// almost all of each interval's width is the market-common regime the two rules SHARE,
+    /// since they trade the same bars of the same months, and differencing window by window
+    /// removes that shared term entirely.
+    pub paired: Dispersion,
+    /// Mean `|f_active - f_control|` at this cap, in units of wealth. Zero means the rule
+    /// changed the position on no bar, which makes any growth difference noise by
+    /// construction.
+    pub mean_abs_gap: f64,
+    /// Mean SIGNED `|f_active| - |f_control|` at this cap. Reported rather than assumed: the
+    /// cumulant rule's direction against the global quadratic is measured from the fitted law,
+    /// and on this corpus the mean is under-dispersed while the variance is OVERSTATED, so the
+    /// two miscalibrations partly cancel in absolute size and no rule's sign is predictable a
+    /// priori.
+    pub mean_signed_gap: f64,
+    /// Cross-bar standard deviation of the chosen position under each rule.
+    ///
+    /// The quantity that decides ALLOCATION once a cap binds. Absolute scale stops mattering
+    /// at a binding cap — every bar is at the ceiling and the book is a sign vector — so what
+    /// a sizing change is worth there is entirely in how it redistributes exposure ACROSS
+    /// bars. A rule that moves the level and not the dispersion cannot help at the headline
+    /// cap however large its level shift is, and only these two series say which happened.
+    pub sd_active: f64,
+    pub sd_control: f64,
+}
+
+impl SizingPoint {
+    pub fn nan() -> Self {
+        Self {
+            cap: f64::NAN,
+            active: PolicyStats::nan(),
+            control: PolicyStats::nan(),
+            paired: Dispersion::nan(),
+            mean_abs_gap: f64::NAN,
+            mean_signed_gap: f64::NAN,
+            sd_active: f64::NAN,
+            sd_control: f64::NAN,
+        }
+    }
+
+    /// True when the paired interval excludes zero at this cap.
+    pub fn resolvable(&self) -> bool {
+        self.paired.ci_low.is_finite()
+            && self.paired.ci_high.is_finite()
+            && (self.paired.ci_low > 0.0 || self.paired.ci_high < 0.0)
+    }
+}
+
+/// What a non-control [`SizingRule`] was worth, measured against the rule it replaced.
+///
+/// Present only when the pass sized on something other than [`SizingRule::CONTROL`]. The
+/// cap axis is the point rather than a courtesy: the surrogate's error is third-order in `f`,
+/// so it is first-order against the whole measured edge at the 4x cap and negligible at the
+/// 0.25x selection cap. A single headline at one cap could not distinguish "the fix matters"
+/// from "the fix matters at the leverage this bench happens to headline" — and the measured
+/// sweep does separate them: insignificant at `0.25x` and `1.0x`, positive across `2-8x`,
+/// insignificant again uncapped.
+#[derive(Clone, Copy, Debug)]
+pub struct SizingComparison {
+    /// The rule the pass sized on. The MINUEND of every paired difference below; the
+    /// subtrahend is always [`SizingRule::CONTROL`].
+    pub rule: SizingRule,
+    /// The recalibration the ACTIVE rule sized on, [`MeanShrink::identity`] when it did not
+    /// recalibrate. The APPLIED slope, which is a different object from the slope
+    /// [`TradeBench::calibration`] MEASURES on these windows: the applied one was fitted on a
+    /// block-disjoint slice, the measured one is this slice's own miscalibration.
+    pub shrink: MeanShrink,
+    pub curve: [SizingPoint; CAP_GRID.len()],
+    /// The uncapped `|f*|` distribution under each rule. Reading the two saturation shares
+    /// against each other is the direct test of the cap-pinning pathology.
+    pub free_kelly_active: FreeKelly,
+    pub free_kelly_control: FreeKelly,
+    /// Mean `|f*_active - f*_control|` over the UNCAPPED optima.
+    pub free_mean_abs_gap: f64,
+    /// Mean SIGNED `|f*_active| - |f*_control|` over the UNCAPPED optima. Negative is the
+    /// active rule de-levering. Reported rather than predicted: on this corpus the measured
+    /// mean slope is BELOW one while the predicted variance is ABOVE the realized one, so the
+    /// two miscalibrations push absolute size in opposite directions and partly cancel — a
+    /// sign assumed in advance would be an assumption dressed as a measurement.
+    pub free_mean_signed_gap: f64,
+    /// Cross-bar standard deviation of the UNCAPPED `f*` under each rule.
+    ///
+    /// Reported beside the level shift because the two answer different questions and the
+    /// second is the one that survives a binding cap. With the cap pinned on most bars the
+    /// book's level is the ceiling under either rule and the only thing a sizing change can
+    /// still do is redistribute exposure across bars, which is exactly the dispersion these
+    /// two numbers measure.
+    pub free_sd_active: f64,
+    pub free_sd_control: f64,
+    /// Bars where the CONTROL's unprojected optimum left the open ruin domain, i.e. where the
+    /// cumulant objective diverges at the size the global quadratic asked for. Measured at
+    /// `19.8-22.9%` of bars on the three frozen controls: roughly one bar in five where only
+    /// the declared clamp stood between the book and the fitted support's ruin boundary. See
+    /// [`surrogate_ruin_breaches`].
+    pub ruin_breach_bars: usize,
+    pub ruin_breach_share: f64,
+    pub bars: usize,
+    pub windows: usize,
+    pub blocks: usize,
+}
+
+impl SizingComparison {
+    /// The point at the headline cap, which is what the console line quotes.
+    pub fn headline(&self) -> &SizingPoint {
+        &self.curve[CAP_GRID_DEFAULT_SLOT]
+    }
+
+    pub fn report_lines(&self) -> Vec<String> {
+        let headline = self.headline();
+        let mut lines = vec![format!(
+            "sizing rule: {} priced against {} ({} windows / {} bars / {} blocks); applied \
+             recalibration mu -> {:+.5e} + {:.4} mu",
+            self.rule.label(),
+            SizingRule::CONTROL.label(),
+            self.windows,
+            self.bars,
+            self.blocks,
+            self.shrink.alpha,
+            self.shrink.beta,
+        )];
+        lines.push(
+            "  every PAIRED figure below is ACTIVE minus CONTROL: positive means the rule this \
+             pass sized on earned more than the rule it replaced"
+                .to_owned(),
+        );
+        lines.push(format!(
+            "  uncapped |f*| {:.2}x vs control {:.2}x (mean signed gap {:+.3}x, mean |gap| \
+             {:.3}x, cross-bar sd {:.3}x vs {:.3}x = {:+.2}%); saturation {:.1}% vs {:.1}%; \
+             {} bars ({:.3}%) where the CONTROL's optimum left the ruin domain",
+            self.free_kelly_active.median,
+            self.free_kelly_control.median,
+            self.free_mean_signed_gap,
+            self.free_mean_abs_gap,
+            self.free_sd_active,
+            self.free_sd_control,
+            100.0 * (self.free_sd_active / self.free_sd_control - 1.0),
+            100.0 * self.free_kelly_active.saturated,
+            100.0 * self.free_kelly_control.saturated,
+            self.ruin_breach_bars,
+            100.0 * self.ruin_breach_share,
+        ));
+        lines.push(format!(
+            "  at the {:.1}x headline: growth {:+.4} vs {:+.4} bps/bar net, PAIRED {:+.4} \
+             (95% CI {:+.4}..{:+.4}, se {:.4}){}, |f| {:.2} vs {:.2}, mean |Δf| {:.3}, \
+             turnover {:.3} vs {:.3}, dd max {:.4} vs {:.4}, ruined {} vs {}",
+            headline.cap,
+            headline.active.net_growth * 1e4,
+            headline.control.net_growth * 1e4,
+            headline.paired.mean * 1e4,
+            headline.paired.ci_low * 1e4,
+            headline.paired.ci_high * 1e4,
+            headline.paired.se * 1e4,
+            if headline.resolvable() {
+                ""
+            } else {
+                " NOT RESOLVABLE"
+            },
+            headline.active.mean_abs_position,
+            headline.control.mean_abs_position,
+            headline.mean_abs_gap,
+            headline.active.turnover,
+            headline.control.turnover,
+            headline.active.max_drawdown,
+            headline.control.max_drawdown,
+            headline.active.ruin_bars,
+            headline.control.ruin_bars,
+        ));
+        for point in &self.curve {
+            lines.push(format!(
+                "  cap {:>5.2}x  paired {:+.4} bps/bar (95% CI {:+.4}..{:+.4}){}, |f| {:.2} \
+                 -> {:.2}, sd {:.3} -> {:.3}, capped {:.0}% -> {:.0}%, mean |Δf| {:.3}, \
+                 signed Δ|f| {:+.3}, dd {:.1}% -> {:.1}%",
+                point.cap,
+                point.paired.mean * 1e4,
+                point.paired.ci_low * 1e4,
+                point.paired.ci_high * 1e4,
+                if point.resolvable() { "" } else { " ns" },
+                point.control.mean_abs_position,
+                point.active.mean_abs_position,
+                point.sd_control,
+                point.sd_active,
+                100.0 * point.control.clamped_fraction,
+                100.0 * point.active.clamped_fraction,
+                point.mean_abs_gap,
+                point.mean_signed_gap,
+                100.0 * point.control.max_drawdown,
+                100.0 * point.active.max_drawdown,
+            ));
+        }
+        lines
+    }
+}
+
+/// [`SizingRule::CONTROL`]'s own window set, built from the evidence the active pass kept.
+///
+/// `None` unless every window carries a complete [`SizingEvidence`], which is every control
+/// bench. The substitution goes through [`rebased`] so the control side is scored by the
+/// identical ledger, cap curve and bootstrap the active side is — nothing here is a second
+/// implementation of the accounting.
+fn control_windows(windows: &[WindowPaths]) -> Option<Vec<WindowPaths>> {
+    if windows.is_empty() {
+        return None;
+    }
+    let replacement: Option<Vec<Vec<f64>>> = windows
+        .iter()
+        .map(|window| {
+            window
+                .sizing
+                .as_ref()
+                .filter(|evidence| evidence.covers(window.bars()))
+                .map(|evidence| evidence.free_control.clone())
+        })
+        .collect();
+    Some(rebased(windows, replacement?))
+}
+
+/// The four cross-bar statistics of two aligned position columns, in one pass.
+///
+/// Every consumer needs all four and each is a reduction over the same two vectors, so one
+/// pass rather than four. The standard deviations are POOLED over every traded bar of every
+/// window and are population rather than sample deviations: the object of interest is the
+/// dispersion of the realized decision sequence, not an estimate of a parameter behind it.
+struct PositionGap {
+    mean_abs_gap: f64,
+    mean_signed_gap: f64,
+    sd_active: f64,
+    sd_control: f64,
+}
+
+impl PositionGap {
+    fn measure<'a>(pairs: impl Iterator<Item = (&'a [f64], &'a [f64])>) -> Self {
+        let mut abs_gap = 0.0f64;
+        let mut signed_gap = 0.0f64;
+        let (mut sum_a, mut sum_sq_a) = (0.0f64, 0.0f64);
+        let (mut sum_c, mut sum_sq_c) = (0.0f64, 0.0f64);
+        let mut bars = 0usize;
+        for (active, control) in pairs {
+            for (a, c) in active.iter().zip(control) {
+                abs_gap += (a - c).abs();
+                signed_gap += a.abs() - c.abs();
+                sum_a += a;
+                sum_sq_a += a * a;
+                sum_c += c;
+                sum_sq_c += c * c;
+                bars += 1;
+            }
+        }
+        if bars == 0 {
+            return Self {
+                mean_abs_gap: f64::NAN,
+                mean_signed_gap: f64::NAN,
+                sd_active: f64::NAN,
+                sd_control: f64::NAN,
+            };
+        }
+        let bars = bars as f64;
+        let sd = |sum: f64, sum_sq: f64| (sum_sq / bars - (sum / bars).powi(2)).max(0.0).sqrt();
+        Self {
+            mean_abs_gap: abs_gap / bars,
+            mean_signed_gap: signed_gap / bars,
+            sd_active: sd(sum_a, sum_sq_a),
+            sd_control: sd(sum_c, sum_sq_c),
+        }
+    }
+}
+
+/// Measure one cap of the active-versus-control comparison.
+fn sizing_point(
+    active: &[WindowPaths],
+    control: &[WindowPaths],
+    blocks: &[u64],
+    cap: f64,
+    free_marginal: f64,
+    cost: f64,
+) -> SizingPoint {
+    let recapped_active = recap(active, cap, free_marginal);
+    let recapped_control = recap(control, cap, free_marginal);
+    let active_ledger = Ledger::build(&recapped_active, POLICY_MODEL, cap);
+    let control_ledger = Ledger::build(&recapped_control, POLICY_MODEL, cap);
+    let deltas: Vec<f64> = active_ledger
+        .window_growth(cost)
+        .iter()
+        .zip(&control_ledger.window_growth(cost))
+        .map(|(active, control)| active - control)
+        .collect();
+    let gap = PositionGap::measure(recapped_active.iter().zip(&recapped_control).map(
+        |(active, control)| {
+            (
+                active.positions[POLICY_MODEL].as_slice(),
+                control.positions[POLICY_MODEL].as_slice(),
+            )
+        },
+    ));
+    SizingPoint {
+        cap,
+        active: active_ledger.stats(cost),
+        control: control_ledger.stats(cost),
+        paired: block_bootstrap(&deltas, blocks, BOOTSTRAP_DRAWS, BOOTSTRAP_SEED),
+        mean_abs_gap: gap.mean_abs_gap,
+        mean_signed_gap: gap.mean_signed_gap,
+        sd_active: gap.sd_active,
+        sd_control: gap.sd_control,
+    }
+}
+
+/// Price the rule the pass sized on against [`SizingRule::CONTROL`] on the SAME windows.
+///
+/// `None` on every control bench, and on any window set whose sizing evidence was dropped by
+/// a rebasing — refusing rather than differencing two paths that were never alternatives.
+pub fn sizing_comparison(
+    windows: &[WindowPaths],
+    blocks: &[u64],
+    config: BenchConfig,
+) -> Option<SizingComparison> {
+    let evidence = windows.first()?.sizing.as_ref()?;
+    let (rule, shrink) = (evidence.rule, evidence.shrink);
+    if rule.is_control() {
+        return None;
+    }
+    assert!(
+        blocks.len() >= windows.len(),
+        "every traded window needs a bootstrap block assignment: {} blocks for {} windows",
+        blocks.len(),
+        windows.len()
+    );
+    let blocks = &blocks[..windows.len()];
+    let control = control_windows(windows)?;
+    let BenchConfig {
+        cost_bps,
+        cap,
+        free_marginal,
+    } = config;
+    let cost = cost_bps * 1e-4;
+
+    let mut curve = [SizingPoint::nan(); CAP_GRID.len()];
+    for (slot, point) in CAP_GRID.iter().enumerate() {
+        curve[slot] = sizing_point(windows, &control, blocks, *point, free_marginal, cost);
+    }
+
+    // The UNCAPPED optima, which is where a sizing rule's effect on the law lives before the
+    // cap projects it away. Ruin breaches are counted on the same pass over the same windows.
+    let gap = PositionGap::measure(windows.iter().map(|window| {
+        let sizing = window
+            .sizing
+            .as_ref()
+            .expect("`control_windows` accepted only fully covered windows");
+        (window.free.as_slice(), sizing.free_control.as_slice())
+    }));
+    let mut breaches = 0usize;
+    let mut bars = 0usize;
+    for window in windows {
+        let sizing = window
+            .sizing
+            .as_ref()
+            .expect("`control_windows` accepted only fully covered windows");
+        bars += window.free.len().min(sizing.free_control.len());
+        breaches += sizing
+            .ruin_breach
+            .iter()
+            .filter(|breach| **breach > 0.0)
+            .count();
+    }
+
+    Some(SizingComparison {
+        rule,
+
+        shrink,
+        curve,
+        free_kelly_active: free_kelly(windows, cap),
+        free_kelly_control: free_kelly(&control, cap),
+        free_mean_abs_gap: gap.mean_abs_gap,
+        free_mean_signed_gap: gap.mean_signed_gap,
+        free_sd_active: gap.sd_active,
+        free_sd_control: gap.sd_control,
+        ruin_breach_bars: breaches,
+        ruin_breach_share: breaches as f64 / bars.max(1) as f64,
+        bars,
+        windows: windows.len(),
+        blocks: curve[CAP_GRID_DEFAULT_SLOT].paired.blocks,
+    })
 }
 
 /// Turn per-window exceedance counts into calibration points with both intervals.
@@ -3809,6 +5764,12 @@ fn promote_shrunk(windows: &[WindowPaths]) -> Option<Vec<WindowPaths>> {
                 outer_signed: window.outer_signed.clone(),
                 trimmed_mean: window.trimmed_mean.clone(),
                 trimmed_var: window.trimmed_var.clone(),
+                realized_variance: window.realized_variance.clone(),
+                // The comparison is against the CONTROL rule's fraction, and this set's
+                // `free` is neither the control's nor the pass's own position, so carrying
+                // the evidence forward would invite a difference between two things that
+                // were never alternatives.
+                sizing: None,
             })
             .collect(),
     )
@@ -4388,6 +6349,10 @@ fn rebased(windows: &[WindowPaths], replacement: Vec<Vec<f64>>) -> Vec<WindowPat
                 outer_signed: window.outer_signed.clone(),
                 trimmed_mean: window.trimmed_mean.clone(),
                 trimmed_var: window.trimmed_var.clone(),
+                realized_variance: window.realized_variance.clone(),
+                // Dropped for the same reason `promote_shrunk` drops it: `free` here is a
+                // rebased path, not the position the sizing rule chose.
+                sizing: None,
             }
         })
         .collect()
@@ -7244,7 +9209,28 @@ pub struct DecayPoint {
     /// `sign(mu_hat_t) * forward_k / k`, in log-return units PER BAR so horizons compare.
     pub edge_per_bar: Dispersion,
     /// Pooled Pearson correlation of `mu_hat_t` against the k-bar forward log return.
+    ///
+    /// Retained for continuity, but read [`Self::rank_ic`] instead: this is a single pooled
+    /// number with no interval, and it is a moment statistic on a fat-tailed regressand, so a
+    /// handful of bars set it.
     pub correlation: f64,
+    /// Per-window SPEARMAN rank correlation of `mu_hat_t` against the k-bar forward log
+    /// return, with a block-bootstrap interval over `(symbol, calendar month)`.
+    ///
+    /// This is a within-window TEMPORAL rank IC, not a cross-sectional IC: observations are
+    /// bars along one window's time axis. It is ROBUST because rank correlation bounds every
+    /// bar's influence, and SCALE-FREE because it is invariant to monotone reparameterization
+    /// of either axis.
+    ///
+    /// Ranked WITHIN each window and then averaged over windows, never pooled: pooling would
+    /// rank a quiet name's bar against a volatile name's and report the cross-sectional
+    /// volatility spread as signal. Finite zero signals remain in the column and share their
+    /// midrank; zero is an abstention for edge and hit rate, not a missing forecast.
+    pub rank_ic: Dispersion,
+    /// The same construction with Pearson instead of Spearman, so the cost of the rank
+    /// transform is visible rather than assumed. A large gap between the two is itself the
+    /// finding: it says the linear correlation is tail-driven.
+    pub pearson_ic: Dispersion,
     pub samples: usize,
 }
 
@@ -7268,13 +9254,19 @@ impl SignalDecay {
              policy and no cost - this bounds a one-bar signal HELD longer, never a k-bar model"
                 .to_owned(),
             format!(
-                "  {:<8}{:>28}{:>30}{:>12}{:>12}",
-                "k bars", "hit rate (95% CI)", "edge bps/bar (95% CI)", "corr", "samples",
+                "  {:<8}{:>28}{:>30}{:>26}{:>26}{:>10}",
+                "k bars",
+                "hit rate (95% CI)",
+                "edge bps/bar (95% CI)",
+                "temporal rank IC (95% CI)",
+                "pearson IC (95% CI)",
+                "samples",
             ),
         ];
         for point in &self.points {
             lines.push(format!(
-                "  {:<8}{:>12.4} ({:.4}..{:.4}){:>+14.4} ({:+.4}..{:+.4}){:>+12.5}{:>12}",
+                "  {:<8}{:>12.4} ({:.4}..{:.4}){:>+14.4} ({:+.4}..{:+.4}){:>+10.5} \
+                 ({:+.5}..{:+.5}){:>+10.5} ({:+.5}..{:+.5}){:>10}",
                 point.horizon,
                 point.hit_rate.mean,
                 point.hit_rate.ci_low,
@@ -7282,12 +9274,75 @@ impl SignalDecay {
                 point.edge_per_bar.mean * 1e4,
                 point.edge_per_bar.ci_low * 1e4,
                 point.edge_per_bar.ci_high * 1e4,
-                point.correlation,
+                point.rank_ic.mean,
+                point.rank_ic.ci_low,
+                point.rank_ic.ci_high,
+                point.pearson_ic.mean,
+                point.pearson_ic.ci_low,
+                point.pearson_ic.ci_high,
                 point.samples,
             ));
         }
         lines
     }
+}
+
+/// Sample Pearson correlation of two equal-length columns.
+///
+/// `0.0` rather than `NAN` when either column has zero spread. A constant signal carries no
+/// directional information, so zero is the correct information coefficient for it — and a
+/// `NAN` in one window would propagate through [`block_bootstrap`] into every draw that
+/// resampled its block, turning one degenerate window into an unmeasured horizon.
+fn pearson(x: &[f64], y: &[f64]) -> f64 {
+    let n = x.len();
+    if n < 2 || y.len() != n {
+        return 0.0;
+    }
+    let count = n as f64;
+    let (mut sum_x, mut sum_y, mut sum_xx, mut sum_yy, mut sum_xy) = (0.0, 0.0, 0.0, 0.0, 0.0);
+    for (left, right) in x.iter().zip(y) {
+        sum_x += left;
+        sum_y += right;
+        sum_xx += left * left;
+        sum_yy += right * right;
+        sum_xy += left * right;
+    }
+    let covariance = sum_xy - sum_x * sum_y / count;
+    let spread = ((sum_xx - sum_x * sum_x / count) * (sum_yy - sum_y * sum_y / count)).sqrt();
+    if spread > 0.0 {
+        covariance / spread
+    } else {
+        0.0
+    }
+}
+
+/// Ranks of `values`, ties sharing their MIDRANK.
+///
+/// Midranks and not first-seen order: Spearman's correlation is only the Pearson correlation
+/// of ranks when tied observations get equal ranks, and this signal ties constantly — the
+/// predicted mean is a reduction over 128 bins, and a forward return of exactly zero is a
+/// flat bar. Breaking ties by position would let the bar ORDER leak into the statistic.
+fn average_ranks(values: &[f64]) -> Vec<f64> {
+    let mut order: Vec<usize> = (0..values.len()).collect();
+    order.sort_unstable_by(|left, right| {
+        values[*left]
+            .partial_cmp(&values[*right])
+            .expect("the caller filters non-finite rows before ranking")
+    });
+    let mut ranks = vec![0.0f64; values.len()];
+    let mut start = 0usize;
+    while start < order.len() {
+        let mut end = start + 1;
+        while end < order.len() && values[order[end]] == values[order[start]] {
+            end += 1;
+        }
+        let midrank = 0.5 * (start + end - 1) as f64;
+        for slot in &order[start..end] {
+            ranks[*slot] = midrank;
+        }
+        start = end;
+    }
+    ranks
 }
 
 /// Measure [`SignalDecay`] over the traded windows.
@@ -7326,27 +9381,36 @@ pub fn signal_decay(windows: &[WindowPaths], blocks: &[u64]) -> SignalDecay {
             let k = *horizon;
             let mut hit_by_window = Vec::with_capacity(windows.len());
             let mut edge_by_window = Vec::with_capacity(windows.len());
+            let mut rank_by_window = Vec::with_capacity(windows.len());
+            let mut pearson_by_window = Vec::with_capacity(windows.len());
             let (mut sum_x, mut sum_y, mut sum_xx, mut sum_yy, mut sum_xy) =
                 (0.0f64, 0.0f64, 0.0f64, 0.0f64, 0.0f64);
             let mut samples = 0usize;
             for (window, prefix) in windows.iter().zip(&prefixes) {
                 let bars = window.bars();
                 let (mut hits, mut edge, mut count) = (0.0f64, 0.0f64, 0usize);
+                // Ranked WITHIN the window, so the pair has to be materialized per window.
+                let mut signal = Vec::with_capacity(bars);
+                let mut forward_returns = Vec::with_capacity(bars);
                 for bar in 0..bars.saturating_sub(k - 1) {
                     let mu = window.predicted_mean[bar];
-                    if mu == 0.0 || !mu.is_finite() {
+                    if !mu.is_finite() {
                         continue;
                     }
                     let forward = prefix[bar + k] - prefix[bar];
                     if !forward.is_finite() {
                         continue;
                     }
-                    let side = if mu > 0.0 { 1.0 } else { -1.0 };
+                    // A finite zero is a real abstention and, for rank IC, a member of the
+                    // zero-signal tie. Handle it explicitly: `f64::signum(+0.0)` is `1.0`.
+                    let side = if mu == 0.0 { 0.0 } else { mu.signum() };
                     if side * forward > 0.0 {
                         hits += 1.0;
                     }
                     edge += side * forward / k as f64;
                     count += 1;
+                    signal.push(mu);
+                    forward_returns.push(forward);
                     sum_x += mu;
                     sum_y += forward;
                     sum_xx += mu * mu;
@@ -7357,6 +9421,11 @@ pub fn signal_decay(windows: &[WindowPaths], blocks: &[u64]) -> SignalDecay {
                 let denominator = count.max(1) as f64;
                 hit_by_window.push(hits / denominator);
                 edge_by_window.push(edge / denominator);
+                pearson_by_window.push(pearson(&signal, &forward_returns));
+                rank_by_window.push(pearson(
+                    &average_ranks(&signal),
+                    &average_ranks(&forward_returns),
+                ));
             }
             let n = samples as f64;
             let covariance = sum_xy - sum_x * sum_y / n;
@@ -7366,6 +9435,13 @@ pub fn signal_decay(windows: &[WindowPaths], blocks: &[u64]) -> SignalDecay {
                 hit_rate: block_bootstrap(&hit_by_window, blocks, BOOTSTRAP_DRAWS, BOOTSTRAP_SEED),
                 edge_per_bar: block_bootstrap(
                     &edge_by_window,
+                    blocks,
+                    BOOTSTRAP_DRAWS,
+                    BOOTSTRAP_SEED,
+                ),
+                rank_ic: block_bootstrap(&rank_by_window, blocks, BOOTSTRAP_DRAWS, BOOTSTRAP_SEED),
+                pearson_ic: block_bootstrap(
+                    &pearson_by_window,
                     blocks,
                     BOOTSTRAP_DRAWS,
                     BOOTSTRAP_SEED,
@@ -7390,7 +9466,7 @@ pub fn signal_decay(windows: &[WindowPaths], blocks: &[u64]) -> SignalDecay {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::torch::bar_dist::{encode_dof, BarDof, VolumeEma, DOF_S};
+    use crate::torch::bar_dist::{encode_dof, BarDof, StandardizedDof, VolumeEma, DOF_S};
     use crate::torch::dataset::mix64;
     use crate::torch::test_rng;
     use tch::nn;
@@ -7400,8 +9476,8 @@ mod tests {
         (mix64(seed, index) >> 11) as f64 / (1u64 << 53) as f64
     }
 
-    fn synthetic_supports(count: usize, seed: u64) -> BarSupports {
-        let samples: Vec<BarDof> = (0..count)
+    fn synthetic_dof(count: usize, seed: u64) -> Vec<BarDof> {
+        (0..count)
             .map(|i| {
                 let i = i as u64;
                 let u1 = uniform(seed, 3 * i).max(1e-12);
@@ -7417,8 +9493,11 @@ mod tests {
                     w: (0.5 * gauss) as f32,
                 }
             })
-            .collect();
-        BarSupports::fit(&samples)
+            .collect()
+    }
+
+    fn synthetic_supports(count: usize, seed: u64) -> BarSupports {
+        BarSupports::fit(&synthetic_dof(count, seed))
     }
 
     /// A head whose weights are not all zero, so the prefix table and the chain
@@ -7513,6 +9592,224 @@ mod tests {
         );
     }
 
+    // -----------------------------------------------------------------------
+    // The second-cumulant expected-log solve
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn the_cumulant_solve_converges_on_the_global_quadratic_as_the_bet_shrinks() {
+        // The objectives agree through second order at zero, so their maximizing fractions
+        // converge as the edge — and therefore `f * R` — shrinks. Use asymmetric outcomes:
+        // a symmetric coin makes the exact log and quadratic optima identical, leaving only
+        // bisection roundoff to compare.
+        let gain = 0.03;
+        let loss = 0.01;
+        let fair_gain_probability = loss / (gain + loss);
+        let returns = [gain, -loss];
+        let seconds = deterministic_seconds(&returns);
+        let mut previous: Option<(f64, f64)> = None;
+        for edge in [4.0e-2, 2.0e-2, 1.0e-2] {
+            let probs = [
+                fair_gain_probability + edge,
+                1.0 - fair_gain_probability - edge,
+            ];
+            let quad = kelly_fraction(&probs, &returns, &seconds, FREE_LEVERAGE);
+            let cumulant = cumulant_kelly_fraction(&probs, &returns, &seconds, FREE_LEVERAGE);
+            // For a deterministic two-outcome law, the cumulant objective is exact expected
+            // log and its analytic optimum is `E[R] / (gain * loss)`.
+            let mean = probs[0] * gain - probs[1] * loss;
+            let exact_log = mean / (gain * loss);
+            assert!(
+                (cumulant - exact_log).abs() < 1e-10 * exact_log.abs().max(1.0),
+                "at edge {edge}, cumulant Kelly {cumulant} missed exact log optimum {exact_log}"
+            );
+            assert!(
+                quad > 0.0 && cumulant > 0.0,
+                "a positive edge must produce a long position: quad {quad}, cumulant {cumulant}"
+            );
+            let gap = (cumulant - quad).abs();
+            assert!(
+                gap > 1e-3,
+                "the asymmetric fixture left only a {gap:.3e} solver-noise gap at edge {edge}"
+            );
+            if let Some((last_edge, last_gap)) = previous {
+                // The absolute argmax gap is second order in the edge. Halving the edge should
+                // therefore reduce a comfortably-resolved gap by about four, not compare a
+                // ratio of machine-noise residuals.
+                assert!(
+                    gap < last_gap / 3.5,
+                    "the gap fell only {:.2}x from edge {last_edge} to {edge} \
+                     ({last_gap:.6} -> {gap:.6}), which is not quadratic convergence",
+                    last_gap / gap,
+                );
+            }
+            previous = Some((edge, gap));
+        }
+    }
+
+    #[test]
+    fn the_cumulant_solve_beats_the_global_quadratic_when_bins_are_deterministic() {
+        // Deterministic bins make the two-moment cumulant approximation equal true expected
+        // log, so the independent scalar reference can arbitrate between the two.
+        for (probs, returns) in [
+            ([0.98, 0.02], [0.01, -0.30]),
+            ([0.05, 0.95], [0.40, -0.01]),
+            ([0.6, 0.4], [0.05, -0.04]),
+            ([0.5, 0.5], [0.20, -0.10]),
+        ] {
+            let seconds = deterministic_seconds(&returns);
+            let quad = kelly_fraction(&probs, &returns, &seconds, LEVERAGE_CAP);
+            let cumulant = cumulant_kelly_fraction(&probs, &returns, &seconds, LEVERAGE_CAP);
+            let at_quad = expected_log_growth(&probs, &returns, quad);
+            let at_cumulant = expected_log_growth(&probs, &returns, cumulant);
+            assert!(
+                at_cumulant >= at_quad - 1.0e-15,
+                "the cumulant solve lost on a deterministic-bin expected-log objective: \
+                 {at_cumulant:.6e} vs {at_quad:.6e} at f {cumulant:.6} vs {quad:.6}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_signed_gap_against_the_global_quadratic_follows_deterministic_bin_skew() {
+        // For these deterministic bins the cumulant objective is true expected log. Its
+        // neglected global-quadratic term carries `E[R³]`, so the cumulant optimum sits below
+        // the quadratic one under negative skew and above it under positive skew.
+        for (probs, returns) in [
+            ([0.98, 0.02], [0.01, -0.30]),
+            ([0.05, 0.95], [0.40, -0.01]),
+            ([0.90, 0.10], [0.02, -0.15]),
+            ([0.10, 0.90], [0.15, -0.02]),
+        ] {
+            let seconds = deterministic_seconds(&returns);
+            let third: f64 = probs.iter().zip(&returns).map(|(p, r)| p * r * r * r).sum();
+            let quad = kelly_fraction(&probs, &returns, &seconds, LEVERAGE_CAP);
+            let cumulant = cumulant_kelly_fraction(&probs, &returns, &seconds, LEVERAGE_CAP);
+            assert!(
+                quad.abs() < LEVERAGE_CAP - 1.0e-9 && cumulant.abs() < LEVERAGE_CAP - 1.0e-9,
+                "a saturated law says nothing about the objective's third order: quad \
+                 {quad}, cumulant {cumulant}"
+            );
+            assert_eq!(
+                (cumulant - quad).signum(),
+                third.signum(),
+                "E[R³] is {third:+.3e} but the cumulant solve moved {:+.3e} against the \
+                 global quadratic",
+                cumulant - quad,
+            );
+        }
+    }
+
+    #[test]
+    fn the_cumulant_solve_retreats_from_a_global_quadratic_size_at_the_ruin_bound() {
+        // 99.9% of a 1% gain against a 0.1% chance of losing half: the global quadratic's
+        // optimum is `27x`, the fitted-support ruin bound is `2x`, and the cumulant objective
+        // diverges at the size the control asked for.
+        let probs = [0.999, 0.001];
+        let returns = [0.01, -0.5];
+        let seconds = deterministic_seconds(&returns);
+        let ruin_bound = 2.0;
+
+        assert!(
+            surrogate_ruin_breach(&probs, &returns, &seconds),
+            "the fixture no longer breaches the ruin domain, so it tests nothing"
+        );
+        let quad = kelly_fraction(&probs, &returns, &seconds, FREE_LEVERAGE);
+        assert!(
+            (quad - ruin_bound).abs() < 1.0e-6,
+            "the surrogate should be pinned to the ruin bracket at {ruin_bound}, not {quad}"
+        );
+        // The global quadratic does not merely size aggressively: the position it asked for
+        // wipes the losing bin out to the wealth floor, where the cumulant objective diverges
+        // and a parabola remains finite.
+        assert!(
+            1.0 + quad * returns[1] <= WEALTH_FLOOR,
+            "the surrogate's clamped position leaves wealth at {}, above the floor, so the \
+             fixture is not exercising the ruin case",
+            1.0 + quad * returns[1],
+        );
+
+        let cumulant = cumulant_kelly_fraction(&probs, &returns, &seconds, FREE_LEVERAGE);
+        assert!(
+            cumulant > 0.0 && cumulant < ruin_bound,
+            "the cumulant optimum must be strictly interior to the ruin domain: {cumulant}"
+        );
+        for (p, r) in probs.iter().zip(&returns) {
+            assert!(
+                *p <= 0.0 || 1.0 + cumulant * r > 0.0,
+                "the cumulant optimum wipes out bin ({p}, {r}) at f {cumulant}"
+            );
+        }
+        assert!(
+            expected_log_growth(&probs, &returns, cumulant)
+                > expected_log_growth(&probs, &returns, quad),
+            "retreating from ruin has to buy growth, or the retreat is not the fix"
+        );
+    }
+
+    #[test]
+    fn a_zero_mass_catastrophe_constrains_neither_solve() {
+        // The bracket is a statement about the LIVE support. A bin the head assigned no mass
+        // must not shrink the position, or every catch-all bin's worst decoded payoff would
+        // silently cap the whole book.
+        let live_probs = [0.999, 0.001];
+        let live_returns = [0.01, -0.5];
+        let live_seconds = deterministic_seconds(&live_returns);
+        let dead_probs = [0.999, 0.001, 0.0];
+        let dead_returns = [0.01, -0.5, -0.999];
+        let dead_seconds = deterministic_seconds(&dead_returns);
+
+        for cap in [LEVERAGE_CAP, FREE_LEVERAGE] {
+            assert_eq!(
+                cumulant_kelly_fraction(&live_probs, &live_returns, &live_seconds, cap),
+                cumulant_kelly_fraction(&dead_probs, &dead_returns, &dead_seconds, cap),
+                "a zero-mass bin moved the cumulant optimum at cap {cap}"
+            );
+            assert_eq!(
+                kelly_fraction(&live_probs, &live_returns, &live_seconds, cap),
+                kelly_fraction(&dead_probs, &dead_returns, &dead_seconds, cap),
+                "a zero-mass bin moved the surrogate optimum at cap {cap}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_cumulant_solve_returns_the_cap_when_the_cap_maximizes_its_objective() {
+        // The boundary case. A law with no losing bin has an objective rising over the whole
+        // feasible set, so the constrained argmax IS the ceiling — and the bisection has to
+        // land there rather than on a spurious interior point.
+        let probs = [0.5, 0.5];
+        let returns = [0.02, 0.01];
+        let seconds = deterministic_seconds(&returns);
+        let cumulant = cumulant_kelly_fraction(&probs, &returns, &seconds, LEVERAGE_CAP);
+        assert!(
+            (cumulant - LEVERAGE_CAP).abs() < 1.0e-9,
+            "an all-gain law must ride the cap, not {cumulant}"
+        );
+        assert!(
+            expected_log_growth(&probs, &returns, cumulant)
+                >= expected_log_growth(&probs, &returns, LEVERAGE_CAP * 0.5),
+            "the cap has to beat any interior size on an all-gain law"
+        );
+    }
+
+    #[test]
+    fn within_bin_dispersion_pulls_the_cumulant_solve_below_the_point_mass_solve() {
+        // The cumulant solve is not the naive `sum_b p_b ln(1 + f E[R|b])`. Taking each bin's
+        // conditional mean as a deterministic payoff deletes the dispersion the two open-tail
+        // bins carry almost all of and is optimistic by Jensen.
+        let probs = [0.5, 0.5];
+        let means = [0.01, -0.005];
+        let point_mass = deterministic_seconds(&means);
+        let dispersed: Vec<f64> = point_mass.iter().map(|m2| m2 + 0.004).collect();
+        let tight = cumulant_kelly_fraction(&probs, &means, &point_mass, FREE_LEVERAGE);
+        let wide = cumulant_kelly_fraction(&probs, &means, &dispersed, FREE_LEVERAGE);
+        assert!(
+            wide > 0.0 && wide < tight,
+            "within-bin dispersion must lower the cumulant optimum: {wide} vs {tight}"
+        );
+    }
+
     #[test]
     fn a_symmetric_zero_edge_law_takes_exactly_no_position() {
         for magnitude in [0.002, 0.02, 0.2] {
@@ -7587,6 +9884,198 @@ mod tests {
             assert_eq!(
                 scalar, *expected,
                 "the batched solver must agree bit for bit with the scalar path"
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // The sizing rule on the whole path
+    // -----------------------------------------------------------------------
+
+    /// One chunk of held-out paths under a declared [`SizingRule`], on a fixed fixture, so two
+    /// rules can be compared bar for bar on the same probabilities.
+    fn sized_chunk(rule: SizingRule, shrink: Option<MeanShrink>) -> (ChunkPaths, Vec<u64>) {
+        let _torch_rng_guard = test_rng::shared();
+        let latent = 20;
+        let (_vs, head) = perturbed_head(latent, 0x5121);
+        let supports = synthetic_supports(30_000, 0x5122);
+        let (returns, return_seconds) = return_moment_tensors(&supports);
+        let (log_means, log_seconds) = log_moment_tensors(&supports);
+        let free_null = marginal_position(&supports, FREE_LEVERAGE);
+        let (windows, bars) = (6i64, 24i64);
+        let h = beliefs(windows * bars, latent, 0x5123).view([windows, bars, latent]);
+        let conditioning = beliefs(windows * bars, latent, 0x5124).view([windows, bars, latent]);
+        let realized = Tensor::from_slice(
+            &(0..windows * bars)
+                .map(|slot| (0.004 * (2.0 * uniform(0x5125, slot as u64) - 1.0)) as f32)
+                .collect::<Vec<f32>>(),
+        )
+        .view([windows, bars]);
+        let mut law = TradedLaw::new(&returns, &return_seconds, &log_means, &log_seconds)
+            .with_sizing_rule(rule);
+        if let Some(shrink) = shrink {
+            law = law.with_shrink(shrink);
+        }
+        let chunk = window_paths(
+            &head,
+            &h,
+            &conditioning,
+            &realized,
+            None,
+            &law,
+            free_null,
+            LEVERAGE_CAP,
+        )
+        .expect("sized paths");
+        let blocks = (0..chunk.windows.len() as u64).collect();
+        (chunk, blocks)
+    }
+
+    #[test]
+    fn an_identity_recalibration_reproduces_the_control_position_exactly() {
+        // The wiring test the whole `--mean-shrink` arm rests on. `mu -> 0 + 1.0 mu` is the
+        // recalibration that changes nothing, so a recalibrated pass under it must produce the
+        // control's own position BIT FOR BIT — otherwise a run whose fitted slope came back at
+        // 1.0, which is exactly what a peak-learning-rate or screen-budget run measures, would
+        // silently be a different experiment rather than a visible no-op.
+        let (control, _) = sized_chunk(SizingRule::CONTROL, None);
+        let (identity, blocks) =
+            sized_chunk(SizingRule::RECALIBRATED, Some(MeanShrink::identity()));
+        assert!(
+            !control.windows.is_empty(),
+            "the fixture produced no windows"
+        );
+        for (control, identity) in control.windows.iter().zip(&identity.windows) {
+            assert_eq!(
+                control.free, identity.free,
+                "an identity recalibration moved the uncapped optimum"
+            );
+            for policy in 0..POLICY_COUNT {
+                assert_eq!(
+                    control.positions[policy], identity.positions[policy],
+                    "an identity recalibration moved policy {policy}'s position path"
+                );
+            }
+            let evidence = identity
+                .sizing
+                .as_ref()
+                .expect("a non-control rule leaves its control's fraction behind");
+            assert_eq!(
+                evidence.free_control, control.free,
+                "the retained control column is not the control's own fraction"
+            );
+        }
+
+        // And the comparison it feeds reads as an exact zero rather than as small noise.
+        let config = BenchConfig::new(DEFAULT_COST_BPS, LEVERAGE_CAP, 0.0);
+        let comparison = sizing_comparison(&identity.windows, &blocks, config)
+            .expect("a non-control rule is comparable against its control");
+        assert_eq!(comparison.free_mean_abs_gap, 0.0);
+        assert_eq!(comparison.free_mean_signed_gap, 0.0);
+        assert_eq!(comparison.free_sd_active, comparison.free_sd_control);
+        assert_eq!(comparison.shrink, MeanShrink::identity());
+        for point in &comparison.curve {
+            assert_eq!(
+                point.mean_abs_gap, 0.0,
+                "cap {} moved a position",
+                point.cap
+            );
+            assert_eq!(point.paired.mean, 0.0, "cap {} moved growth", point.cap);
+            assert_eq!(point.sd_active, point.sd_control);
+        }
+    }
+
+    #[test]
+    fn a_control_pass_leaves_no_sizing_evidence_and_no_comparison() {
+        // What keeps an unflagged run bit-identical: the control does not carry a second
+        // column, so there is nothing for the comparison to difference and no chart to write.
+        let (control, blocks) = sized_chunk(SizingRule::CONTROL, None);
+        for window in &control.windows {
+            assert!(
+                window.sizing.is_none(),
+                "a control pass fabricated sizing evidence"
+            );
+            assert!(
+                window.free_shrunk.is_none(),
+                "a control pass with no recalibration fabricated a shrunk column"
+            );
+        }
+        let config = BenchConfig::new(DEFAULT_COST_BPS, LEVERAGE_CAP, 0.0);
+        assert!(
+            sizing_comparison(&control.windows, &blocks, config).is_none(),
+            "a control pass has no alternative rule to be priced against"
+        );
+    }
+
+    #[test]
+    fn sizing_labels_state_the_estimand_without_claiming_exact_expected_log() {
+        let cases = [
+            (
+                SizingRule::CONTROL,
+                "global quadratic on the raw mean (control)",
+            ),
+            (
+                SizingRule::CUMULANT_LOG,
+                "second-cumulant expected-log approximation on the raw mean",
+            ),
+            (
+                SizingRule::RECALIBRATED,
+                "global quadratic on the recalibrated mean",
+            ),
+            (
+                SizingRule::BOTH,
+                "second-cumulant expected-log approximation on the recalibrated mean",
+            ),
+        ];
+        for (rule, expected) in cases {
+            assert_eq!(rule.label(), expected);
+            assert!(
+                !rule.label().to_ascii_lowercase().contains("exact"),
+                "sizing label overclaims the two-moment estimand: {}",
+                rule.label()
+            );
+        }
+        assert!(!SizingRule::CONTROL.cumulant_log);
+        assert!(SizingRule::CUMULANT_LOG.cumulant_log);
+    }
+
+    #[test]
+    fn the_cumulant_rule_changes_the_position_and_is_measured_against_its_control() {
+        let (cumulant, blocks) = sized_chunk(SizingRule::CUMULANT_LOG, None);
+        let config = BenchConfig::new(DEFAULT_COST_BPS, LEVERAGE_CAP, 0.0);
+        let comparison = sizing_comparison(&cumulant.windows, &blocks, config)
+            .expect("a non-control rule is comparable against its control");
+        assert_eq!(comparison.rule, SizingRule::CUMULANT_LOG);
+        assert_eq!(
+            comparison.shrink,
+            MeanShrink::identity(),
+            "a rule that does not recalibrate must report the identity as its applied slope"
+        );
+        assert!(
+            comparison.bars > 0 && comparison.windows == cumulant.windows.len(),
+            "the comparison covered {} bars of {} windows",
+            comparison.bars,
+            comparison.windows
+        );
+        assert!(
+            comparison.free_mean_abs_gap > 0.0,
+            "the cumulant solve chose the global quadratic's position on every one of {} bars, \
+             so this fixture cannot resolve the rule",
+            comparison.bars
+        );
+        assert!(
+            comparison.free_sd_active.is_finite() && comparison.free_sd_control.is_finite(),
+            "the cross-bar dispersions must be measured, not NaN"
+        );
+        // Every bar the surrogate would have taken outside the ruin domain is counted, and the
+        // count is a subset of the traded bars rather than a rate that could exceed one.
+        assert!(comparison.ruin_breach_bars <= comparison.bars);
+        assert!((0.0..=1.0).contains(&comparison.ruin_breach_share));
+        for point in &comparison.curve {
+            assert!(
+                point.active.net_growth.is_finite() && point.control.net_growth.is_finite(),
+                "cap {} produced a non-finite realized growth under one of the two rules",
+                point.cap
             );
         }
     }
@@ -7703,6 +10192,7 @@ mod tests {
                 &h,
                 &conditioning,
                 realized,
+                None,
                 &TradedLaw::new(&returns, &return_seconds, &log_means, &log_seconds),
                 free_null,
                 LEVERAGE_CAP,
@@ -7807,6 +10297,7 @@ mod tests {
                 &h,
                 &conditioning,
                 &realized,
+                None,
                 &TradedLaw::new(&returns, &return_seconds, &log_means, &log_seconds),
                 marginal_position(&supports, FREE_LEVERAGE),
                 LEVERAGE_CAP,
@@ -7866,6 +10357,12 @@ mod tests {
                         vec![1.7; bars]
                     } else if policy == POLICY_BUY_HOLD {
                         vec![1.0; bars]
+                    } else if policy == POLICY_VOL_TARGET {
+                        // A constant stake, not the oracle row: this fixture carries no
+                        // realized bar geometry, so there is no trailing sigma to size on,
+                        // and falling through to the perfect-foresight branch would make a
+                        // model-free baseline tie the ceiling it is supposed to sit under.
+                        vec![0.7; bars]
                     } else {
                         realized
                             .iter()
@@ -8178,6 +10675,7 @@ mod tests {
             &h,
             &conditioning,
             &realized,
+            None,
             &TradedLaw::new(&returns, &return_seconds, &log_means, &log_seconds)
                 .with_bounds(&lo, &hi),
             marginal_position(&supports, FREE_LEVERAGE),
@@ -8211,6 +10709,165 @@ mod tests {
         assert!(
             chunk.tail.upper[loosest].iter().sum::<f64>() > 0.0,
             "a path with 9% bars must breach the model's upper tail somewhere"
+        );
+    }
+
+    /// One chunk's raw `(realized_r, geometry)` fixture, shared by the two predictive
+    /// parametrization tests.
+    fn parametrization_fixture(rows: usize, seed: u64) -> (Vec<f32>, Vec<f32>) {
+        let realized_r = (0..rows)
+            .map(|slot| (0.006 * (2.0 * uniform(seed, slot as u64) - 1.0)) as f32)
+            .collect();
+        let geometry = (0..rows)
+            .flat_map(|slot| {
+                let s = 0.004 * uniform(mix64(seed, 1), slot as u64) + 1.0e-4;
+                let u = 0.9 * uniform(mix64(seed, 2), slot as u64) + 0.05;
+                let v = 0.9 * uniform(mix64(seed, 3), slot as u64) + 0.05;
+                [s as f32, u as f32, v as f32]
+            })
+            .collect();
+        (realized_r, geometry)
+    }
+
+    /// Raw realized targets carry NO predictive standardization factor.
+    ///
+    /// The payoff must stay `expm1(r)` and Garman-Klass must stay in the supplied raw range
+    /// units. This direct entry-point test pins the same outcome contract as
+    /// [`TradeSetup::paths`] without involving standardized predictive supports.
+    #[test]
+    fn the_raw_path_carries_no_standardization_factor() {
+        let _torch_rng_guard = test_rng::shared();
+        let latent = 12;
+        let (_vs, head) = perturbed_head(latent, 0x5011_2A01);
+        let supports = synthetic_supports(20_000, 0x5011_2A02);
+        let (returns, return_seconds) = return_moment_tensors(&supports);
+        let (log_means, log_seconds) = log_moment_tensors(&supports);
+        let (windows, bars) = (2i64, 48i64);
+        let rows = (windows * bars) as usize;
+        let h = beliefs(windows * bars, latent, 0x5011_2A03).view([windows, bars, latent]);
+        let conditioning =
+            beliefs(windows * bars, latent, 0x5011_2A04).view([windows, bars, latent]);
+        let (realized_r, geometry) = parametrization_fixture(rows, 0x5011_2A05);
+        let chunk = window_paths(
+            &head,
+            &h,
+            &conditioning,
+            &Tensor::from_slice(&realized_r).view([windows, bars]),
+            Some(&Tensor::from_slice(&geometry).view([windows, bars, 3])),
+            &TradedLaw::new(&returns, &return_seconds, &log_means, &log_seconds),
+            marginal_position(&supports, FREE_LEVERAGE),
+            LEVERAGE_CAP,
+        )
+        .expect("raw paths");
+        for (window, paths) in chunk.windows.iter().enumerate() {
+            for bar in 0..bars as usize {
+                let slot = window * bars as usize + bar;
+                let payoff = (realized_r[slot] as f64).exp_m1();
+                assert!(
+                    (paths.realized[bar] - payoff).abs() <= 1e-14 * payoff.abs(),
+                    "the raw payoff at row {slot} is {} against expm1(r) = {payoff}",
+                    paths.realized[bar]
+                );
+                let proxy = garman_klass(
+                    geometry[3 * slot] as f64,
+                    geometry[3 * slot + 1] as f64,
+                    geometry[3 * slot + 2] as f64,
+                );
+                assert!(
+                    (paths.realized_variance[bar] - proxy).abs() <= 1e-14 * proxy,
+                    "the raw variance proxy at row {slot} is {} against Garman-Klass {proxy}, \
+                     a factor of {}",
+                    paths.realized_variance[bar],
+                    paths.realized_variance[bar] / proxy
+                );
+            }
+        }
+    }
+
+    /// A standardized predictive law still receives RAW realized outcomes.
+    ///
+    /// Non-unit, row-varying sigma makes any accidental second multiplication observable in
+    /// both `r` and `s`. Sigma may change the position and predicted moments, but never the
+    /// realized payoff or Garman-Klass target.
+    #[test]
+    fn standardized_predictive_paths_do_not_rescale_raw_realized_dof() {
+        let _torch_rng_guard = test_rng::shared();
+        let latent = 12;
+        let (_vs, head) = perturbed_head(latent, 0x5011_2B01);
+        let samples = synthetic_dof(20_000, 0x5011_2B02);
+        let standardized: Vec<StandardizedDof> = samples
+            .iter()
+            .map(|dof| StandardizedDof {
+                dof: *dof,
+                sigma: 1.0,
+            })
+            .collect();
+        let supports = BarSupports::fit_standardized(&standardized);
+        let setup = TradeSetup::new(&supports, Device::Cpu, LEVERAGE_CAP);
+        let (windows, bars) = (2i64, 48i64);
+        let rows = (windows * bars) as usize;
+        let h = beliefs(windows * bars, latent, 0x5011_2B03).view([windows, bars, latent]);
+        let conditioning =
+            beliefs(windows * bars, latent, 0x5011_2B04).view([windows, bars, latent]);
+        let (realized_r, geometry) = parametrization_fixture(rows, 0x5011_2B05);
+        let mut dof = vec![0.0f32; rows * BAR_DOF];
+        for slot in 0..rows {
+            dof[slot * BAR_DOF + DOF_R] = realized_r[slot];
+            dof[slot * BAR_DOF + DOF_S] = geometry[3 * slot];
+            dof[slot * BAR_DOF + DOF_U] = geometry[3 * slot + 1];
+            dof[slot * BAR_DOF + DOF_V] = geometry[3 * slot + 2];
+        }
+        let realized_dof = Tensor::from_slice(&dof).view([windows, bars, BAR_DOF as i64]);
+        let sigma_values: Vec<f32> = (0..rows)
+            .map(|slot| if slot % 2 == 0 { 0.5 } else { 1.75 })
+            .collect();
+        let sigma = Tensor::from_slice(&sigma_values).view([windows, bars]);
+        let chunk = setup
+            .paths(
+                &head,
+                &h,
+                &conditioning,
+                &realized_dof,
+                Some(&sigma),
+                windows as usize,
+            )
+            .expect("standardized predictive paths over raw outcomes");
+        for (window, paths) in chunk.windows.iter().enumerate() {
+            for bar in 0..bars as usize {
+                let slot = window * bars as usize + bar;
+                let payoff = (realized_r[slot] as f64).exp_m1();
+                assert!(
+                    (paths.realized[bar] - payoff).abs() <= 1e-14 * payoff.abs().max(1.0),
+                    "sigma {} rescaled raw payoff at row {slot}: {} against {payoff}",
+                    sigma_values[slot],
+                    paths.realized[bar]
+                );
+                let proxy = garman_klass(
+                    geometry[3 * slot] as f64,
+                    geometry[3 * slot + 1] as f64,
+                    geometry[3 * slot + 2] as f64,
+                );
+                assert!(
+                    (paths.realized_variance[bar] - proxy).abs() <= 1e-14 * proxy.abs().max(1.0),
+                    "sigma {} rescaled raw Garman-Klass at row {slot}: {} against {proxy}",
+                    sigma_values[slot],
+                    paths.realized_variance[bar]
+                );
+            }
+        }
+        // Sigma is still required to integrate the standardized PREDICTIVE law.
+        assert!(
+            setup
+                .paths(
+                    &head,
+                    &h,
+                    &conditioning,
+                    &realized_dof,
+                    None,
+                    windows as usize
+                )
+                .is_err(),
+            "a standardized predictive law ran without the sigma needed for raw moments"
         );
     }
 
@@ -8702,6 +11359,7 @@ mod tests {
             &h,
             &conditioning,
             &realized,
+            None,
             &TradedLaw::new(&returns, &return_seconds, &log_means, &log_seconds),
             free_null,
             LEVERAGE_CAP,
@@ -8712,6 +11370,7 @@ mod tests {
             &h,
             &conditioning,
             &realized,
+            None,
             &TradedLaw::new(&returns, &return_seconds, &log_means, &concentrated),
             free_null,
             LEVERAGE_CAP,
@@ -9004,7 +11663,7 @@ mod tests {
     /// `resolvable()` is the gate the whole verdict hangs on, so its three cases are pinned
     /// directly rather than only through a fixture that happens to land in one of them.
     #[test]
-    fn a_paired_gain_is_resolvable_only_when_its_interval_excludes_zero() {
+    fn a_paired_is_resolvable_only_when_its_interval_excludes_zero() {
         let point = |mean: f64, lo: f64, hi: f64| ShrunkPoint {
             paired: Dispersion {
                 mean,
@@ -9133,7 +11792,14 @@ mod tests {
         let setup = TradeSetup::new(&supports, Device::Cpu, LEVERAGE_CAP)
             .with_shrink(Some(MeanShrink::identity()));
         let chunk = setup
-            .paths(&head, &h, &conditioning, &realized_dof, windows as usize)
+            .paths(
+                &head,
+                &h,
+                &conditioning,
+                &realized_dof,
+                None,
+                windows as usize,
+            )
             .expect("paths");
         for window in &chunk.windows {
             let shrunk = window
@@ -11010,6 +13676,709 @@ mod tests {
                 point.horizon,
                 point.hit_rate.mean,
                 40
+            );
+        }
+    }
+
+    /// 800 bars ~ 8.6 trading days: a regime HAR's 1/5/21-day components can track.
+    const VOL_FIXTURE_PERSISTENT_REGIME: f64 = 800.0;
+    /// 31 bars divides every HAR lag exactly, so each trailing component averages complete
+    /// cycles and cannot forecast the regime contrast.
+    const VOL_FIXTURE_STRAW_REGIME: f64 = 31.0;
+    /// Log-space amplitude used by the ordinary volatility fixtures.
+    const VOL_FIXTURE_LOG_AMPLITUDE: f64 = 0.9;
+    /// A deliberately severe but finite regime contrast that makes lagged HAR genuinely
+    /// degenerate rather than merely worse than the oracle.
+    const VOL_FIXTURE_STRAW_LOG_AMPLITUDE: f64 = 3.0;
+
+    /// Windows carrying a KNOWN latent per-bar variance, a noisy conditionally-unbiased proxy
+    /// of it, and a `predicted_var` the caller chooses as a multiple of the truth.
+    ///
+    /// The latent variance is a sine in log space with the declared period and amplitude. At
+    /// [`VOL_FIXTURE_PERSISTENT_REGIME`] the regime is persistent on the timescale of HAR's
+    /// own 1/5/21-day components, which is the regime a real vol forecaster is judged in. A
+    /// period well BELOW the daily component prevents those trailing means from tracking the
+    /// high-amplitude contrast, which is what
+    /// `the_verdict_is_withheld_when_the_baseline_is_degenerate` needs.
+    ///
+    /// The proxy is `sigma2 * Exp(1)`: strictly positive, mean exactly `sigma2`, and heavily
+    /// right-skewed, so it stands in for [`garman_klass`]'s estimator noise without pretending
+    /// to reconstruct a bar. QLIKE's proxy-robustness needs conditional unbiasedness and
+    /// nothing more, which is what makes this a fair stand-in.
+    fn vol_fixture(
+        count: usize,
+        bars: usize,
+        seed: u64,
+        model_scale: f64,
+        regime_bars: f64,
+        log_amplitude: f64,
+    ) -> Vec<WindowPaths> {
+        (0..count)
+            .map(|window| {
+                let index = |bar: usize| (window * bars + bar) as u64;
+                let truth: Vec<f64> = (0..bars)
+                    .map(|bar| {
+                        let phase =
+                            (window * bars + bar) as f64 / regime_bars * std::f64::consts::TAU;
+                        3.0e-6 * (log_amplitude * phase.sin()).exp()
+                    })
+                    .collect();
+                let proxy: Vec<f64> = truth
+                    .iter()
+                    .enumerate()
+                    .map(|(bar, variance)| {
+                        // `-ln U` is Exp(1); the floor keeps `U = 0` from producing an
+                        // infinite proxy on the one draw in 2^53 that returns exactly zero.
+                        let u = uniform(seed, index(bar)).max(1e-12);
+                        variance * -u.ln()
+                    })
+                    .collect();
+                let realized: Vec<f64> = truth
+                    .iter()
+                    .enumerate()
+                    .map(|(bar, variance)| {
+                        variance.sqrt() * (2.0 * uniform(mix64(seed, 7), index(bar)) - 1.0)
+                    })
+                    .collect();
+                let free = vec![0.5; bars];
+                let positions = std::array::from_fn(|_| vec![0.5; bars]);
+                let mut paths = WindowPaths::unmeasured(realized, free, positions);
+                paths.predicted_mean = vec![0.0; bars];
+                paths.predicted_var = truth.iter().map(|v| model_scale * v).collect();
+                paths.realized_variance = proxy;
+                paths
+            })
+            .collect()
+    }
+
+    /// The causality claim in [`trailing_vol`]'s contract, tested the only way that cannot
+    /// rot: perturb one bar's proxy and require every forecast at or before it to be
+    /// BIT-identical. An off-by-one that let a forecast read its own bar would move
+    /// `forecast[t]`, and a full-sample fit would move all of them.
+    #[test]
+    fn the_trailing_forecasts_cannot_see_their_own_bar() {
+        let base: Vec<f64> = (0..900)
+            .map(|bar| {
+                2.0e-6
+                    * (1.0 + 0.7 * (bar as f64 / 37.0).sin())
+                    * (1.0 + uniform(0x5011, bar as u64))
+            })
+            .collect();
+        let tampered_at = 700usize;
+        let mut tampered = base.clone();
+        tampered[tampered_at] *= 50.0;
+
+        let honest = trailing_vol(&base);
+        let perturbed = trailing_vol(&tampered);
+        for bar in 0..=tampered_at {
+            assert_eq!(
+                honest.ewma[bar].to_bits(),
+                perturbed.ewma[bar].to_bits(),
+                "the ewma forecast for bar {bar} moved when bar {tampered_at} changed"
+            );
+            assert_eq!(
+                honest.har[bar].to_bits(),
+                perturbed.har[bar].to_bits(),
+                "the har forecast for bar {bar} moved when bar {tampered_at} changed, so its \
+                 fit is not confined to strictly past rows"
+            );
+        }
+        assert_ne!(
+            honest.ewma[tampered_at + 1].to_bits(),
+            perturbed.ewma[tampered_at + 1].to_bits(),
+            "the perturbation never reached the forecasts at all, so the test is vacuous"
+        );
+    }
+
+    #[test]
+    fn qlike_is_zero_only_at_a_perfect_forecast_and_charges_understatement_harder() {
+        assert!(qlike(4.0e-6, 4.0e-6).abs() < 1e-15);
+        for factor in [1.5f64, 2.0, 4.0, 10.0] {
+            let under = qlike(factor * 1.0e-6, 1.0e-6);
+            let over = qlike(1.0e-6, factor * 1.0e-6);
+            assert!(
+                under > 0.0 && over > 0.0,
+                "qlike is not positive at {factor}x"
+            );
+            assert!(
+                under > over,
+                "understating the variance by {factor}x cost {under} against {over} for \
+                 overstating it, so the loss is not asymmetric in the direction a leveraged \
+                 bettor is ruined in"
+            );
+        }
+    }
+
+    /// The point of W0.4: a forecaster that KNOWS the latent variance must beat the causal
+    /// HAR-RV baseline with an interval that excludes zero. If this fixture cannot separate
+    /// them, the measurement could never separate a real model either.
+    #[test]
+    fn an_oracle_variance_forecast_beats_the_causal_har_baseline() {
+        let windows = vol_fixture(
+            12,
+            600,
+            0x5011_0704,
+            1.0,
+            VOL_FIXTURE_PERSISTENT_REGIME,
+            VOL_FIXTURE_LOG_AMPLITUDE,
+        );
+        let blocks = blocks_for(&windows);
+        let bench = vol_bench(&windows, &blocks);
+        assert!(
+            bench.measured(),
+            "the vol bench refused a fully-formed fixture"
+        );
+        assert_eq!(bench.windows, 12);
+        assert!(
+            bench.bars >= 12 * (600 - VOL_WARMUP_BARS) - 12,
+            "only {} bars were scored out of {} past warmup",
+            bench.bars,
+            12 * (600 - VOL_WARMUP_BARS)
+        );
+        for forecast in 0..VOL_FORECASTS {
+            assert!(
+                bench.scores[forecast].qlike.mean > 0.0,
+                "{} scored a non-positive qlike",
+                VOL_FORECAST_NAMES[forecast]
+            );
+        }
+        assert_eq!(
+            bench.versus_har[VOL_HAR].mean, 0.0,
+            "the baseline is not paired against itself at exactly zero"
+        );
+        let paired = bench.model_versus_har();
+        assert!(
+            paired.ci_high < 0.0,
+            "an oracle variance forecast failed to beat causal HAR-RV: {:.5} \
+             ({:.5}..{:.5})",
+            paired.mean,
+            paired.ci_low,
+            paired.ci_high
+        );
+        // HAR must be a real null and not a straw man, in two independent senses. It is an
+        // average of the proxy, so a working trailing forecast is level-unbiased almost by
+        // construction — a row that had collapsed to a fallback or a fitted negative would
+        // not be. And its loss must sit close to the ORACLE's, which is the irreducible
+        // `E[Exp(1) - ln Exp(1) - 1] = gamma` floor of the proxy itself: a baseline whose
+        // excess over that floor were several times the floor would not be tracking at all.
+        let har = &bench.scores[VOL_HAR];
+        assert!(
+            (har.level_ratio - 1.0).abs() < 0.15,
+            "the har baseline is level-biased at {:.4}, so it is not averaging the proxy",
+            har.level_ratio
+        );
+        assert!(
+            har.qlike.mean < 2.0 * bench.scores[VOL_MODEL_SCALED].qlike.mean,
+            "the har baseline is a straw man at {:.5} qlike against the oracle's {:.5}",
+            har.qlike.mean,
+            bench.scores[VOL_MODEL_SCALED].qlike.mean
+        );
+    }
+
+    /// QLIKE is not scale-invariant, which is the whole reason [`VOL_MODEL_SCALED`] exists.
+    /// A forecast with perfect conditional SHAPE and three-times-too-large units must lose on
+    /// the raw row and be recovered by the causal running rescale.
+    #[test]
+    fn the_causal_scale_correction_recovers_a_units_mismatch_it_did_not_fit_on() {
+        let windows = vol_fixture(
+            12,
+            600,
+            0x5011_0704,
+            3.0,
+            VOL_FIXTURE_PERSISTENT_REGIME,
+            VOL_FIXTURE_LOG_AMPLITUDE,
+        );
+        let blocks = blocks_for(&windows);
+        let bench = vol_bench(&windows, &blocks);
+        assert!(bench.measured());
+        assert!(
+            bench.scores[VOL_MODEL].level_ratio < 0.4,
+            "the raw row's level bias is not the 1/3 the fixture built: {:.4}",
+            bench.scores[VOL_MODEL].level_ratio
+        );
+        assert!(
+            (bench.scores[VOL_MODEL_SCALED].level_ratio - 1.0).abs() < 0.05,
+            "the rescaled row is still level-biased: {:.4}",
+            bench.scores[VOL_MODEL_SCALED].level_ratio
+        );
+        assert!(
+            bench.scores[VOL_MODEL_SCALED].qlike.mean < bench.scores[VOL_MODEL].qlike.mean,
+            "the scale correction did not help: {:.5} against {:.5}",
+            bench.scores[VOL_MODEL_SCALED].qlike.mean,
+            bench.scores[VOL_MODEL].qlike.mean
+        );
+        assert_eq!(
+            bench.model_versus_har(),
+            bench.versus_har[VOL_MODEL],
+            "the headline must select the raw model variance row"
+        );
+        assert_eq!(
+            bench.causal_scaled_model_versus_har(),
+            bench.versus_har[VOL_MODEL_SCALED],
+            "causal rescaling must remain a separately named comparison"
+        );
+        assert!(
+            bench.causal_scaled_model_versus_har().ci_high < 0.0,
+            "a shape-perfect forecast lost to HAR after its separately reported rescaling"
+        );
+    }
+
+    #[test]
+    fn the_vol_bench_refuses_windows_that_carry_no_realized_geometry() {
+        let windows = fixture_windows(6, 600, 0x5011);
+        let blocks = blocks_for(&windows);
+        assert!(
+            !vol_bench(&windows, &blocks).measured(),
+            "the accounting-only constructor has no proxy, so nothing can be scored on it"
+        );
+        let short = vol_fixture(
+            6,
+            VOL_WARMUP_BARS,
+            0x5011,
+            1.0,
+            VOL_FIXTURE_PERSISTENT_REGIME,
+            VOL_FIXTURE_LOG_AMPLITUDE,
+        );
+        let short_blocks = blocks_for(&short);
+        assert!(
+            !vol_bench(&short, &short_blocks).measured(),
+            "a window no longer than the warmup would score the baselines mid-warmup"
+        );
+    }
+
+    /// The MAGNITUDE guard, at the decision it is made in.
+    ///
+    /// The sign check this replaced accepted any strictly positive fit, so a solve that broke
+    /// to a thousandth of the level was reported as a forecast — and QLIKE charges that
+    /// linearly through `E[z]`, which is exactly how a baseline gets straw-manned without
+    /// anything in the report saying so.
+    #[test]
+    fn the_har_floor_rejects_a_fit_that_is_a_fraction_of_the_trailing_level() {
+        let daily = 4.0e-6;
+        let legs = VOL_HAR_LAGS_BARS.len();
+        for broken in [
+            1.0e-18,
+            1.0e-12,
+            1.0e-9,
+            0.5 * VOL_HAR_FLOOR_FRACTION * daily,
+        ] {
+            let (value, source) = accept_har_fit(Some(broken), daily, legs);
+            assert_eq!(
+                source,
+                HarSource::Floored,
+                "a fit at {broken:e} against a trailing daily {daily:e} was accepted as a \
+                 variance forecast"
+            );
+            assert_eq!(
+                value.to_bits(),
+                daily.to_bits(),
+                "a floored bar must fall back to the trailing daily component exactly"
+            );
+        }
+        // The sign failure the old check caught must still be caught, by the same branch.
+        for broken in [0.0, -1.0e-9, -daily] {
+            assert_eq!(
+                accept_har_fit(Some(broken), daily, legs).1,
+                HarSource::Floored
+            );
+        }
+        // And a genuinely low forecast is NOT clipped: the floor is a guard against a
+        // numerically broken solve, not a lower bound on volatility. Half the trailing daily
+        // variance is an ordinary thing for a regime to do.
+        for genuine in [0.5, 0.2, 2.0 * VOL_HAR_FLOOR_FRACTION] {
+            let (value, source) = accept_har_fit(Some(genuine * daily), daily, legs);
+            assert_eq!(
+                source,
+                HarSource::Full,
+                "a forecast at {genuine}x the trailing daily variance was clipped"
+            );
+            assert_eq!(value.to_bits(), (genuine * daily).to_bits());
+        }
+        assert_eq!(
+            accept_har_fit(None, daily, legs),
+            (daily, HarSource::Refused),
+            "a refused solve must be distinguishable from a floored one in the report"
+        );
+        assert_eq!(
+            accept_har_fit(Some(daily), daily, legs - 1).1,
+            HarSource::Reduced,
+            "a fit on fewer than the three declared legs must say so"
+        );
+    }
+
+    /// A regressor set the window cannot yet tell apart is REFUSED rather than solved.
+    ///
+    /// `component` clamps its trailing window, so below bar 93 all three HAR columns are the
+    /// same expanding mean and below bar 465 two of them are. The old code solved that system
+    /// anyway — exactly singular, separated only by a `1e-8` ridge — and used the answer to
+    /// forecast scored bars from bar 372 on.
+    #[test]
+    fn a_collinear_har_leg_set_is_dropped_rather_than_solved() {
+        // A design whose last two columns are IDENTICAL, which is what the clamped components
+        // are before their lags are reached, plus a target the reduced fit reproduces exactly.
+        let mut gram = [[0.0f64; 4]; 4];
+        let mut moment = [0.0f64; 4];
+        for row in 0..400usize {
+            // Orthogonal, exactly representable columns keep ridge bias proportional to the
+            // declared loading rather than to an accidental condition number. The duplicated
+            // final column is still exactly singular in the full system.
+            let daily = if row % 4 < 2 { -1.0 } else { 1.0 };
+            let shared = if row % 2 == 0 { -1.0 } else { 1.0 };
+            let features = [1.0, daily, shared, shared];
+            let target = 0.25 + 0.5 * daily + 0.125 * shared;
+            for (i, left) in features.iter().enumerate() {
+                moment[i] += left * target;
+                for (j, right) in features.iter().enumerate() {
+                    gram[i][j] += left * right;
+                }
+            }
+        }
+        let reduced = solve_ridge(&gram, &moment, 3).expect("the reduced system is well posed");
+        assert_eq!(reduced[3], 0.0, "a dropped leg must come back exactly zero");
+        for (term, expected) in [0.25f64, 0.5, 0.125].iter().enumerate() {
+            let relative_error = ((reduced[term] - expected) / expected).abs();
+            assert!(
+                relative_error <= 2.0 * VOL_HAR_RIDGE,
+                "the reduced fit missed coefficient {term}: {} against {expected} \
+                 ({relative_error:e} relative, ridge {VOL_HAR_RIDGE:e})",
+                reduced[term]
+            );
+        }
+        // The full system on the same rows is singular in the duplicated direction, and the
+        // ridge does not identify either duplicated coefficient — it only chooses an
+        // arbitrary split between them. The leg gate keeps that ridge-selected split from
+        // being reported as a fitted three-leg model.
+        let full = solve_ridge(&gram, &moment, 4);
+        assert!(
+            full.is_none_or(|beta| { (beta[2] - 0.125).abs() > 0.01 || (beta[3]).abs() > 0.01 }),
+            "the exactly-singular full system returned coefficients as if it were identified, \
+             so the leg gate is the only thing standing between it and the report: {full:?}"
+        );
+
+        // The gate itself, on the forecaster: no bar may be fitted on all three legs until
+        // the rows can discriminate the weekly leg from the monthly one, and the reduced fit
+        // must be live well before that so the scored range never loses its baseline.
+        let bars = VOL_HAR_LAGS_BARS[1] + VOL_HAR_LEG_MIN_ROWS + 200;
+        let proxy: Vec<f64> = (0..bars)
+            .map(|bar| {
+                let u = uniform(0x5011_C011, bar as u64).max(1e-12);
+                2.0e-6 * (1.0 + 0.6 * (bar as f64 / 130.0).sin()) * -u.ln()
+            })
+            .collect();
+        let trailing = trailing_vol(&proxy);
+        let distinct = VOL_HAR_LAGS_BARS[1] + VOL_HAR_LEG_MIN_ROWS;
+        for bar in 0..=distinct {
+            assert_ne!(
+                trailing.har_source[bar],
+                HarSource::Full,
+                "bar {bar} was fitted on three legs while two of its columns are the same \
+                 expanding mean"
+            );
+        }
+        assert_eq!(
+            trailing.har_source[VOL_WARMUP_BARS],
+            HarSource::Reduced,
+            "the first SCORED bar must carry a reduced fit, not a fallback: dropping the legs \
+             the window cannot support is what keeps a real forecast there"
+        );
+        assert!(trailing.har[VOL_WARMUP_BARS].is_finite() && trailing.har[VOL_WARMUP_BARS] > 0.0);
+        assert!(
+            trailing.har_source[bars - 1] == HarSource::Full,
+            "the full three-leg fit never arrived, so the gate never opens: {:?}",
+            trailing.har_source[bars - 1]
+        );
+    }
+
+    /// QLIKE is invariant to a COMMON rescale of its raw realized and predicted variances.
+    ///
+    /// `z = realized / predicted` is unchanged when both are multiplied by the same positive
+    /// constant, so `z - ln z - 1` is too. This is a unit-invariance check, not permission to
+    /// rescale either raw realized target inside [`window_paths`].
+    #[test]
+    fn qlike_is_invariant_to_a_common_rescale_of_both_sides() {
+        for scale in [1.0e-9f64, 1.0e-3, 2.77259, 1.0, 4.0, 1.0e6, 1.0e9] {
+            for (realized, predicted) in [(4.0e-6, 4.0e-6), (9.0e-6, 4.0e-6), (1.0e-7, 4.0e-6)] {
+                let base = qlike(realized, predicted);
+                let scaled = qlike(scale * realized, scale * predicted);
+                assert!(
+                    (scaled - base).abs() <= 1e-12 * base.abs().max(1.0),
+                    "a common {scale:e} rescale moved qlike from {base} to {scaled}"
+                );
+            }
+        }
+        // And at the bench level, where the rescale has to survive the running scale
+        // correction, the trailing baselines and the bootstrap.
+        let windows = vol_fixture(
+            12,
+            600,
+            0x5011_0704,
+            1.0,
+            VOL_FIXTURE_PERSISTENT_REGIME,
+            VOL_FIXTURE_LOG_AMPLITUDE,
+        );
+        let scale = 1.0 / (4.0 * std::f64::consts::LN_2);
+        let rescaled: Vec<WindowPaths> = windows
+            .iter()
+            .map(|window| {
+                let mut scaled = window.clone();
+                scaled.predicted_var = window.predicted_var.iter().map(|v| scale * v).collect();
+                scaled.realized_variance =
+                    window.realized_variance.iter().map(|v| scale * v).collect();
+                scaled
+            })
+            .collect();
+        let blocks = blocks_for(&windows);
+        let base = vol_bench(&windows, &blocks);
+        let moved = vol_bench(&rescaled, &blocks);
+        assert!(base.measured() && moved.measured());
+        for forecast in 0..VOL_FORECASTS {
+            let (a, b) = (
+                base.scores[forecast].qlike.mean,
+                moved.scores[forecast].qlike.mean,
+            );
+            assert!(
+                (a - b).abs() < 1e-9 * a.abs().max(1.0),
+                "{} moved from {a} to {b} under a common rescale of both sides",
+                VOL_FORECAST_NAMES[forecast]
+            );
+        }
+        assert!(
+            (base.model_versus_har().mean - moved.model_versus_har().mean).abs() < 1e-9,
+            "the verdict itself moved under a common rescale"
+        );
+    }
+
+    /// A model cannot be credited with beating a baseline that is not forecasting.
+    ///
+    /// The fixture's 31-bar period divides HAR's 93/465/1953-bar components, so its trailing
+    /// means average complete cycles while the oracle retains the high-amplitude conditional
+    /// variance. HAR's QLIKE is therefore several times the oracle's, and the verdict must be
+    /// WITHHELD rather than printed as a win — which is what the real run did at 4.83 vs 1.70.
+    #[test]
+    fn the_verdict_is_withheld_when_the_baseline_is_degenerate() {
+        let windows = vol_fixture(
+            12,
+            600,
+            0x5011_D06E,
+            1.0,
+            VOL_FIXTURE_STRAW_REGIME,
+            VOL_FIXTURE_STRAW_LOG_AMPLITUDE,
+        );
+        let blocks = blocks_for(&windows);
+        let bench = vol_bench(&windows, &blocks);
+        assert!(bench.measured());
+        assert!(
+            bench.scores[VOL_HAR].qlike.mean > VOL_HAR_STRAW_MULTIPLE * bench.best_model_qlike(),
+            "the fixture failed to produce a straw-man baseline, so the test is vacuous: har \
+             {:.5} against the best model row's {:.5}",
+            bench.scores[VOL_HAR].qlike.mean,
+            bench.best_model_qlike()
+        );
+        assert!(
+            bench.har_degenerate,
+            "the bench measured a straw-man baseline and did not flag it"
+        );
+        assert!(
+            bench.scores[VOL_MODEL].qlike.mean < bench.scores[VOL_HAR].qlike.mean,
+            "the raw model must have a nominal win before the withholding test is meaningful"
+        );
+        for (forecast, dispersion) in bench.versus_har.iter().enumerate() {
+            assert!(
+                dispersion.mean.is_nan()
+                    && dispersion.se.is_nan()
+                    && dispersion.ci_low.is_nan()
+                    && dispersion.ci_high.is_nan(),
+                "{} retained a numeric versus-HAR verdict after degeneration: {dispersion:?}",
+                VOL_FORECAST_NAMES[forecast]
+            );
+        }
+        assert!(bench.model_versus_har().mean.is_nan());
+        assert!(bench.causal_scaled_model_versus_har().mean.is_nan());
+        let lines = bench.report_lines().join("\n");
+        assert!(
+            lines.contains("BASELINE IS DEGENERATE") && lines.contains("WITHHELD"),
+            "the printed verdict does not say the baseline is broken:\n{lines}"
+        );
+        assert!(
+            !lines.contains("BEATS"),
+            "a win was claimed against a degenerate baseline:\n{lines}"
+        );
+
+        // The mirror case: on the persistent regime the same oracle wins and the verdict is
+        // printed, so the withholding is a property of the BASELINE and not of the gate being
+        // permanently on.
+        let honest = vol_fixture(
+            12,
+            600,
+            0x5011_0704,
+            1.0,
+            VOL_FIXTURE_PERSISTENT_REGIME,
+            VOL_FIXTURE_LOG_AMPLITUDE,
+        );
+        let honest_bench = vol_bench(&honest, &blocks_for(&honest));
+        assert!(!honest_bench.har_degenerate);
+        assert!(honest_bench.report_lines().join("\n").contains("BEATS"));
+    }
+
+    /// The vol-targeted row sizes inversely to the trailing sigma and is bounded by the SAME
+    /// clamp every other policy uses.
+    #[test]
+    fn the_vol_targeted_baseline_sizes_inversely_and_respects_the_cap() {
+        let bars = 400usize;
+        // A calm first half and a violent second half. The trailing estimator lags, so the
+        // comparison is between well-separated regime interiors rather than at the seam.
+        let proxy: Vec<f64> = (0..bars)
+            .map(|bar| if bar < bars / 2 { 1.0e-6 } else { 1.0e-4 })
+            .collect();
+        let positions = vol_target_positions(&proxy, bars, LEVERAGE_CAP);
+        assert_eq!(positions.len(), bars);
+        assert!(
+            positions.iter().all(|f| *f >= 0.0 && *f <= LEVERAGE_CAP),
+            "a position escaped [0, LEVERAGE_CAP], so it did not go through clamp_fraction"
+        );
+        let calm = positions[bars / 2 - 1];
+        let violent = positions[bars - 1];
+        assert!(
+            violent < calm,
+            "a 100x rise in realized variance did not shrink the stake: {violent} against \
+             {calm}"
+        );
+        // 100x the variance is 10x the sigma, and the trailing estimator still carries a
+        // little of the calm regime 199 bars later, so the stake shrinks by somewhat less
+        // than ten. Bounded on BOTH sides: an unbounded upper bound would pass on a row
+        // that had simply collapsed to zero, and the lower bound is what says the sizing is
+        // `1 / sigma` rather than merely monotone in it.
+        let ratio = calm / violent;
+        assert!(
+            (5.0..12.0).contains(&ratio),
+            "a 10x rise in trailing sigma moved the stake by {ratio}x, which is not inverse \
+             sigma sizing"
+        );
+        // The cap, on a regime so calm that the uncapped target asks for 98x leverage. This
+        // is the branch that proves the row is projected by `clamp_fraction` rather than
+        // scaled by it.
+        let capped = vol_target_positions(&vec![1.0e-10; bars], bars, LEVERAGE_CAP);
+        assert!(
+            capped[bars - 1] == LEVERAGE_CAP,
+            "a 1e-10 per-bar variance asks for far more than the cap, so the row must sit \
+             exactly at it, got {}",
+            capped[bars - 1]
+        );
+        assert!(
+            violent > 0.0,
+            "the violent regime is not a reason to hold nothing at all"
+        );
+        assert!(
+            vol_target_positions(&[], bars, LEVERAGE_CAP)
+                .iter()
+                .all(|f| *f == 0.0),
+            "a window with no proxy must trade flat rather than invent a sigma"
+        );
+    }
+
+    /// Why the rank version is charted beside the Pearson one: a single outlier can carry the
+    /// moment statistic while the rank statistic sees the monotone relationship that is
+    /// actually there. Both directions of that gap are checked.
+    #[test]
+    fn rank_correlation_survives_an_outlier_and_a_monotone_reparameterization() {
+        let x: Vec<f64> = (0..200).map(|i| i as f64).collect();
+        let y: Vec<f64> = x.iter().map(|v| (v / 40.0).exp()).collect();
+        let rank_ic = pearson(&average_ranks(&x), &average_ranks(&y));
+        assert!(
+            (rank_ic - 1.0).abs() < 1e-12,
+            "a strictly monotone map must leave the rank IC at exactly 1, got {rank_ic}"
+        );
+        assert!(
+            pearson(&x, &y) < 0.95,
+            "the fixture's convexity is too weak for the contrast to mean anything"
+        );
+
+        // The mirror case: no monotone relationship at all, and one bar that manufactures a
+        // large Pearson correlation on its own. Both columns are deterministic — a seeded
+        // draw would make the size of the contrast a property of the seed.
+        let mut noise: Vec<f64> = (0..200).map(|i| (i as f64).sin()).collect();
+        let mut signal: Vec<f64> = (0..200).map(|i| (2.399_963 * i as f64).sin()).collect();
+        noise[0] = 400.0;
+        signal[0] = 400.0;
+        assert!(
+            pearson(&noise, &signal) > 0.9,
+            "the outlier failed to hijack the moment statistic, so the contrast is vacuous"
+        );
+        let ranked = pearson(&average_ranks(&noise), &average_ranks(&signal));
+        assert!(
+            ranked.abs() < 0.2,
+            "one bar moved the rank IC to {ranked}, which no bounded-influence statistic \
+             should allow"
+        );
+    }
+
+    #[test]
+    fn tied_observations_share_their_midrank() {
+        let ranks = average_ranks(&[5.0, 1.0, 1.0, 1.0, 9.0]);
+        assert_eq!(ranks, vec![3.0, 1.0, 1.0, 1.0, 4.0]);
+        // Position must not leak in: reordering the tied block leaves every rank fixed.
+        assert_eq!(
+            average_ranks(&[0.0, 0.0, 0.0]),
+            vec![1.0, 1.0, 1.0],
+            "a constant column must be all-midrank, which is what makes `pearson` return 0"
+        );
+    }
+
+    #[test]
+    fn finite_zero_signals_remain_as_temporal_rank_ties() {
+        let bars = 8;
+        let mut windows = fixture_windows(4, bars, 0xDEC4_0000);
+        for window in &mut windows {
+            window.predicted_mean = vec![0.0; bars];
+        }
+        let decay = signal_decay(&windows, &blocks_for(&windows));
+        let one_bar = decay
+            .points
+            .iter()
+            .find(|point| point.horizon == 1)
+            .expect("the one-bar temporal rank IC is reported");
+        assert_eq!(
+            one_bar.samples,
+            windows.len() * bars,
+            "finite zero signals were filtered as missing instead of retained as ties"
+        );
+        assert_eq!(one_bar.rank_ic.mean, 0.0);
+        assert_eq!(one_bar.pearson_ic.mean, 0.0);
+        assert_eq!(one_bar.hit_rate.mean, 0.0);
+        assert_eq!(one_bar.edge_per_bar.mean, 0.0);
+    }
+
+    /// The rank IC is measured on the same windows and blocks as the rest of [`DecayPoint`],
+    /// and it carries an interval where the pooled Pearson column carries none.
+    #[test]
+    fn every_horizon_carries_a_rank_ic_with_an_interval() {
+        let windows = conviction_windows(8, 240, 40);
+        let blocks = blocks_for(&windows);
+        let decay = signal_decay(&windows, &blocks);
+        assert!(decay.measured());
+        for point in &decay.points {
+            assert!(
+                point.rank_ic.mean.is_finite()
+                    && point.rank_ic.ci_low.is_finite()
+                    && point.rank_ic.ci_high.is_finite(),
+                "k={} has no rank IC interval",
+                point.horizon
+            );
+            assert!(
+                point.rank_ic.ci_low <= point.rank_ic.mean
+                    && point.rank_ic.mean <= point.rank_ic.ci_high,
+                "k={} has an interval that does not contain its own mean",
+                point.horizon
+            );
+            assert!(
+                point.rank_ic.mean.abs() <= 1.0 && point.pearson_ic.mean.abs() <= 1.0,
+                "k={} produced a correlation outside [-1, 1]",
+                point.horizon
+            );
+            assert!(
+                point.rank_ic.blocks > 1,
+                "k={} was bootstrapped over a single block, so its interval is not one",
+                point.horizon
             );
         }
     }

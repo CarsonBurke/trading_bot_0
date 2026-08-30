@@ -63,6 +63,114 @@ pub const BAR_PREFIX_SLOTS: usize = BAR_DOF - 1;
 /// Span of the causal volume EMA that anchors the `w` degree of freedom.
 pub const BAR_VOLUME_EMA_SPAN: f64 = 20.0;
 
+/// Bar spans of the three causal variance EMAs [`RangeVolHar`] combines.
+///
+/// A geometric short/medium/long ladder, the categorical analogue of HAR-RV's `(1, 5, 22)`
+/// day ladder: the short leg supplies adaptivity, the long leg supplies a level the network
+/// no longer has to re-derive from context. Spans are in BARS rather than days so one
+/// constant serves every resolution the corpus carries.
+pub const BAR_VOL_HAR_SPANS: [f64; 3] = [16.0, 64.0, 256.0];
+
+/// Weights of the three [`BAR_VOL_HAR_SPANS`] components, which must sum to one.
+///
+/// Deliberately FIXED and equal rather than fitted. A fitted weight is a train-region
+/// statistic and would need the whole leakage discipline the supports carry, for a quantity
+/// the published HAR-RV coefficients pin at roughly a third each anyway — well inside their
+/// own standard errors. Nothing downstream depends on the split being optimal: the emission
+/// head sees `sigma_t` as conditioning and can correct any fixed misweighting, which is the
+/// entire point of handing it the analytic level.
+pub const BAR_VOL_HAR_WEIGHTS: [f64; 3] = [1.0 / 3.0, 1.0 / 3.0, 1.0 / 3.0];
+
+/// `sqrt(4 ln 2)`, the constant that puts the log range on the same scale as `sigma`.
+///
+/// For a driftless Brownian bar with log-return standard deviation `sigma`, the expected
+/// squared log range is `4 ln(2) sigma^2`, so `s / (BAR_RANGE_TO_SIGMA * sigma)` has unit
+/// mean square. It is a pure cosmetic normalizer for the equal-mass fit — rescaling every
+/// row of a DOF by one positive constant is monotone and therefore leaves the quantile
+/// partition of the sample bit-identical — but it is what makes the standardized-target
+/// report readable as "roughly unit scale".
+pub const BAR_RANGE_TO_SIGMA: f64 = 1.665_109_222_315_395_2;
+
+/// Span of the slow, name-specific trailing variance anchor used to floor the HAR reference.
+///
+/// Sixteen times the longest adaptive HAR leg: slow enough that a halted or temporarily flat
+/// name keeps its own established scale, while still remaining a strictly causal trailing
+/// statistic rather than a corpus-wide absolute policy.
+pub const BAR_VOL_SLOW_ANCHOR_SPAN: f64 = 4096.0;
+
+/// Minimum HAR volatility as a fraction of the same name's slow trailing volatility.
+///
+/// Applied in variance space as `slow_variance * BAR_SIGMA_RELATIVE_FLOOR^2`. Because both
+/// sides scale quadratically with the name, multiplying every log move by a positive constant
+/// leaves every standardized row unchanged (up to floating-point rounding).
+pub const BAR_SIGMA_RELATIVE_FLOOR: f64 = 0.01;
+
+/// Last-resort divisor when a name's causal history contains no positive variance at all.
+///
+/// This is numerical completion, not a volatility policy: once any positive scale has been
+/// observed, [`RangeVolHar`] uses only its name-specific relative floor. Every use is exposed
+/// by [`ScaleDiagnostics::numerical_fallback`] and counted by
+/// [`crate::torch::dataset::TargetGeometry`].
+pub const BAR_SIGMA_NUMERICAL_FALLBACK: f64 = 1e-6;
+
+/// Compatibility name consumed by report code outside this module's ownership.
+///
+/// It now denotes only [`BAR_SIGMA_NUMERICAL_FALLBACK`], never the policy floor. Report
+/// integration must move to the explicit relative-floor and fallback counters.
+pub const BAR_SIGMA_FLOOR: f64 = BAR_SIGMA_NUMERICAL_FALLBACK;
+
+/// Hard bound on a standardized degree of freedom, in units of `sigma_t`.
+///
+/// The one-level-up twin of [`LOG_LIMIT`], and load-bearing for the same reason: a symbol
+/// that prints flat bars for an hour and then jumps has a legitimately tiny `sigma_t` and a
+/// legitimately large move, and the ratio of the two is unbounded. Left unbounded those bars
+/// would stretch the interior equal-mass edges and spend real resolution on broken feeds;
+/// clamped, they collect in the outermost bin — or, if they are numerous enough to clear
+/// [`BAR_ATOM_MASS_THRESHOLD`], in an atom of their own, which is a more honest
+/// representation of "off-scale event" than a distorted grid. Fifty sigma is far past any
+/// event a working feed can produce, so it never binds on a real bar.
+pub const BAR_Z_LIMIT: f64 = 50.0;
+
+/// Causal bars of warm-up a standardized encode needs before its first emitted row.
+///
+/// Eight times the longest adaptive [`BAR_VOL_HAR_SPANS`] entry. The much slower anchor is
+/// deliberately not treated as an adaptive estimate: it only supplies a one-percent emergency
+/// floor, and paying its full convergence horizon on every sampled window would turn a bounded
+/// batch encode into a second corpus scan.
+pub const BAR_SIGMA_WARMUP_BARS: usize = 2048;
+
+/// Canonical, persisted identity of every semantic choice in standardized target scaling.
+///
+/// This is intentionally a literal rather than generated JSON: it is stable across serde and
+/// formatter versions and can be authenticated byte-for-byte. Any change to a listed constant
+/// requires a new contract version and standardized support schema.
+pub const STANDARDIZED_SCALING_CONTRACT: &str = "vol-standardized-v1;har-spans=16,64,256;har-weights=1/3,1/3,1/3;range-to-sigma=sqrt(4ln2):1.6651092223153952;relative-sigma-floor=0.01*slow-sigma;slow-variance-ema-span=4096;numerical-fallback=1e-6;z-r-clamp=[-50,50];z-s-clamp=[0,50];warmup-bars=2048";
+
+/// Stable API for checkpoint/support lineage code that must authenticate standardized scaling.
+pub const fn standardized_scaling_contract() -> &'static str {
+    STANDARDIZED_SCALING_CONTRACT
+}
+
+/// Canonical identity of the unscaled target encoder.
+///
+/// Raw supports historically encoded this only implicitly through their schema. Campaign fits
+/// persist it in [`BarSupportsProvenance`] so an existing file can be authenticated against the
+/// exact target law requested by a new fit, rather than merely observed to have raw-shaped rows.
+pub const RAW_SCALING_CONTRACT: &str =
+    "raw-v1;r=ln(C_t/C_t-1);s=ln(H_t/L_t);u,v=range-position;w=ln(V/EMA20);warmup-bars=256";
+
+/// Canonical identity of the support-fitting law shared by raw and standardized targets.
+///
+/// This names every choice that changes which observation lands in which categorical outcome.
+/// A change to the quantile tiling, clipping, atom detection, or mandated atoms must mint a new
+/// value even when the persisted JSON remains structurally readable.
+pub const BAR_SUPPORTS_SEMANTICS_CONTRACT: &str =
+    "equal-mass-mixture-v1;bins=128;clip-quantile=1e-4;atom-mass=0.005;max-atoms=8;mandated=s:0|u,v:0,0.5,1";
+
+/// Causal bars of warm-up a RAW encode needs before its first emitted row: enough for the
+/// span-20 volume EMA alone. [`crate::torch::dataset::DOF_WARMUP_BARS`] is defined as this.
+pub const BAR_RAW_WARMUP_BARS: usize = 256;
+
 // ---------------------------------------------------------------------------
 // Scoring rule
 // ---------------------------------------------------------------------------
@@ -152,6 +260,96 @@ impl FromStr for BarScoring {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Target parametrization policy
+// ---------------------------------------------------------------------------
+
+/// How the two SCALE-CARRYING degrees of freedom are parametrized.
+///
+/// `u` and `v` are positions in `[0, 1]` and `w` is already divided by a causal volume EMA,
+/// so three of the five factors are scale-free whichever variant is in force. The choice is
+/// precisely about `r` and `s`.
+///
+/// [`Self::Raw`] fits one globally pooled grid over unnormalized log quantities. A quiet name
+/// then concentrates in a handful of central bins while a volatile one spreads across the
+/// whole grid, so effective resolution varies by an order of magnitude across the panel; a
+/// 30 bp move on a quiet name and a 150 bp move on a volatile one are the same event and
+/// share no parameters; and the head has to re-derive the active bin window from context at
+/// every step, spending learned capacity on a quantity a causal range estimator gives
+/// analytically.
+///
+/// [`Self::VolStandardized`] divides both by [`RangeVolHar`]'s strictly causal `sigma_t`, so
+/// one grid in sigma units serves every symbol and every regime and the head predicts only
+/// the standardized shape.
+///
+/// It selects a TARGET SPACE, so the two are NOT comparable in nats: the bin geometry, the
+/// discretization measure and hence every `nll_bar` scale differ. A run records which one it
+/// used in its checkpoint lineage, and a support artifact records it in its own schema, so
+/// the two can never be silently mixed.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DofScaling {
+    /// `r = ln(C_t / C_{t-1})` and `s = ln(H_t / L_t)`, unnormalized.
+    #[default]
+    Raw,
+    /// `r = z_r * sigma_t` and `s = z_s * BAR_RANGE_TO_SIGMA * sigma_t`, with `sigma_t`
+    /// measurable on bars `< t` only.
+    VolStandardized,
+}
+
+impl DofScaling {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Raw => "raw",
+            Self::VolStandardized => "vol_standardized",
+        }
+    }
+
+    pub fn is_standardized(self) -> bool {
+        matches!(self, Self::VolStandardized)
+    }
+
+    /// Causal bars an encoder must consume before it may emit its first row.
+    ///
+    /// [`Self::Raw`] needs only the span-20 volume EMA to converge; [`Self::VolStandardized`]
+    /// additionally needs the span-256 leg of [`RangeVolHar`], hence
+    /// [`BAR_SIGMA_WARMUP_BARS`].
+    pub fn warmup_bars(self) -> usize {
+        match self {
+            Self::Raw => BAR_RAW_WARMUP_BARS,
+            Self::VolStandardized => BAR_SIGMA_WARMUP_BARS,
+        }
+    }
+
+    /// Exact target-encoding contract a fitted support must authenticate.
+    pub const fn scaling_contract(self) -> &'static str {
+        match self {
+            Self::Raw => RAW_SCALING_CONTRACT,
+            Self::VolStandardized => STANDARDIZED_SCALING_CONTRACT,
+        }
+    }
+}
+
+impl fmt::Display for DofScaling {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl FromStr for DofScaling {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "raw" => Ok(Self::Raw),
+            "vol_standardized" => Ok(Self::VolStandardized),
+            other => Err(format!(
+                "unknown DOF scaling {other:?}; expected one of raw, vol_standardized"
+            )),
+        }
+    }
+}
+
 /// DOF slot indices. The tensor layout is always `[r, s, u, v, w]`.
 pub const DOF_R: usize = 0;
 pub const DOF_S: usize = 1;
@@ -191,7 +389,6 @@ const BAR_PREFIX_WIDTH: i64 = BAR_PREFIX_SLOTS as i64 * BAR_PREFIX_EMBED_DIM;
 /// projection, so the pretrain optimizer routes it to AdamW exactly like
 /// `value_proj` / `next_return_head`.
 pub const BAR_EMISSION_ADAMW_NAME_SUBSTRINGS: [&str; 2] = ["bar_dof_head", "bar_prefix_embed"];
-
 const SQRT_2: f64 = std::f64::consts::SQRT_2;
 /// Prices below this are treated as corrupt and clamped away from zero/negatives.
 const PRICE_FLOOR: f64 = 1e-6;
@@ -379,6 +576,221 @@ pub fn decode_dof(prev_close: f32, dof: &BarDof, ema_volume: f32) -> PackedBar {
     }
 }
 
+/// One standardized observation: the encoded DOF and the causal volatility they were divided
+/// by.
+///
+/// The pair is inseparable. `z_r` alone is not a return and cannot be sized on; `sigma_t` is
+/// what turns it back into one, and it is known at decision time, so carrying the two together
+/// lets [`BarSupports::simple_return_bin_moments_at`] evaluate the measured moment-matching
+/// sub-bin law at the correct payoff scale.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct StandardizedDof {
+    pub dof: BarDof,
+    /// The divisor applied to `r`; `s` was divided by `BAR_RANGE_TO_SIGMA * sigma`.
+    pub sigma: f32,
+}
+/// Per-row facts about exceptional standardized scaling decisions.
+///
+/// These are emitted by the encoder rather than inferred from the resulting float: equality
+/// with a boundary cannot distinguish a true boundary value from a clamp, and the relative
+/// floor cannot be recovered from `sigma` without the private slow-anchor state.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ScaleDiagnostics {
+    pub relative_floor: bool,
+    pub numerical_fallback: bool,
+    pub r_clamped: bool,
+    pub s_clamped: bool,
+}
+
+/// A standardized row together with the exact exceptional-path decisions used to create it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct EncodedDof {
+    pub row: StandardizedDof,
+    pub diagnostics: ScaleDiagnostics,
+}
+
+/// Divide the two scale-carrying DOF by `sigma`, leaving `u`, `v` and `w` untouched.
+///
+/// `z_s = s / (BAR_RANGE_TO_SIGMA * sigma)` rather than the log-ratio `ln s - ln(c sigma)`,
+/// and the reason is structural: `s == 0` is the flat bar, 11-15% of a real corpus, a MANDATED
+/// atom of the `s` support ([`mandated_atoms`]) and the antecedent of the hard identity
+/// `s == 0 => u == v == 0.5` that the [`BAR_CHAIN`] ordering assertion exists to protect.
+/// `ln(0)` is `-inf`, so the log form deletes that atom and with it the one identity the
+/// prefix embedding represents exactly. Nothing is lost by using the ratio: the bins are
+/// EQUAL-MASS quantile bins, `ln` is monotone, and a monotone reparametrization of one DOF
+/// leaves the quantile partition of the sample bit-identical — only the bin geometry moves.
+pub fn standardize_dof(raw: BarDof, sigma: f32) -> BarDof {
+    standardize_dof_with_diagnostics(raw, sigma).0
+}
+
+/// [`standardize_dof`] plus exact clamp indicators for the two standardized coordinates.
+pub fn standardize_dof_with_diagnostics(raw: BarDof, sigma: f32) -> (BarDof, ScaleDiagnostics) {
+    let supplied_scale = positive_finite(sigma);
+    let scale = supplied_scale.unwrap_or(BAR_SIGMA_NUMERICAL_FALLBACK);
+    let r = finite_or(raw.r, 0.0) / scale;
+    let s = finite_or(raw.s, 0.0) / (BAR_RANGE_TO_SIGMA * scale);
+    let r_scaled = r.clamp(-BAR_Z_LIMIT, BAR_Z_LIMIT);
+    let s_scaled = s.clamp(0.0, BAR_Z_LIMIT);
+    (
+        BarDof {
+            r: r_scaled as f32,
+            s: s_scaled as f32,
+            u: raw.u,
+            v: raw.v,
+            w: raw.w,
+        },
+        ScaleDiagnostics {
+            numerical_fallback: supplied_scale.is_none(),
+            r_clamped: r_scaled != r,
+            s_clamped: s_scaled != s,
+            ..ScaleDiagnostics::default()
+        },
+    )
+}
+
+/// Exact inverse of [`standardize_dof`] for any row it did not clamp.
+///
+/// `s >= 0` and `u`, `v` are carried across untouched, so `decode_dof` applied to the result
+/// still builds the four log prices as `ln_low + {0, v, u, 1} * s` and the
+/// `L <= {O, C} <= H` ordering identity holds by exactly the same construction as on the raw
+/// path.
+pub fn destandardize_dof(z: BarDof, sigma: f32) -> BarDof {
+    let scale = positive_finite(sigma).unwrap_or(BAR_SIGMA_NUMERICAL_FALLBACK);
+    let r = finite_or(z.r, 0.0) * scale;
+    let s = finite_or(z.s, 0.0) * BAR_RANGE_TO_SIGMA * scale;
+    BarDof {
+        r: r.clamp(-LOG_LIMIT, LOG_LIMIT) as f32,
+        s: s.clamp(0.0, LOG_LIMIT) as f32,
+        u: z.u,
+        v: z.v,
+        w: z.w,
+    }
+}
+
+/// Garman-Klass-Yang-Zhang variance of ONE bar, read straight off its raw DOF.
+///
+/// `v = g^2 + 0.5 * s^2 - (2 ln 2 - 1) * ln(C/O)^2` with the gap `g = ln(O_t / C_{t-1})` and
+/// `ln(C/O) = (u - v) * s`, so `g = r + (v - u) * s`. Every term is already in the DOF: this
+/// costs three multiplies and no transcendental, which is why the warm-up can afford
+/// [`BAR_SIGMA_WARMUP_BARS`] bars.
+///
+/// Range-based rather than close-to-close on purpose: the range uses the whole intra-bar path
+/// instead of two prices and is roughly five to seven times more efficient per observation,
+/// and `s` is already an observable of the parametrization. The gap term is what keeps a name
+/// whose moves arrive as jumps rather than as intra-bar excursions from being assigned a
+/// spuriously small scale. Non-negative by construction: the bracket
+/// `0.5 - (2 ln 2 - 1) (u - v)^2` is bounded below by `0.5 - (2 ln 2 - 1) > 0` because
+/// `u, v in [0, 1]`.
+pub fn har_variance(dof: &BarDof) -> f64 {
+    let s = finite_or(dof.s, 0.0);
+    let r = finite_or(dof.r, 0.0);
+    let close_open = (finite_or(dof.u, 0.5) - finite_or(dof.v, 0.5)) * s;
+    let gap = r - close_open;
+    gap * gap + s * s * 0.5 - GARMAN_KLASS_OPEN_CLOSE * close_open * close_open
+}
+
+/// `2 ln 2 - 1`, the Garman-Klass weight on the squared open-to-close move.
+const GARMAN_KLASS_OPEN_CLOSE: f64 = 2.0 * std::f64::consts::LN_2 - 1.0;
+
+/// Strictly causal HAR combination of range-volatility EMAs: the scale reference for `r` and
+/// `s` under [`DofScaling::VolStandardized`].
+///
+/// Mirrors [`VolumeEma`]'s causality discipline exactly. The reference for bar `t` is built
+/// from [`har_variance`] over bars `< t`, so a standardized target never sees its own
+/// volatility, and the estimator has no way to: [`Self::reference`] reads state that
+/// [`Self::observe`] has not yet been given the current bar for.
+///
+/// Three components rather than one because the network should be predicting the volatility
+/// INNOVATION, not re-deriving the level. A single short EMA is noisy enough that dividing by
+/// it injects estimator noise into every target; a single long EMA is too slow at a regime
+/// break. The [`BAR_VOL_HAR_SPANS`] ladder with fixed [`BAR_VOL_HAR_WEIGHTS`] is the standard
+/// HAR answer to that trade-off and costs three fused multiply-adds per bar.
+#[derive(Clone, Copy, Debug)]
+pub struct RangeVolHar {
+    alpha: [f64; 3],
+    value: [f64; 3],
+    initialized: bool,
+    slow_alpha: f64,
+    /// `None` until the name has exhibited positive variance. Zeros then decay the established
+    /// anchor slowly; they never manufacture a positive scale for an always-flat history.
+    slow_variance: Option<f64>,
+}
+
+/// A causal volatility reference and whether the relative policy floor supplied it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct VolScaleReference {
+    pub sigma: f32,
+    pub relative_floor: bool,
+}
+
+impl RangeVolHar {
+    pub fn new(spans: [f64; 3]) -> Self {
+        assert!(
+            spans.iter().all(|span| *span >= 1.0),
+            "every HAR variance span must be at least 1 bar"
+        );
+        Self {
+            alpha: spans.map(|span| 2.0 / (span + 1.0)),
+            value: [0.0; 3],
+            initialized: false,
+            slow_alpha: 2.0 / (BAR_VOL_SLOW_ANCHOR_SPAN + 1.0),
+            slow_variance: None,
+        }
+    }
+
+    /// `sigma_t` for the bar about to be encoded, or `None` while the name's entire causal
+    /// history has no positive scale.
+    pub fn reference(&self) -> Option<f32> {
+        self.reference_with_diagnostics()
+            .map(|reference| reference.sigma)
+    }
+
+    /// [`Self::reference`] with the exact relative-floor decision.
+    pub fn reference_with_diagnostics(&self) -> Option<VolScaleReference> {
+        let slow_variance = self.slow_variance.filter(|variance| *variance > 0.0)?;
+        let variance: f64 = self
+            .value
+            .iter()
+            .zip(BAR_VOL_HAR_WEIGHTS)
+            .map(|(value, weight)| weight * value)
+            .sum();
+        let relative_floor_variance =
+            slow_variance * BAR_SIGMA_RELATIVE_FLOOR * BAR_SIGMA_RELATIVE_FLOOR;
+        let relative_floor = variance < relative_floor_variance;
+        Some(VolScaleReference {
+            sigma: variance.max(relative_floor_variance).sqrt() as f32,
+            relative_floor,
+        })
+    }
+
+    /// Fold one bar's [`har_variance`] into the adaptive HAR and slow trailing anchor.
+    pub fn observe(&mut self, dof: &BarDof) {
+        let variance = har_variance(dof).max(0.0);
+        if !variance.is_finite() {
+            return;
+        }
+        if self.initialized {
+            for (value, alpha) in self.value.iter_mut().zip(self.alpha) {
+                *value += alpha * (variance - *value);
+            }
+        } else {
+            self.value = [variance; 3];
+            self.initialized = true;
+        }
+        match self.slow_variance.as_mut() {
+            Some(anchor) => *anchor += self.slow_alpha * (variance - *anchor),
+            None if variance > 0.0 => self.slow_variance = Some(variance),
+            None => {}
+        }
+    }
+}
+
+impl Default for RangeVolHar {
+    fn default() -> Self {
+        Self::new(BAR_VOL_HAR_SPANS)
+    }
+}
+
 /// Causal EMA of bar volume, the reference for the `w` degree of freedom.
 ///
 /// The reference for bar `t` is the EMA over bars `< t`, so `w` never sees its own
@@ -427,25 +839,90 @@ impl Default for VolumeEma {
     }
 }
 
-/// Encode a contiguous bar series, carrying the previous close and the causal
-/// volume EMA forward. The first bar has no predecessor and is skipped, so the
+/// Encode a contiguous bar series under [`DofScaling::Raw`], carrying the previous close and
+/// the causal volume EMA forward. The first bar has no predecessor and is skipped, so the
 /// result aligns with `bars[1..]`.
 pub fn encode_series(bars: &[PackedBar]) -> Vec<BarDof> {
+    encode_series_scaled(bars, DofScaling::Raw)
+        .into_iter()
+        .map(|row| row.dof)
+        .collect()
+}
+
+/// [`encode_series`] under an explicit parametrization, carrying the standardizing `sigma_t`
+/// out alongside each row.
+///
+/// The volatility estimator is SEEDED from bar 0 through `encode_dof(bars[0].open, &bars[0])`,
+/// which sets that row's gap to exactly zero and so reduces [`har_variance`] to plain
+/// Garman-Klass. That is the one bar of the series with no predecessor close, and inventing a
+/// gap for it from a later price would be a leak; dropping it instead would leave bar 1 with
+/// no reference at all. Every subsequent observation carries its real gap.
+pub fn encode_series_scaled(bars: &[PackedBar], scaling: DofScaling) -> Vec<StandardizedDof> {
+    encode_series_scaled_with_diagnostics(bars, scaling)
+        .into_iter()
+        .map(|encoded| encoded.row)
+        .collect()
+}
+
+/// [`encode_series_scaled`] with exact relative-floor, fallback, and clamp facts per row.
+pub fn encode_series_scaled_with_diagnostics(
+    bars: &[PackedBar],
+    scaling: DofScaling,
+) -> Vec<EncodedDof> {
     if bars.len() < 2 {
         return Vec::new();
     }
     let mut ema = VolumeEma::default();
     let first_volume = bars[0].volume;
     ema.observe(first_volume);
+    let mut har = RangeVolHar::default();
+    if scaling.is_standardized() {
+        har.observe(&encode_dof(bars[0].open, &bars[0], first_volume));
+    }
     let mut out = Vec::with_capacity(bars.len() - 1);
     let mut prev_close = bars[0].close;
     for bar in &bars[1..] {
         let volume = bar.volume;
-        out.push(encode_dof(prev_close, bar, ema.reference_for(volume)));
+        let raw = encode_dof(prev_close, bar, ema.reference_for(volume));
+        out.push(scale_row(raw, &har, scaling));
+        if scaling.is_standardized() {
+            har.observe(&raw);
+        }
         ema.observe(volume);
         prev_close = bar.close;
     }
     out
+}
+
+/// Turn one RAW row plus the causal estimator state into the emitted row.
+///
+/// [`DofScaling::Raw`] reports `sigma = 1`, which is not a placeholder: it is the exact
+/// divisor that was applied, so `r = sigma * z_r` holds identically on both paths and every
+/// sigma-parameterized consumer is total.
+pub(crate) fn scale_row(raw: BarDof, har: &RangeVolHar, scaling: DofScaling) -> EncodedDof {
+    match scaling {
+        DofScaling::Raw => EncodedDof {
+            row: StandardizedDof {
+                dof: raw,
+                sigma: 1.0,
+            },
+            diagnostics: ScaleDiagnostics::default(),
+        },
+        DofScaling::VolStandardized => {
+            let (sigma, relative_floor, numerical_fallback) = match har.reference_with_diagnostics()
+            {
+                Some(reference) => (reference.sigma, reference.relative_floor, false),
+                None => (BAR_SIGMA_NUMERICAL_FALLBACK as f32, false, true),
+            };
+            let (dof, mut diagnostics) = standardize_dof_with_diagnostics(raw, sigma);
+            diagnostics.relative_floor = relative_floor;
+            diagnostics.numerical_fallback = numerical_fallback;
+            EncodedDof {
+                row: StandardizedDof { dof, sigma },
+                diagnostics,
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -508,8 +985,22 @@ pub struct BarSupportsProvenance {
     /// `(train|val, val|test)` split instants in epoch millis. The fit draws from the train
     /// region only, so these bound what the supports were allowed to see.
     pub split_bounds: (i64, i64),
-    /// Training DOF actually drawn for the fit.
+    /// Requested maximum training DOF for the deterministic fit sample.
     pub sample_count: usize,
+    /// RNG seed that selected the training rows used by the fit.
+    ///
+    /// `None` is readable legacy provenance, not an authenticated seed. A new campaign fit must
+    /// refuse it rather than infer a seed from caller arguments.
+    #[serde(default)]
+    pub fit_seed: Option<u64>,
+    /// Exact target encoder contract in force for the sampled rows.
+    ///
+    /// Optional only so ordinary loading and diagnostics can still inspect older artifacts.
+    #[serde(default)]
+    pub scaling_contract: Option<String>,
+    /// Exact support-fitting law that turned the sampled rows into categorical geometry.
+    #[serde(default)]
+    pub support_semantics: Option<String>,
     /// UTC ISO-8601 instant the fit completed.
     pub fitted_utc: String,
 }
@@ -552,18 +1043,51 @@ struct BarSupportsJson {
     /// moment, a finite risk-only completion rather than an invented geometric payoff.
     #[serde(default)]
     bin_simple_return_second_moments: Option<Vec<f64>>,
+    /// The target parametrization these bins were fitted over.
+    ///
+    /// ABSENT means [`DofScaling::Raw`], which is what every artifact written before the
+    /// standardized path existed is. Skipped on serialization when raw, so this member alone
+    /// never moves a raw geometry's digest; newly authenticated provenance may still do so.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    dof_scaling: Option<DofScaling>,
+    /// `NUM_BAR_BINS` rows of [`SMOOTHING_FLOOR_NODES`]: measured `E[z | sub-bin]` over
+    /// equal-mass sub-bins of each `r` bin. Present only on a
+    /// [`DofScaling::VolStandardized`] artifact, where it is what makes
+    /// [`BarSupports::simple_return_bin_moments_at`] a measurement rather than a geometric
+    /// stand-in.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    bin_z_subbin_means: Option<Vec<Vec<f64>>>,
+    /// `NUM_BAR_BINS` rows of [`SMOOTHING_FLOOR_NODES`]: measured `E[z^2 | sub-bin]`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    bin_z_subbin_second_moments: Option<Vec<Vec<f64>>>,
+    /// Exact standardized-scaling semantics that produced the rows fitted by this artifact.
+    /// Omitted from raw v6 documents because their scaling contract lives in provenance.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    standardized_scaling_contract: Option<String>,
 }
 
 impl BarSupportsJson {
-    /// The ONLY place [`BAR_SUPPORTS_FORMAT_VERSION`] is stamped, and it takes every fitted
-    /// moment promised by the current schema as a REQUIRED argument.
+    /// The ONLY place a format version is stamped, and it takes every fitted moment promised
+    /// by the schema it stamps as a REQUIRED argument.
+    ///
+    /// The version is a function of CONTENT, not a constant: a raw fit stamps
+    /// [`BAR_SUPPORTS_FORMAT_VERSION`] and omits every standardized geometry member, while a
+    /// standardized fit stamps [`BAR_SUPPORTS_STANDARDIZED_VERSION`] and carries them. The raw
+    /// geometry schema therefore stays v6; independently extended provenance (such as fit seed
+    /// authentication) can still move the artifact digest without pretending the bins changed.
     fn current(supports: &BarSupports, moments: &BarBinMoments) -> Self {
         let simple = moments
             .simple_return
             .as_ref()
             .expect("the current support schema requires fitted simple-return moments");
+        let standardized = supports.scaling.is_standardized();
+        let subbin = simple.z_subbin.as_ref();
         Self {
-            format_version: BAR_SUPPORTS_FORMAT_VERSION,
+            format_version: if standardized {
+                BAR_SUPPORTS_STANDARDIZED_VERSION
+            } else {
+                BAR_SUPPORTS_FORMAT_VERSION
+            },
             num_bins: NUM_BAR_BINS,
             dof_names: BAR_DOF_NAMES.iter().map(|s| (*s).to_owned()).collect(),
             lo: supports.lo.iter().cloned().collect(),
@@ -575,23 +1099,42 @@ impl BarSupportsJson {
             bin_second_moments: Some(moments.second.iter().cloned().collect()),
             bin_simple_return_means: Some(simple.mean.clone()),
             bin_simple_return_second_moments: Some(simple.second.clone()),
+            dof_scaling: standardized.then_some(supports.scaling),
+            bin_z_subbin_means: subbin.map(|rows| rows.host_rows(&rows.mean)),
+            bin_z_subbin_second_moments: subbin.map(|rows| rows.host_rows(&rows.second)),
+            standardized_scaling_contract: standardized
+                .then(|| standardized_scaling_contract().to_owned()),
         }
     }
 }
 
-/// Current persisted schema. v4 adds [`BarSupportsProvenance`], v5 adds fitted log-space
-/// per-bin moments, and v6 adds directly measured simple-return moments for the traded DOF.
+/// Current persisted schema for a [`DofScaling::Raw`] support. v4 adds
+/// [`BarSupportsProvenance`], v5 adds fitted log-space per-bin moments, and v6 adds directly
+/// measured simple-return moments for the traded DOF.
 pub(crate) const BAR_SUPPORTS_FORMAT_VERSION: u32 = 6;
 /// First schema carrying fitted log-space per-bin moments.
 pub(crate) const BAR_SUPPORTS_MOMENTS_VERSION: u32 = 5;
 /// First schema carrying `E[expm1(r) | bin]` and `E[expm1(r)^2 | bin]`.
 pub(crate) const BAR_SUPPORTS_SIMPLE_RETURN_MOMENTS_VERSION: u32 = 6;
+/// Schema of a [`DofScaling::VolStandardized`] support: v6 plus the recorded parametrization,
+/// equal-mass sub-bin law of `z`, and authenticated [`STANDARDIZED_SCALING_CONTRACT`].
+pub(crate) const BAR_SUPPORTS_STANDARDIZED_VERSION: u32 = 8;
+/// First schema that represented standardized supports, before it authenticated scaling
+/// semantics. Kept readable only to issue a precise refusal rather than "unknown version".
+const BAR_SUPPORTS_UNAUTHENTICATED_STANDARDIZED_VERSION: u32 = 7;
 /// Still readable so an operator can run the explicit moments migration. Consumers that need
 /// simple-return moments must ask for them and fail on their absence; they never reconstruct
 /// them from v5's log-space moments.
 const BAR_SUPPORTS_LEGACY_VERSION: u32 = 3;
-/// Every schema this build accepts. An unlisted version is refused outright.
-const BAR_SUPPORTS_READABLE_VERSIONS: [u32; 4] = [6, 5, 4, BAR_SUPPORTS_LEGACY_VERSION];
+/// Every schema this build recognizes. Version 7 is recognized but refused as unauthenticated.
+const BAR_SUPPORTS_READABLE_VERSIONS: [u32; 6] = [
+    BAR_SUPPORTS_STANDARDIZED_VERSION,
+    BAR_SUPPORTS_UNAUTHENTICATED_STANDARDIZED_VERSION,
+    6,
+    5,
+    4,
+    BAR_SUPPORTS_LEGACY_VERSION,
+];
 
 /// `format_version` of the artifact at `path`, read WITHOUT building a support.
 ///
@@ -717,6 +1260,13 @@ pub struct BarSupports {
     /// support the caller has not stamped yet; never inferred, because a guessed
     /// provenance is worse than an absent one.
     provenance: Option<BarSupportsProvenance>,
+    /// The target parametrization these bins tile.
+    ///
+    /// Not a decoration: it is what makes "these bins are in sigma units" a fact the artifact
+    /// carries rather than a convention the operator has to remember. A consumer that needs a
+    /// return rather than a standardized return branches on this, and the two spaces have
+    /// disjoint `format_version`s so a mixed pair cannot be assembled by accident.
+    scaling: DofScaling,
 }
 
 /// Fitted conditional moments measured on raw, unclamped fit observations.
@@ -744,10 +1294,206 @@ struct SimpleReturnBinMoments {
     /// `[1, NUM_BAR_BINS]` device copies.
     mean_t: Tensor,
     second_t: Tensor,
+    /// The within-bin law of `z`, present only on a standardized support.
+    z_subbin: Option<ZSubBins>,
+}
+
+/// Equal-mass, moment-matching representation of the within-bin law of the standardized
+/// traded DOF.
+///
+/// [`SMOOTHING_FLOOR_NODES`] sub-bins per bin, each holding exactly
+/// `1 / SMOOTHING_FLOOR_NODES` of that bin's fit mass and carrying the MEASURED conditional
+/// first and second moments of `z`. Each sub-bin is represented by the symmetric two-point
+/// law `m ± sqrt(v)`, with weight one half on each point. It preserves that sub-bin's
+/// `E[z]` and `E[z²]` while providing a bounded-support quadrature for
+/// `E[expm1(sigma z)]` at the decision-time `sigma`.
+///
+/// Sub-bins are equal in MASS, not in width, and their `(m, v)` are measurements rather than
+/// geometric interval summaries. Both choices are load-bearing. The catch-alls hold 1.4474%
+/// of the mass of `r` and 92.38% of its central second moment; `bin_of` routes everything past
+/// the clip quantile into them, so a uniform law over their FINITE routing interval would
+/// understate the crash tail by construction — exactly the direction that over-levers a Kelly
+/// sizer. Equal-mass partitioning isolates the most extreme sixteenth of the observed bin
+/// before its two representative points are derived from that slice's measured moments.
+#[derive(Debug)]
+struct ZSubBins {
+    /// `[NUM_BAR_BINS * SMOOTHING_FLOOR_NODES]` row-major `E[z | sub-bin]`.
+    mean: Vec<f64>,
+    /// `[NUM_BAR_BINS * SMOOTHING_FLOOR_NODES]` row-major `E[z^2 | sub-bin]`.
+    second: Vec<f64>,
+    /// `[NUM_BAR_BINS, SMOOTHING_FLOOR_NODES]` f64 device copies of the two symmetric
+    /// moment-matching points `mean ± sqrt(max(second - mean², 0))`.
+    lower_t: Tensor,
+    upper_t: Tensor,
+}
+
+impl ZSubBins {
+    const NODES: usize = SMOOTHING_FLOOR_NODES;
+
+    fn new(mean: Vec<f64>, second: Vec<f64>, device: Device) -> Self {
+        let cells = NUM_BAR_BINS as usize * Self::NODES;
+        assert_eq!(mean.len(), cells, "sub-bin means must be one per sub-bin");
+        assert_eq!(second.len(), cells, "sub-bin second moments must match");
+        // Persisted rows are canonical f32 values. Re-widen before deriving both quadrature
+        // points so host and device evaluate the same moment-matching law after a JSON round
+        // trip.
+        let narrow =
+            |row: Vec<f64>| -> Vec<f64> { row.into_iter().map(|x| x as f32 as f64).collect() };
+        let mean = narrow(mean);
+        let second = narrow(second);
+        let shape = [NUM_BAR_BINS, Self::NODES as i64];
+        let (lower, upper): (Vec<f64>, Vec<f64>) = mean
+            .iter()
+            .zip(&second)
+            .map(|(&mean, &second)| {
+                let deviation = (second - mean * mean).max(0.0).sqrt();
+                (mean - deviation, mean + deviation)
+            })
+            .unzip();
+        let lower_t = Tensor::from_slice(&lower).view(shape).to_device(device);
+        let upper_t = Tensor::from_slice(&upper).view(shape).to_device(device);
+        Self {
+            mean,
+            second,
+            lower_t,
+            upper_t,
+        }
+    }
+
+    /// One `[NUM_BAR_BINS][NODES]` nested vector for the JSON document.
+    fn host_rows(&self, flat: &[f64]) -> Vec<Vec<f64>> {
+        flat.chunks(Self::NODES).map(<[f64]>::to_vec).collect()
+    }
+
+    /// Symmetric moment-matching points for one sub-bin.
+    fn points(&self, cell: usize) -> (f64, f64) {
+        let mean = self.mean[cell];
+        let deviation = (self.second[cell] - mean * mean).max(0.0).sqrt();
+        (mean - deviation, mean + deviation)
+    }
+
+    fn to_device(&self, device: Device) -> Self {
+        Self {
+            mean: self.mean.clone(),
+            second: self.second.clone(),
+            lower_t: self.lower_t.to_device(device),
+            upper_t: self.upper_t.to_device(device),
+        }
+    }
+}
+
+/// The measured within-bin law of the standardized traded DOF, owned and device-resident.
+///
+/// It exists because the sigma-conditional payoff law CANNOT be precomputed. `sigma_t` is a
+/// property of the bar, so `E[expm1(sigma_t z) | bin]` has to be integrated at the row that
+/// uses it, and a consumer whose lifetime is the RUN rather than a borrow of the artifact —
+/// [`crate::torch::train::growth::GrowthSupport`] is one — needs the law itself.
+///
+/// Lifted out through [`BarSupports::traded_z_law`] rather than reconstructed by consumers.
+/// Both this device law and [`BarSupports::simple_return_bin_moments_at`] derive the same
+/// symmetric point pair from the same canonical persisted `(m, E[z²])`, so host and device
+/// cannot silently assume different within-sub-bin distributions.
+#[derive(Debug)]
+pub struct TradedZLaw {
+    /// `[NUM_BAR_BINS, ZSubBins::NODES]` lower symmetric moment-matching point.
+    lower: Tensor,
+    /// `[NUM_BAR_BINS, ZSubBins::NODES]` upper symmetric moment-matching point.
+    upper: Tensor,
+    /// `[1, NUM_BAR_BINS]` double, one where the fit observed the bin and zero where it did not.
+    observed: Tensor,
+    device: Device,
+}
+
+impl TradedZLaw {
+    /// `(E[expm1(sigma z) | bin], E[expm1(sigma z)^2 | bin])`, `[rows, NUM_BAR_BINS]` each, from
+    /// a `[rows]` or `[rows, 1]` volatility tensor.
+    ///
+    /// Each symmetric side is evaluated separately in f64. Its
+    /// `[rows, NUM_BAR_BINS, SMOOTHING_FLOOR_NODES]` payoff and transient square are reduced
+    /// to two `[rows, NUM_BAR_BINS]` tensors and dropped before the other side is allocated.
+    /// Each measured sub-bin contributes its two moment-matching points with weight one half;
+    /// unlike a Gaussian MGF reconstruction, no unbounded distribution is assumed from only
+    /// `(m, v)`.
+    pub fn simple_return_moments_at(&self, sigma: &Tensor) -> Result<(Tensor, Tensor)> {
+        let rows = match sigma.size().as_slice() {
+            [rows] => *rows,
+            [rows, 1] => *rows,
+            other => bail!("the volatility tensor must be [rows] or [rows, 1], got {other:?}"),
+        };
+        // `[rows, 1, 1]` against one `[1, NUM_BAR_BINS, NODES]` side at a time.
+        let sigma = sigma
+            .reshape([rows, 1, 1])
+            .to_kind(Kind::Double)
+            .to_device(self.device);
+        let (lower_first, lower_second) = {
+            let lower_return = (&sigma * self.lower.unsqueeze(0)).expm1();
+            let first = lower_return.mean_dim([-1].as_slice(), false, Kind::Double);
+            let second = (&lower_return * &lower_return).mean_dim(
+                [-1].as_slice(),
+                false,
+                Kind::Double,
+            );
+            // The opposite side is allocated only after both reductions have stopped borrowing
+            // this full payoff tensor.
+            drop(lower_return);
+            (first, second)
+        };
+        let (first, second) = {
+            let upper_return = (&sigma * self.upper.unsqueeze(0)).expm1();
+            let first = lower_first
+                + upper_return.mean_dim([-1].as_slice(), false, Kind::Double);
+            let second = lower_second
+                + (&upper_return * &upper_return).mean_dim(
+                    [-1].as_slice(),
+                    false,
+                    Kind::Double,
+                );
+            drop(upper_return);
+            (first * 0.5, second * 0.5)
+        };
+        let second = second.maximum(&(&first * &first));
+        // Unobserved bins take the conservative completion: zero first moment, so forecast mass
+        // moved onto a bin absent from the fit cannot manufacture edge, and the largest second
+        // moment any observed bin carries at this sigma, so it cannot lower the risk scale
+        // either.
+        let worst = (&second * &self.observed).amax([-1].as_slice(), true);
+        let first = &first * &self.observed;
+        let second = &second * &self.observed + &worst * (self.observed.neg() + 1.0);
+        Ok((first, second))
+    }
+
+    pub(crate) fn to_device(&self, device: Device) -> Self {
+        Self {
+            lower: self.lower.to_device(device),
+            upper: self.upper.to_device(device),
+            observed: self.observed.to_device(device),
+            device,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_subbin_moments_for_test(
+        mean: Vec<f64>,
+        second: Vec<f64>,
+        device: Device,
+    ) -> Self {
+        let subbins = ZSubBins::new(mean, second, device);
+        Self {
+            lower: subbins.lower_t,
+            upper: subbins.upper_t,
+            observed: Tensor::ones([1, NUM_BAR_BINS], (Kind::Double, device)),
+            device,
+        }
+    }
 }
 
 impl SimpleReturnBinMoments {
-    fn new(mean: Vec<f64>, second: Vec<f64>, device: Device) -> Self {
+    fn new(
+        mean: Vec<f64>,
+        second: Vec<f64>,
+        z_subbin: Option<(Vec<f64>, Vec<f64>)>,
+        device: Device,
+    ) -> Self {
         let narrow =
             |row: Vec<f64>| -> Vec<f64> { row.into_iter().map(|x| x as f32 as f64).collect() };
         let mean = narrow(mean);
@@ -763,6 +1509,7 @@ impl SimpleReturnBinMoments {
             second,
             mean_t,
             second_t,
+            z_subbin: z_subbin.map(|(mean, second)| ZSubBins::new(mean, second, device)),
         }
     }
 
@@ -772,15 +1519,26 @@ impl SimpleReturnBinMoments {
             second: self.second.clone(),
             mean_t: self.mean_t.to_device(device),
             second_t: self.second_t.to_device(device),
+            z_subbin: self.z_subbin.as_ref().map(|rows| rows.to_device(device)),
         }
     }
+}
+
+/// The traded DOF's economic measurement as it comes off the fit, before it is narrowed to
+/// `f32` and mirrored onto a device.
+struct SimpleReturnFit {
+    mean: Vec<f64>,
+    second: Vec<f64>,
+    /// `(E[z | sub-bin], E[z^2 | sub-bin])`, row-major over
+    /// `[NUM_BAR_BINS][SMOOTHING_FLOOR_NODES]`. Present only on a standardized fit.
+    z_subbin: Option<(Vec<f64>, Vec<f64>)>,
 }
 
 impl BarBinMoments {
     fn new(
         mean: [Vec<f64>; BAR_DOF],
         second: [Vec<f64>; BAR_DOF],
-        simple_return: Option<(Vec<f64>, Vec<f64>)>,
+        simple_return: Option<SimpleReturnFit>,
         device: Device,
     ) -> Self {
         // Narrowed to f32 for the tensor path and re-widened on the host side, exactly as
@@ -805,7 +1563,7 @@ impl BarBinMoments {
             mean: narrow(mean),
             second: narrow(second),
             simple_return: simple_return
-                .map(|(mean, second)| SimpleReturnBinMoments::new(mean, second, device)),
+                .map(|fit| SimpleReturnBinMoments::new(fit.mean, fit.second, fit.z_subbin, device)),
             mean_t,
             second_t,
         }
@@ -878,10 +1636,41 @@ impl fmt::Display for MeanDecode {
 }
 
 impl BarSupports {
-    /// Fit the mixture support from encoded bars. Each DOF is fitted independently;
+    /// Fit the mixture support from RAW encoded bars. Each DOF is fitted independently;
     /// non-finite values are dropped. One column is materialized at a time, so the
     /// transient cost is `4 * samples.len()` bytes.
     pub fn fit(samples: &[BarDof]) -> Self {
+        Self::fit_geometry(samples, DofScaling::Raw).with_measured_bin_moments(samples)
+    }
+
+    /// Fit the mixture support from VOLATILITY-STANDARDIZED encoded bars.
+    ///
+    /// The geometry rule is identical — equal-mass quantile bins with mandated atoms — and
+    /// applies to `z` instead of to the raw log quantities, so one grid in sigma units serves
+    /// every symbol and every regime. Two measurements are added on top of the raw set:
+    ///
+    /// * the traded DOF's simple-return moments are accumulated from the RAW return
+    ///   `r = sigma * z_r` behind each row, so `E[R | bin]` and `E[R^2 | bin]` remain the same
+    ///   economic object every existing sizing consumer already reads, marginalized over the
+    ///   `sigma` distribution of the fit draw rather than silently becoming moments of `z`;
+    /// * the equal-mass sub-bin law of `z` ([`ZSubBins`]) is measured, which is what lets
+    ///   [`Self::simple_return_bin_moments_at`] return the SHARPER `sigma`-conditional moments
+    ///   at the decision-time volatility.
+    pub fn fit_standardized(rows: &[StandardizedDof]) -> Self {
+        assert!(
+            !rows.is_empty(),
+            "bar supports need at least one sample to fit"
+        );
+        let dof: Vec<BarDof> = rows.iter().map(|row| row.dof).collect();
+        let sigma: Vec<f32> = rows.iter().map(|row| row.sigma).collect();
+        let mut supports = Self::fit_geometry(&dof, DofScaling::VolStandardized);
+        supports.bin_moments = Some(supports.measure_bin_moments_scaled(&dof, Some(&sigma)));
+        supports
+    }
+
+    /// The equal-mass geometry, its histogram and its smoothed marginal, with `scaling`
+    /// recorded and per-bin moments deliberately still absent.
+    fn fit_geometry(samples: &[BarDof], scaling: DofScaling) -> Self {
         assert!(
             !samples.is_empty(),
             "bar supports need at least one sample to fit"
@@ -924,9 +1713,10 @@ impl BarSupports {
             .expect("fitted supports are well formed");
         let masses = geometry.measure_bin_masses(samples);
         let smoothed_marginal = geometry.measure_smoothed_marginal(samples, &masses);
-        Self::from_bins(lo, hi, masses, smoothed_marginal, Device::Cpu)
-            .expect("fitted supports are well formed")
-            .with_measured_bin_moments(samples)
+        let mut fitted = Self::from_bins(lo, hi, masses, smoothed_marginal, Device::Cpu)
+            .expect("fitted supports are well formed");
+        fitted.scaling = scaling;
+        fitted
     }
 
     /// Empirical bin probabilities of `samples`, using exactly [`Self::bin_of`].
@@ -1028,13 +1818,40 @@ impl BarSupports {
     /// `R = expm1(r)`, then accumulate `R` and `R^2`. Applying `expm1` to `E[r | bin]` would
     /// erase Jensen curvature; squaring `E[R | bin]` would erase within-bin variance.
     fn measure_bin_moments(&self, samples: &[BarDof]) -> BarBinMoments {
+        self.measure_bin_moments_scaled(samples, None)
+    }
+
+    /// [`Self::measure_bin_moments`] with the per-row volatility divisor supplied.
+    ///
+    /// `sigma` is `None` on the raw path, where the divisor is one; the traded DOF's simple
+    /// return is then `expm1(r)` and every arithmetic operation is the one the raw path
+    /// performed before this parameter existed. On the standardized path the log-space moments
+    /// are moments of `z` — that is what the bins tile — while the simple-return moments are
+    /// accumulated from `expm1(sigma_i * z_i)`, i.e. from the realized return behind the row.
+    /// Mixing those two spaces is the whole risk of standardization, so they are measured in
+    /// one pass and never derived from one another.
+    fn measure_bin_moments_scaled(
+        &self,
+        samples: &[BarDof],
+        sigma: Option<&[f32]>,
+    ) -> BarBinMoments {
+        if let Some(sigma) = sigma {
+            assert_eq!(
+                sigma.len(),
+                samples.len(),
+                "one volatility divisor per standardized sample"
+            );
+        }
         let bins = NUM_BAR_BINS as usize;
         let mut sum: [Vec<f64>; BAR_DOF] = std::array::from_fn(|_| vec![0.0; bins]);
         let mut sum_sq: [Vec<f64>; BAR_DOF] = std::array::from_fn(|_| vec![0.0; bins]);
         let mut count: [Vec<f64>; BAR_DOF] = std::array::from_fn(|_| vec![0.0; bins]);
         let mut simple_sum = vec![0.0; bins];
         let mut simple_sum_sq = vec![0.0; bins];
-        for sample in samples.iter().filter(|d| d.is_finite()) {
+        for (row, sample) in samples.iter().enumerate() {
+            if !sample.is_finite() {
+                continue;
+            }
             let values = sample.to_array();
             for dof in 0..BAR_DOF {
                 let x = values[dof] as f64;
@@ -1043,7 +1860,10 @@ impl BarSupports {
                 sum_sq[dof][bin] += x * x;
                 count[dof][bin] += 1.0;
                 if dof == DOF_R {
-                    let simple = x.exp_m1();
+                    let simple = match sigma {
+                        None => x.exp_m1(),
+                        Some(sigma) => (x * sigma[row] as f64).exp_m1(),
+                    };
                     simple_sum[bin] += simple;
                     simple_sum_sq[bin] += simple * simple;
                 }
@@ -1103,9 +1923,71 @@ impl BarSupports {
         BarBinMoments::new(
             mean,
             second,
-            Some((simple_mean, simple_second)),
+            Some(SimpleReturnFit {
+                mean: simple_mean,
+                second: simple_second,
+                z_subbin: sigma.map(|_| self.measure_z_subbins(samples)),
+            }),
             self.device,
         )
+    }
+
+    /// Measure the equal-mass sub-bin law of the traded DOF: `SMOOTHING_FLOOR_NODES` nodes per
+    /// bin, each the conditional first and second moment of `z` over one sixteenth of that
+    /// bin's fit mass.
+    ///
+    /// `bin_of` is monotone non-decreasing in the value, so a sorted column partitions into
+    /// bins as one contiguous run each and the sub-bins are contiguous slices of those runs.
+    /// One `f32` column and one sort, the same cost the geometry fit already pays.
+    ///
+    /// An unobserved bin has no law to measure and gets zeros, which is inert: it also has
+    /// zero mass, and [`Self::simple_return_bin_moments_at`] applies the same conservative
+    /// completion to it that the marginalized rows use.
+    fn measure_z_subbins(&self, samples: &[BarDof]) -> (Vec<f64>, Vec<f64>) {
+        let bins = NUM_BAR_BINS as usize;
+        let nodes = ZSubBins::NODES;
+        let mut column: Vec<f32> = samples
+            .iter()
+            .filter(|d| d.is_finite())
+            .map(|d| d.r)
+            .map(|x| if x == 0.0 { 0.0 } else { x })
+            .collect();
+        column.par_sort_unstable_by(f32::total_cmp);
+        let mut mean = vec![0.0f64; bins * nodes];
+        let mut second = vec![0.0f64; bins * nodes];
+        let binner = self.binner(DOF_R);
+        let mut at = 0usize;
+        for bin in 0..bins {
+            let start = at;
+            while at < column.len() && binner.bin_of(column[at] as f64) == bin {
+                at += 1;
+            }
+            let run = &column[start..at];
+            if run.is_empty() {
+                continue;
+            }
+            for node in 0..nodes {
+                let lo = run.len() * node / nodes;
+                let hi = run.len() * (node + 1) / nodes;
+                // A bin holding fewer rows than nodes leaves some sub-bins empty; fall back to
+                // the nearest occupied row so every node carries a real observation rather
+                // than a zero that would drag the quadrature toward `expm1(0)`.
+                let slice = if lo < hi {
+                    &run[lo..hi]
+                } else {
+                    &run[lo.min(run.len() - 1)..=lo.min(run.len() - 1)]
+                };
+                let n = slice.len() as f64;
+                let (s, s2) = slice.iter().fold((0.0f64, 0.0f64), |(s, s2), &x| {
+                    let x = x as f64;
+                    (s + x, s2 + x * x)
+                });
+                let m = s / n;
+                mean[bin * nodes + node] = m;
+                second[bin * nodes + node] = (s2 / n).max(m * m);
+            }
+        }
+        (mean, second)
     }
 
     fn from_bins(
@@ -1297,6 +2179,9 @@ impl BarSupports {
             // Fitted moments are attached by `fit` or by `load`, never invented here:
             // `from_bins` knows the geometry but has never seen an observation.
             bin_moments: None,
+            // Likewise: the geometry alone cannot tell which space it tiles, so the caller
+            // that fitted or loaded it says so.
+            scaling: DofScaling::Raw,
         })
     }
 
@@ -1312,6 +2197,7 @@ impl BarSupports {
         )
         .expect("existing supports stay well formed");
         moved.provenance = self.provenance.clone();
+        moved.scaling = self.scaling;
         moved.bin_moments = self
             .bin_moments
             .as_ref()
@@ -1390,18 +2276,174 @@ impl BarSupports {
             ensure!(
                 deviation <= tolerance,
                 "DOF {}: re-measuring the bin masses of the {} supplied samples reproduces the \
-                 persisted histogram only to {deviation:.3e} (bin {bin_of_worst}: measured \
-                 {:.9} against persisted {:.9}), past the tolerance of {tolerance:.3e}. The \
-                 sample or the binning rule is not the one this support was fitted with, so \
-                 per-bin moments measured on it would describe a different population than the \
-                 masses they sit beside; refusing the upgrade",
+                 fitted law only to {:.3e} (worst at bin {bin_of_worst}: recomputed {:.9} \
+                 against persisted {:.9}), past the tolerance of {tolerance:.3e}. The sample \
+                 or the binning rule is not the one this support was fitted with, so per-bin \
+                 moments measured on it would describe a different population than the masses \
+                 they sit beside; refusing the upgrade",
                 BAR_DOF_NAMES[dof],
                 samples.len(),
+                deviation,
                 recomputed[dof][bin_of_worst],
                 self.masses[dof][bin_of_worst],
             );
         }
         Ok((self.with_measured_bin_moments(samples), worst))
+    }
+
+    /// The target parametrization these bins tile.
+    pub fn dof_scaling(&self) -> DofScaling {
+        self.scaling
+    }
+
+    /// `(E[expm1(sigma z) | bin], E[expm1(sigma z)^2 | bin])` for the traded DOF at the
+    /// decision-time volatility `sigma`.
+    ///
+    /// The standardized grid's moment-matching Kelly input. `sigma_t` is measurable on bars
+    /// `< t`, so it is known when the bet is sized. The measured mean `m_bk` and variance
+    /// `v_bk` of each of sixteen equal-mass sub-bins define two symmetric points:
+    ///
+    /// ```text
+    /// z_bk- = m_bk - sqrt(v_bk),  weight = 1/2
+    /// z_bk+ = m_bk + sqrt(v_bk),  weight = 1/2
+    /// ```
+    ///
+    /// Evaluating `expm1(sigma z)` at both points and averaging first over the pair and then
+    /// over the sixteen sub-bins preserves every measured sub-bin `E[z]` and `E[z²]`. It is a
+    /// bounded, moment-matching quadrature, not an assertion that an unknown sub-bin law is
+    /// Gaussian.
+    ///
+    /// The completion for an unobserved bin is the one
+    /// [`Self::simple_return_bin_moments`] documents and for the same reason: zero first
+    /// moment, so forecast mass moved onto a bin absent from the fit cannot manufacture edge,
+    /// and the largest second moment any observed bin carries at this `sigma`, so it cannot
+    /// lower the risk scale either.
+    pub fn simple_return_bin_moments_at(&self, sigma: f64) -> Result<(Vec<f64>, Vec<f64>)> {
+        ensure!(
+            self.scaling.is_standardized(),
+            "simple_return_bin_moments_at needs a {} support: a {} grid has no volatility \
+             reference to be parameterized by, and its per-bin simple-return moments are \
+             already unconditional. Read `simple_return_bin_moments` instead",
+            DofScaling::VolStandardized,
+            DofScaling::Raw
+        );
+        ensure!(
+            sigma.is_finite() && sigma > 0.0,
+            "the decision-time volatility must be finite and positive, got {sigma}"
+        );
+        let subbin = self
+            .bin_moments
+            .as_ref()
+            .and_then(|moments| moments.simple_return.as_ref())
+            .and_then(|moments| moments.z_subbin.as_ref())
+            .with_context(|| {
+                format!(
+                    "these {} supports carry no measured sub-bin law of z, so the \
+                     sigma-conditional simple-return moments cannot be integrated; refit with \
+                     `BarSupports::fit_standardized` (schema version \
+                     {BAR_SUPPORTS_STANDARDIZED_VERSION})",
+                    DofScaling::VolStandardized
+                )
+            })?;
+        let bins = NUM_BAR_BINS as usize;
+        let nodes = ZSubBins::NODES;
+        let mut first = vec![0.0f64; bins];
+        let mut second = vec![0.0f64; bins];
+        let mut conservative_second = 0.0f64;
+        for bin in 0..bins {
+            if self.masses[DOF_R][bin] <= 0.0 {
+                continue;
+            }
+            let (mut first_sum, mut second_sum) = (0.0f64, 0.0f64);
+            for node in 0..nodes {
+                let cell = bin * nodes + node;
+                let (lower, upper) = subbin.points(cell);
+                let lower_return = (sigma * lower).exp_m1();
+                let upper_return = (sigma * upper).exp_m1();
+                first_sum += lower_return + upper_return;
+                second_sum +=
+                    lower_return * lower_return + upper_return * upper_return;
+            }
+            let mean = first_sum / (2 * nodes) as f64;
+            first[bin] = mean;
+            second[bin] = (second_sum / (2 * nodes) as f64).max(mean * mean);
+            conservative_second = conservative_second.max(second[bin]);
+        }
+        for bin in 0..bins {
+            if self.masses[DOF_R][bin] <= 0.0 {
+                second[bin] = conservative_second;
+            }
+        }
+        Ok((first, second))
+    }
+
+    /// The measured within-bin law of `z`, lifted out of this support as an owned
+    /// device-resident object. `None` on a raw grid, or on an artifact fitted before the
+    /// sub-bin law existed.
+    pub fn traded_z_law(&self) -> Option<TradedZLaw> {
+        if !self.scaling.is_standardized() {
+            return None;
+        }
+        let subbin = self
+            .bin_moments
+            .as_ref()?
+            .simple_return
+            .as_ref()?
+            .z_subbin
+            .as_ref()?;
+        let observed: Vec<f32> = (0..NUM_BAR_BINS as usize)
+            .map(|bin| f32::from(self.masses[DOF_R][bin] > 0.0))
+            .collect();
+        Some(TradedZLaw {
+            lower: subbin.lower_t.shallow_clone(),
+            upper: subbin.upper_t.shallow_clone(),
+            observed: Tensor::from_slice(&observed)
+                .view([1, NUM_BAR_BINS])
+                .to_kind(Kind::Double)
+                .to_device(self.device),
+            device: self.device,
+        })
+    }
+
+    /// Batched twin of [`Self::simple_return_bin_moments_at`]: a `[rows]` or `[rows, 1]`
+    /// volatility tensor in, two `[rows, NUM_BAR_BINS]` tensors out, on this support's device.
+    pub fn simple_return_bin_moment_tensors_at(&self, sigma: &Tensor) -> Result<(Tensor, Tensor)> {
+        ensure!(
+            self.scaling.is_standardized(),
+            "simple_return_bin_moment_tensors_at needs a {} support",
+            DofScaling::VolStandardized
+        );
+        self.traded_z_law()
+            .context("these supports carry no measured sub-bin law of z")?
+            .simple_return_moments_at(sigma)
+    }
+
+    /// Shannon entropy of one DOF's fitted bin occupancy, in nats.
+    ///
+    /// `ln(NUM_BAR_BINS)` for a perfectly equal-mass grid, which is what the POOLED fit is by
+    /// construction on either path. The statistic is informative per SYMBOL or per REGIME,
+    /// where it measures exactly the defect standardization exists to fix: a quiet name that
+    /// concentrates in a handful of central bins has a low entropy and therefore a low
+    /// effective resolution, no matter how well the pooled grid is balanced.
+    pub fn bin_occupancy_entropy(occupancy: &[f64]) -> f64 {
+        let total: f64 = occupancy.iter().filter(|p| p.is_finite()).sum();
+        if total <= 0.0 {
+            return 0.0;
+        }
+        -occupancy
+            .iter()
+            .filter(|p| p.is_finite() && **p > 0.0)
+            .map(|p| {
+                let share = p / total;
+                share * share.ln()
+            })
+            .sum::<f64>()
+    }
+
+    /// `exp(bin_occupancy_entropy)`: the number of bins an equal-mass grid with this entropy
+    /// would have. Reads directly as "effective resolution", capped at [`NUM_BAR_BINS`].
+    pub fn effective_bins(occupancy: &[f64]) -> f64 {
+        Self::bin_occupancy_entropy(occupancy).exp()
     }
 
     /// `E[x | bin]` per DOF, or `None` on a pre-v5 artifact.
@@ -2101,6 +3143,20 @@ impl BarSupports {
                 path.display()
             );
         }
+        if self.scaling.is_standardized()
+            && moments
+                .simple_return
+                .as_ref()
+                .is_none_or(|simple| simple.z_subbin.is_none())
+        {
+            bail!(
+                "refusing to write bar supports {}: these bins tile the {} space but carry no \
+                 measured sub-bin law of z, so no consumer could recover the sigma-conditional \
+                 Kelly moments from them. Refit with `BarSupports::fit_standardized`",
+                path.display(),
+                DofScaling::VolStandardized
+            );
+        }
         let json = BarSupportsJson::current(self, moments);
         let body = serde_json::to_vec_pretty(&json).context("serializing bar supports")?;
         if let Some(parent) = path.parent() {
@@ -2170,6 +3226,56 @@ impl BarSupports {
                 json.format_version
             );
         }
+        // Standardized grids are a different target space. Version 7 recorded that fact but
+        // did not authenticate the scaling algorithm, so it is recognized only to produce an
+        // actionable refusal. Version 8 additionally carries the canonical contract string.
+        let standardized = json.format_version >= BAR_SUPPORTS_UNAUTHENTICATED_STANDARDIZED_VERSION;
+        if !standardized
+            && (json.dof_scaling.is_some()
+                || json.bin_z_subbin_means.is_some()
+                || json.bin_z_subbin_second_moments.is_some()
+                || json.standardized_scaling_contract.is_some())
+        {
+            bail!(
+                "bar supports {} declares raw version {} but contains standardized-target \
+                 members; raw v6 serialization must remain unchanged",
+                path.display(),
+                json.format_version
+            );
+        }
+        if standardized && json.format_version != BAR_SUPPORTS_STANDARDIZED_VERSION {
+            bail!(
+                "bar supports {} uses unauthenticated standardized schema version {}; refit \
+                 with version {BAR_SUPPORTS_STANDARDIZED_VERSION}, which records scaling \
+                 contract {:?}",
+                path.display(),
+                json.format_version,
+                STANDARDIZED_SCALING_CONTRACT
+            );
+        }
+        if standardized
+            && (json.dof_scaling != Some(DofScaling::VolStandardized)
+                || json.bin_z_subbin_means.is_none()
+                || json.bin_z_subbin_second_moments.is_none())
+        {
+            bail!(
+                "bar supports {} declares version {BAR_SUPPORTS_STANDARDIZED_VERSION} but does \
+                 not carry a {} parametrization together with both sub-bin rows of z",
+                path.display(),
+                DofScaling::VolStandardized
+            );
+        }
+        if standardized
+            && json.standardized_scaling_contract.as_deref() != Some(STANDARDIZED_SCALING_CONTRACT)
+        {
+            bail!(
+                "bar supports {} has standardized scaling contract {:?}, but this build \
+                 requires {:?}; refusing bins fitted under different target semantics",
+                path.display(),
+                json.standardized_scaling_contract.as_deref(),
+                STANDARDIZED_SCALING_CONTRACT
+            );
+        }
         if json.num_bins != NUM_BAR_BINS {
             bail!(
                 "bar supports {} has {} bins, this build uses {}",
@@ -2226,6 +3332,57 @@ impl BarSupports {
                     );
                 }
             }
+            let nodes = ZSubBins::NODES;
+            let z_subbin = match (json.bin_z_subbin_means, json.bin_z_subbin_second_moments) {
+                (Some(z_mean), Some(z_second)) => {
+                    for (what, rows) in [
+                        ("bin_z_subbin_means", &z_mean),
+                        ("bin_z_subbin_second_moments", &z_second),
+                    ] {
+                        if rows.len() != bins
+                            || rows
+                                .iter()
+                                .any(|row| row.len() != nodes || row.iter().any(|x| !x.is_finite()))
+                        {
+                            bail!(
+                                "bar supports {} has malformed {what}: expected {bins} finite \
+                                 rows of {nodes}",
+                                path.display()
+                            );
+                        }
+                    }
+                    for bin in 0..bins {
+                        for node in 0..nodes {
+                            let mean = z_mean[bin][node] as f32 as f64;
+                            let second = z_second[bin][node] as f32 as f64;
+                            let rounding_tolerance = 8.0
+                                * f64::from(f32::EPSILON)
+                                * (mean * mean).max(second.abs()).max(f64::from(f32::MIN_POSITIVE));
+                            if !mean.is_finite()
+                                || !second.is_finite()
+                                || mean.abs() > BAR_Z_LIMIT
+                                || !(0.0..=BAR_Z_LIMIT * BAR_Z_LIMIT).contains(&second)
+                                || second + rounding_tolerance < mean * mean
+                            {
+                                bail!(
+                                    "bar supports {} has an invalid z sub-bin moment at bin \
+                                     {bin}, node {node}: E[z]={}, E[z^2]={}",
+                                    path.display(),
+                                    z_mean[bin][node],
+                                    z_second[bin][node]
+                                );
+                            }
+                        }
+                    }
+                    let flatten = |rows: Vec<Vec<f64>>| -> Vec<f64> { rows.concat() };
+                    Some((flatten(z_mean), flatten(z_second)))
+                }
+                (None, None) => None,
+                _ => bail!(
+                    "bar supports {} has only one of the two sub-bin rows of z",
+                    path.display()
+                ),
+            };
             let simple_return = match (
                 json.bin_simple_return_means,
                 json.bin_simple_return_second_moments,
@@ -2243,7 +3400,11 @@ impl BarSupports {
                             );
                         }
                     }
-                    Some((simple_mean, simple_second))
+                    Some(SimpleReturnFit {
+                        mean: simple_mean,
+                        second: simple_second,
+                        z_subbin,
+                    })
                 }
                 (None, None) => None,
                 _ => bail!(
@@ -2261,6 +3422,7 @@ impl BarSupports {
             ));
         }
         supports.provenance = provenance;
+        supports.scaling = json.dof_scaling.unwrap_or_default();
         Ok(supports)
     }
 
@@ -2898,11 +4060,11 @@ fn with_tail(lead: &[i64], tail: &[i64]) -> Vec<i64> {
 /// `p(bar|h,c) = p(r|h,c) p(s|h,c,r) p(u|h,c,r,s) p(v|..) p(w|..)`, where `c`
 /// is the forecast-safe conditioning embedding supplied by the shared bar trunk.
 ///
-/// One `Linear(2 * latent_dim + BAR_PREFIX_SLOTS * BAR_PREFIX_EMBED_DIM ->
-/// NUM_BAR_BINS)` per DOF, plus one `[NUM_BAR_BINS, BAR_PREFIX_EMBED_DIM]`
-/// embedding table per prefix slot. A constant `[BAR_DOF, BAR_PREFIX_SLOTS, 1]`
-/// mask zeroes the embeddings of the slots a head may not see, which lets all
-/// five factors be evaluated in a single batched pass instead of a loop.
+/// Each horizon bank owns one `Linear(2 * latent_dim + BAR_PREFIX_SLOTS *
+/// BAR_PREFIX_EMBED_DIM -> NUM_BAR_BINS)` per DOF and one combined prefix table.
+/// The deployed h1 bank is isolated from private h2/h3 direct-supervision banks.
+/// A constant `[BAR_DOF, BAR_PREFIX_SLOTS, 1]` mask zeroes the embeddings of the
+/// slots a head may not see, which lets all five factors be evaluated in one pass.
 ///
 /// The chain conditions on the prefix DOF's BIN, never on its raw value. An affine
 /// map of the value (`x * w + b`) is exactly rank one in `x`, so the whole head
@@ -2928,11 +4090,15 @@ pub struct BarEmissionHead {
     /// tables laid end to end, so one `embedding` gathers every slot at once.
     /// Slot `s` owns rows `[s * NUM_BAR_BINS, (s + 1) * NUM_BAR_BINS)`.
     prefix_embed: Tensor,
+    /// Private complete-bar emission banks for horizons t+2 and t+3. The trunk and forecast
+    /// conditioning stay shared, but a direct objective cannot update the deployed h1 readout.
+    direct_heads: [Vec<nn::Linear>; 2],
+    direct_prefix_embed: [Tensor; 2],
     latent_dim: i64,
     /// `[BAR_DOF, BAR_PREFIX_SLOTS, 1]`, constant, not a VarStore variable.
     prefix_mask: Tensor,
     /// `[1, BAR_PREFIX_SLOTS]` constant `slot * NUM_BAR_BINS`, the row base of
-    /// each slot's table inside [`Self::prefix_embed`].
+    /// each slot's table inside an emission bank's prefix table.
     prefix_row_base: Tensor,
     /// `[BAR_PREFIX_SLOTS]` constant, the DOF slot occupying each prefix slot.
     prefix_slot_dof: Tensor,
@@ -2977,7 +4143,7 @@ impl BarEmissionHead {
         );
         let in_features = 2 * latent_dim + BAR_PREFIX_WIDTH;
         let weight_bound = 3f64.sqrt() * 0.5 / (in_features as f64).sqrt();
-        let heads = (0..BAR_DOF)
+        let heads: Vec<nn::Linear> = (0..BAR_DOF)
             .map(|dof| {
                 nn::linear(
                     vs / format!("bar_dof_head_{}", BAR_DOF_NAMES[dof]),
@@ -3002,6 +4168,47 @@ impl BarEmissionHead {
             &[BAR_PREFIX_SLOTS as i64 * NUM_BAR_BINS, BAR_PREFIX_EMBED_DIM],
             Init::Const(0.0),
         );
+        // Private banks start as exact copies without consuming RNG, so adding them cannot move
+        // the already-initialized trunk, h1 head, or following dynamics initialization stream.
+        let mut direct_heads: [Vec<nn::Linear>; 2] = std::array::from_fn(|slot| {
+            let horizon = slot + 2;
+            (0..BAR_DOF)
+                .map(|dof| {
+                    nn::linear(
+                        vs / format!("bar_dof_head_direct_h{horizon}_{}", BAR_DOF_NAMES[dof]),
+                        in_features,
+                        NUM_BAR_BINS,
+                        nn::LinearConfig {
+                            ws_init: Init::Const(0.0),
+                            bs_init: Some(Init::Const(0.0)),
+                            bias: true,
+                        },
+                    )
+                })
+                .collect::<Vec<_>>()
+        });
+        let mut direct_prefix_embed: [Tensor; 2] = std::array::from_fn(|slot| {
+            vs.var(
+                &format!("bar_prefix_embed_direct_h{}", slot + 2),
+                &[BAR_PREFIX_SLOTS as i64 * NUM_BAR_BINS, BAR_PREFIX_EMBED_DIM],
+                Init::Const(0.0),
+            )
+        });
+        tch::no_grad(|| {
+            for bank in &mut direct_heads {
+                for (private, shared) in bank.iter_mut().zip(&heads) {
+                    private.ws.copy_(&shared.ws);
+                    private
+                        .bs
+                        .as_mut()
+                        .expect("private head bias")
+                        .copy_(shared.bs.as_ref().expect("shared head bias"));
+                }
+            }
+            for table in &mut direct_prefix_embed {
+                table.copy_(&prefix_embed);
+            }
+        });
 
         let mut mask = vec![0f32; BAR_DOF * BAR_PREFIX_SLOTS];
         for dof in 0..BAR_DOF {
@@ -3026,6 +4233,8 @@ impl BarEmissionHead {
         Self {
             heads,
             prefix_embed,
+            direct_heads,
+            direct_prefix_embed,
             latent_dim,
             prefix_mask,
             prefix_row_base,
@@ -3037,27 +4246,25 @@ impl BarEmissionHead {
         self.latent_dim
     }
 
-    fn readout_weights(&self, detach: bool) -> Tensor {
+    fn readout_weights(&self, heads: &[nn::Linear], detach: bool) -> Tensor {
         stack_maybe_detached(
-            self.heads
-                .iter()
-                .map(|h| h.ws.narrow(1, 0, 2 * self.latent_dim)),
+            heads.iter().map(|h| h.ws.narrow(1, 0, 2 * self.latent_dim)),
             detach,
         )
     }
 
-    fn prefix_weights(&self, detach: bool) -> Tensor {
+    fn prefix_weights(&self, heads: &[nn::Linear], detach: bool) -> Tensor {
         stack_maybe_detached(
-            self.heads
+            heads
                 .iter()
                 .map(|h| h.ws.narrow(1, 2 * self.latent_dim, BAR_PREFIX_WIDTH)),
             detach,
         )
     }
 
-    fn biases(&self, detach: bool) -> Tensor {
+    fn biases(&self, heads: &[nn::Linear], detach: bool) -> Tensor {
         stack_maybe_detached(
-            self.heads
+            heads
                 .iter()
                 .map(|h| h.bs.as_ref().expect("head bias").shallow_clone()),
             detach,
@@ -3067,12 +4274,12 @@ impl BarEmissionHead {
     /// `[rows, BAR_PREFIX_SLOTS, BAR_PREFIX_EMBED_DIM]` slot embeddings for
     /// `[rows, BAR_PREFIX_SLOTS]` prefix bin ids. One gather over the four tables
     /// laid end to end: no GEMM, and the result is bounded by the table itself.
-    fn prefix_lookup(&self, prefix_bins: &Tensor, detach: bool) -> Tensor {
+    fn prefix_lookup(&self, prefix_bins: &Tensor, prefix_embed: &Tensor, detach: bool) -> Tensor {
         let device = prefix_bins.device();
         let table = if detach {
-            self.prefix_embed.detach()
+            prefix_embed.detach()
         } else {
-            self.prefix_embed.shallow_clone()
+            prefix_embed.shallow_clone()
         };
         let flat = (prefix_bins + self.prefix_row_base.to_device(device)).reshape([-1]);
         Tensor::embedding(&table, &flat, -1, false, false).view([
@@ -3094,6 +4301,33 @@ impl BarEmissionHead {
         self.forward_logits(h, conditioning, target_bins, false)
     }
 
+    /// Teacher-forced logits for a complete bar at direct horizon `2` or `3`.
+    ///
+    /// The caller supplies the unchanged decision belief `h[t]`, forecast conditioning built
+    /// from the target clock and current market at `t`, and only the target bar's own
+    /// `r -> s -> u -> v -> w` prefix bins. No intervening bar is accepted by this API.
+    pub fn direct_logits(
+        &self,
+        h: &Tensor,
+        conditioning: &Tensor,
+        target_bins: &Tensor,
+        horizon: usize,
+    ) -> Tensor {
+        assert!(
+            (2..=3).contains(&horizon),
+            "direct horizon must be 2 or 3, got {horizon}"
+        );
+        let slot = horizon - 2;
+        self.forward_logits_with_bank(
+            h,
+            conditioning,
+            target_bins,
+            &self.direct_heads[slot],
+            &self.direct_prefix_embed[slot],
+            false,
+        )
+    }
+
     /// Same factorization with every head parameter detached, so gradients reach
     /// only `h` and `conditioning`. This is the predicted-latent branch of the
     /// dynamics KL term.
@@ -3106,6 +4340,25 @@ impl BarEmissionHead {
         h: &Tensor,
         conditioning: &Tensor,
         target_bins: &Tensor,
+        detach: bool,
+    ) -> Tensor {
+        self.forward_logits_with_bank(
+            h,
+            conditioning,
+            target_bins,
+            &self.heads,
+            &self.prefix_embed,
+            detach,
+        )
+    }
+
+    fn forward_logits_with_bank(
+        &self,
+        h: &Tensor,
+        conditioning: &Tensor,
+        target_bins: &Tensor,
+        heads: &[nn::Linear],
+        prefix_embed: &Tensor,
         detach: bool,
     ) -> Tensor {
         let lead = leading_dims(h, self.latent_dim, "latent");
@@ -3141,7 +4394,7 @@ impl BarEmissionHead {
             .reshape([-1, BAR_DOF as i64])
             .index_select(1, &self.prefix_slot_dof.to_device(device));
 
-        let embedded = self.prefix_lookup(&prefix_bins, detach);
+        let embedded = self.prefix_lookup(&prefix_bins, prefix_embed, detach);
         let masked = (embedded.unsqueeze(1) * self.prefix_mask.to_device(device)).reshape([
             rows,
             BAR_DOF as i64,
@@ -3150,15 +4403,15 @@ impl BarEmissionHead {
 
         let latent_part = Tensor::einsum(
             "nl,kol->nko",
-            &[&readout, &self.readout_weights(detach)],
+            &[&readout, &self.readout_weights(heads, detach)],
             None::<&[i64]>,
         );
         let prefix_part = Tensor::einsum(
             "nkp,kop->nko",
-            &[&masked, &self.prefix_weights(detach)],
+            &[&masked, &self.prefix_weights(heads, detach)],
             None::<&[i64]>,
         );
-        (latent_part + prefix_part + self.biases(detach).unsqueeze(0))
+        (latent_part + prefix_part + self.biases(heads, detach).unsqueeze(0))
             .reshape(with_tail(&lead, &[BAR_DOF as i64, NUM_BAR_BINS]))
     }
 
@@ -3214,10 +4467,10 @@ impl BarEmissionHead {
 
             let base = Tensor::einsum(
                 "nl,kol->nko",
-                &[&readout, &self.readout_weights(false)],
+                &[&readout, &self.readout_weights(&self.heads, false)],
                 None::<&[i64]>,
-            ) + self.biases(false).unsqueeze(0);
-            let prefix_w_all = self.prefix_weights(false);
+            ) + self.biases(&self.heads, false).unsqueeze(0);
+            let prefix_w_all = self.prefix_weights(&self.heads, false);
             let mask = self.prefix_mask.to_device(device);
 
             // Unvisited slots hold bin 0; the mask zeroes their embedding, so the
@@ -3230,7 +4483,7 @@ impl BarEmissionHead {
 
             for (position, &dof) in BAR_CHAIN.iter().enumerate() {
                 let prefix_bins = Tensor::stack(&slot_bins, 1);
-                let embedded = self.prefix_lookup(&prefix_bins, false);
+                let embedded = self.prefix_lookup(&prefix_bins, &self.prefix_embed, false);
                 let masked =
                     (embedded * mask.select(0, dof as i64)).reshape([rows, BAR_PREFIX_WIDTH]);
                 let logits = base.select(1, dof as i64)
@@ -3313,10 +4566,10 @@ impl BarEmissionHead {
             );
             let base = Tensor::einsum(
                 "nl,kol->nko",
-                &[&readout, &self.readout_weights(false)],
+                &[&readout, &self.readout_weights(&self.heads, false)],
                 None::<&[i64]>,
-            ) + self.biases(false).unsqueeze(0);
-            let prefix_w_all = self.prefix_weights(false);
+            ) + self.biases(&self.heads, false).unsqueeze(0);
+            let prefix_w_all = self.prefix_weights(&self.heads, false);
             let mask = self.prefix_mask.to_device(device);
 
             let mut total: Option<Tensor> = None;
@@ -3329,7 +4582,7 @@ impl BarEmissionHead {
                 let mut per_dof: Vec<Option<Tensor>> = (0..BAR_DOF).map(|_| None).collect();
                 for (position, &dof) in BAR_CHAIN.iter().enumerate() {
                     let prefix_bins = Tensor::stack(&slot_bins, 1);
-                    let embedded = self.prefix_lookup(&prefix_bins, false);
+                    let embedded = self.prefix_lookup(&prefix_bins, &self.prefix_embed, false);
                     let masked =
                         (embedded * mask.select(0, dof as i64)).reshape([rows, BAR_PREFIX_WIDTH]);
                     let logits = base.select(1, dof as i64)
@@ -4604,12 +5857,49 @@ mod tests {
             corpus_fingerprint: "a".repeat(64),
             split_bounds: (1_700_000_000_000, 1_710_000_000_000),
             sample_count: 4_000_000,
+            fit_seed: Some(0x5EED),
+            scaling_contract: Some(RAW_SCALING_CONTRACT.to_owned()),
+            support_semantics: Some(BAR_SUPPORTS_SEMANTICS_CONTRACT.to_owned()),
             fitted_utc: "2026-08-15T00:00:00Z".to_owned(),
         };
         let fitted = synthetic_supports(20_000, 0x9A9A).with_provenance(provenance.clone());
         fitted.save(&path).expect("save");
         let reloaded = BarSupports::load(&path).expect("load");
         assert_eq!(reloaded.provenance(), Some(&provenance));
+        let persisted: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).expect("read")).expect("parse");
+        assert_eq!(
+            persisted["provenance"]["fit_seed"],
+            serde_json::json!(0x5EED)
+        );
+        assert_eq!(
+            persisted["provenance"]["sample_count"],
+            serde_json::json!(4_000_000)
+        );
+
+        // A provenance-bearing artifact written before these authentication fields remains
+        // loadable for ordinary diagnostics, but exposes their absence instead of inventing
+        // caller values.
+        let mut seedless = persisted.clone();
+        let old_provenance = seedless["provenance"]
+            .as_object_mut()
+            .expect("provenance object");
+        old_provenance.remove("fit_seed");
+        old_provenance.remove("scaling_contract");
+        old_provenance.remove("support_semantics");
+        std::fs::write(
+            &path,
+            serde_json::to_vec(&seedless).expect("serialize seedless provenance"),
+        )
+        .expect("write seedless provenance");
+        let old = BarSupports::load(&path).expect("old provenance remains ordinarily readable");
+        let old = old
+            .provenance()
+            .expect("old artifact still carries provenance");
+        assert_eq!(old.fit_seed, None);
+        assert_eq!(old.scaling_contract, None);
+        assert_eq!(old.support_semantics, None);
+        fitted.save(&path).expect("restore current artifact");
 
         // A v3 artifact predates both provenance and every fitted-moment member. Build an
         // internally honest legacy fixture rather than changing only the version tag on a v6
@@ -7029,5 +8319,572 @@ mod tests {
             "teacher-forcing inflation on the synthetic fixture: {dependent_inflation:.4} \
              nats/bar dependent, {independent_inflation:.2e} independent"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // T1.1: volatility-standardized targets
+    // -----------------------------------------------------------------------
+
+    /// A synthetic panel with a DELIBERATE order-of-magnitude spread of per-symbol volatility,
+    /// which is the condition defect 1 is about. `scale` multiplies every log move, so symbol
+    /// `k` is `scale` times as volatile as a unit symbol while sharing its shape.
+    fn vol_series(bars: usize, scale: f64, seed: u64) -> Vec<PackedBar> {
+        let mut rng = Rng::new(seed);
+        let mut out = Vec::with_capacity(bars);
+        let mut close = 100.0f64;
+        for i in 0..bars {
+            let r = scale * 0.0009 * rng.normal();
+            let open = close;
+            close = (open * r.exp()).clamp(1e-3, 1e6);
+            let range = scale * 0.002 * (1.0 + 0.5 * rng.normal()).abs();
+            let high = open.max(close) * (0.5 * range).exp();
+            let low = open.min(close) * (-0.5 * range).exp();
+            let mut packed = bar(open as f32, high as f32, low as f32, close as f32, 1e5);
+            packed.ts_ms = 1_700_000_000_000 + i as i64 * 300_000;
+            out.push(packed);
+        }
+        out
+    }
+
+    /// `standardize_dof` and `destandardize_dof` invert to f32 precision, and `decode_dof` of
+    /// the round trip reproduces the bar — which is the property the whole standardized path
+    /// rests on, because a target the model cannot be decoded back out of is not a forecast.
+    #[test]
+    fn the_standardized_round_trip_reproduces_the_bar() {
+        let bars = vol_series(4096, 1.0, 0x51D3);
+        let rows = encode_series_scaled(&bars, DofScaling::VolStandardized);
+        assert_eq!(rows.len(), bars.len() - 1);
+        // Skip the warm-up: before the HAR has converged the divisor is legitimately far from
+        // the local scale and `BAR_Z_LIMIT` can clamp, which is a documented saturation rather
+        // than a round-trip failure. Every row past the warm-up must invert.
+        let mut worst_dof = 0.0f64;
+        let mut worst_price = 0.0f64;
+        for (index, row) in rows.iter().enumerate().skip(BAR_VOL_HAR_SPANS[2] as usize) {
+            let prev_close = bars[index].close;
+            let raw = encode_dof(prev_close, &bars[index + 1], bars[index].volume);
+            let back = destandardize_dof(row.dof, row.sigma);
+            for (a, b) in back.to_array().iter().zip(raw.to_array().iter()) {
+                worst_dof = worst_dof.max(relative(*a, *b));
+            }
+            let rebuilt = decode_dof(prev_close, &back, bars[index].volume);
+            let original = decode_dof(prev_close, &raw, bars[index].volume);
+            for (a, b) in [
+                (rebuilt.open, original.open),
+                (rebuilt.high, original.high),
+                (rebuilt.low, original.low),
+                (rebuilt.close, original.close),
+            ] {
+                worst_price = worst_price.max(relative(a, b));
+            }
+        }
+        assert!(
+            worst_dof < 1e-5,
+            "standardize/destandardize is not an inverse: worst relative DOF error \
+             {worst_dof:.3e}"
+        );
+        assert!(
+            worst_price < 1e-5,
+            "the decoded bar does not survive the round trip: worst relative price error \
+             {worst_price:.3e}"
+        );
+    }
+
+    /// `L <= {O, C} <= H` still holds by construction on the standardized path.
+    ///
+    /// It has to be checked rather than assumed even though `decode_dof` builds the four log
+    /// prices as `ln_low + {0, v, u, 1} * s`: the identity depends on `s >= 0` and
+    /// `u, v in [0, 1]`, and standardization divides `s` while leaving `u`, `v` alone. A sign
+    /// error in the divisor, or a clamp that let `z_s` go negative, would break the ordering
+    /// silently and produce bars no market could print.
+    #[test]
+    fn the_ordering_identity_survives_standardization() {
+        for (scale, seed) in [(0.2, 0xA1u64), (1.0, 0xA2), (7.0, 0xA3)] {
+            let bars = vol_series(2048, scale, seed);
+            for (index, row) in encode_series_scaled(&bars, DofScaling::VolStandardized)
+                .iter()
+                .enumerate()
+            {
+                assert!(
+                    row.dof.s >= 0.0,
+                    "z_s went negative at scale {scale}, row {index}: {}",
+                    row.dof.s
+                );
+                assert!(
+                    (0.0..=1.0).contains(&row.dof.u) && (0.0..=1.0).contains(&row.dof.v),
+                    "u/v left the unit interval at scale {scale}, row {index}"
+                );
+                assert!(
+                    row.sigma > 0.0 && row.sigma.is_finite(),
+                    "sigma must be finite and positive at scale {scale}, row {index}: {}",
+                    row.sigma
+                );
+                let rebuilt = decode_dof(
+                    bars[index].close,
+                    &destandardize_dof(row.dof, row.sigma),
+                    bars[index].volume,
+                );
+                assert!(
+                    rebuilt.low <= rebuilt.open
+                        && rebuilt.open <= rebuilt.high
+                        && rebuilt.low <= rebuilt.close
+                        && rebuilt.close <= rebuilt.high,
+                    "L <= {{O, C}} <= H broke at scale {scale}, row {index}: \
+                     O={} H={} L={} C={}",
+                    rebuilt.open,
+                    rebuilt.high,
+                    rebuilt.low,
+                    rebuilt.close
+                );
+            }
+        }
+    }
+
+    /// `sigma_t` is measurable on bars `<= t`, proved by construction rather than by reading
+    /// the code: replacing every bar STRICTLY AFTER `t` must leave row `t`'s divisor and its
+    /// standardized value bit-identical.
+    ///
+    /// This is the leak that would make the whole change worthless — a divisor that saw the
+    /// bar it normalizes would shrink exactly the moves the model is scored on.
+    #[test]
+    fn the_volatility_divisor_cannot_see_the_future() {
+        let bars = vol_series(1024, 1.0, 0xC0FF);
+        let baseline = encode_series_scaled(&bars, DofScaling::VolStandardized);
+        let cut = 700usize;
+        let mut perturbed = bars.clone();
+        // A violent, structured replacement of the future: 40% gaps in alternating directions,
+        // which no causal estimator of the past can react to.
+        for (offset, bar) in perturbed[cut + 1..].iter_mut().enumerate() {
+            let sign = if offset % 2 == 0 { 1.4f32 } else { 0.6 };
+            bar.open *= sign;
+            bar.high *= sign * 1.05;
+            bar.low *= sign * 0.95;
+            bar.close *= sign;
+        }
+        let moved = encode_series_scaled(&perturbed, DofScaling::VolStandardized);
+        // Row `i` of the series describes bar `i + 1`, so rows `0 ..= cut - 1` are the ones
+        // whose bar is at or before `cut`.
+        for index in 0..cut {
+            assert_eq!(
+                baseline[index].sigma, moved[index].sigma,
+                "sigma at row {index} moved when only bars after {cut} changed"
+            );
+            assert_eq!(
+                baseline[index].dof, moved[index].dof,
+                "the standardized row {index} moved when only bars after {cut} changed"
+            );
+        }
+    }
+
+    /// Reducing the two point sides in separate lifetimes must remain algebraically identical
+    /// to the scalar host quadrature, including the conservative completion of unobserved bins.
+    #[test]
+    fn sidewise_device_quadrature_matches_the_host_two_point_law() {
+        let bins = NUM_BAR_BINS as usize;
+        let nodes = ZSubBins::NODES;
+        let cells = bins * nodes;
+        let means: Vec<f64> = (0..cells)
+            .map(|cell| {
+                let bin = cell / nodes;
+                let node = cell % nodes;
+                -0.8 + 1.6 * bin as f64 / (bins - 1) as f64
+                    + 0.03 * (node as f64 / (nodes - 1) as f64 - 0.5)
+            })
+            .collect();
+        let seconds: Vec<f64> = means
+            .iter()
+            .enumerate()
+            .map(|(cell, &mean)| mean * mean + 0.0025 * (1 + cell % 13) as f64)
+            .collect();
+        // Exercise completion as part of the same equality: these bins contribute neither edge
+        // nor their own risk, and inherit the largest observed second moment at each sigma.
+        let observed: Vec<f64> = (0..bins)
+            .map(|bin| if bin % 11 == 0 { 0.0 } else { 1.0 })
+            .collect();
+        let mut law = TradedZLaw::from_subbin_moments_for_test(
+            means.clone(),
+            seconds.clone(),
+            Device::Cpu,
+        );
+        law.observed = Tensor::from_slice(&observed).view([1, NUM_BAR_BINS]);
+
+        let sigmas = [0.003, 0.1, 0.9];
+        let sigma = Tensor::from_slice(&sigmas);
+        let (device_first, device_second) = law
+            .simple_return_moments_at(&sigma)
+            .expect("the row-shaped sigma tensor is valid");
+        assert_eq!(device_first.kind(), Kind::Double);
+        assert_eq!(device_second.kind(), Kind::Double);
+
+        for (row, &sigma) in sigmas.iter().enumerate() {
+            let mut host_first = vec![0.0; bins];
+            let mut host_second = vec![0.0; bins];
+            let mut conservative_second = 0.0f64;
+            for bin in 0..bins {
+                if observed[bin] == 0.0 {
+                    continue;
+                }
+                let (mut first_sum, mut second_sum) = (0.0, 0.0);
+                for node in 0..nodes {
+                    let cell = bin * nodes + node;
+                    // ZSubBins canonicalizes persisted moments through f32 before constructing
+                    // both device points; mirror that canonical host law exactly.
+                    let mean = means[cell] as f32 as f64;
+                    let second = seconds[cell] as f32 as f64;
+                    let deviation = (second - mean * mean).max(0.0).sqrt();
+                    let lower_return = (sigma * (mean - deviation)).exp_m1();
+                    let upper_return = (sigma * (mean + deviation)).exp_m1();
+                    first_sum += lower_return + upper_return;
+                    second_sum +=
+                        lower_return * lower_return + upper_return * upper_return;
+                }
+                let first = first_sum / (2 * nodes) as f64;
+                let second =
+                    (second_sum / (2 * nodes) as f64).max(first * first);
+                host_first[bin] = first;
+                host_second[bin] = second;
+                conservative_second = conservative_second.max(second);
+            }
+            for bin in 0..bins {
+                if observed[bin] == 0.0 {
+                    host_second[bin] = conservative_second;
+                }
+                let got_first = device_first.double_value(&[row as i64, bin as i64]);
+                let got_second = device_second.double_value(&[row as i64, bin as i64]);
+                let first_tolerance = 2.0e-13f64.max(2.0e-12 * host_first[bin].abs());
+                let second_tolerance = 2.0e-13f64.max(2.0e-12 * host_second[bin].abs());
+                assert!(
+                    (got_first - host_first[bin]).abs() <= first_tolerance
+                        && (got_second - host_second[bin]).abs() <= second_tolerance,
+                    "row {row}, bin {bin}: device ({got_first:.16e}, {got_second:.16e}) != \
+                     host ({:.16e}, {:.16e})",
+                    host_first[bin],
+                    host_second[bin]
+                );
+            }
+        }
+    }
+
+    /// MOMENT-MATCHING Kelly consumption. At a CONSTANT `sigma` the standardized path's
+    /// `sigma`-parameterized per-bin simple-return moments must agree closely with the raw
+    /// path's directly measured ones on the same population.
+    ///
+    /// The construction makes the two comparable rather than merely similar: `sigma` is pinned
+    /// to one value by feeding the HAR a series it has already converged on, so `z = r / sigma`
+    /// is a pure rescaling, the equal-mass quantile partition of the sample is bit-identical
+    /// under it, and bin `j` therefore holds exactly the same OBSERVATIONS on both paths. Any
+    /// disagreement is then the quadrature, not the population — which is precisely what this
+    /// test is for, because the sizing layer's correctness rests on that quadrature.
+    #[test]
+    fn the_sigma_conditional_moments_match_the_raw_path_at_constant_sigma() {
+        // A rescaling of ONE fixed sample, not two draws: `raw[i].r == SIGMA * z[i].r` exactly.
+        const SIGMA: f32 = 0.0031;
+        let mut rng = Rng::new(0x5161);
+        let z: Vec<BarDof> = (0..40_000)
+            .map(|_| {
+                let base = synthetic_dof(&mut rng);
+                BarDof {
+                    r: (base.r as f64 / SIGMA as f64) as f32,
+                    s: (base.s as f64 / (BAR_RANGE_TO_SIGMA * SIGMA as f64)) as f32,
+                    ..base
+                }
+            })
+            .collect();
+        let raw: Vec<BarDof> = z.iter().map(|row| destandardize_dof(*row, SIGMA)).collect();
+        let rows: Vec<StandardizedDof> = z
+            .iter()
+            .map(|row| StandardizedDof {
+                dof: *row,
+                sigma: SIGMA,
+            })
+            .collect();
+
+        let control = BarSupports::fit(&raw);
+        let arm = BarSupports::fit_standardized(&rows);
+        assert_eq!(control.dof_scaling(), DofScaling::Raw);
+        assert_eq!(arm.dof_scaling(), DofScaling::VolStandardized);
+
+        // The premise: a monotone rescaling leaves the equal-mass partition alone, so the two
+        // grids hold the same observations bin for bin. Without this the moment comparison
+        // would be comparing two different populations and could not fail informatively.
+        for bin in 0..NUM_BAR_BINS as usize {
+            assert!(
+                (control.bin_masses(DOF_R)[bin] - arm.bin_masses(DOF_R)[bin]).abs() < 5e-4,
+                "bin {bin} holds a different share of the sample on the two paths: {} vs {}",
+                control.bin_masses(DOF_R)[bin],
+                arm.bin_masses(DOF_R)[bin]
+            );
+        }
+
+        let (want_first, want_second) = control
+            .simple_return_bin_moments()
+            .expect("a fresh raw fit carries measured simple-return moments");
+        let (got_first, got_second) = arm
+            .simple_return_bin_moments_at(SIGMA as f64)
+            .expect("a fresh standardized fit carries the sub-bin law of z");
+
+        let mut worst_first = 0.0f64;
+        let mut worst_second = 0.0f64;
+        for bin in 0..NUM_BAR_BINS as usize {
+            if arm.bin_masses(DOF_R)[bin] <= 0.0 {
+                continue;
+            }
+            // Relative to the RETURN SCALE rather than to each bin's own value: a bin whose
+            // conditional mean sits near zero would otherwise report an unbounded relative
+            // error on an absolutely negligible difference.
+            worst_first = worst_first.max((got_first[bin] - want_first[bin]).abs());
+            worst_second = worst_second.max((got_second[bin] - want_second[bin]).abs());
+        }
+        let scale = SIGMA as f64;
+        assert!(
+            worst_first < 1e-3 * scale,
+            "the sigma-conditional first moment disagrees with the directly measured one by \
+             {worst_first:.3e} in absolute return, {:.4}% of one sigma",
+            100.0 * worst_first / scale
+        );
+        assert!(
+            worst_second < 1e-2 * scale * scale,
+            "the sigma-conditional second moment disagrees by {worst_second:.3e}, {:.4}% of \
+             sigma squared",
+            100.0 * worst_second / (scale * scale)
+        );
+        println!(
+            "constant-sigma moment equivalence: first {worst_first:.3e} ({:.4}% of sigma), \
+             second {worst_second:.3e} ({:.4}% of sigma^2)",
+            100.0 * worst_first / scale,
+            100.0 * worst_second / (scale * scale)
+        );
+    }
+
+    /// DEFECT 1, MEASURED. One pooled absolute grid over a panel whose symbols differ by an
+    /// order of magnitude in volatility gives each symbol a small fraction of the 128 bins;
+    /// standardizing gives every symbol nearly the whole grid.
+    ///
+    /// The statistic is `exp(H)` of the per-symbol occupancy, which reads directly as "how many
+    /// bins this symbol effectively has". The claim under test is about the WORST symbol and
+    /// about the SPREAD across symbols, not about the pooled average: a pooled histogram is
+    /// equal-mass by construction on both paths, so only the per-symbol decomposition can see
+    /// the defect at all.
+    #[test]
+    fn standardization_equalizes_the_effective_resolution_across_symbols() {
+        let scales = [0.25f64, 1.0, 4.0, 16.0];
+        let panel: Vec<Vec<PackedBar>> = scales
+            .iter()
+            .enumerate()
+            .map(|(index, &scale)| vol_series(6_000, scale, 0xBEE0 + index as u64))
+            .collect();
+
+        let effective = |scaling: DofScaling| -> Vec<f64> {
+            let pooled: Vec<StandardizedDof> = panel
+                .iter()
+                .flat_map(|bars| encode_series_scaled(bars, scaling))
+                .collect();
+            let supports = match scaling {
+                DofScaling::Raw => {
+                    BarSupports::fit(&pooled.iter().map(|row| row.dof).collect::<Vec<_>>())
+                }
+                DofScaling::VolStandardized => BarSupports::fit_standardized(&pooled),
+            };
+            panel
+                .iter()
+                .map(|bars| {
+                    let mut occupancy = vec![0.0f64; NUM_BAR_BINS as usize];
+                    let rows = encode_series_scaled(bars, scaling);
+                    for row in &rows {
+                        occupancy[supports.bin_of(DOF_R, row.dof.r as f64)] += 1.0;
+                    }
+                    let total = rows.len() as f64;
+                    for slot in occupancy.iter_mut() {
+                        *slot /= total;
+                    }
+                    BarSupports::effective_bins(&occupancy)
+                })
+                .collect()
+        };
+
+        let control = effective(DofScaling::Raw);
+        let arm = effective(DofScaling::VolStandardized);
+        let ratio = |bins: &[f64]| {
+            bins.iter().copied().fold(f64::MIN, f64::max)
+                / bins.iter().copied().fold(f64::MAX, f64::min)
+        };
+        let control_spread = ratio(&control);
+        let arm_spread = ratio(&arm);
+        println!(
+            "effective r-bins per symbol at scales {scales:?}\n  raw          {:.1?}\n  \
+             standardized {:.1?}\n  worst/best spread: raw {:.2}x, standardized {:.2}x",
+            control, arm, control_spread, arm_spread
+        );
+        let worst_control = control.iter().copied().fold(f64::MAX, f64::min);
+        let worst_arm = arm.iter().copied().fold(f64::MAX, f64::min);
+        assert!(
+            worst_arm > 2.0 * worst_control,
+            "standardization must materially raise the WORST symbol's effective resolution: \
+             raw {worst_control:.1} bins, standardized {worst_arm:.1}"
+        );
+        // A spread ratio cannot fall below 1.0, so measure compression of the excess over
+        // that ideal rather than demanding the standardized ratio be a fraction of the raw
+        // ratio. The latter becomes impossible whenever the raw spread is below 2x.
+        let control_excess = control_spread - 1.0;
+        let arm_excess = arm_spread - 1.0;
+        assert!(
+            arm_excess < 0.5 * control_excess,
+            "standardization must remove at least half the excess spread of effective resolution \
+             across symbols: raw {control_spread:.2}x, standardized {arm_spread:.2}x"
+        );
+    }
+
+    #[test]
+    fn relative_floor_preserves_name_scale_equivariance() {
+        const MULTIPLE: f32 = 37.0;
+        let seed = BarDof {
+            r: 0.01,
+            s: 0.02,
+            ..BarDof::default()
+        };
+        let scaled_seed = BarDof {
+            r: seed.r * MULTIPLE,
+            s: seed.s * MULTIPLE,
+            ..seed
+        };
+        let mut base_har = RangeVolHar::default();
+        let mut scaled_har = RangeVolHar::default();
+        base_har.observe(&seed);
+        scaled_har.observe(&scaled_seed);
+        // Collapse the adaptive legs while retaining a materially positive slow anchor.
+        for _ in 0..5_000 {
+            base_har.observe(&BarDof::default());
+            scaled_har.observe(&BarDof::default());
+        }
+        let target = BarDof {
+            r: 1e-5,
+            s: 2e-5,
+            ..BarDof::default()
+        };
+        let scaled_target = BarDof {
+            r: target.r * MULTIPLE,
+            s: target.s * MULTIPLE,
+            ..target
+        };
+        let base = scale_row(target, &base_har, DofScaling::VolStandardized);
+        let scaled = scale_row(scaled_target, &scaled_har, DofScaling::VolStandardized);
+        assert!(base.diagnostics.relative_floor);
+        assert!(scaled.diagnostics.relative_floor);
+        assert!(!base.diagnostics.numerical_fallback);
+        assert!(!scaled.diagnostics.numerical_fallback);
+        assert!((base.row.dof.r - scaled.row.dof.r).abs() < 2e-6);
+        assert!((base.row.dof.s - scaled.row.dof.s).abs() < 2e-6);
+        assert!(
+            (scaled.row.sigma / base.row.sigma - MULTIPLE).abs() < 2e-4,
+            "the name-specific floor must scale with the name"
+        );
+    }
+
+    #[test]
+    fn scaling_diagnostics_distinguish_fallback_floor_and_clamps() {
+        let mut flat_history = RangeVolHar::default();
+        for _ in 0..128 {
+            flat_history.observe(&BarDof::default());
+        }
+        let fallback = scale_row(
+            BarDof {
+                r: 0.1,
+                s: 0.1,
+                ..BarDof::default()
+            },
+            &flat_history,
+            DofScaling::VolStandardized,
+        );
+        assert!(!fallback.diagnostics.relative_floor);
+        assert!(fallback.diagnostics.numerical_fallback);
+        assert!(fallback.diagnostics.r_clamped);
+        assert!(fallback.diagnostics.s_clamped);
+        assert_eq!(fallback.row.dof.r, BAR_Z_LIMIT as f32);
+        assert_eq!(fallback.row.dof.s, BAR_Z_LIMIT as f32);
+
+        let raw = scale_row(
+            BarDof {
+                r: 1.0,
+                s: 1.0,
+                ..BarDof::default()
+            },
+            &flat_history,
+            DofScaling::Raw,
+        );
+        assert_eq!(raw.diagnostics, ScaleDiagnostics::default());
+    }
+
+    #[test]
+    fn standardized_supports_authenticate_scaling_contract_and_raw_v6_omits_it() {
+        let _torch_rng_guard = test_rng::shared();
+        let mut rng = Rng::new(0xC07A_C7);
+        let raw_rows: Vec<BarDof> = (0..4_096).map(|_| synthetic_dof(&mut rng)).collect();
+        let standardized_rows: Vec<StandardizedDof> = raw_rows
+            .iter()
+            .copied()
+            .map(|raw| StandardizedDof {
+                dof: standardize_dof(raw, 0.01),
+                sigma: 0.01,
+            })
+            .collect();
+        let dir = std::env::temp_dir().join(format!(
+            "trading_bot_0_scaling_contract_{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let raw_path = dir.join("raw.json");
+        let standardized_path = dir.join("standardized.json");
+        BarSupports::fit(&raw_rows)
+            .save(&raw_path)
+            .expect("save raw support");
+        BarSupports::fit_standardized(&standardized_rows)
+            .save(&standardized_path)
+            .expect("save standardized support");
+
+        let raw_json: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&raw_path).expect("read raw")).expect("raw json");
+        assert_eq!(
+            raw_json["format_version"].as_u64(),
+            Some(BAR_SUPPORTS_FORMAT_VERSION as u64)
+        );
+        assert!(
+            raw_json.get("standardized_scaling_contract").is_none(),
+            "raw v6 must not acquire a serialized member or a new hash"
+        );
+
+        let mut standardized_json: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&standardized_path).expect("read standardized"))
+                .expect("standardized json");
+        assert_eq!(
+            standardized_json["standardized_scaling_contract"].as_str(),
+            Some(STANDARDIZED_SCALING_CONTRACT)
+        );
+        let valid_standardized_json = standardized_json.clone();
+        BarSupports::load(&standardized_path).expect("matching scaling contract loads");
+        standardized_json["standardized_scaling_contract"] =
+            serde_json::json!("vol-standardized-v999");
+        std::fs::write(
+            &standardized_path,
+            serde_json::to_vec(&standardized_json).expect("serialize mismatch"),
+        )
+        .expect("write mismatch");
+        let error = BarSupports::load(&standardized_path)
+            .expect_err("mismatched scaling semantics must be refused")
+            .to_string();
+        assert!(error.contains("different target semantics"), "{error}");
+        for (mean, second) in [(1.0e100, 1.0), (1.0, -1.0)] {
+            let mut corrupt = valid_standardized_json.clone();
+            corrupt["bin_z_subbin_means"][0][0] = serde_json::json!(mean);
+            corrupt["bin_z_subbin_second_moments"][0][0] = serde_json::json!(second);
+            std::fs::write(
+                &standardized_path,
+                serde_json::to_vec(&corrupt).expect("serialize corrupt moments"),
+            )
+            .expect("write corrupt moments");
+            let error = BarSupports::load(&standardized_path)
+                .expect_err("impossible standardized sub-bin moments must be refused")
+                .to_string();
+            assert!(error.contains("invalid z sub-bin moment"), "{error}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

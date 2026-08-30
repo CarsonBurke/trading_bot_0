@@ -2986,6 +2986,7 @@ mod tests {
                 split_bounds: None,
                 derive_split_bounds: false,
                 min_dollar_volume: 0.0,
+                dof_scaling: crate::torch::bar_dist::DofScaling::Raw,
             },
             supports: "<in-memory fixture>".to_owned(),
             output: String::new(),

@@ -698,11 +698,9 @@ impl RowLrState {
             return (scaled, None);
         };
 
-        let raw_f32 = raw_gradient
-            .to_kind(Kind::Float)
-            .nan_to_num(0.0, 0.0, 0.0);
-        let evidence_raw = -(&raw_f32 * &self.previous_delta)
-            .mean_dim([1i64].as_slice(), true, Kind::Float);
+        let raw_f32 = raw_gradient.to_kind(Kind::Float).nan_to_num(0.0, 0.0, 0.0);
+        let evidence_raw =
+            -(&raw_f32 * &self.previous_delta).mean_dim([1i64].as_slice(), true, Kind::Float);
         let centered = &evidence_raw - evidence_raw.mean(Kind::Float);
         let std = centered.square().mean(Kind::Float).sqrt();
         let evidence = (&centered / std.clamp_min(1e-8))
@@ -717,15 +715,12 @@ impl RowLrState {
                 -&evidence * ROW_LR_LOG_SPAN * &sigmoid * (1.0 - &sigmoid) / rows;
             let (beta1, beta2) = ROW_LR_CONTROLLER_BETAS;
             let _ = self.adam_m.lerp_(&objective_gradient, 1.0 - beta1);
-            let _ = self
-                .adam_v
-                .lerp_(&objective_gradient.square(), 1.0 - beta2);
+            let _ = self.adam_v.lerp_(&objective_gradient.square(), 1.0 - beta2);
             self.adam_step += 1;
             let bc1 = 1.0 - beta1.powi(self.adam_step as i32);
             let bc2 = 1.0 - beta2.powi(self.adam_step as i32);
             let denom = self.adam_v.sqrt() / bc2.sqrt() + ROW_LR_CONTROLLER_EPS;
-            let logit_delta =
-                &self.adam_m / denom * (-ROW_LR_CONTROLLER_LR / bc1);
+            let logit_delta = &self.adam_m / denom * (-ROW_LR_CONTROLLER_LR / bc1);
             update_magnitude = logit_delta.abs();
             let _ = self.logit.g_add_(&logit_delta);
         }
@@ -859,9 +854,7 @@ impl Muon {
                         second_momentum_shape(&size, layout).as_slice(),
                         (Kind::Float, device),
                     ),
-                    row_lr: cfg
-                        .row_learned_lr
-                        .then(|| RowLrState::new(m, n, device)),
+                    row_lr: cfg.row_learned_lr.then(|| RowLrState::new(m, n, device)),
                 });
             } else {
                 adamw_indices.push(i);
@@ -1027,11 +1020,9 @@ impl Muon {
                     // This is theta_new - theta_old from the gradient update only. Decoupled
                     // decay above is intentionally absent from the next-step credit tensor.
                     let signed_delta = &update * (-eff_lr);
-                    controller.previous_delta.copy_(
-                        &signed_delta
-                            .to_kind(Kind::Float)
-                            .nan_to_num(0.0, 0.0, 0.0),
-                    );
+                    controller
+                        .previous_delta
+                        .copy_(&signed_delta.to_kind(Kind::Float).nan_to_num(0.0, 0.0, 0.0));
                     let _ = p.g_add_(&signed_delta);
                     continue;
                 }
@@ -1284,11 +1275,10 @@ impl Muon {
         matched
     }
 
-    /// Serialize all optimizer state (per-param momentum/second-momentum for the
-    /// NorMuon 2D params, AdamW m/v for the rest, and the global step counter) to
-    /// a named-tensor sidecar. Keying by variable name makes restoration robust to
-    /// param ordering. Requires `new_named` (the unnamed path stores empty names
-    /// and its keys would collide).
+    /// Serialize complete optimizer state, including AdamW gradients retained between cadence
+    /// updates, to a named-tensor sidecar. Keying by variable name makes restoration robust to
+    /// param ordering. Requires `new_named` (the unnamed path stores empty names and its keys
+    /// would collide).
     pub fn save_state(&self, path: impl AsRef<Path>) -> Result<()> {
         let path = path.as_ref();
         let mut named: Vec<(String, Tensor)> = Vec::new();
@@ -1337,6 +1327,26 @@ impl Muon {
             ));
         }
         named.push((
+            "__adamw_pending_grads__".to_owned(),
+            Tensor::from(if self.adamw_pending_grads { 1i64 } else { 0 }),
+        ));
+        if self.adamw_pending_grads {
+            for &idx in &self.adamw_indices {
+                let name = &self.names[idx];
+                let grad = self.params[idx].grad();
+                named.push((
+                    format!("{name}.__adamw_pending_grad_defined"),
+                    Tensor::from(if grad.defined() { 1i64 } else { 0 }),
+                ));
+                if grad.defined() {
+                    named.push((
+                        format!("{name}.__adamw_pending_grad"),
+                        grad.to_device(Device::Cpu),
+                    ));
+                }
+            }
+        }
+        named.push((
             "__muon_step_count__".to_owned(),
             Tensor::from(self.step_count),
         ));
@@ -1345,10 +1355,10 @@ impl Muon {
             .with_context(|| format!("failed saving optimizer state {}", path.display()))
     }
 
-    /// Restore optimizer state saved by [`Muon::save_state`], copying buffers in
-    /// place so device/dtype match the live params. Absent 2D buffers are an
-    /// error (the checkpoint is incomplete); absent AdamW buffers leave that param
-    /// lazily re-initialized on its next step.
+    /// Restore optimizer state saved by [`Muon::save_state`], copying buffers and any retained
+    /// AdamW gradients in place so device/dtype match the live params. Absent 2D buffers are an
+    /// error (the checkpoint is incomplete); absent AdamW moment buffers leave that parameter
+    /// lazily re-initialized on its next update.
     pub fn load_state(&mut self, path: impl AsRef<Path>) -> Result<()> {
         let path = path.as_ref();
         let device = self
@@ -1362,8 +1372,13 @@ impl Muon {
             .collect();
         let global_step_count = loaded
             .get("__muon_step_count__")
-            .map(|t| t.int64_value(&[]))
-            .unwrap_or(0);
+            .context("optimizer state missing global step")?
+            .int64_value(&[]);
+        let adamw_pending_grads = loaded
+            .get("__adamw_pending_grads__")
+            .context("optimizer state missing AdamW accumulation state")?
+            .int64_value(&[])
+            != 0;
         tch::no_grad(|| -> Result<()> {
             for entry in &mut self.entries_2d {
                 let name = &self.names[entry.idx];
@@ -1381,17 +1396,23 @@ impl Muon {
                     controller.logit.copy_(
                         loaded
                             .get(&format!("{name}.__row_lr_logit"))
-                            .with_context(|| format!("optimizer state missing row LR logit for {name}"))?,
+                            .with_context(|| {
+                                format!("optimizer state missing row LR logit for {name}")
+                            })?,
                     );
                     controller.adam_m.copy_(
                         loaded
                             .get(&format!("{name}.__row_lr_adam_m"))
-                            .with_context(|| format!("optimizer state missing row LR m for {name}"))?,
+                            .with_context(|| {
+                                format!("optimizer state missing row LR m for {name}")
+                            })?,
                     );
                     controller.adam_v.copy_(
                         loaded
                             .get(&format!("{name}.__row_lr_adam_v"))
-                            .with_context(|| format!("optimizer state missing row LR v for {name}"))?,
+                            .with_context(|| {
+                                format!("optimizer state missing row LR v for {name}")
+                            })?,
                     );
                     controller.previous_delta.copy_(
                         loaded
@@ -1430,6 +1451,47 @@ impl Muon {
         })?;
         self.step_count = global_step_count;
         self.row_lr_metrics = None;
+        self.adamw_pending_grads = adamw_pending_grads;
+        if adamw_pending_grads {
+            for &idx in &self.adamw_indices {
+                let name = &self.names[idx];
+                let defined = loaded
+                    .get(&format!("{name}.__adamw_pending_grad_defined"))
+                    .with_context(|| {
+                        format!("optimizer state missing pending-gradient marker for {name}")
+                    })?
+                    .int64_value(&[])
+                    != 0;
+                if !defined {
+                    ensure!(
+                        !self.params[idx].grad().defined(),
+                        "cannot restore undefined pending AdamW gradient over an existing slot for {name}"
+                    );
+                    continue;
+                }
+                let saved = loaded
+                    .get(&format!("{name}.__adamw_pending_grad"))
+                    .with_context(|| {
+                        format!("optimizer state missing pending AdamW gradient for {name}")
+                    })?;
+                let mut grad = self.params[idx].grad();
+                if !grad.defined() {
+                    // tch exposes no gradient-slot setter. Backpropagating from one scalar view
+                    // allocates the ordinary dense leaf slot without reading the full parameter;
+                    // the saved accumulation immediately replaces that synthetic unit gradient.
+                    self.params[idx].flatten(0, -1).get(0).backward();
+                    grad = self.params[idx].grad();
+                }
+                tch::no_grad(|| grad.copy_(saved));
+            }
+        } else {
+            for &idx in &self.adamw_indices {
+                let mut grad = self.params[idx].grad();
+                if grad.defined() {
+                    let _ = grad.zero_();
+                }
+            }
+        }
         Ok(())
     }
 
@@ -1444,6 +1506,12 @@ impl Muon {
             .collect::<Vec<_>>();
         names.sort();
         names
+    }
+
+    /// Whether the next backward must accumulate into AdamW gradients retained by the previous
+    /// cadence-skipped primary step.
+    pub fn adamw_accumulation_pending(&self) -> bool {
+        self.adamw_pending_grads
     }
 
     /// Validate the complete optimizer tensor schema against a freshly
@@ -1461,12 +1529,25 @@ impl Muon {
             .collect();
         let mut expected_keys = HashSet::new();
         expected_keys.insert("__muon_step_count__".to_owned());
+        expected_keys.insert("__adamw_pending_grads__".to_owned());
         let global_step = loaded
             .get("__muon_step_count__")
             .context("optimizer state missing global step")?;
         ensure!(
             global_step.numel() == 1 && global_step.int64_value(&[]) == expected_step,
             "optimizer global step disagrees with checkpoint metadata"
+        );
+        let pending = loaded
+            .get("__adamw_pending_grads__")
+            .context("optimizer state missing AdamW accumulation state")?;
+        ensure!(
+            pending.numel() == 1,
+            "optimizer AdamW accumulation state is not scalar"
+        );
+        let pending = pending.int64_value(&[]);
+        ensure!(
+            pending == 0 || pending == 1,
+            "optimizer AdamW accumulation state must be 0 or 1"
         );
 
         for entry in &self.entries_2d {
@@ -1564,6 +1645,32 @@ impl Muon {
                 "optimizer AdamW step is not scalar for {name}"
             );
             expected_keys.extend([m_name, v_name, step_name]);
+        }
+        if pending != 0 {
+            for &idx in &self.adamw_indices {
+                let name = &self.names[idx];
+                let marker_key = format!("{name}.__adamw_pending_grad_defined");
+                let marker = loaded.get(&marker_key).with_context(|| {
+                    format!("optimizer state missing pending-gradient marker for {name}")
+                })?;
+                ensure!(
+                    marker.numel() == 1 && matches!(marker.int64_value(&[]), 0 | 1),
+                    "optimizer pending-gradient marker must be 0 or 1 for {name}"
+                );
+                expected_keys.insert(marker_key);
+                if marker.int64_value(&[]) != 0 {
+                    let key = format!("{name}.__adamw_pending_grad");
+                    let grad = loaded.get(&key).with_context(|| {
+                        format!("optimizer state missing pending AdamW gradient for {name}")
+                    })?;
+                    ensure!(
+                        grad.size() == self.params[idx].size()
+                            && grad.kind() == self.params[idx].kind(),
+                        "optimizer pending AdamW gradient schema mismatch for {name}"
+                    );
+                    expected_keys.insert(key);
+                }
+            }
         }
 
         let actual_keys = loaded.keys().cloned().collect::<HashSet<_>>();
@@ -2089,6 +2196,66 @@ mod tests {
                 > 1e-6,
             "auxiliary steps did not reach the NorMuon parameters at all"
         );
+    }
+
+    #[test]
+    fn recovery_restores_the_pending_adamw_accumulation_before_the_next_update() {
+        let state_path = std::env::temp_dir().join(format!(
+            "muon-pending-adamw-{}-{}.ot",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let config = || MuonConfig {
+            use_muon_for_2d: false,
+            adamw_lr: 0.1,
+            adamw_betas: (0.0, 0.0),
+            adamw_eps: 0.0,
+            adamw_wd: 0.0,
+            adamw_every: 2,
+            quiet: true,
+            ..MuonConfig::default()
+        };
+
+        let uninterrupted = Tensor::ones([1], (Kind::Float, Device::Cpu)).set_requires_grad(true);
+        let mut optimizer = Muon::new_named(
+            &[("bias".to_owned(), uninterrupted.shallow_clone())],
+            config(),
+        );
+        (&uninterrupted * 2.0).sum(Kind::Float).backward();
+        optimizer.step(StepKind::Primary);
+        assert!(optimizer.adamw_accumulation_pending());
+        optimizer
+            .save_state(&state_path)
+            .expect("save pending state");
+
+        let recovered = Tensor::ones([1], (Kind::Float, Device::Cpu)).set_requires_grad(true);
+        let mut recovered_optimizer =
+            Muon::new_named(&[("bias".to_owned(), recovered.shallow_clone())], config());
+        recovered_optimizer
+            .validate_state_strict(&state_path, &[], 1)
+            .expect("pending state validates");
+        recovered_optimizer
+            .load_state_strict(&state_path, &[])
+            .expect("pending state restores");
+        assert!(recovered_optimizer.adamw_accumulation_pending());
+
+        optimizer.zero_grad();
+        (&uninterrupted * -1.0).sum(Kind::Float).backward();
+        optimizer.step(StepKind::Primary);
+        recovered_optimizer.zero_grad();
+        (&recovered * -1.0).sum(Kind::Float).backward();
+        recovered_optimizer.step(StepKind::Primary);
+
+        assert_eq!(
+            uninterrupted.double_value(&[]),
+            recovered.double_value(&[]),
+            "the recovered update must consume the same two accumulated gradients"
+        );
+        assert!(
+            (recovered.double_value(&[]) - 0.9).abs() < 1e-7,
+            "a next-batch-only update would move in the opposite direction"
+        );
+        std::fs::remove_file(state_path).expect("remove optimizer fixture");
     }
 
     #[test]
@@ -2934,8 +3101,10 @@ mod tests {
         let mut off_cfg = controller_config();
         off_cfg.row_learned_lr = false;
         let mut off = Muon::new_named(&[("w".to_owned(), off_param.shallow_clone())], off_cfg);
-        let mut on =
-            Muon::new_named(&[("w".to_owned(), on_param.shallow_clone())], controller_config());
+        let mut on = Muon::new_named(
+            &[("w".to_owned(), on_param.shallow_clone())],
+            controller_config(),
+        );
 
         backward_rows(&off_param, &[1.0, -2.0, 0.5, 3.0]);
         backward_rows(&on_param, &[1.0, -2.0, 0.5, 3.0]);
@@ -2975,12 +3144,21 @@ mod tests {
         backward_rows(&parameter, &[1.0, 1.0, 1.0, 1.0]);
         optimizer.step(StepKind::Primary);
         let first = optimizer.row_learned_lr_metrics().unwrap();
-        assert_eq!(first.alpha_mean, 1.0, "the logit update must take effect next step");
+        assert_eq!(
+            first.alpha_mean, 1.0,
+            "the logit update must take effect next step"
+        );
         assert!(first.evidence_mean.abs() < 1e-6);
         assert!((first.evidence_std - 1.0).abs() < 1e-6);
         let logit = &optimizer.entries_2d[0].row_lr.as_ref().unwrap().logit;
-        assert!(logit.double_value(&[0, 0]) > 0.0, "productive row must speed up");
-        assert!(logit.double_value(&[1, 0]) < 0.0, "harmful row must slow down");
+        assert!(
+            logit.double_value(&[0, 0]) > 0.0,
+            "productive row must speed up"
+        );
+        assert!(
+            logit.double_value(&[1, 0]) < 0.0,
+            "harmful row must slow down"
+        );
 
         optimizer.zero_grad();
         backward_rows(&parameter, &[1.0, 1.0, 1.0, 1.0]);
@@ -3068,10 +3246,11 @@ mod tests {
             quiet: true,
             ..MuonConfig::default()
         };
-        let mut off =
-            Muon::new_named(&[("head".to_owned(), off_param.shallow_clone())], cfg(false));
-        let mut on =
-            Muon::new_named(&[("head".to_owned(), on_param.shallow_clone())], cfg(true));
+        let mut off = Muon::new_named(
+            &[("head".to_owned(), off_param.shallow_clone())],
+            cfg(false),
+        );
+        let mut on = Muon::new_named(&[("head".to_owned(), on_param.shallow_clone())], cfg(true));
         backward_rows(&off_param, &[1.0, -2.0, 3.0, -4.0]);
         backward_rows(&on_param, &[1.0, -2.0, 3.0, -4.0]);
         off.step(StepKind::Primary);
@@ -3084,14 +3263,14 @@ mod tests {
     #[test]
     fn previous_delta_is_the_actual_signed_muon_update_without_weight_decay() {
         let _torch_rng_guard = test_rng::shared();
-        let parameter =
-            Tensor::from_slice(&[0.5f32, -0.25, 0.75, -1.0]).reshape([2, 2]).set_requires_grad(true);
+        let parameter = Tensor::from_slice(&[0.5f32, -0.25, 0.75, -1.0])
+            .reshape([2, 2])
+            .set_requires_grad(true);
         let before = parameter.copy();
         let mut cfg = controller_config();
         cfg.weight_decay = 0.4;
         let decay = cfg.weight_decay * cfg.lr;
-        let mut optimizer =
-            Muon::new_named(&[("w".to_owned(), parameter.shallow_clone())], cfg);
+        let mut optimizer = Muon::new_named(&[("w".to_owned(), parameter.shallow_clone())], cfg);
         backward_rows(&parameter, &[1.0, -2.0, 3.0, -4.0]);
         optimizer.step(StepKind::Primary);
 
@@ -3105,6 +3284,9 @@ mod tests {
             .abs()
             .max()
             .double_value(&[]);
-        assert!(error < 1e-6, "credit delta included decay or missed the applied update: {error}");
+        assert!(
+            error < 1e-6,
+            "credit delta included decay or missed the applied update: {error}"
+        );
     }
 }

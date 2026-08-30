@@ -4,7 +4,9 @@ use std::ops::Range;
 use std::path::Path;
 
 use anyhow::{anyhow, ensure, Context, Result};
-use shared::report::{write_report, Report, ReportKind, ReportSeries, ScaleKind, PRETRAIN_REPORT_BASES};
+use shared::report::{
+    write_report, Report, ReportKind, ReportSeries, ScaleKind, PRETRAIN_REPORT_BASES,
+};
 use tch::Device;
 
 use crate::torch::bar_dist::BarScoring;
@@ -25,15 +27,8 @@ const SERIAL_DRIFT_TOLERANCE_NATS: f64 = 1e-4;
 const MIN_CONFIRMATION_GAIN_NATS: f64 = 0.05;
 const MIN_EFFECTIVE_RANK_RATIO: f64 = 0.5;
 const RAMP_POSITIONS: usize = 10;
-const PAPER_SCALED_PAIRS: [(usize, usize); 7] = [
-    (4, 1),
-    (4, 2),
-    (5, 2),
-    (5, 3),
-    (6, 2),
-    (6, 3),
-    (7, 3),
-];
+const PAPER_SCALED_PAIRS: [(usize, usize); 7] =
+    [(4, 1), (4, 2), (5, 2), (5, 3), (6, 2), (6, 3), (7, 3)];
 const ALPHAS: [f64; 3] = [0.05, 0.10, 0.15];
 
 #[derive(Clone, Debug)]
@@ -85,12 +80,8 @@ pub fn pretrain_recirculate(args: RecirculateArgs) -> Result<()> {
     let device = Device::cuda_if_available();
     let corpus = load_corpus(&args.corpus)?;
     let world = load_frozen_checkpoint(&args, &corpus, device)?;
-    let mut validation = PinnedSet::pinned(
-        &corpus,
-        Split::Val,
-        args.context,
-        args.confirmation_windows,
-    )?;
+    let mut validation =
+        PinnedSet::pinned(&corpus, Split::Val, args.context, args.confirmation_windows)?;
     ensure!(
         validation.windows.len() >= args.confirmation_windows,
         "validation supplied only {} pinned windows, fewer than the requested {}",
@@ -350,15 +341,13 @@ fn pair_grid() -> Result<Vec<RecirculationConfig>> {
 fn tuning_grid(source: usize, destination: usize) -> Result<Vec<RecirculationConfig>> {
     ALPHAS
         .into_iter()
-        .flat_map(|alpha| [false, true].into_iter().map(move |beta_one| (alpha, beta_one)))
+        .flat_map(|alpha| {
+            [false, true]
+                .into_iter()
+                .map(move |beta_one| (alpha, beta_one))
+        })
         .map(|(alpha, beta_one)| {
-            RecirculationConfig::new(
-                source,
-                destination,
-                alpha,
-                beta_one,
-                RAMP_POSITIONS,
-            )
+            RecirculationConfig::new(source, destination, alpha, beta_one, RAMP_POSITIONS)
         })
         .collect()
 }
@@ -382,8 +371,7 @@ fn estimated_token_batches(args: &RecirculateArgs) -> u64 {
     let pair = batches(PAIR_SCREEN_WINDOWS) * (2 + PAPER_SCALED_PAIRS.len() as u64);
     let tune_windows = args.screen_windows - PAIR_SCREEN_WINDOWS;
     let tune = batches(tune_windows) * (1 + (ALPHAS.len() * 2) as u64);
-    let confirmation =
-        batches(args.confirmation_windows - args.screen_windows) * 2;
+    let confirmation = batches(args.confirmation_windows - args.screen_windows) * 2;
     let test = batches(args.confirmation_windows) * 2;
     context * (pair + tune + confirmation + test)
 }
@@ -422,7 +410,6 @@ fn measure_range(
     })
 }
 
-
 fn blocks_for_range(set: &mut PinnedSet, range: Range<usize>) -> Result<Vec<u64>> {
     ensure!(
         range.start < range.end && range.end <= set.windows.len(),
@@ -437,7 +424,6 @@ fn blocks_for_range(set: &mut PinnedSet, range: Range<usize>) -> Result<Vec<u64>
     Ok(blocks)
 }
 
-
 fn compare(baseline: &Measurement, candidate: &Measurement, blocks: &[u64]) -> Comparison {
     assert_eq!(baseline.window_nll.len(), candidate.window_nll.len());
     assert_eq!(candidate.window_nll.len(), blocks.len());
@@ -448,12 +434,7 @@ fn compare(baseline: &Measurement, candidate: &Measurement, blocks: &[u64]) -> C
         .map(|(candidate, baseline)| candidate - baseline)
         .collect();
     Comparison {
-        nll: block_bootstrap(
-            &difference,
-            blocks,
-            BOOTSTRAP_DRAWS,
-            BOOTSTRAP_SEED,
-        ),
+        nll: block_bootstrap(&difference, blocks, BOOTSTRAP_DRAWS, BOOTSTRAP_SEED),
         windows: difference.len(),
         dir_delta: candidate.dir_acc - baseline.dir_acc,
         rank_ratio: candidate.effective_rank / baseline.effective_rank,
@@ -484,7 +465,11 @@ fn comparison_slots(comparison: Option<Comparison>) -> [f32; 7] {
 }
 
 fn bool_flag(value: bool) -> f32 {
-    if value { 1.0 } else { 0.0 }
+    if value {
+        1.0
+    } else {
+        0.0
+    }
 }
 fn write_sweep_report(
     output: &Path,
@@ -533,7 +518,11 @@ fn write_sweep_report(
                 result.config.source_layer(),
                 result.config.destination_layer(),
                 result.config.alpha(),
-                if result.config.beta_one() { "1" } else { "1-alpha_t" },
+                if result.config.beta_one() {
+                    "1"
+                } else {
+                    "1-alpha_t"
+                },
             ),
             values,
         });
@@ -598,6 +587,7 @@ mod tests {
                 split_bounds: None,
                 derive_split_bounds: false,
                 min_dollar_volume: 0.0,
+                dof_scaling: crate::torch::bar_dist::DofScaling::Raw,
             },
         }
     }

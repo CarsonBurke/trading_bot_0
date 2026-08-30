@@ -29,10 +29,10 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, OnceLock, RwLock};
 
 use anyhow::{bail, ensure, Context, Result};
-use chrono::{Datelike, Duration, NaiveDate, TimeZone, Timelike, Weekday};
+use chrono::{Datelike, Duration, NaiveDate, NaiveDateTime, TimeZone, Timelike, Weekday};
 use chrono_tz::America::New_York;
 use rand::seq::SliceRandom;
 use rand::{Rng, SeedableRng};
@@ -44,8 +44,9 @@ use shared::report::{Report, ReportKind, ReportSeries, ScaleKind};
 use tch::{Device, Kind, Tensor};
 
 use crate::torch::bar_dist::{
-    encode_dof, BarDof, BarSupports, BarSupportsProvenance, VolumeEma, BAR_DOF, DOF_R, DOF_S,
-    DOF_W, NUM_BAR_BINS,
+    encode_dof, scale_row, BarDof, BarSupports, BarSupportsProvenance, DofBinner, DofScaling,
+    EncodedDof, RangeVolHar, StandardizedDof, VolumeEma, BAR_DOF, BAR_RAW_WARMUP_BARS, DOF_R,
+    DOF_S, DOF_W, NUM_BAR_BINS,
 };
 
 /// Causal bars fed to the volume EMA before the first emitted DOF of a window. The span-20
@@ -53,7 +54,12 @@ use crate::torch::bar_dist::{
 /// window's DOF are numerically indistinguishable from encoding the symbol's whole series
 /// with [`crate::torch::bar_dist::encode_series`] and slicing. The warm-up is strictly causal
 /// past and may reach back across a split boundary; the DOF-carrying bars never do.
-pub const DOF_WARMUP_BARS: usize = 256;
+///
+/// This is the [`DofScaling::Raw`] warm-up. [`DofScaling::VolStandardized`] additionally has
+/// to converge the span-256 leg of [`RangeVolHar`] and so uses the longer
+/// [`crate::torch::bar_dist::BAR_SIGMA_WARMUP_BARS`]; both are read through
+/// [`DofScaling::warmup_bars`].
+pub const DOF_WARMUP_BARS: usize = BAR_RAW_WARMUP_BARS;
 
 /// Share of the global trading-time axis reserved for training, then for validation.
 pub const TRAIN_FRACTION: f64 = 0.80;
@@ -256,6 +262,31 @@ pub struct BarBatch {
     pub dof: Tensor,
     /// `[N, L, BAR_TIME_FEATURES]` i64.
     pub time_ids: Tensor,
+    /// `[N, L]` f32 causal `sigma_t`: the divisor `dof`'s two scale-carrying degrees of
+    /// freedom were divided by, one per row.
+    ///
+    /// Always present and always exact, including under [`DofScaling::Raw`] where every entry
+    /// is `1.0`. It is not a normalization bookkeeping detail: it is the bridge back to an
+    /// economic return, `r = sigma * z_r`, and it is measurable from bars strictly before the
+    /// row, so a head may condition on it and a sizer may consume it without leakage.
+    pub sigma: Tensor,
+    /// `[N, L, BAR_DOF]` f32 true realized raw targets before standardization or z clamping.
+    ///
+    /// Present only when [`Self::dof`] is standardized. It is materialized while building this
+    /// batch from the already-decoded row and is never retained by the corpus. Raw batches use
+    /// `dof` itself and leave this `None`, avoiding both a duplicate host allocation and a
+    /// duplicate device tensor.
+    pub raw_dof: Option<Tensor>,
+    /// `[N, context, 2, BAR_TIME_FEATURES]` forecast-safe target clocks for direct h2/h3.
+    ///
+    /// `None` for general corpus windows and samplers carrying fewer than three future bars.
+    /// Every row is derived only from its decision timestamp on the deterministic exchange
+    /// schedule; realized future availability and market channels never enter it.
+    pub direct_time_ids: Option<Tensor>,
+    /// `[N, context, 2]` mask for h2/h3 targets whose intervening realized rows exactly
+    /// occupy the deterministic scheduled slots. Gap/halt rows are excluded rather than
+    /// pairing an ordinary-clock forecast with a later realized bar.
+    pub direct_valid: Option<Tensor>,
     /// Bars in this batch whose [`BAR_TIME_MARKET`] channels are [`MARKET_MISSING`], out of
     /// `N * L`. Reported as `pretrain_market_coverage`: a market channel that is absent for
     /// most rows is a data problem, and it is not visible in any loss.
@@ -435,52 +466,60 @@ fn easter_sunday(year: i32) -> NaiveDate {
 /// holidays in [`is_us_equity_trading_date`]. Daily and coarser resolutions retain the
 /// decision's ET wall-clock time and advance across trading dates. No corpus, symbol, proxy or
 /// future availability is consulted, so a halt or missing future file cannot move this clock.
-pub fn forecast_schedule_after(decision_ts_ms: i64, steps: usize, res_secs: u32) -> Vec<i64> {
-    assert!(steps > 0, "a forecast schedule needs at least one step");
+fn forecast_schedule_local(decision_ts_ms: i64, res_secs: u32) -> NaiveDateTime {
     assert!(
         res_secs > 0,
         "a forecast schedule needs a positive resolution"
     );
-    let decision = New_York
+    New_York
         .timestamp_millis_opt(decision_ts_ms)
         .single()
-        .expect("a timestamp has one New York representation");
-    let mut local = decision.naive_local();
-    let mut out = Vec::with_capacity(steps);
-    while out.len() < steps {
-        if res_secs >= 86_400 {
-            loop {
-                local += Duration::days(1);
-                if is_us_equity_trading_date(local.date()) {
-                    break;
-                }
-            }
-        } else {
-            local += Duration::seconds(i64::from(res_secs));
-            loop {
-                let date = local.date();
-                let seconds = i64::from(local.time().num_seconds_from_midnight());
-                let in_session = (4 * 3600..20 * 3600).contains(&seconds);
-                if is_us_equity_trading_date(date) && in_session {
-                    break;
-                }
-                let next_date = if is_us_equity_trading_date(date) && seconds < 4 * 3600 {
-                    date
-                } else {
-                    date + Duration::days(1)
-                };
-                local = next_date
-                    .and_hms_opt(4, 0, 0)
-                    .expect("04:00 is a valid local wall time");
+        .expect("a timestamp has one New York representation")
+        .naive_local()
+}
+
+fn advance_forecast_schedule(local: &mut NaiveDateTime, res_secs: u32) -> i64 {
+    if res_secs >= 86_400 {
+        loop {
+            *local += Duration::days(1);
+            if is_us_equity_trading_date(local.date()) {
+                break;
             }
         }
-        let scheduled = New_York
-            .from_local_datetime(&local)
-            .single()
-            .expect("the extended session does not cross a DST transition");
-        out.push(scheduled.timestamp_millis());
+    } else {
+        *local += Duration::seconds(i64::from(res_secs));
+        loop {
+            let date = local.date();
+            let seconds = i64::from(local.time().num_seconds_from_midnight());
+            let in_session = (4 * 3600..20 * 3600).contains(&seconds);
+            if is_us_equity_trading_date(date) && in_session {
+                break;
+            }
+            let next_date = if is_us_equity_trading_date(date) && seconds < 4 * 3600 {
+                date
+            } else {
+                date + Duration::days(1)
+            };
+            *local = next_date
+                .and_hms_opt(4, 0, 0)
+                .expect("04:00 is a valid local wall time");
+        }
     }
-    out
+    New_York
+        .from_local_datetime(local)
+        .single()
+        .expect("the extended session does not cross a DST transition")
+        .timestamp_millis()
+}
+/// Deterministic extended-hours timestamps beginning strictly after `decision_ts_ms`.
+///
+/// No corpus, symbol, proxy, or future availability is consulted.
+pub fn forecast_schedule_after(decision_ts_ms: i64, steps: usize, res_secs: u32) -> Vec<i64> {
+    assert!(steps > 0, "a forecast schedule needs at least one step");
+    let mut local = forecast_schedule_local(decision_ts_ms, res_secs);
+    (0..steps)
+        .map(|_| advance_forecast_schedule(&mut local, res_secs))
+        .collect()
 }
 
 /// Forecast-safe time IDs on the deterministic US-equity schedule.
@@ -499,6 +538,20 @@ pub fn forecast_schedule_ids_after(
             ids
         })
         .collect()
+}
+
+fn direct_forecast_schedule_ids(
+    decision_ts_ms: i64,
+    res_secs: u32,
+) -> [(i64, [i64; BAR_TIME_FEATURES]); 3] {
+    let mut local = forecast_schedule_local(decision_ts_ms, res_secs);
+    let mut previous = decision_ts_ms;
+    std::array::from_fn(|_| {
+        let timestamp = advance_forecast_schedule(&mut local, res_secs);
+        let ids = future_conditioning_ids(timestamp, Some(previous), res_secs);
+        previous = timestamp;
+        (timestamp, ids)
+    })
 }
 
 /// The deterministic scheduled bar immediately before `ts_ms`.
@@ -699,9 +752,14 @@ impl MarketChannel {
         let mut ids = Vec::with_capacity(usable);
         if usable >= 1 {
             let mut pending: Vec<f32> = Vec::with_capacity(MARKET_ENCODE_CHUNK * BAR_DOF);
-            for_each_window_dof(bars, 1, usable, |bar, dof| {
+            // RAW deliberately, on both this encode and `fit_market_supports`. The market
+            // channel is forecast-safe CONTEXT with its own separately fitted buckets, never a
+            // target, so it has nothing to gain from being in sigma units — and it is built
+            // during `open_files`, before `with_dof_scaling` can have been called, so a
+            // scaling-dependent channel would not even be expressible here.
+            for_each_window_dof(bars, 1, usable, DofScaling::Raw, |bar, dof| {
                 ts_ms.push(bar.ts());
-                pending.extend_from_slice(&dof.to_array());
+                pending.extend_from_slice(&dof.dof.to_array());
                 if pending.len() >= MARKET_ENCODE_CHUNK * BAR_DOF {
                     append_market_ids(supports, &pending, &mut ids);
                     pending.clear();
@@ -803,7 +861,9 @@ fn fit_market_supports(file: &BarFile, train_end: usize) -> Result<BarSupports> 
          fit the market channel's buckets"
     );
     let mut samples = Vec::with_capacity(train_end - 1);
-    for_each_window_dof(file.bars(), 1, train_end - 1, |_, dof| samples.push(dof));
+    for_each_window_dof(file.bars(), 1, train_end - 1, DofScaling::Raw, |_, dof| {
+        samples.push(dof.dof)
+    });
     Ok(BarSupports::fit(&samples))
 }
 
@@ -844,9 +904,19 @@ fn market_proxy_fingerprint(file: &BarFile, res_secs: u32, sample_count: usize) 
     digest.update(MARKET_PROXY_SYMBOL.as_bytes());
     digest.update(&res_secs.to_le_bytes());
     digest.update(&(sample_count as u64).to_le_bytes());
+    update_bar_encoding_content(&mut digest, bars);
+    Some(hex_digest(digest))
+}
+
+/// Add the exact per-bar fields consumed by dataset encoding to `digest`.
+///
+/// `vwap` and `trades` are intentionally absent: no dataset encoding path reads them, while
+/// timestamps and OHLCV determine calendar ids, DOF and causal volume state.
+fn update_bar_encoding_content(digest: &mut DigestContext, bars: &[PackedBar]) {
     // Chunked so the digest sees one call per few thousand bars rather than one per field.
-    let mut scratch: Vec<u8> = Vec::with_capacity(MARKET_FINGERPRINT_CHUNK * 24);
-    for chunk in bars.chunks(MARKET_FINGERPRINT_CHUNK) {
+    let mut scratch =
+        Vec::with_capacity(BAR_CONTENT_FINGERPRINT_CHUNK * BAR_CONTENT_FINGERPRINT_BYTES);
+    for chunk in bars.chunks(BAR_CONTENT_FINGERPRINT_CHUNK) {
         scratch.clear();
         for bar in chunk {
             let bar = *bar;
@@ -857,10 +927,17 @@ fn market_proxy_fingerprint(file: &BarFile, res_secs: u32, sample_count: usize) 
         }
         digest.update(&scratch);
     }
-    Some(hex_digest(digest))
 }
 
-const MARKET_FINGERPRINT_CHUNK: usize = 8_192;
+fn bar_encoding_content_sha256(file: &BarFile) -> String {
+    let mut digest = DigestContext::new(&SHA256);
+    digest.update(b"bar-encoding-content-v1");
+    update_bar_encoding_content(&mut digest, file.bars());
+    hex_digest(digest)
+}
+
+const BAR_CONTENT_FINGERPRINT_CHUNK: usize = 8_192;
+const BAR_CONTENT_FINGERPRINT_BYTES: usize = 8 + 5 * 4;
 
 /// Process-level opt-out from the provenance guard below, set by the global
 /// `--freeze-market-supports`.
@@ -1044,6 +1121,9 @@ fn load_or_fit_market_supports(
         corpus_fingerprint: fingerprint,
         split_bounds: bounds,
         sample_count,
+        fit_seed: None,
+        scaling_contract: None,
+        support_semantics: None,
         fitted_utc: chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string(),
     });
     match supports.save(&path) {
@@ -1185,11 +1265,22 @@ struct Corpus {
     symbols: Vec<String>,
     total_bars: usize,
     bounds: (i64, i64),
+    /// Lazily cached v3 identity. Bar-file v1 has no persisted content digest, so the first
+    /// identity request hashes each retained mmap; clones share the result through `Arc<Corpus>`.
+    identity_fingerprint: OnceLock<String>,
     /// Bucketed [`MARKET_PROXY_SYMBOL`] state, derived before any symbol restriction is
     /// applied so a symbol-universe ablation cannot silently delete the channel. `None` when
     /// the directory holds no proxy file at this resolution, in which case every row's market
     /// ids are [`MARKET_MISSING`] and the trunk sees an honestly absent channel.
     market: Option<MarketChannel>,
+    /// Target parametrization every encode through this corpus applies.
+    ///
+    /// Lives on the corpus rather than on each accessor because it must be the SAME on every
+    /// path a run touches: the supports fit, the training batches, the pinned evaluation sets
+    /// and any rollout all have to agree, and a per-call argument would let one of them
+    /// disagree silently. Selected once, right after load, by
+    /// [`BarCorpus::with_dof_scaling`].
+    dof_scaling: DofScaling,
 }
 
 /// All `<dir>/*.<res_secs>.bars` files, held open and mmap'd. Cloning is an `Arc` bump, so
@@ -1207,6 +1298,7 @@ impl std::fmt::Debug for BarCorpus {
             .field("symbols", &self.inner.symbols.len())
             .field("total_bars", &self.inner.total_bars)
             .field("bounds", &self.inner.bounds)
+            .field("dof_scaling", &self.inner.dof_scaling)
             .finish()
     }
 }
@@ -1358,10 +1450,33 @@ impl BarCorpus {
                 files,
                 symbols,
                 total_bars,
+                identity_fingerprint: OnceLock::new(),
                 bounds,
                 market,
+                dof_scaling: DofScaling::Raw,
             }),
         })
+    }
+
+    /// Select the target parametrization every encode through this corpus applies.
+    ///
+    /// Consumed immediately after load, BEFORE any sampler is built: [`BarSampler`] clones the
+    /// inner `Arc`, so the policy has to be settled while the corpus is still uniquely owned.
+    /// Panics rather than silently mutating one view of a shared corpus, which would leave two
+    /// accessors encoding the same bar two different ways.
+    #[must_use]
+    pub fn with_dof_scaling(mut self, scaling: DofScaling) -> Self {
+        Arc::get_mut(&mut self.inner)
+            .expect(
+                "the DOF scaling policy must be selected before any sampler or clone shares \
+                 the corpus",
+            )
+            .dof_scaling = scaling;
+        self
+    }
+
+    pub fn dof_scaling(&self) -> DofScaling {
+        self.inner.dof_scaling
     }
 
     /// This corpus's [`TIME_RESOLUTION`] id.
@@ -1410,13 +1525,14 @@ impl BarCorpus {
     }
 
     /// Stream every DOF-carrying bar of one series through `sink`, in bar order, with the bar's
-    /// own index.
+    /// own index, in RAW log-return units regardless of this corpus's
+    /// [`BarCorpus::dof_scaling`].
     ///
-    /// The whole-series form of the accessor [`Self::sample_train_dof`] draws blocks with, and it
-    /// goes through the SAME [`for_each_window_dof`] so a full-corpus audit measures exactly the
-    /// `r`, `s` and `w` the supports were fitted on rather than a second, subtly different
-    /// definition of them. Bar 0 is skipped because it has no predecessor close and therefore no
-    /// DOF at all.
+    /// Raw unconditionally because its consumers are absolute-scale audits: a split/dividend
+    /// seam is a threshold on `ln(C_t / C_{t-1})` in log points, and dividing that by a
+    /// conditional volatility would make the threshold mean a different thing on every bar. Use
+    /// [`Self::for_each_series_dof_scaled`] for anything that has to match the fit draw.
+    /// Bar 0 is skipped because it has no predecessor close and therefore no DOF at all.
     ///
     /// Bounded by construction: the sink sees one bar at a time and nothing is buffered, so a
     /// pass over the whole corpus costs whatever the caller's accumulator costs and no more.
@@ -1425,12 +1541,38 @@ impl BarCorpus {
         series: usize,
         mut sink: impl FnMut(usize, &PackedBar, BarDof),
     ) {
+        self.for_each_series_dof_with(series, DofScaling::Raw, |index, bar, row| {
+            sink(index, bar, row.dof)
+        });
+    }
+
+    /// [`Self::for_each_series_dof`] under this corpus's own scaling, handing the sink the
+    /// causal `sigma_t` alongside the row.
+    ///
+    /// The whole-series form of the accessor [`Self::sample_train_dof`] draws blocks with, and
+    /// it goes through the SAME [`for_each_window_dof`] so a full-corpus audit measures exactly
+    /// the quantities the supports were fitted on rather than a second, subtly different
+    /// definition of them.
+    pub fn for_each_series_dof_scaled(
+        &self,
+        series: usize,
+        sink: impl FnMut(usize, &PackedBar, StandardizedDof),
+    ) {
+        self.for_each_series_dof_with(series, self.inner.dof_scaling, sink);
+    }
+
+    fn for_each_series_dof_with(
+        &self,
+        series: usize,
+        scaling: DofScaling,
+        mut sink: impl FnMut(usize, &PackedBar, StandardizedDof),
+    ) {
         let bars = self.inner.files[series].bars();
         if bars.len() < 2 {
             return;
         }
         let mut index = 1;
-        for_each_window_dof(bars, 1, bars.len() - 1, |bar, dof| {
+        for_each_window_dof(bars, 1, bars.len() - 1, scaling, |bar, dof| {
             sink(index, bar, dof);
             index += 1;
         });
@@ -1475,6 +1617,7 @@ impl BarCorpus {
             len,
             self.inner.res_secs,
             self.inner.market.as_ref(),
+            self.inner.dof_scaling,
             device,
         ))
     }
@@ -1607,37 +1750,170 @@ impl BarCorpus {
         }
     }
 
-    /// SHA-256 over everything that decides which bars a split contains and what the model is
-    /// conditioned on: the resolution, both split instants, every symbol's name, length and
-    /// timestamp span, and the market channel's bucket geometry. Fold this into any evaluation
-    /// fingerprint — the corpus grows under running jobs, and a fingerprint blind to the symbol
-    /// set would compare two different evaluation sets as if they were one.
+    /// Measure what the target parametrization does to `split`: the causal volatility
+    /// estimator's own distribution, the scale the encoded `r` and `s` reach
+    /// [`BarSupports::fit`] at, and the share of the `r` grid each SYMBOL occupies.
     ///
-    /// `v2` adds the market channel. `MarketChannel::support_sha256` is a geometry hash, not a
+    /// The three panels this feeds are the direct test of the standardized parametrization,
+    /// and they are measured on EVERY run rather than only on the standardized arm: a
+    /// per-symbol occupancy spread means nothing without the control's spread beside it, and a
+    /// chart the control does not write cannot supply one.
+    ///
+    /// `sigma_t` is therefore always measured under [`DofScaling::VolStandardized`] whatever
+    /// the corpus trains on. Under [`DofScaling::Raw`] the divisor that was actually applied is
+    /// identically one, so scanning the run's own parametrization would report a constant and
+    /// say nothing about the estimator; measuring the estimator regardless makes the control's
+    /// panel the answer to "what would the arm have divided by".
+    ///
+    /// `r` and `s` in contrast are measured under the corpus's OWN parametrization, because the
+    /// question they answer is what the fitter received. `supports` must tile the same
+    /// parametrization for the same reason.
+    ///
+    /// Costs one streamed pass over `split` per parametrization — two only when they differ —
+    /// with the per-series causal warm-up [`for_each_window_dof`] already applies. Nothing
+    /// scales with the corpus except the per-symbol row and the bounded quantile subsample.
+    pub fn audit_target_geometry(
+        &self,
+        supports: &BarSupports,
+        split: Split,
+    ) -> Result<TargetGeometry> {
+        let scaling = self.inner.dof_scaling;
+        ensure!(
+            supports.dof_scaling() == scaling,
+            "the target-geometry audit bins `r` on the supplied support, so it must tile the \
+             corpus's own parametrization: corpus is {scaling}, support is {}",
+            supports.dof_scaling()
+        );
+        // `for_each_window_dof` refuses bar 0, which carries no predecessor close and therefore
+        // no DOF at all.
+        let ranges: Vec<(usize, usize)> = (0..self.inner.files.len())
+            .map(|series| {
+                let (lo, hi) = self.inner.split_range(series, split);
+                let lo = lo.max(1);
+                (lo, hi.max(lo))
+            })
+            .collect();
+        let mut offsets = Vec::with_capacity(ranges.len());
+        let mut bars = 0u64;
+        for (lo, hi) in &ranges {
+            offsets.push(bars);
+            bars += (hi - lo) as u64;
+        }
+        // One deterministic uniform stride over the whole split, so the retained rows are a
+        // sample of the SPLIT rather than of whichever symbols happen to be long.
+        let stride = (bars / TARGET_QUANTILE_ROWS as u64).max(1);
+        let warmup = DofScaling::VolStandardized.warmup_bars();
+        // The binner rather than the support: `BarSupports` owns device tensors and is not
+        // `Sync`, while `DofBinner` is a `Copy` view of the two edge slices and the atom table
+        // and resolves the bin by exactly `BarSupports::bin_of`.
+        let binner = supports.binner(DOF_R);
+        let scans: Vec<SeriesGeometry> = (0..self.inner.files.len())
+            .into_par_iter()
+            .map(|series| {
+                let file = &self.inner.files[series];
+                let (lo, hi) = ranges[series];
+                let mut scan = SeriesGeometry::new(file.symbol());
+                if hi <= lo {
+                    return scan;
+                }
+                let all = file.bars();
+                let len = hi - lo;
+                scan.bars = len as u64;
+                // Structural, not scanned: `for_each_window_dof` seeds its estimator at
+                // `anchor - warmup - 1` clamped to the series start, so a bar has a fully
+                // converged reference exactly when its own index is at least `warmup`.
+                scan.sigma_unwarmed = warmup.min(hi).saturating_sub(lo) as u64;
+                let standardized = scaling.is_standardized();
+                let mut position = offsets[series];
+                for_each_window_dof_detailed(
+                    all,
+                    lo,
+                    len,
+                    DofScaling::VolStandardized,
+                    |_, _, encoded| {
+                        let keep = position % stride == 0;
+                        position += 1;
+                        scan.sigma_relative_floored += encoded.diagnostics.relative_floor as u64;
+                        scan.sigma_numerical_fallback +=
+                            encoded.diagnostics.numerical_fallback as u64;
+                        scan.r_z_clamped += encoded.diagnostics.r_clamped as u64;
+                        scan.s_z_clamped += encoded.diagnostics.s_clamped as u64;
+                        if keep {
+                            scan.sigma_rows.push(encoded.row.sigma);
+                        }
+                        if standardized {
+                            scan.absorb_dof(&binner, &encoded.row.dof, keep);
+                        }
+                    },
+                );
+                if !standardized {
+                    let mut position = offsets[series];
+                    for_each_window_dof(all, lo, len, scaling, |_, row| {
+                        let keep = position % stride == 0;
+                        position += 1;
+                        scan.absorb_dof(&binner, &row.dof, keep);
+                    });
+                }
+                scan
+            })
+            .collect();
+        Ok(TargetGeometry::reduce(
+            self.inner.res_secs,
+            scaling,
+            split,
+            scans,
+        ))
+    }
+
+    /// SHA-256 over everything that decides which bars a split contains and what the model is
+    /// conditioned on: the resolution, both split instants, every symbol's name and exact
+    /// timestamp/OHLCV encoding content, and the market channel's bucket geometry. Fold this into
+    /// any evaluation fingerprint — the corpus grows under running jobs, and a fingerprint blind
+    /// to the symbol set or an interior vendor correction would compare different observations as
+    /// if they were one.
+    ///
+    /// `v3` adds each ordinary symbol's [`bar_encoding_content_sha256`]. Bar-file v1 has no
+    /// persisted digest, so the first identity request computes these from the mmap in parallel.
+    /// The result is cached on the corpus, avoiding both work on opens that do not need lineage and
+    /// rereads by repeated lineage consumers.
+    ///
+    /// `v2` added the market channel. `MarketChannel::support_sha256` is a geometry hash, not a
     /// file hash, so re-persisting the same buckets does not move the fingerprint while a refit
-    /// that moves one edge does — which is the whole reason the buckets are pinned to an
-    /// artifact rather than refitted per run.
+    /// that moves one edge does — which is the whole reason the buckets are pinned to an artifact
+    /// rather than refitted per run.
     pub fn identity_fingerprint(&self) -> String {
-        let mut digest = DigestContext::new(&SHA256);
-        digest.update(b"bar-corpus-v2");
-        digest.update(&self.inner.res_secs.to_le_bytes());
-        digest.update(&self.inner.bounds.0.to_le_bytes());
-        digest.update(&self.inner.bounds.1.to_le_bytes());
-        for file in &self.inner.files {
-            digest.update(file.symbol().as_bytes());
-            digest.update(&(file.len() as u64).to_le_bytes());
-            digest.update(&file.first_ts_ms().unwrap_or(0).to_le_bytes());
-            digest.update(&file.last_ts_ms().unwrap_or(0).to_le_bytes());
-        }
-        match &self.inner.market {
-            Some(channel) => {
-                digest.update(MARKET_PROXY_SYMBOL.as_bytes());
-                digest.update(&(channel.bars() as u64).to_le_bytes());
-                digest.update(channel.support_sha256().as_bytes());
-            }
-            None => digest.update(b"no-market-channel"),
-        }
-        hex_digest(digest)
+        self.inner
+            .identity_fingerprint
+            .get_or_init(|| {
+                // Indexed parallel collection preserves deterministic file order. Each worker
+                // holds one bounded scratch chunk rather than materializing bar content.
+                let content_sha256: Vec<String> = self
+                    .inner
+                    .files
+                    .par_iter()
+                    .map(bar_encoding_content_sha256)
+                    .collect();
+                let mut digest = DigestContext::new(&SHA256);
+                digest.update(b"bar-corpus-v3");
+                digest.update(&self.inner.res_secs.to_le_bytes());
+                digest.update(&self.inner.bounds.0.to_le_bytes());
+                digest.update(&self.inner.bounds.1.to_le_bytes());
+                for (file, content_sha256) in self.inner.files.iter().zip(&content_sha256) {
+                    digest.update(file.symbol().as_bytes());
+                    digest.update(&(file.len() as u64).to_le_bytes());
+                    digest.update(content_sha256.as_bytes());
+                }
+                match &self.inner.market {
+                    Some(channel) => {
+                        digest.update(MARKET_PROXY_SYMBOL.as_bytes());
+                        digest.update(&(channel.bars() as u64).to_le_bytes());
+                        digest.update(channel.support_sha256().as_bytes());
+                    }
+                    None => digest.update(b"no-market-channel"),
+                }
+                hex_digest(digest)
+            })
+            .clone()
     }
 
     /// The corpus's market channel, or `None` when the directory holds no
@@ -1662,37 +1938,42 @@ impl BarCorpus {
             .sum()
     }
 
-    /// Where [`Self::fit_supports`] persists its result.
+    /// Conventional cache path for fitted supports at this corpus's resolution and target
+    /// parametrization.
+    ///
+    /// The parametrization is in the FILENAME, not just inside the artifact. Two arms of a
+    /// measurement campaign share a data directory, and a standardized fit landing on the
+    /// control's `bar_supports.<res>.json` would silently redefine the control's output space
+    /// on its next run. [`DofScaling::Raw`] keeps the historical name exactly, so no existing
+    /// cache is orphaned.
     pub fn supports_path(&self) -> PathBuf {
-        self.inner
-            .dir
-            .join(format!("bar_supports.{}.json", self.inner.res_secs))
+        let res_secs = self.inner.res_secs;
+        self.inner.dir.join(match self.inner.dof_scaling {
+            DofScaling::Raw => format!("bar_supports.{res_secs}.json"),
+            DofScaling::VolStandardized => format!("bar_supports.volstd.{res_secs}.json"),
+        })
     }
 
-    /// Fit equal-mass supports from the train region only, and persist them next to the
-    /// corpus. Sampling never touches a bar at or after the `train | val` bound, so no
-    /// normalization statistic can leak out of validation or test.
+    /// Fit equal-mass supports from the train region only, under this corpus's
+    /// [`BarCorpus::dof_scaling`].
+    ///
+    /// This operation is pure with respect to the filesystem: the caller owns provenance and
+    /// destination policy and must explicitly persist the returned artifact. Sampling never
+    /// touches a bar at or after the `train | val` bound, so no normalization statistic can leak
+    /// out of validation or test — and under [`DofScaling::VolStandardized`] neither can
+    /// `sigma_t`, which is a causal function of bars strictly before each row.
     pub fn fit_supports(&self, max_samples: usize, seed: u64) -> BarSupports {
-        let samples: Vec<BarDof> = self
-            .sample_train_dof(max_samples, seed)
-            .into_iter()
-            .map(|(_, dof)| dof)
-            .collect();
-        let supports = BarSupports::fit(&samples);
-        let path = self.supports_path();
-        match supports.save(&path) {
-            Ok(()) => println!(
-                "[dataset] fitted bar supports from {} train DOF -> {}",
-                samples.len(),
-                path.display()
-            ),
-            Err(error) => eprintln!(
-                "[dataset] fitted bar supports from {} train DOF but could not write {}: {error:#}",
-                samples.len(),
-                path.display()
-            ),
+        let rows = self.sample_train_dof_scaled(max_samples, seed);
+        match self.inner.dof_scaling {
+            DofScaling::Raw => {
+                let samples: Vec<BarDof> = rows.iter().map(|(_, row)| row.dof).collect();
+                BarSupports::fit(&samples)
+            }
+            DofScaling::VolStandardized => {
+                let samples: Vec<StandardizedDof> = rows.iter().map(|(_, row)| *row).collect();
+                BarSupports::fit_standardized(&samples)
+            }
         }
-        supports
     }
 
     /// Deterministically draw up to `max_samples` `(ts_ms, dof)` pairs from the train region,
@@ -1702,6 +1983,23 @@ impl BarCorpus {
     /// causal prefix; a block amortizes that prefix over 64 samples while keeping the draw
     /// uniform over the train timeline.
     pub fn sample_train_dof(&self, max_samples: usize, seed: u64) -> Vec<(i64, BarDof)> {
+        self.sample_train_dof_scaled(max_samples, seed)
+            .into_iter()
+            .map(|(ts, row)| (ts, row.dof))
+            .collect()
+    }
+
+    /// [`Self::sample_train_dof`] with the causal `sigma_t` each row was divided by carried
+    /// alongside it.
+    ///
+    /// The SAME draw, row for row: `sample_train_dof` is this function with the divisor
+    /// dropped. Under [`DofScaling::Raw`] every `sigma` is exactly `1.0`, so the pair is total
+    /// and the raw path is a special case rather than a separate code path.
+    pub fn sample_train_dof_scaled(
+        &self,
+        max_samples: usize,
+        seed: u64,
+    ) -> Vec<(i64, StandardizedDof)> {
         let blocks = self.train_dof_blocks(max_samples, seed);
         self.flatten_train_blocks(&blocks, max_samples, |_, _, bar, dof| (bar.ts(), dof))
     }
@@ -1729,7 +2027,7 @@ impl BarCorpus {
                     bar_index: bar_index as u32,
                 },
                 bar.ts(),
-                dof,
+                dof.dof,
             )
         })
     }
@@ -1798,16 +2096,17 @@ impl BarCorpus {
     fn flatten_train_blocks<T, F>(&self, blocks: &[WindowRef], max_samples: usize, row: F) -> Vec<T>
     where
         T: Send,
-        F: Fn(u32, usize, &PackedBar, BarDof) -> T + Send + Sync,
+        F: Fn(u32, usize, &PackedBar, StandardizedDof) -> T + Send + Sync,
     {
         let inner = &self.inner;
+        let scaling = inner.dof_scaling;
         let mut out: Vec<T> = blocks
             .par_iter()
             .flat_map_iter(|r| {
                 let bars = inner.files[r.symbol as usize].bars();
                 let anchor = r.bar_index as usize;
                 let mut block = Vec::with_capacity(SUPPORT_BLOCK);
-                for_each_window_dof(bars, anchor, SUPPORT_BLOCK, |bar, dof| {
+                for_each_window_dof(bars, anchor, SUPPORT_BLOCK, scaling, |bar, dof| {
                     block.push(row(r.symbol, anchor + block.len(), bar, dof));
                 });
                 block
@@ -1835,6 +2134,9 @@ pub struct BarSampler {
     corpus: Arc<Corpus>,
     split: Split,
     context: i64,
+    /// Number of bars after each decision row materialized in a batch. One is the legacy
+    /// next-bar contract; direct multi-horizon pretraining requests three.
+    future_bars: i64,
     seed: u64,
     anchors: Vec<WindowRef>,
     /// `(start, len)` of each symbol's contiguous, time-ordered run inside `anchors`.
@@ -1860,14 +2162,26 @@ impl std::fmt::Debug for BarSampler {
 }
 
 impl BarSampler {
-    /// Anchors are strided by exactly `context`, so consecutive windows of one symbol share
-    /// only their seam bar. A window occupies bars `[a, a + context]` — `context + 1` DOF, the
-    /// caller slices inputs `[..context]` and targets `[1..]` — and every one of those bars is
-    /// required to lie inside `split`.
+    /// Legacy one-step sampler.
     pub fn new(corpus: &BarCorpus, split: Split, context: i64, seed: u64) -> Self {
+        Self::new_with_future(corpus, split, context, 1, seed)
+    }
+
+    /// Sampler whose windows carry `context` decision beliefs and `future_bars` aligned
+    /// target bars. Anchors remain strided by `context`; only tails that cannot supply every
+    /// requested future target are excluded.
+    pub fn new_with_future(
+        corpus: &BarCorpus,
+        split: Split,
+        context: i64,
+        future_bars: i64,
+        seed: u64,
+    ) -> Self {
         assert!(context > 0, "context must be positive");
+        assert!(future_bars > 0, "future_bars must be positive");
         let inner = corpus.inner.clone();
         let ctx = context as usize;
+        let future = future_bars as usize;
         let mut anchors = Vec::new();
         let mut symbol_runs = Vec::with_capacity(inner.files.len());
         for symbol in 0..inner.files.len() {
@@ -1875,8 +2189,8 @@ impl BarSampler {
             let (lo, hi) = inner.split_range(symbol, split);
             // Bar 0 has no predecessor close, so it can never carry a DOF.
             let first = lo.max(1);
-            if hi > first + ctx {
-                for a in (first..=hi - 1 - ctx).step_by(ctx) {
+            if hi >= first + ctx + future {
+                for a in (first..=hi - ctx - future).step_by(ctx) {
                     anchors.push(WindowRef {
                         symbol: symbol as u32,
                         bar_index: a as u32,
@@ -1889,6 +2203,7 @@ impl BarSampler {
             corpus: inner,
             split,
             context,
+            future_bars,
             seed,
             anchors,
             symbol_runs,
@@ -1927,6 +2242,11 @@ impl BarSampler {
         &self.corpus.symbols[index as usize]
     }
 
+    /// The target parametrization every batch this sampler builds is encoded in.
+    pub fn dof_scaling(&self) -> DofScaling {
+        self.corpus.dof_scaling
+    }
+
     /// Number of near-disjoint windows in this split: `sum_symbols floor((usable - 1) / context)`
     /// where `usable` is the symbol's bar count inside the split, minus the leading bar when the
     /// split starts at the file's first record.
@@ -1949,8 +2269,8 @@ impl BarSampler {
         &self.anchors
     }
 
-    /// `[batch, context + 1, ..]` DOF and calendar ids on `device`, bit-identical for a given
-    /// `(seed, epoch, index, batch)` and reordered by `epoch`.
+    /// `[batch, context + future_bars, ..]` DOF and calendar ids on `device`,
+    /// bit-identical for a given `(seed, epoch, index, batch)` and reordered by `epoch`.
     pub fn batch(&self, epoch: usize, index: usize, batch: usize, device: Device) -> BarBatch {
         self.batch_of(&self.batch_refs(epoch, index, batch), device)
     }
@@ -2036,24 +2356,65 @@ impl BarSampler {
     /// one deep NVMe queue. Call it a step ahead of [`Self::batch_of`] to overlap I/O with
     /// compute entirely.
     pub fn prefetch(&self, refs: &[WindowRef]) {
-        let len = (self.context + 1) as usize;
+        let len = (self.context + self.future_bars) as usize;
         refs.par_iter().for_each(|r| readahead(self.slab(r, len)));
     }
 
-    /// `[refs.len(), context + 1, ..]` DOF and calendar ids on `device`.
+    /// `[refs.len(), context + future_bars, ..]` DOF and calendar ids on `device`.
     pub fn batch_of(&self, refs: &[WindowRef], device: Device) -> BarBatch {
         assert!(!refs.is_empty(), "cannot build an empty batch");
-        let len = (self.context + 1) as usize;
+        let len = (self.context + self.future_bars) as usize;
         let rows: Vec<(usize, usize)> = refs
             .iter()
             .map(|r| (r.symbol as usize, r.bar_index as usize))
             .collect();
-        build_batch(
+        let mut batch = build_batch(
             &self.corpus.files,
             &rows,
             len,
             self.corpus.res_secs,
             self.corpus.market.as_ref(),
+            self.corpus.dof_scaling,
+            device,
+        );
+        if self.future_bars >= 3 {
+            let (time_ids, valid) = build_direct_forecast_time_ids(
+                &self.corpus.files,
+                &rows,
+                self.context as usize,
+                self.corpus.res_secs,
+                device,
+            );
+            batch.direct_time_ids = Some(time_ids);
+            batch.direct_valid = Some(valid);
+        }
+        batch
+    }
+
+    /// One forecast-safe next-bar clock for every consecutive decision row in each window.
+    ///
+    /// Used by exact teacher-forced comparators that must match the rolling deployment cache
+    /// without consulting the realized target timestamp.
+    pub fn one_step_forecast_time_ids(
+        &self,
+        refs: &[WindowRef],
+        decisions: usize,
+        device: Device,
+    ) -> Tensor {
+        assert!(!refs.is_empty(), "forecast clocks need at least one window");
+        assert!(
+            decisions <= (self.context + self.future_bars) as usize,
+            "requested forecast clocks escape the sampled window"
+        );
+        let rows: Vec<(usize, usize)> = refs
+            .iter()
+            .map(|reference| (reference.symbol as usize, reference.bar_index as usize))
+            .collect();
+        build_one_step_forecast_time_ids(
+            &self.corpus.files,
+            &rows,
+            decisions,
+            self.corpus.res_secs,
             device,
         )
     }
@@ -2213,17 +2574,22 @@ impl BarSampler {
             }
 
             let mut schedule_slot = 0usize;
+            // Corpus scaling, not raw: these rows are SCORING TARGETS compared against a
+            // rollout the model emits in its own target space, so the two must be the same
+            // space. The flat-carry default is the origin of both spaces — `r = 0`, `s = 0`,
+            // `u = v = 0.5` — so a missing print means the same thing either way.
             for_each_window_dof(
                 bars,
                 observed_start,
                 observed_end - observed_start,
+                self.corpus.dof_scaling,
                 |bar, encoded| {
                     while schedule_slot < steps && schedule[schedule_slot] < bar.ts() {
                         schedule_slot += 1;
                     }
                     if schedule_slot < steps && schedule[schedule_slot] == bar.ts() {
                         out[schedule_slot * BAR_DOF..(schedule_slot + 1) * BAR_DOF]
-                            .copy_from_slice(&encoded.to_array());
+                            .copy_from_slice(&encoded.dof.to_array());
                         schedule_slot += 1;
                     }
                 },
@@ -2401,6 +2767,20 @@ impl PassPlan {
         token_weights: &[f64],
         seed: u64,
     ) -> Result<Self> {
+        Self::new_with_future(corpus, split, contexts, token_weights, 1, seed)
+    }
+
+    /// As [`Self::new`], while reserving `future_bars - 1` split-local bars after each
+    /// primary target span for direct multi-horizon supervision.
+    pub fn new_with_future(
+        corpus: &BarCorpus,
+        split: Split,
+        contexts: &[i64],
+        token_weights: &[f64],
+        future_bars: usize,
+        seed: u64,
+    ) -> Result<Self> {
+        ensure!(future_bars > 0, "a pass plan needs at least one future bar");
         ensure!(
             !contexts.is_empty(),
             "a pass plan needs at least one ramp context"
@@ -2448,7 +2828,7 @@ impl PassPlan {
             // is an input rather than a target.
             let first = lo.max(1);
             let span = hi.saturating_sub(lo);
-            let targets = hi.saturating_sub(first + 1);
+            let targets = hi.saturating_sub(first + future_bars);
             debug_assert!(span >= targets);
             ensure!(
                 hi <= u32::MAX as usize,
@@ -3236,50 +3616,137 @@ impl CumulativeCoverage {
 /// Encode `len` bars starting at `start` for every `(series, start)` row into one
 /// [`BarBatch`]. The DOF and the calendar ids come off the same bar in the same pass, which is
 /// the whole reason the two tensors are returned together.
+fn build_one_step_forecast_time_ids(
+    files: &[BarFile],
+    rows: &[(usize, usize)],
+    decisions: usize,
+    res_secs: u32,
+    device: Device,
+) -> Tensor {
+    let output_row = decisions * BAR_TIME_FEATURES;
+    let mut flat = vec![0i64; rows.len() * output_row];
+    flat.par_chunks_mut(output_row)
+        .zip(rows.par_iter())
+        .for_each(|(output, &(series, start))| {
+            let bars = files[series].bars();
+            for decision in 0..decisions {
+                let ids = direct_forecast_schedule_ids(bars[start + decision].ts(), res_secs)[0].1;
+                let offset = decision * BAR_TIME_FEATURES;
+                output[offset..offset + BAR_TIME_FEATURES].copy_from_slice(&ids);
+            }
+        });
+    Tensor::from_slice(&flat)
+        .view([
+            rows.len() as i64,
+            decisions as i64,
+            BAR_TIME_FEATURES as i64,
+        ])
+        .to_device(device)
+}
+
+fn build_direct_forecast_time_ids(
+    files: &[BarFile],
+    rows: &[(usize, usize)],
+    context: usize,
+    res_secs: u32,
+    device: Device,
+) -> (Tensor, Tensor) {
+    let time_row = context * 2 * BAR_TIME_FEATURES;
+    let valid_row = context * 2;
+    let mut flat_time = vec![0i64; rows.len() * time_row];
+    let mut flat_valid = vec![0u8; rows.len() * valid_row];
+    flat_time
+        .par_chunks_mut(time_row)
+        .zip(flat_valid.par_chunks_mut(valid_row))
+        .zip(rows.par_iter())
+        .for_each(|((time_output, valid_output), &(series, start))| {
+            let bars = files[series].bars();
+            for decision in 0..context {
+                let horizons = direct_forecast_schedule_ids(bars[start + decision].ts(), res_secs);
+                let time_offset = decision * 2 * BAR_TIME_FEATURES;
+                time_output[time_offset..time_offset + BAR_TIME_FEATURES]
+                    .copy_from_slice(&horizons[1].1);
+                time_output[time_offset + BAR_TIME_FEATURES..time_offset + 2 * BAR_TIME_FEATURES]
+                    .copy_from_slice(&horizons[2].1);
+                let mut ordinary = true;
+                for step in 0..3 {
+                    ordinary &= bars[start + decision + step + 1].ts() == horizons[step].0;
+                    if step >= 1 {
+                        valid_output[decision * 2 + step - 1] = u8::from(ordinary);
+                    }
+                }
+            }
+        });
+    let time_ids = Tensor::from_slice(&flat_time)
+        .view([
+            rows.len() as i64,
+            context as i64,
+            2,
+            BAR_TIME_FEATURES as i64,
+        ])
+        .to_device(device);
+    let valid = Tensor::from_slice(&flat_valid)
+        .view([rows.len() as i64, context as i64, 2])
+        .to_device(device)
+        .to_kind(Kind::Bool);
+    (time_ids, valid)
+}
+
 fn build_batch(
     files: &[BarFile],
     rows: &[(usize, usize)],
     len: usize,
     res_secs: u32,
     market: Option<&MarketChannel>,
+    scaling: DofScaling,
     device: Device,
 ) -> BarBatch {
     let dof_row = len * BAR_DOF;
     let time_row = len * BAR_TIME_FEATURES;
     let mut dof = vec![0f32; rows.len() * dof_row];
     let mut time = vec![0i64; rows.len() * time_row];
-    let market_missing = dof
-        .par_chunks_mut(dof_row)
-        .zip(time.par_chunks_mut(time_row))
-        .zip(rows.par_iter())
-        .map(|((dof_out, time_out), &(series, start))| {
-            let bars = files[series].bars();
-            readahead(&bars[start.saturating_sub(DOF_WARMUP_BARS + 1)..start + len]);
-            let mut slot = 0usize;
-            let mut missing = 0usize;
-            for_each_window_dof(bars, start, len, |bar, encoded| {
-                dof_out[slot * BAR_DOF..(slot + 1) * BAR_DOF].copy_from_slice(&encoded.to_array());
-                // `start >= 1` for every window — bar 0 carries no DOF — so the predecessor is
-                // always addressable, and the elapsed and day-edge ids are never the unknown
-                // row on a training bar. The market channel is joined at the row bar's OWN
-                // timestamp, which is the bar the trunk conditions on at this position; the
-                // bar it predicts is `slot + 1`, so the proxy is one step BEHIND the target,
-                // exactly as the name's own DOF is.
-                let ids = bar_time_ids(
-                    bar.ts(),
-                    Some(bars[start + slot - 1].ts()),
-                    res_secs,
-                    market,
-                );
-                missing += usize::from(ids[TIME_MARKET_R] == MARKET_MISSING);
-                time_out[slot * BAR_TIME_FEATURES..(slot + 1) * BAR_TIME_FEATURES]
-                    .copy_from_slice(&ids);
-                slot += 1;
-            });
-            debug_assert_eq!(slot, len);
-            missing
-        })
-        .sum();
+    let mut sigma = vec![0f32; rows.len() * len];
+    let mut raw_dof = scaling
+        .is_standardized()
+        .then(|| vec![0f32; rows.len() * dof_row]);
+    let market_missing: usize = match raw_dof.as_mut() {
+        Some(raw) => dof
+            .par_chunks_mut(dof_row)
+            .zip(time.par_chunks_mut(time_row))
+            .zip(sigma.par_chunks_mut(len))
+            .zip(raw.par_chunks_mut(dof_row))
+            .zip(rows.par_iter())
+            .map(
+                |((((dof_out, time_out), sigma_out), raw_out), &(series, start))| {
+                    fill_batch_row(
+                        files,
+                        series,
+                        start,
+                        len,
+                        res_secs,
+                        market,
+                        scaling,
+                        dof_out,
+                        time_out,
+                        sigma_out,
+                        Some(raw_out),
+                    )
+                },
+            )
+            .sum(),
+        None => dof
+            .par_chunks_mut(dof_row)
+            .zip(time.par_chunks_mut(time_row))
+            .zip(sigma.par_chunks_mut(len))
+            .zip(rows.par_iter())
+            .map(|(((dof_out, time_out), sigma_out), &(series, start))| {
+                fill_batch_row(
+                    files, series, start, len, res_secs, market, scaling, dof_out, time_out,
+                    sigma_out, None,
+                )
+            })
+            .sum(),
+    };
     let n = rows.len() as i64;
     let len = len as i64;
     BarBatch {
@@ -3289,8 +3756,56 @@ fn build_batch(
         time_ids: Tensor::from_slice(&time)
             .view([n, len, BAR_TIME_FEATURES as i64])
             .to_device(device),
+        sigma: Tensor::from_slice(&sigma).view([n, len]).to_device(device),
+        raw_dof: raw_dof.map(|raw| {
+            Tensor::from_slice(&raw)
+                .view([n, len, BAR_DOF as i64])
+                .to_device(device)
+        }),
+        direct_time_ids: None,
+        direct_valid: None,
         market_missing,
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn fill_batch_row(
+    files: &[BarFile],
+    series: usize,
+    start: usize,
+    len: usize,
+    res_secs: u32,
+    market: Option<&MarketChannel>,
+    scaling: DofScaling,
+    dof_out: &mut [f32],
+    time_out: &mut [i64],
+    sigma_out: &mut [f32],
+    mut raw_out: Option<&mut [f32]>,
+) -> usize {
+    let bars = files[series].bars();
+    readahead(&bars[start.saturating_sub(scaling.warmup_bars() + 1)..start + len]);
+    let mut slot = 0usize;
+    let mut missing = 0usize;
+    for_each_window_dof_detailed(bars, start, len, scaling, |bar, raw, encoded| {
+        dof_out[slot * BAR_DOF..(slot + 1) * BAR_DOF].copy_from_slice(&encoded.row.dof.to_array());
+        sigma_out[slot] = encoded.row.sigma;
+        if let Some(output) = raw_out.as_deref_mut() {
+            output[slot * BAR_DOF..(slot + 1) * BAR_DOF].copy_from_slice(&raw.to_array());
+        }
+        // `start >= 1` for every window — bar 0 carries no DOF — so the predecessor is always
+        // addressable. The market channel is joined at the row bar's own timestamp.
+        let ids = bar_time_ids(
+            bar.ts(),
+            Some(bars[start + slot - 1].ts()),
+            res_secs,
+            market,
+        );
+        missing += usize::from(ids[TIME_MARKET_R] == MARKET_MISSING);
+        time_out[slot * BAR_TIME_FEATURES..(slot + 1) * BAR_TIME_FEATURES].copy_from_slice(&ids);
+        slot += 1;
+    });
+    debug_assert_eq!(slot, len);
+    missing
 }
 
 // ---------------------------------------------------------------------------
@@ -3495,6 +4010,432 @@ impl CorpusAnomalies {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Target-geometry audit: what the parametrization does to the corpus
+// ---------------------------------------------------------------------------
+
+/// Quantile probabilities every target-geometry panel reports, ASCENDING.
+pub const TARGET_QUANTILES: [f64; 9] = [0.01, 0.05, 0.10, 0.25, 0.50, 0.75, 0.90, 0.95, 0.99];
+
+/// Rows the strided quantile subsample retains over the whole audited split.
+///
+/// A quantile needs order statistics and an evaluation split runs to tens of millions of bars,
+/// so the audit keeps a deterministic uniform stride of at most this many rows — the same
+/// device [`BarSupports`] uses for its own marginal estimate. At this cap a median carries
+/// `1.25 / sqrt(n) ~ 0.12%` of relative noise, which is three orders below the effect the
+/// panels are read for.
+///
+/// Moments and occupancy are accumulated over EVERY bar rather than over the subsample, and
+/// deliberately: the fourth moment of a fat-tailed return lives in the handful of most extreme
+/// observations in the split, and a one-in-forty stride would simply lose them.
+const TARGET_QUANTILE_ROWS: usize = 1 << 20;
+
+/// Streaming first four central moments, mergeable so the audit can fold over series in
+/// parallel.
+///
+/// Pébay's centred pairwise update rather than raw power sums. `E[r^4]` over a log return of
+/// scale `1e-3` is a number near `1e-12`, and accumulating it as `sum(x^4) - 4 mu sum(x^3) +
+/// ...` loses most of its significance to cancellation at exactly the corpus sizes this runs
+/// on. The centred form has no cancellation to lose.
+#[derive(Clone, Copy, Debug, Default)]
+struct CentralMoments {
+    n: f64,
+    mean: f64,
+    m2: f64,
+    m3: f64,
+    m4: f64,
+}
+
+impl CentralMoments {
+    fn push(&mut self, x: f64) {
+        if !x.is_finite() {
+            return;
+        }
+        let prior = self.n;
+        let n = prior + 1.0;
+        let delta = x - self.mean;
+        let step = delta / n;
+        let step2 = step * step;
+        let term = delta * step * prior;
+        self.mean += step;
+        self.m4 +=
+            term * step2 * (n * n - 3.0 * n + 3.0) + 6.0 * step2 * self.m2 - 4.0 * step * self.m3;
+        self.m3 += term * step * (n - 2.0) - 3.0 * step * self.m2;
+        self.m2 += term;
+        self.n = n;
+    }
+
+    fn merge(&mut self, other: &Self) {
+        if other.n == 0.0 {
+            return;
+        }
+        if self.n == 0.0 {
+            *self = *other;
+            return;
+        }
+        let (a, b) = (self.n, other.n);
+        let n = a + b;
+        let delta = other.mean - self.mean;
+        let d2 = delta * delta;
+        let m4 = self.m4
+            + other.m4
+            + d2 * d2 * a * b * (a * a - a * b + b * b) / (n * n * n)
+            + 6.0 * d2 * (a * a * other.m2 + b * b * self.m2) / (n * n)
+            + 4.0 * delta * (a * other.m3 - b * self.m3) / n;
+        let m3 = self.m3
+            + other.m3
+            + d2 * delta * a * b * (a - b) / (n * n)
+            + 3.0 * delta * (a * other.m2 - b * self.m2) / n;
+        self.m2 += other.m2 + d2 * a * b / n;
+        self.m3 = m3;
+        self.m4 = m4;
+        self.mean += b * delta / n;
+        self.n = n;
+    }
+
+    fn sd(&self) -> f64 {
+        if self.n < 2.0 {
+            return f64::NAN;
+        }
+        (self.m2 / self.n).sqrt()
+    }
+
+    /// `E[(x - mu)^4] / sigma^4 - 3`: zero for a Gaussian, and large and positive for a bar
+    /// return.
+    fn excess_kurtosis(&self) -> f64 {
+        if self.n < 4.0 || self.m2 <= 0.0 {
+            return f64::NAN;
+        }
+        self.n * self.m4 / (self.m2 * self.m2) - 3.0
+    }
+}
+
+/// The two degrees of freedom [`DofScaling::VolStandardized`] moves, in the order
+/// [`TargetGeometry::dof`] carries them.
+pub const TARGET_SCALE_DOF: [(usize, &str); 2] = [(DOF_R, "r"), (DOF_S, "s")];
+
+/// One degree of freedom's scale, exactly as the supports fitter receives it.
+#[derive(Clone, Debug)]
+pub struct DofScale {
+    pub name: &'static str,
+    pub mean: f64,
+    pub sd: f64,
+    /// [`TARGET_QUANTILES`] of the strided subsample.
+    pub quantiles: [f64; TARGET_QUANTILES.len()],
+    /// `E[(x - mu)^4] / sigma^4 - 3`.
+    ///
+    /// The load-bearing number, and the one that can refute the parametrization rather than
+    /// merely confirm it. Standardization is supposed to remove the CROSS-SECTIONAL scale
+    /// mixture and leave the conditional shape alone, so the fat tail must SURVIVE it. A
+    /// standardized kurtosis collapsing toward zero means the divisor is tracking the bar's own
+    /// move closely enough to absorb it, which is a leak of exactly the signal the head is
+    /// there to predict.
+    pub excess_kurtosis: f64,
+}
+
+/// One symbol's share of the pooled `r` grid.
+#[derive(Clone, Debug)]
+pub struct SymbolBinOccupancy {
+    pub symbol: String,
+    /// Bars this entropy was measured over. Carried because it BOUNDS the statistic: a symbol
+    /// with 90 evaluation bars cannot exceed `ln(90)` however well the grid fits it, and
+    /// reading such a row as poor resolution would be a measurement artifact.
+    pub bars: u64,
+    /// Occupancy entropy in nats, from [`BarSupports::bin_occupancy_entropy`].
+    pub entropy: f64,
+    /// `exp(entropy)`, from [`BarSupports::effective_bins`]: the number of bins this symbol
+    /// effectively has.
+    pub effective_bins: f64,
+}
+
+/// Per-series accumulator of [`BarCorpus::audit_target_geometry`].
+struct SeriesGeometry {
+    symbol: String,
+    bars: u64,
+    sigma_relative_floored: u64,
+    sigma_numerical_fallback: u64,
+    r_z_clamped: u64,
+    s_z_clamped: u64,
+    sigma_unwarmed: u64,
+    occupancy: Vec<f64>,
+    moments: [CentralMoments; TARGET_SCALE_DOF.len()],
+    sigma_rows: Vec<f32>,
+    dof_rows: [Vec<f32>; TARGET_SCALE_DOF.len()],
+}
+
+impl SeriesGeometry {
+    fn new(symbol: &str) -> Self {
+        Self {
+            symbol: symbol.to_owned(),
+            bars: 0,
+            sigma_relative_floored: 0,
+            sigma_numerical_fallback: 0,
+            r_z_clamped: 0,
+            s_z_clamped: 0,
+            sigma_unwarmed: 0,
+            occupancy: vec![0.0; NUM_BAR_BINS as usize],
+            moments: [CentralMoments::default(); TARGET_SCALE_DOF.len()],
+            sigma_rows: Vec::new(),
+            dof_rows: std::array::from_fn(|_| Vec::new()),
+        }
+    }
+
+    /// Absorb one encoded row under the corpus's own parametrization.
+    ///
+    /// The bin comes from [`BarSupports::bin_of`], which is the same rule the emission head's
+    /// targets go through, so the occupancy is the grid the model actually trains against
+    /// rather than a second discretization of it.
+    fn absorb_dof(&mut self, binner: &DofBinner<'_>, dof: &BarDof, keep: bool) {
+        let values = [dof.r as f64, dof.s as f64];
+        for (slot, value) in values.into_iter().enumerate() {
+            self.moments[slot].push(value);
+            if keep {
+                self.dof_rows[slot].push(value as f32);
+            }
+        }
+        self.occupancy[binner.bin_of(values[0])] += 1.0;
+    }
+
+    fn finish(&self) -> SymbolBinOccupancy {
+        SymbolBinOccupancy {
+            symbol: self.symbol.clone(),
+            bars: self.bars,
+            entropy: BarSupports::bin_occupancy_entropy(&self.occupancy),
+            effective_bins: BarSupports::effective_bins(&self.occupancy),
+        }
+    }
+}
+
+/// What the target parametrization actually does to the corpus, measured on one split before a
+/// single optimizer step.
+///
+/// Three panels, one object, because they are the same measurement read at three depths: the
+/// divisor, the quotient, and what the quotient does to the grid the head predicts on.
+#[derive(Clone, Debug)]
+pub struct TargetGeometry {
+    pub res_secs: u32,
+    /// The parametrization `dof` and `per_symbol` were measured under, i.e. the corpus's own.
+    pub scaling: DofScaling,
+    pub split: Split,
+    pub bars: u64,
+    /// `sigma_t` quantiles in LOG-RETURN units, always measured under
+    /// [`DofScaling::VolStandardized`] whatever the corpus trains on, so the control and the
+    /// standardized arm report the same object.
+    pub sigma_quantiles: [f64; TARGET_QUANTILES.len()],
+    /// Bars whose adaptive HAR reference used the name's slow-anchor-relative floor.
+    pub sigma_relative_floored: u64,
+    /// Bars whose causal history contained no positive scale and therefore required the
+    /// explicitly numerical fallback divisor.
+    pub sigma_numerical_fallback: u64,
+    /// Standardized return targets clipped to `[-BAR_Z_LIMIT, BAR_Z_LIMIT]`.
+    pub r_z_clamped: u64,
+    /// Standardized range targets clipped to `[0, BAR_Z_LIMIT]`.
+    pub s_z_clamped: u64,
+    /// Bars with fewer than [`crate::torch::bar_dist::BAR_SIGMA_WARMUP_BARS`] causal
+    /// predecessors, i.e. whose reference is DEFINED but whose span-256 leg has not forgotten
+    /// its seed. [`for_each_window_dof`] truncates the warm-up at the series start rather than
+    /// reaching past it, so this is a property of the split's position in each symbol and is
+    /// computed from the bar indices rather than scanned.
+    pub sigma_unwarmed: u64,
+    /// `r` then `s`, in [`TARGET_SCALE_DOF`] order.
+    pub dof: [DofScale; TARGET_SCALE_DOF.len()],
+    /// Pooled `r` occupancy SHARES over the audited split; sums to one.
+    pub r_occupancy: Vec<f64>,
+    /// Per symbol, WORST effective resolution first.
+    ///
+    /// This is the decomposition that can see the defect at all. A pooled equal-mass histogram
+    /// is balanced by construction on either parametrization, so the pooled entropy is `ln(128)`
+    /// on both and says nothing; the claim under test is about the worst symbol and about the
+    /// SPREAD across symbols.
+    pub per_symbol: Vec<SymbolBinOccupancy>,
+}
+
+impl TargetGeometry {
+    fn reduce(
+        res_secs: u32,
+        scaling: DofScaling,
+        split: Split,
+        scans: Vec<SeriesGeometry>,
+    ) -> Self {
+        let bins = NUM_BAR_BINS as usize;
+        let mut r_occupancy = vec![0.0f64; bins];
+        let mut moments = [CentralMoments::default(); TARGET_SCALE_DOF.len()];
+        let mut sigma_rows: Vec<f32> = Vec::new();
+        let mut dof_rows: [Vec<f32>; TARGET_SCALE_DOF.len()] = std::array::from_fn(|_| Vec::new());
+        let mut per_symbol = Vec::with_capacity(scans.len());
+        let (
+            mut bars,
+            mut sigma_relative_floored,
+            mut sigma_numerical_fallback,
+            mut r_z_clamped,
+            mut s_z_clamped,
+            mut sigma_unwarmed,
+        ) = (0u64, 0u64, 0u64, 0u64, 0u64, 0u64);
+        for scan in &scans {
+            bars += scan.bars;
+            sigma_relative_floored += scan.sigma_relative_floored;
+            sigma_numerical_fallback += scan.sigma_numerical_fallback;
+            r_z_clamped += scan.r_z_clamped;
+            s_z_clamped += scan.s_z_clamped;
+            sigma_unwarmed += scan.sigma_unwarmed;
+            for (total, count) in r_occupancy.iter_mut().zip(&scan.occupancy) {
+                *total += count;
+            }
+            for slot in 0..TARGET_SCALE_DOF.len() {
+                moments[slot].merge(&scan.moments[slot]);
+                dof_rows[slot].extend_from_slice(&scan.dof_rows[slot]);
+            }
+            sigma_rows.extend_from_slice(&scan.sigma_rows);
+            if scan.bars > 0 {
+                per_symbol.push(scan.finish());
+            }
+        }
+        let occupied: f64 = r_occupancy.iter().sum();
+        if occupied > 0.0 {
+            for share in r_occupancy.iter_mut() {
+                *share /= occupied;
+            }
+        }
+        // Worst first, which is the convention `CorpusAnomalies` already ranks by and the order
+        // the headline is read off.
+        per_symbol.sort_unstable_by(|a, b| {
+            a.effective_bins
+                .total_cmp(&b.effective_bins)
+                .then_with(|| a.symbol.cmp(&b.symbol))
+        });
+        Self {
+            res_secs,
+            scaling,
+            split,
+            bars,
+            sigma_quantiles: subsample_quantiles(&mut sigma_rows),
+            sigma_relative_floored,
+            sigma_numerical_fallback,
+            r_z_clamped,
+            s_z_clamped,
+            sigma_unwarmed,
+            dof: std::array::from_fn(|slot| DofScale {
+                name: TARGET_SCALE_DOF[slot].1,
+                mean: if moments[slot].n > 0.0 {
+                    moments[slot].mean
+                } else {
+                    f64::NAN
+                },
+                sd: moments[slot].sd(),
+                quantiles: subsample_quantiles(&mut dof_rows[slot]),
+                excess_kurtosis: moments[slot].excess_kurtosis(),
+            }),
+            r_occupancy,
+            per_symbol,
+        }
+    }
+
+    /// Pooled occupancy entropy as a fraction of the uniform maximum `ln(NUM_BAR_BINS)`.
+    pub fn entropy_fraction(&self) -> f64 {
+        BarSupports::bin_occupancy_entropy(&self.r_occupancy) / (NUM_BAR_BINS as f64).ln()
+    }
+
+    pub fn sigma_relative_floored_share(&self) -> f64 {
+        self.share(self.sigma_relative_floored)
+    }
+
+    pub fn sigma_numerical_fallback_share(&self) -> f64 {
+        self.share(self.sigma_numerical_fallback)
+    }
+
+    pub fn r_z_clamped_share(&self) -> f64 {
+        self.share(self.r_z_clamped)
+    }
+
+    pub fn s_z_clamped_share(&self) -> f64 {
+        self.share(self.s_z_clamped)
+    }
+
+    pub fn sigma_unwarmed_share(&self) -> f64 {
+        self.share(self.sigma_unwarmed)
+    }
+
+    fn share(&self, count: u64) -> f64 {
+        if self.bars == 0 {
+            0.0
+        } else {
+            count as f64 / self.bars as f64
+        }
+    }
+
+    /// Effective `r`-bins of the worst-resolved symbol.
+    pub fn worst_effective_bins(&self) -> f64 {
+        self.per_symbol
+            .first()
+            .map_or(f64::NAN, |s| s.effective_bins)
+    }
+
+    pub fn best_effective_bins(&self) -> f64 {
+        self.per_symbol
+            .last()
+            .map_or(f64::NAN, |s| s.effective_bins)
+    }
+
+    pub fn median_effective_bins(&self) -> f64 {
+        if self.per_symbol.is_empty() {
+            return f64::NAN;
+        }
+        self.per_symbol[self.per_symbol.len() / 2].effective_bins
+    }
+
+    /// THE headline. Best over worst per-symbol effective resolution, at least one by
+    /// construction. The audit's defect 1 is that this is an order of magnitude on a pooled
+    /// absolute grid; standardization is supposed to drive it toward one.
+    pub fn effective_bin_spread(&self) -> f64 {
+        self.best_effective_bins() / self.worst_effective_bins()
+    }
+
+    pub fn summary(&self) -> String {
+        format!(
+            "target geometry on {:?} at {}s under {}: {} bars, sigma_t p50 {:.2} bps/bar \
+             (p1 {:.2}, p99 {:.2}), {} relative-floored, {} numerical-fallback, z clamps r={} \
+             s={}, {} under-warmed; sd(z_{}) {:.4}, mean(z_{}) {:.4}, excess kurtosis {:.1} / \
+             {:.1}; pooled r occupancy {:.4} of ln({}), per-symbol effective bins worst {:.1} \
+             median {:.1} best {:.1} (spread {:.2}x over {} symbols)",
+            self.split,
+            self.res_secs,
+            self.scaling,
+            self.bars,
+            1e4 * self.sigma_quantiles[TARGET_QUANTILES.len() / 2],
+            1e4 * self.sigma_quantiles[0],
+            1e4 * self.sigma_quantiles[TARGET_QUANTILES.len() - 1],
+            self.sigma_relative_floored,
+            self.sigma_numerical_fallback,
+            self.r_z_clamped,
+            self.s_z_clamped,
+            self.sigma_unwarmed,
+            self.dof[0].name,
+            self.dof[0].sd,
+            self.dof[1].name,
+            self.dof[1].mean,
+            self.dof[0].excess_kurtosis,
+            self.dof[1].excess_kurtosis,
+            self.entropy_fraction(),
+            NUM_BAR_BINS,
+            self.worst_effective_bins(),
+            self.median_effective_bins(),
+            self.best_effective_bins(),
+            self.effective_bin_spread(),
+            self.per_symbol.len(),
+        )
+    }
+}
+
+/// Exact [`TARGET_QUANTILES`] of the retained subsample, sorting it in place.
+fn subsample_quantiles(rows: &mut [f32]) -> [f64; TARGET_QUANTILES.len()] {
+    if rows.is_empty() {
+        return [f64::NAN; TARGET_QUANTILES.len()];
+    }
+    rows.sort_unstable_by(f32::total_cmp);
+    let last = rows.len() - 1;
+    TARGET_QUANTILES.map(|q| rows[(q * last as f64).round() as usize] as f64)
+}
+
 fn scan_symbol(file: &BarFile) -> SymbolAnomalies {
     let bars = file.bars();
     let hole_ms = ANOMALY_HOLE_DAYS * 86_400_000;
@@ -3511,13 +4452,15 @@ fn scan_symbol(file: &BarFile) -> SymbolAnomalies {
         return out;
     }
     // Going through `encode_dof` means the audit measures exactly the r and s the supports are
-    // fitted on, rather than a second, subtly different definition.
+    // fitted on, rather than a second, subtly different definition. RAW unconditionally:
+    // `ANOMALY_LOG_LIMIT` is a statement about a 4x price move in log points, and expressing a
+    // corruption threshold in sigma units would make it mean a different thing on every bar.
     let mut returns = Vec::with_capacity(bars.len() - 1);
-    for_each_window_dof(bars, 1, bars.len() - 1, |_, dof| {
-        if dof.s as f64 > ANOMALY_LOG_LIMIT {
+    for_each_window_dof(bars, 1, bars.len() - 1, DofScaling::Raw, |_, row| {
+        if row.dof.s as f64 > ANOMALY_LOG_LIMIT {
             out.extreme_range += 1;
         }
-        returns.push(dof.r);
+        returns.push(row.dof.r);
     });
     for (i, &r) in returns.iter().enumerate() {
         // `returns[i]` is the return of bar `i + 1` against bar `i`.
@@ -3543,29 +4486,68 @@ fn scan_symbol(file: &BarFile) -> SymbolAnomalies {
     out
 }
 
-/// Emit the DOF of bars `[anchor, anchor + len)`, preceded by a causal [`DOF_WARMUP_BARS`]
-/// volume-EMA warm-up. Uses exactly the [`VolumeEma`] / [`encode_dof`] pair that
-/// [`crate::torch::bar_dist::encode_series`] uses, so the values agree with a whole-series
-/// encode to EMA warm-up precision.
+/// Emit the DOF of bars `[anchor, anchor + len)`, preceded by the selected scaling warm-up.
 fn for_each_window_dof(
     bars: &[PackedBar],
     anchor: usize,
     len: usize,
-    mut sink: impl FnMut(&PackedBar, BarDof),
+    scaling: DofScaling,
+    mut sink: impl FnMut(&PackedBar, StandardizedDof),
+) {
+    for_each_window_dof_detailed(bars, anchor, len, scaling, |bar, _, encoded| {
+        sink(bar, encoded.row)
+    });
+}
+
+/// Detailed window encoder carrying the exact pre-standardization row and scaling decisions.
+///
+/// The volume EMA always starts at the raw policy's warm-up boundary, independently of the
+/// longer volatility warm-up. Consequently the raw row embedded in a standardized batch is
+/// identical to the corresponding raw batch target rather than changing `w` merely because a
+/// second estimator needed more history.
+fn for_each_window_dof_detailed(
+    bars: &[PackedBar],
+    anchor: usize,
+    len: usize,
+    scaling: DofScaling,
+    mut sink: impl FnMut(&PackedBar, BarDof, EncodedDof),
 ) {
     assert!(anchor >= 1, "bar 0 has no predecessor close");
     assert!(anchor + len <= bars.len(), "window runs past the symbol");
-    let start = anchor.saturating_sub(DOF_WARMUP_BARS + 1);
+    let start = anchor.saturating_sub(scaling.warmup_bars() + 1);
+    let volume_start = anchor.saturating_sub(BAR_RAW_WARMUP_BARS + 1);
     let mut ema = VolumeEma::default();
-    ema.observe(bars[start].volume);
+    let mut volume_active = start >= volume_start;
+    if volume_active {
+        ema.observe(bars[start].volume);
+    }
+    let mut har = RangeVolHar::default();
+    if scaling.is_standardized() {
+        har.observe(&encode_dof(
+            bars[start].open,
+            &bars[start],
+            bars[start].volume,
+        ));
+    }
     let mut prev_close = bars[start].close;
     for (offset, bar) in bars[start + 1..anchor + len].iter().enumerate() {
+        let index = start + 1 + offset;
         let volume = bar.volume;
-        let reference = ema.reference_for(volume);
-        if start + 1 + offset >= anchor {
-            sink(bar, encode_dof(prev_close, bar, reference));
+        let seeded_volume_here = !volume_active && index == volume_start;
+        if seeded_volume_here {
+            ema.observe(volume);
+            volume_active = true;
         }
-        ema.observe(volume);
+        let raw = encode_dof(prev_close, bar, ema.reference_for(volume));
+        if index >= anchor {
+            sink(bar, raw, scale_row(raw, &har, scaling));
+        }
+        if scaling.is_standardized() {
+            har.observe(&raw);
+        }
+        if volume_active && !seeded_volume_here {
+            ema.observe(volume);
+        }
         prev_close = bar.close;
     }
 }
@@ -3834,6 +4816,52 @@ mod tests {
         let (_fx, corpus) = fixture("drop");
         assert_eq!(corpus.symbols(), &["AAA", "BBB", "CCC"]);
         assert_eq!(corpus.unique_bars(), 5_000 + 3_100 + 4_400);
+    }
+
+    /// A wholesale vendor correction can preserve every metadata field bar-corpus v2 hashed.
+    /// Identity must follow the interior observation the encoder will actually consume.
+    #[test]
+    fn corpus_fingerprint_tracks_interior_consumed_content() {
+        let dir = std::env::temp_dir().join(format!(
+            "trading_bot_0_dataset_content_fp_{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let fx = Fixture { dir };
+        let base = 1_600_000_000_000i64 / RES_MS * RES_MS;
+        let path = bar_path(&fx.dir, "AAA");
+        let original = synth_bars(7, 1_000, base);
+        write_bar_file(&path, "AAA", RES, &original).unwrap();
+
+        let baseline = BarCorpus::load(&fx.dir, RES, 100).unwrap();
+        let fingerprint = baseline.identity_fingerprint();
+        let unchanged = BarCorpus::load(&fx.dir, RES, 100).unwrap();
+        assert_eq!(
+            unchanged.identity_fingerprint(),
+            fingerprint,
+            "unchanged reloads must reproduce the corpus identity"
+        );
+
+        let mut corrected = original.clone();
+        corrected[500].close *= 1.01;
+        write_bar_file(&path, "AAA", RES, &corrected).unwrap();
+        let revised_file = BarFile::open(&path).unwrap();
+        assert_eq!(revised_file.len(), original.len());
+        assert_eq!(revised_file.first_ts_ms(), Some(original[0].ts()));
+        assert_eq!(
+            revised_file.last_ts_ms(),
+            Some(original.last().unwrap().ts())
+        );
+
+        let revised = BarCorpus::load(&fx.dir, RES, 100).unwrap();
+        assert_eq!(revised.symbols(), baseline.symbols());
+        assert_eq!(revised.unique_bars(), baseline.unique_bars());
+        assert_eq!(revised.split_bounds(), baseline.split_bounds());
+        assert_ne!(
+            revised.identity_fingerprint(),
+            fingerprint,
+            "an interior OHLCV correction must change the corpus identity"
+        );
     }
 
     /// The located draw must be the SAME draw: same rows, same order, same truncation. Two
@@ -4274,6 +5302,97 @@ mod tests {
     }
 
     #[test]
+    fn future_windows_cover_every_direct_target_and_truncate_short_tails() {
+        let (_fx, corpus) = fixture("direct_future");
+        for context in [32usize, 64, 256] {
+            for future in [1usize, 3, 5] {
+                let sampler = BarSampler::new_with_future(
+                    &corpus,
+                    Split::Train,
+                    context as i64,
+                    future as i64,
+                    17,
+                );
+                let mut expected = 0usize;
+                for symbol in 0..corpus.symbols().len() {
+                    let (lo, hi) = corpus.split_range(symbol, Split::Train);
+                    let usable = hi.saturating_sub(lo.max(1));
+                    expected += usable.saturating_sub(future) / context;
+                }
+                assert_eq!(sampler.windows(), expected);
+                let refs: Vec<_> = sampler.anchors().iter().copied().take(2).collect();
+                if !refs.is_empty() {
+                    let batch = sampler.batch_of(&refs, Device::Cpu);
+                    assert_eq!(
+                        batch.dof.size(),
+                        [refs.len() as i64, (context + future) as i64, BAR_DOF as i64],
+                    );
+                    if future >= 3 {
+                        let direct = batch
+                            .direct_time_ids
+                            .as_ref()
+                            .expect("three-future-bar samplers must carry direct clocks");
+                        assert_eq!(
+                            direct.size(),
+                            [
+                                refs.len() as i64,
+                                context as i64,
+                                2,
+                                BAR_TIME_FEATURES as i64
+                            ],
+                        );
+                        let valid = batch
+                            .direct_valid
+                            .as_ref()
+                            .expect("three-future-bar samplers must carry ordinary-row masks");
+                        assert_eq!(valid.size(), [refs.len() as i64, context as i64, 2],);
+                        assert_eq!(valid.kind(), Kind::Bool);
+                        for (row, reference) in refs.iter().enumerate() {
+                            let bars = corpus.inner.files[reference.symbol as usize].bars();
+                            let start = reference.bar_index as usize;
+                            let schedule =
+                                forecast_schedule_after(bars[start].ts(), 3, corpus.res_secs());
+                            let expected_h2 =
+                                (1..=2).all(|step| bars[start + step].ts() == schedule[step - 1]);
+                            let expected_h3 = expected_h2 && bars[start + 3].ts() == schedule[2];
+                            assert_eq!(valid.int64_value(&[row as i64, 0, 0]) != 0, expected_h2);
+                            assert_eq!(valid.int64_value(&[row as i64, 0, 1]) != 0, expected_h3);
+                        }
+                        let expected = sampler
+                            .forecast_time_ids(&refs, 0, 3, Device::Cpu)
+                            .expect("decision-only forecast clock")
+                            .narrow(1, 1, 2);
+                        assert!(bool::try_from(
+                            direct
+                                .narrow(1, 0, 1)
+                                .squeeze_dim(1)
+                                .eq_tensor(&expected)
+                                .all()
+                        )
+                        .unwrap());
+                        for market in BAR_TIME_MARKET {
+                            assert!(bool::try_from(
+                                direct.narrow(-1, market as i64, 1).eq(MARKET_MISSING).all()
+                            )
+                            .unwrap());
+                        }
+                    } else {
+                        assert!(batch.direct_time_ids.is_none());
+                        assert!(batch.direct_valid.is_none());
+                    }
+                }
+                for window in sampler.anchors() {
+                    let (_, hi) = corpus.split_range(window.symbol as usize, Split::Train);
+                    assert!(
+                        window.bar_index as usize + context + future <= hi,
+                        "short tail admitted without every future target"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn batches_are_bit_reproducible_and_reordered_per_epoch() {
         let (_fx, corpus) = fixture("determinism");
         let a = BarSampler::new(&corpus, Split::Train, 64, 4242);
@@ -4438,12 +5557,13 @@ mod tests {
             "sampling must be pinned"
         );
 
+        let default_path = corpus.supports_path();
         let supports = corpus.fit_supports(4_000, 31);
-        assert!(corpus.supports_path().is_file());
-        let reloaded = BarSupports::load(&corpus.supports_path()).unwrap();
-        for dof in 0..BAR_DOF {
-            assert_eq!(supports.bin_of(dof, 0.0), reloaded.bin_of(dof, 0.0));
-        }
+        assert!(
+            !default_path.exists(),
+            "fitting in memory must not choose or mutate a persistence destination"
+        );
+        assert_eq!(supports.num_bins(), crate::torch::bar_dist::NUM_BAR_BINS);
     }
 
     /// `YYYY-MM-DDTHH:MM:SS` in ET, as epoch millis. Built via the same offset table the
@@ -4875,8 +5995,8 @@ mod tests {
                 .zip(anchors.par_iter())
                 .map(|(bars, &anchor)| {
                     let mut n = 0usize;
-                    for_each_window_dof(bars, anchor, len, |_, dof| {
-                        n += dof.r.is_finite() as usize
+                    for_each_window_dof(bars, anchor, len, DofScaling::Raw, |_, row| {
+                        n += row.dof.r.is_finite() as usize
                     });
                     n
                 })
@@ -4922,9 +6042,9 @@ mod tests {
                 .for_each(|((d, c), &(series, start))| {
                     let bars = corpus.bars(series);
                     let mut slot = 0usize;
-                    for_each_window_dof(bars, start, len, |bar, encoded| {
+                    for_each_window_dof(bars, start, len, DofScaling::Raw, |bar, encoded| {
                         d[slot * BAR_DOF..(slot + 1) * BAR_DOF]
-                            .copy_from_slice(&encoded.to_array());
+                            .copy_from_slice(&encoded.dof.to_array());
                         c[slot * BAR_TIME_FEATURES..(slot + 1) * BAR_TIME_FEATURES]
                             .copy_from_slice(&bar_time_ids(
                                 bar.ts(),
@@ -6008,6 +7128,9 @@ mod tests {
             corpus_fingerprint: market_proxy_fingerprint(&file, RES, samples).unwrap(),
             split_bounds: bounds,
             sample_count: samples,
+            fit_seed: None,
+            scaling_contract: None,
+            support_semantics: None,
             fitted_utc: "2026-08-20T00:00:00Z".to_owned(),
         };
 
@@ -6204,5 +7327,80 @@ mod tests {
             hex_digest(digest),
         );
         let _ = std::fs::remove_dir_all(&scratch);
+    }
+
+    #[test]
+    fn standardized_batches_carry_exact_raw_targets_without_duplicating_raw_batches() {
+        let (_fixture, corpus) = fixture("raw-target-batch");
+        let rows = [(0usize, 3_000usize), (1usize, 2_000usize)];
+        let len = 32usize;
+        let raw = build_batch(
+            &corpus.inner.files,
+            &rows,
+            len,
+            RES,
+            corpus.inner.market.as_ref(),
+            DofScaling::Raw,
+            Device::Cpu,
+        );
+        let standardized = build_batch(
+            &corpus.inner.files,
+            &rows,
+            len,
+            RES,
+            corpus.inner.market.as_ref(),
+            DofScaling::VolStandardized,
+            Device::Cpu,
+        );
+        assert!(
+            raw.raw_dof.is_none(),
+            "a raw batch must use dof directly, not allocate a duplicate tensor"
+        );
+        let realized = standardized
+            .raw_dof
+            .as_ref()
+            .expect("a standardized batch preserves true raw targets");
+        for row in 0..rows.len() {
+            for step in 0..len {
+                for dof in 0..BAR_DOF {
+                    let index = [row as i64, step as i64, dof as i64];
+                    assert_eq!(
+                        realized.double_value(&index) as f32,
+                        raw.dof.double_value(&index) as f32,
+                        "raw target mismatch at row {row}, step {step}, DOF {dof}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn target_geometry_reduces_each_scaling_exception_counter_exactly() {
+        let mut first = SeriesGeometry::new("AAA");
+        first.bars = 10;
+        first.sigma_relative_floored = 2;
+        first.sigma_numerical_fallback = 1;
+        first.r_z_clamped = 3;
+        first.s_z_clamped = 4;
+        let mut second = SeriesGeometry::new("BBB");
+        second.bars = 30;
+        second.sigma_relative_floored = 5;
+        second.sigma_numerical_fallback = 6;
+        second.r_z_clamped = 7;
+        second.s_z_clamped = 8;
+        let geometry = TargetGeometry::reduce(
+            RES,
+            DofScaling::VolStandardized,
+            Split::Train,
+            vec![first, second],
+        );
+        assert_eq!(geometry.sigma_relative_floored, 7);
+        assert_eq!(geometry.sigma_numerical_fallback, 7);
+        assert_eq!(geometry.r_z_clamped, 10);
+        assert_eq!(geometry.s_z_clamped, 12);
+        assert_eq!(geometry.sigma_relative_floored_share(), 7.0 / 40.0);
+        assert_eq!(geometry.sigma_numerical_fallback_share(), 7.0 / 40.0);
+        assert_eq!(geometry.r_z_clamped_share(), 10.0 / 40.0);
+        assert_eq!(geometry.s_z_clamped_share(), 12.0 / 40.0);
     }
 }

@@ -3,8 +3,8 @@
 //!
 //! # Why this module exists, and what it is NOT
 //!
-//! [`super::trade_bench`] answers "what is the predictive law WORTH under moment-correct
-//! quadratic Kelly sizing". Every number it reports is conditioned on a policy: a moment
+//! [`super::trade_bench`] answers "what is the predictive law WORTH under the checkpoint's
+//! recorded Kelly sizing rule". Every number it reports is conditioned on a policy: a moment
 //! reduction, leverage cap, cost charge, and rebalance schedule. That is the right question
 //! for deployment and the wrong question for diagnosis, because a policy can hide a signal
 //! and a signal can be flattered by a policy. This module removes the policy entirely. It
@@ -137,17 +137,15 @@ use tch::Device;
 
 use shared::report::{read_report, write_report, Report, ReportKind, ReportSeries, ScaleKind};
 
+use super::pretrain::{
+    configure_threads, evaluate, load_checkpoint_corpus, pinned_blocks, CorpusFlags, PinnedSet,
+    TradedSizing, EVAL_WINDOW_SEED,
+};
+use super::pretrain_stats::{Dispersion, BOOTSTRAP_DRAWS, BOOTSTRAP_SEED, CI_MASS};
+use super::trade_bench::{SizingRule, WindowPaths, MAX_BREAK_EVEN_BPS, TRADE_WINDOWS};
 use crate::torch::bar_dist::{BarScoring, BAR_CHAIN, DOF_R};
 use crate::torch::cuda::cfg::configure_cuda;
 use crate::torch::dataset::Split;
-use crate::torch::world_model::{world_model_metadata_path, BarWorldModel};
-
-use super::pretrain::{
-    configure_threads, evaluate, load_corpus, pinned_blocks, CorpusFlags, PinnedSet,
-    EVAL_WINDOW_SEED,
-};
-use super::pretrain_stats::{Dispersion, BOOTSTRAP_DRAWS, BOOTSTRAP_SEED, CI_MASS};
-use super::trade_bench::{WindowPaths, MAX_BREAK_EVEN_BPS, TRADE_WINDOWS};
 
 /// This module scores `p(r | past)`, which is the head's own `r` row only because `r` heads
 /// the chain and therefore has no prefix. A reorder that puts any factor before `r` makes
@@ -248,7 +246,7 @@ pub struct SkillBar {
     pub sigma: f64,
     /// The realized `r` the prediction is scored against.
     pub r: f64,
-    /// The bench's UNCAPPED moment-correct quadratic Kelly fraction for this bar.
+    /// The bench's uncapped fraction under the checkpoint's authenticated sizing rule.
     ///
     /// Carried for exactly one purpose: reconciling this module's `sign(mu_hat)` accuracy
     /// with [`super::trade_bench::PolicyStats::hit_rate`], which scores `sign(f*)`. The two
@@ -2872,6 +2870,24 @@ pub fn write_skill_profile(dir: &Path, profile: &SkillProfile) -> Result<()> {
 // The entry point
 // ---------------------------------------------------------------------------
 
+/// Parse the exact label folded into checkpoint lineage.
+///
+/// Comparing against labels emitted by [`SizingRule`] keeps this consumer tied to the producer's
+/// vocabulary without accepting an alias that was never authenticated. Unknown and empty legacy
+/// values are refusals: silently substituting the historical quadratic control would make the
+/// Kelly-sign path disagree with the artifact being audited.
+fn recorded_sizing_rule(label: &str) -> Result<SizingRule> {
+    [
+        SizingRule::CONTROL,
+        SizingRule::CUMULANT_LOG,
+        SizingRule::RECALIBRATED,
+        SizingRule::BOTH,
+    ]
+    .into_iter()
+    .find(|rule| rule.label() == label)
+    .ok_or_else(|| anyhow!("checkpoint records unknown sizing rule {label:?}"))
+}
+
 /// Arguments of the standalone directional-skill audit.
 #[derive(Clone, Debug)]
 pub struct SkillArgs {
@@ -2909,51 +2925,43 @@ pub fn pretrain_skill(args: SkillArgs) -> Result<()> {
 
     let device = Device::cuda_if_available();
     let weights = Path::new(&args.weights);
-    let metadata = world_model_metadata_path(weights);
-    ensure!(
-        metadata.exists(),
-        "no metadata sidecar beside {}; copy {} next to the weights",
-        weights.display(),
-        metadata.display()
-    );
-    let world = BarWorldModel::load(weights, &metadata, device)?;
-    ensure!(
-        world.metadata().res_secs == args.corpus.resolution_secs,
-        "checkpoint was trained for {}s bars but --resolution-secs is {}",
-        world.metadata().res_secs,
-        args.corpus.resolution_secs
-    );
-    let corpus = load_corpus(&args.corpus)?;
+    let (world, corpus) = load_checkpoint_corpus(weights, device, &args.corpus)?;
     let fingerprint = corpus.identity_fingerprint();
-    if let Some(trained) = world.metadata().training.as_ref() {
-        if trained.corpus_fingerprint != fingerprint {
-            println!(
-                "WARNING corpus {} is not the {} the checkpoint was trained on; the pinned \
-                 windows are drawn from a different symbol set and are NOT the run's own",
-                &fingerprint[..12.min(fingerprint.len())],
-                &trained.corpus_fingerprint[..12.min(trained.corpus_fingerprint.len())],
-            );
-        }
-        ensure!(
-            trained.eval_window_seed == EVAL_WINDOW_SEED,
-            "checkpoint pinned its evaluation with eval_window_seed {:#x} but this build uses \
-             {EVAL_WINDOW_SEED:#x}; the audit would score different data than the run's bench",
-            trained.eval_window_seed
+    let trained = world.metadata().training.as_ref().ok_or_else(|| {
+        anyhow!(
+            "checkpoint {} has no authenticated training provenance, so its sizing rule is \
+             unknown; refusing to manufacture quadratic economic paths",
+            weights.display()
+        )
+    })?;
+    if trained.corpus_fingerprint != fingerprint {
+        println!(
+            "WARNING corpus {} is not the {} the checkpoint was trained on; the pinned \
+             windows are drawn from a different symbol set and are NOT the run's own",
+            &fingerprint[..12.min(fingerprint.len())],
+            &trained.corpus_fingerprint[..12.min(trained.corpus_fingerprint.len())],
         );
     }
+    ensure!(
+        trained.eval_window_seed == EVAL_WINDOW_SEED,
+        "checkpoint pinned its evaluation with eval_window_seed {:#x} but this build uses \
+         {EVAL_WINDOW_SEED:#x}; the audit would score different data than the run's bench",
+        trained.eval_window_seed
+    );
+    let sizing_rule = recorded_sizing_rule(&trained.sizing_rule)?;
+    ensure!(
+        !sizing_rule.recalibrated,
+        "checkpoint records sizing rule {:?}, but it does not persist the block-disjoint \
+         mean-shrink intercept and slope needed to reproduce that rule. Refusing to generate \
+         raw-mean economic paths under a recalibrated label.",
+        trained.sizing_rule
+    );
     // The scoring rule enters not one statistic below - the moments come from the head's
     // probabilities - but `evaluate` needs one to reduce its NLL, so it is read off the
-    // artifact rather than re-declared.
-    let scoring: BarScoring = world
-        .metadata()
-        .training
-        .as_ref()
-        .map(|trained| trained.scoring.parse())
-        .transpose()
-        .map_err(|reason| {
-            anyhow!("the checkpoint records a scoring rule this build cannot parse: {reason}")
-        })?
-        .unwrap_or_default();
+    // authenticated artifact rather than re-declared.
+    let scoring: BarScoring = trained.scoring.parse().map_err(|reason| {
+        anyhow!("the checkpoint records a scoring rule this build cannot parse: {reason}")
+    })?;
 
     let set = PinnedSet::pinned(&corpus, args.split, args.context, args.windows)?;
     let stats = evaluate(
@@ -2964,7 +2972,10 @@ pub fn pretrain_skill(args: SkillArgs) -> Result<()> {
         device,
         true,
         scoring,
-        None,
+        TradedSizing {
+            rule: sizing_rule,
+            shrink: None,
+        },
         TRADE_WINDOWS,
     )?;
     let scored = stats.trade_paths.windows.len();
@@ -2995,7 +3006,8 @@ pub fn pretrain_skill(args: SkillArgs) -> Result<()> {
 
     println!(
         "directional skill audit of {} (lineage {}) on the pinned {:?} split at context {}: the \
-         first {} of {} drawn windows (TRADE_WINDOWS = {}), nll {:.4} nats/bar",
+         first {} of {} drawn windows (TRADE_WINDOWS = {}), nll {:.4} nats/bar; Kelly-sign and \
+         economic paths use authenticated sizing rule {:?}",
         weights.display(),
         world.lineage_sha256(),
         args.split,
@@ -3004,6 +3016,7 @@ pub fn pretrain_skill(args: SkillArgs) -> Result<()> {
         set.windows.len(),
         TRADE_WINDOWS,
         stats.nll_bar,
+        trained.sizing_rule,
     );
     for line in profile.report_lines() {
         println!("{line}");
@@ -3023,6 +3036,23 @@ mod tests {
     use crate::torch::test_rng;
     use crate::torch::train::trade_bench::TradeSetup;
     use tch::{nn, Kind, Tensor};
+
+    #[test]
+    fn recorded_sizing_rules_are_exact_and_unknown_labels_are_refused() {
+        for expected in [
+            SizingRule::CONTROL,
+            SizingRule::CUMULANT_LOG,
+            SizingRule::RECALIBRATED,
+            SizingRule::BOTH,
+        ] {
+            assert_eq!(
+                recorded_sizing_rule(expected.label()).expect("producer label must parse"),
+                expected
+            );
+        }
+        assert!(recorded_sizing_rule("").is_err());
+        assert!(recorded_sizing_rule("cumulant").is_err());
+    }
 
     /// A panel built from explicit `(symbol, block, mu, sigma, r)` rows, one window per
     /// distinct `(symbol, block)`, so a statistic can be asserted against arithmetic rather
@@ -3918,7 +3948,7 @@ mod tests {
             let mut s_column = dof.select(-1, DOF_S as i64);
             let _ = s_column.copy_(s);
             let paths = setup
-                .paths(&head, &beliefs, &conditioning, &dof, windows as usize)
+                .paths(&head, &beliefs, &conditioning, &dof, None, windows as usize)
                 .expect("paths");
             let panel = SkillPanel::from_paths(&paths.windows, &symbols, &blocks).expect("panel");
             SkillProfile::measure(&panel, "fixture", &SkillCutpoints::from_panel(&panel))

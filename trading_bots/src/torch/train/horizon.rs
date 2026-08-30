@@ -18,10 +18,10 @@
 //!
 //! The selected-horizon reports also carry a clearly labelled, non-self-financing scalar
 //! moment diagnostic beside a four-rung shared-book attribution. Validation additionally writes
-//! the fixed solver-safe dead-zone frontier; locked test never does. One optional, predeclared
-//! mean-sign hysteresis candidate can be paired against Raw without changing production defaults.
-//! Economic output is written only as `.report.bin`, defaults to validation, and refuses the
-//! locked test split without an explicit second opt-in.
+//! the fixed solver-safe dead-zone and causal forecast-moment EMA persistence frontiers; locked
+//! test never does. One optional, predeclared mean-sign hysteresis candidate can be paired against
+//! Raw without changing production defaults. Economic output is written only as `.report.bin`,
+//! defaults to validation, and refuses the locked test split without an explicit second opt-in.
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -30,20 +30,21 @@ use anyhow::{bail, ensure, Context, Result};
 use shared::report::{read_report, write_report, Report, ReportKind, ReportSeries, ScaleKind};
 use tch::{Device, Kind, Tensor};
 
-use crate::torch::bar_dist::{BarSupports, DOF_R, NUM_BAR_BINS};
+use crate::torch::bar_dist::{BarSupports, BAR_DOF, DOF_R, NUM_BAR_BINS};
 use crate::torch::dataset::{
     bar_time_ids, forecast_schedule_after, forecast_schedule_ids_from, BarCorpus, BarEndpoint,
-    Split, BAR_TIME_FEATURES,
+    Split, BAR_TIME_FEATURES, DEFAULT_MIN_BARS,
 };
-use crate::torch::world_model::{world_model_metadata_path, BarWorldModel, BAR_MODEL_DIM};
+use crate::torch::world_model::{BarWorldModel, BAR_MODEL_DIM};
 
 use super::portfolio::{
     marginal_forecasts, solve_cost_aware_kelly, CostModel, CostParts, FactorCovariance, FlatCost,
     KellyConstraints, Panel, PanelConfig, PanelCost, PanelForecast, Policy,
     TrailingFactorCovariance, ADV_TRAILING_BARS, BELIEF_EMIT, BELIEF_PRE_CONTEXT, DEFAULT_COST_BPS,
-    DEFAULT_GROSS_CAP, MAX_BREAK_EVEN_BPS, POLICIES,
+    DEFAULT_GROSS_CAP, GROSS_TOLERANCE, MAX_BREAK_EVEN_BPS, POLICIES,
 };
 use super::portfolio_cost::{BarCostModel, CostCalibration};
+use super::pretrain::load_authenticated_checkpoint;
 use super::pretrain_reports::write_chart;
 use super::pretrain_stats::{
     block_bootstrap, moving_block_bootstrap, Dispersion, BOOTSTRAP_DRAWS, BOOTSTRAP_SEED,
@@ -392,10 +393,17 @@ pub struct PanelBeliefs {
     /// through that lossy representation.
     pub mean_simple: Vec<Vec<f64>>,
     pub second_simple: Vec<Vec<f64>>,
-    /// Mean of the same law's LOG return, per panel entry, in nats.
+    /// Mean of the same law's LOG return, reduced against fitted `E[r | bin]`, per panel
+    /// entry in nats.
     pub mu_log: Vec<Vec<f64>>,
-    /// Variance of the same law's LOG return, per panel entry, in nats squared.
+    /// Variance of the same law's LOG return, including fitted within-bin second moments, per
+    /// panel entry in nats squared.
     pub var_log: Vec<Vec<f64>>,
+    /// Causal volatility reference of each predicted row. Exactly `1` on raw corpora.
+    pub sigma: Vec<Vec<f32>>,
+    /// True raw, unclipped realized targets for standardized rows. Raw corpora use their
+    /// ordinary DOF directly and allocate no duplicate target.
+    pub raw_dof: Option<Vec<Vec<[f32; BAR_DOF]>>>,
 }
 
 /// Largest belief cache this module will allocate, in bytes. Six gibibytes is generous for a
@@ -435,22 +443,49 @@ pub fn scan_panel(
         .supports_for(res_secs)
         .with_context(|| format!("the checkpoint carries no supports at {res_secs}s"))?;
     let device = model.device();
-    let (returns_host, second_host) = supports
-        .simple_return_bin_moments()
-        .context("supports lack fitted simple-return moments; refit the v6 artifact")?;
-    let returns = Tensor::from_slice(returns_host)
-        .view([1, NUM_BAR_BINS])
-        .to_device(device);
-    let second_returns = Tensor::from_slice(second_host)
+    let standardized = supports.dof_scaling().is_standardized();
+    let traded_z = if standardized {
+        Some(
+            supports
+                .traded_z_law()
+                .context("standardized supports lack the measured sub-bin law of z")?,
+        )
+    } else {
+        None
+    };
+    let (returns, second_returns) = if standardized {
+        (None, None)
+    } else {
+        let (returns_host, second_host) = supports
+            .simple_return_bin_moments()
+            .context("supports lack fitted simple-return moments; refit the v6 artifact")?;
+        (
+            Some(
+                Tensor::from_slice(returns_host)
+                    .view([1, NUM_BAR_BINS])
+                    .to_device(device),
+            ),
+            Some(
+                Tensor::from_slice(second_host)
+                    .view([NUM_BAR_BINS, 1])
+                    .to_device(device)
+                    .to_kind(Kind::Double),
+            ),
+        )
+    };
+    let (log_first, log_second) = supports
+        .bin_moment_tensors()
+        .context("supports lack fitted log-return moments; refit the support artifact")?;
+    let log_first = log_first
+        .select(0, DOF_R as i64)
         .view([NUM_BAR_BINS, 1])
         .to_device(device)
         .to_kind(Kind::Double);
-    let centers_host: Vec<f64> = supports.centers(DOF_R).to_vec();
-    let centers = Tensor::from_slice(&centers_host)
+    let log_second = log_second
+        .select(0, DOF_R as i64)
         .view([NUM_BAR_BINS, 1])
         .to_device(device)
         .to_kind(Kind::Double);
-    let centers_sq = &centers * &centers;
 
     let entries: usize = panel.slices().iter().map(|s| s.symbols.len()).sum();
     let want = entries * BAR_MODEL_DIM as usize * std::mem::size_of::<f32>();
@@ -498,6 +533,18 @@ pub fn scan_panel(
             .iter()
             .map(|s| vec![f64::NAN; s.symbols.len()])
             .collect(),
+        sigma: panel
+            .slices()
+            .iter()
+            .map(|s| vec![f32::NAN; s.symbols.len()])
+            .collect(),
+        raw_dof: standardized.then(|| {
+            panel
+                .slices()
+                .iter()
+                .map(|s| vec![[f32::NAN; BAR_DOF]; s.symbols.len()])
+                .collect()
+        }),
     };
 
     // Where each (symbol, bar) lands, grouped by symbol and in bar order, and the belief-cache
@@ -574,35 +621,79 @@ pub fn scan_panel(
                 .reshape([emit, latent])
                 .contiguous();
 
+            let sigma_block = batch
+                .sigma
+                .narrow(1, len - emit + 1, emit)
+                .reshape([emit])
+                .contiguous();
+            let sigma_host = host_f32(&sigma_block);
+            let raw_host = batch.raw_dof.as_ref().map(|raw| {
+                host_f32(
+                    &raw.narrow(1, len - emit + 1, emit)
+                        .reshape([emit, BAR_DOF as i64])
+                        .contiguous(),
+                )
+            });
+
             let mut start = 0i64;
             while start < emit {
                 let rows = ROW_CHUNK.min(emit - start);
                 let chunk = block.narrow(0, start, rows);
                 let chunk_conditioning = conditioning_block.narrow(0, start, rows);
-                // The decision law and its moments with autocast OFF: `mu = sum_i p_i c_i` is
-                // a cancelling sum whose value is ~1e-4 against a term spread of ~1e-3, and
-                // bf16's eight mantissa bits would destroy exactly the quantity this sweep is
-                // about. The BELIEF above is computed under the ambient autocast on purpose —
-                // that is the regime the checkpoint was trained and selected under.
+                let chunk_sigma = sigma_block.narrow(0, start, rows);
+                let standardized_moments = traded_z
+                    .as_ref()
+                    .map(|law| law.simple_return_moments_at(&chunk_sigma))
+                    .transpose()?;
+                // The decision law and its moments with autocast OFF: `mu = sum_i p_i m_i` is
+                // a cancelling sum whose value is ~1e-4 against a term spread of ~1e-3.
                 let (kelly, mean, second, var, mu_l, var_l) = tch::autocast(false, || {
                     let probs = forecast_r_probs(model.head(), &chunk, &chunk_conditioning);
-                    let kelly = host_f64(&kelly_fractions(
-                        &probs,
-                        &returns,
-                        &second_returns,
-                        FREE_LEVERAGE,
-                    ));
-                    let probs = probs.to_kind(Kind::Double);
-                    let mean = probs
-                        .matmul(&returns.reshape([NUM_BAR_BINS, 1]).to_kind(Kind::Double))
-                        .reshape([-1]);
-                    let second = probs.matmul(&second_returns).reshape([-1]);
+                    let probs64 = probs.to_kind(Kind::Double);
+                    let (mean, second, kelly) = if let Some((first_by_row, second_by_row)) =
+                        &standardized_moments
+                    {
+                        let first_by_row = first_by_row.to_kind(Kind::Double);
+                        let second_by_row = second_by_row.to_kind(Kind::Double);
+                        let mean = (&probs64 * first_by_row).sum_dim_intlist(
+                            [1i64].as_slice(),
+                            false,
+                            Kind::Double,
+                        );
+                        let second = (&probs64 * second_by_row).sum_dim_intlist(
+                            [1i64].as_slice(),
+                            false,
+                            Kind::Double,
+                        );
+                        let kelly = (&mean / &second.clamp_min(VARIANCE_FLOOR))
+                            .clamp(-FREE_LEVERAGE, FREE_LEVERAGE);
+                        (mean, second, kelly)
+                    } else {
+                        let raw_returns =
+                            returns.as_ref().expect("raw supports carry return moments");
+                        let raw_seconds = second_returns
+                            .as_ref()
+                            .expect("raw supports carry return second moments");
+                        let mean = probs64
+                            .matmul(&raw_returns.reshape([NUM_BAR_BINS, 1]).to_kind(Kind::Double))
+                            .reshape([-1]);
+                        let second = probs64.matmul(raw_seconds).reshape([-1]);
+                        let kelly =
+                            kelly_fractions(&probs, raw_returns, raw_seconds, FREE_LEVERAGE);
+                        (mean, second, kelly)
+                    };
                     let var = (&second - &mean * &mean).clamp_min(0.0);
-                    let mu_l = probs.matmul(&centers).reshape([-1]);
-                    let second_l = probs.matmul(&centers_sq).reshape([-1]);
+                    let sigma64 = chunk_sigma.to_kind(Kind::Double);
+                    let z_mu_l = probs64.matmul(&log_first).reshape([-1]);
+                    let z_second_l = probs64.matmul(&log_second).reshape([-1]);
+                    let (mu_l, second_l) = if standardized {
+                        (&z_mu_l * &sigma64, &z_second_l * &sigma64 * &sigma64)
+                    } else {
+                        (z_mu_l, z_second_l)
+                    };
                     let var_l = (&second_l - &mu_l * &mu_l).clamp_min(0.0);
                     (
-                        kelly,
+                        host_f64(&kelly),
                         host_f64(&mean),
                         host_f64(&second),
                         host_f64(&var),
@@ -623,10 +714,19 @@ pub fn scan_panel(
                     out.one_bar[t].var_r[k] = var[row] as f32;
                     out.mean_simple[t][k] = mean[row];
                     out.second_simple[t][k] = second[row];
-                    out.mu_log[t][k] = mu_l[row];
                     out.var_log[t][k] = var_l[row];
-                    let at = out.row_of[t][k] as usize * dim;
-                    out.beliefs[at..at + dim].copy_from_slice(&flat[row * dim..(row + 1) * dim]);
+                    let cache_row = out.row_of[t][k] as usize;
+                    let belief_at = (start as usize + row) * dim;
+                    out.beliefs[cache_row * dim..(cache_row + 1) * dim]
+                        .copy_from_slice(&flat[belief_at..belief_at + dim]);
+                    out.mu_log[t][k] = mu_l[row];
+                    out.sigma[t][k] = sigma_host[start as usize + row];
+                    if let (Some(raw_rows), Some(raw_host)) =
+                        (out.raw_dof.as_mut(), raw_host.as_ref())
+                    {
+                        let raw_at = (start as usize + row) * BAR_DOF;
+                        raw_rows[t][k].copy_from_slice(&raw_host[raw_at..raw_at + BAR_DOF]);
+                    }
                 }
                 start += rows;
             }
@@ -640,10 +740,28 @@ pub fn scan_panel(
                 && out.mean_simple[t].iter().all(|m| m.is_finite())
                 && out.second_simple[t].iter().all(|m| m.is_finite())
                 && out.mu_log[t].iter().all(|m| m.is_finite())
-                && out.var_log[t].iter().all(|v| v.is_finite()),
+                && out.var_log[t].iter().all(|v| v.is_finite())
+                && out.sigma[t]
+                    .iter()
+                    .all(|sigma| sigma.is_finite() && *sigma > 0.0)
+                && out.raw_dof.as_ref().is_none_or(|rows| {
+                    rows[t]
+                        .iter()
+                        .all(|row| row.iter().all(|value| value.is_finite()))
+                }),
             "instant {t} has a symbol the belief pass never reached, so its position would be \
              sized from a NaN"
         );
+        if let Some(raw_rows) = out.raw_dof.as_ref() {
+            ensure!(
+                raw_rows[t]
+                    .iter()
+                    .zip(&panel.slices()[t].realized_r)
+                    .all(|(raw, realized)| raw[DOF_R].to_bits() == realized.to_bits()),
+                "instant {t} standardized model targets do not reproduce the panel's raw \
+                 realized log returns"
+            );
+        }
     }
     Ok(out)
 }
@@ -656,6 +774,23 @@ fn host_f32(tensor: &Tensor) -> Vec<f32> {
 fn host_f64(tensor: &Tensor) -> Vec<f64> {
     Vec::<f64>::try_from(tensor.to_kind(Kind::Double).reshape([-1]).to(Device::Cpu))
         .expect("a double tensor converts to a host vector")
+}
+
+/// Advance the fitted conditional first and raw-second moments of an additive log-return path.
+///
+/// `bin_first` and `bin_second` are indexed fitted moments for the bins sampled at this step.
+/// The sampled representative still advances model state, but never enters these diagnostics.
+fn accumulate_conditional_log_moments(
+    sum_first: &mut Tensor,
+    sum_second: &mut Tensor,
+    bin_first: Tensor,
+    bin_second: Tensor,
+    live: &Tensor,
+) {
+    let first = bin_first * live;
+    let second = bin_second * live;
+    *sum_second += 2.0 * &*sum_first * &first + second;
+    *sum_first += first;
 }
 
 // ---------------------------------------------------------------------------
@@ -865,14 +1000,17 @@ pub fn receding_schedule(
 /// evidence that the estimator worked.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct AggregateLaw {
-    /// Rao-Blackwellized `E[sum_j r_j | past]`, in nats.
+    /// Rao-Blackwellized `E[sum_j r_j | past]`, in nats, reduced against fitted
+    /// `E[r | bin]`.
     pub mu_log: f64,
-    /// Plain sampled-mean estimate of the same quantity, in nats. Reported beside `mu_log`
-    /// because the ratio of their standard errors is the variance reduction the module docs
-    /// claim, measured on the real panel.
+    /// Sampled-bin estimate of the same quantity, in nats. Within-bin values are integrated
+    /// against fitted moments rather than decoded geometric representatives. Reported beside
+    /// `mu_log` because the ratio of their standard errors is the variance reduction the module
+    /// docs claim, measured on the real panel.
     pub plain_mu_log: f64,
     /// Variance of the aggregate log return, in nats squared. Exact under the fitted
-    /// categorical one-bar law at H1; sampled from ancestral paths at H>1.
+    /// categorical one-bar law at H1; at H>1 sampled over ancestral bin paths while preserving
+    /// each sampled bin's fitted `E[r² | bin]`.
     pub var_log: f64,
     /// Monte-Carlo standard error of [`Self::mu_log`], in nats. This is exactly zero at H1.
     pub mu_se: f64,
@@ -965,21 +1103,49 @@ pub fn horizon_laws(
     let head = model.head();
     let dynamics = model.dynamics();
     let trunk = model.trunk();
-    let centers_host: Vec<f64> = supports.centers(DOF_R).to_vec();
-    let centers = Tensor::from_slice(&centers_host)
-        .view([NUM_BAR_BINS, 1])
+    let (log_first, log_second) = supports
+        .bin_moment_tensors()
+        .context("supports lack fitted log-return moments; refit the support artifact")?;
+    let log_first = log_first
+        .select(0, DOF_R as i64)
+        .reshape([-1])
         .to_device(device)
         .to_kind(Kind::Double);
-    let (simple_first_host, simple_second_host) = supports
-        .simple_return_bin_moments()
-        .context("supports lack fitted simple-return moments; refit the v6 artifact")?;
-    let simple_first = Tensor::from_slice(simple_first_host)
+    let log_first_column = log_first.view([NUM_BAR_BINS, 1]);
+    let log_second = log_second
+        .select(0, DOF_R as i64)
+        .reshape([-1])
         .to_device(device)
         .to_kind(Kind::Double);
-    let simple_second = Tensor::from_slice(simple_second_host)
-        .to_device(device)
-        .to_kind(Kind::Double);
-
+    let standardized = supports.dof_scaling().is_standardized();
+    let traded_z = if standardized {
+        Some(
+            supports
+                .traded_z_law()
+                .context("standardized supports lack the measured sub-bin law of z")?,
+        )
+    } else {
+        None
+    };
+    let (simple_first, simple_second) = if standardized {
+        (None, None)
+    } else {
+        let (simple_first_host, simple_second_host) = supports
+            .simple_return_bin_moments()
+            .context("supports lack fitted simple-return moments; refit the v6 artifact")?;
+        (
+            Some(
+                Tensor::from_slice(simple_first_host)
+                    .to_device(device)
+                    .to_kind(Kind::Double),
+            ),
+            Some(
+                Tensor::from_slice(simple_second_host)
+                    .to_device(device)
+                    .to_kind(Kind::Double),
+            ),
+        )
+    };
     let mut out: Vec<Vec<AggregateLaw>> = periods
         .iter()
         .map(|p| vec![AggregateLaw::default(); p.legs.len()])
@@ -1017,6 +1183,7 @@ pub fn horizon_laws(
         let mut current_clock = vec![0i64; chunk.len() * BAR_TIME_FEATURES];
         let mut active = vec![0.0f64; chunk.len() * deepest];
         let mut flat = vec![0.0f32; chunk.len() * BAR_MODEL_DIM as usize];
+        let mut sigma = vec![1.0f32; chunk.len()];
         for (index, &(p, l)) in chunk.iter().enumerate() {
             let leg = periods[p].legs[l];
             let series = panel.series_of(leg.id);
@@ -1041,6 +1208,7 @@ pub fn horizon_laws(
             }
             let dim = BAR_MODEL_DIM as usize;
             flat[index * dim..(index + 1) * dim].copy_from_slice(beliefs.belief_row(leg.row));
+            sigma[index] = beliefs.sigma[periods[p].instant][leg.slot];
         }
         let clock = Tensor::from_slice(&clock)
             .view([count, deepest as i64, BAR_TIME_FEATURES as i64])
@@ -1054,99 +1222,153 @@ pub fn horizon_laws(
         let seed = Tensor::from_slice(&flat)
             .view([count, BAR_MODEL_DIM])
             .to_device(device);
-
-        let (rb, plain, gross_first, gross_second, prefix_gross) = tch::no_grad(|| {
-            // One row per (pair, path), interleaved so row `pair * samples + n` is path `n`.
-            let mut h = seed.repeat_interleave_self_int(samples_i, 0, None);
-            let first_current = current_clock.repeat_interleave_self_int(samples_i, 0, None);
-            let total = count * samples_i;
-            let mut sum_m = Tensor::zeros([total], (Kind::Double, device));
-            let mut sum_r = Tensor::zeros([total], (Kind::Double, device));
-            let mut gross_first = Tensor::ones([total], (Kind::Double, device));
-            let mut gross_second = Tensor::ones([total], (Kind::Double, device));
-            let mut prefix_gross = Vec::with_capacity(FORECAST_HORIZONS.len());
-            let mut next_prefix = 0usize;
-            for step in 0..deepest as i64 {
-                let live = active
-                    .select(1, step)
-                    .repeat_interleave_self_int(samples_i, 0, None);
-                let ids = clock
-                    .select(1, step)
-                    .repeat_interleave_self_int(samples_i, 0, None);
-                let current = if step == 0 {
-                    first_current.shallow_clone()
-                } else {
-                    clock
-                        .select(1, step - 1)
-                        .repeat_interleave_self_int(samples_i, 0, None)
-                };
-                let conditioning = trunk.forecast_conditioning(&ids, &current);
-                // The DECISION moment, BEFORE this bar is drawn: the conditional mean of its
-                // log return under the head's prefix-free `r` row. Autocast off, for the
-                // reason stated in `scan_panel`, and row-chunked so the peak stays bounded by
-                // `ROW_CHUNK` rather than by the sample count.
-                let m = tch::autocast(false, || {
-                    let mut parts = Vec::with_capacity((total / ROW_CHUNK + 1) as usize);
-                    let mut at = 0i64;
-                    while at < total {
-                        let rows = ROW_CHUNK.min(total - at);
-                        let probs = forecast_r_probs(
-                            head,
-                            &h.narrow(0, at, rows),
-                            &conditioning.narrow(0, at, rows),
-                        )
-                        .to_kind(Kind::Double);
-                        parts.push(probs.matmul(&centers).reshape([-1]));
-                        at += rows;
-                    }
-                    Tensor::cat(&parts, 0)
-                });
-                sum_m += &m * &live;
-
-                // Keep the decoded draw for the autoregressive state and the plain log-return
-                // diagnostic, but retain the exact categorical bins the chain sampled. The
-                // economic law integrates out the within-bin draw using the v6 fitted moments:
-                // E[1+R | b] = 1+m1_b and E[(1+R)^2 | b] = 1+2m1_b+m2_b.
-                let (dof, bins) =
-                    head.sample_binned(&h, &conditioning, supports, ROLLOUT_TEMPERATURE);
-                let drawn = dof
-                    .select(1, DOF_R as i64)
-                    .to_kind(Kind::Double)
-                    .reshape([-1]);
-                sum_r += &drawn * &live;
-                let r_bins = bins.select(1, DOF_R as i64).reshape([-1]);
-                let m1 = simple_first.index_select(0, &r_bins);
-                let m2 = simple_second.index_select(0, &r_bins);
-                gross_first = &gross_first * (1.0 + &m1 * &live);
-                gross_second = &gross_second * (1.0 + (2.0 * &m1 + &m2) * &live);
-                while next_prefix < FORECAST_HORIZONS.len()
-                    && FORECAST_HORIZONS[next_prefix] <= step as usize + 1
-                {
-                    prefix_gross.push((gross_first.shallow_clone(), gross_second.shallow_clone()));
-                    next_prefix += 1;
-                }
-                let token = trunk
-                    .token_embedding(&dof.unsqueeze(1), &bins.unsqueeze(1), &ids.unsqueeze(1))
-                    .squeeze_dim(1);
-                h = dynamics.step(&h, &token);
-            }
-            while prefix_gross.len() < FORECAST_HORIZONS.len() {
-                prefix_gross.push((gross_first.shallow_clone(), gross_second.shallow_clone()));
-            }
-            (
-                sum_m.view([count, samples_i]),
-                sum_r.view([count, samples_i]),
-                gross_first.view([count, samples_i]),
-                gross_second.view([count, samples_i]),
-                prefix_gross,
-            )
+        // `sigma_t` is causal information available at this decision. A standardized head
+        // predicts z; raw checkpoints retain their original allocation path.
+        let path_sigma = standardized.then(|| {
+            Tensor::from_slice(&sigma)
+                .to_device(device)
+                .repeat_interleave_self_int(samples_i, 0, None)
         });
+        let standardized_path_moments = match (traded_z.as_ref(), path_sigma.as_ref()) {
+            (Some(law), Some(sigma)) => Some(law.simple_return_moments_at(sigma)?),
+            _ => None,
+        };
+
+        let (rb, plain, log_raw_second, gross_first, gross_second, prefix_gross) =
+            tch::no_grad(|| {
+                // One row per (pair, path), interleaved so row `pair * samples + n` is path `n`.
+                let mut h = seed.repeat_interleave_self_int(samples_i, 0, None);
+                let first_current = current_clock.repeat_interleave_self_int(samples_i, 0, None);
+                let total = count * samples_i;
+                let mut sum_m = Tensor::zeros([total], (Kind::Double, device));
+                let mut sum_log_first = Tensor::zeros([total], (Kind::Double, device));
+                let mut sum_log_second = Tensor::zeros([total], (Kind::Double, device));
+                let mut gross_first = Tensor::ones([total], (Kind::Double, device));
+                let mut gross_second = Tensor::ones([total], (Kind::Double, device));
+                let mut prefix_gross = Vec::with_capacity(FORECAST_HORIZONS.len());
+                let mut next_prefix = 0usize;
+                for step in 0..deepest as i64 {
+                    let live = active
+                        .select(1, step)
+                        .repeat_interleave_self_int(samples_i, 0, None);
+                    let ids = clock
+                        .select(1, step)
+                        .repeat_interleave_self_int(samples_i, 0, None);
+                    let current = if step == 0 {
+                        first_current.shallow_clone()
+                    } else {
+                        clock
+                            .select(1, step - 1)
+                            .repeat_interleave_self_int(samples_i, 0, None)
+                    };
+                    let conditioning = trunk.forecast_conditioning(&ids, &current);
+                    // The DECISION moment, BEFORE this bar is drawn: the conditional mean of its
+                    // log return under the head's prefix-free `r` row. Autocast off, for the
+                    // reason stated in `scan_panel`, and row-chunked so the peak stays bounded by
+                    // `ROW_CHUNK` rather than by the sample count.
+                    let m = tch::autocast(false, || {
+                        let mut parts = Vec::with_capacity((total / ROW_CHUNK + 1) as usize);
+                        let mut at = 0i64;
+                        while at < total {
+                            let rows = ROW_CHUNK.min(total - at);
+                            let probs = forecast_r_probs(
+                                head,
+                                &h.narrow(0, at, rows),
+                                &conditioning.narrow(0, at, rows),
+                            )
+                            .to_kind(Kind::Double);
+                            let z_mean = probs.matmul(&log_first_column).reshape([-1]);
+                            parts.push(if let Some(path_sigma) = path_sigma.as_ref() {
+                                let row_sigma =
+                                    path_sigma.narrow(0, at, rows).to_kind(Kind::Double);
+                                z_mean * row_sigma
+                            } else {
+                                z_mean
+                            });
+                            at += rows;
+                        }
+                        Tensor::cat(&parts, 0)
+                    });
+                    sum_m += &m * &live;
+
+                    // Keep the decoded draw only for the autoregressive state and retain the exact
+                    // categorical bins the chain sampled. Both reported laws integrate out the
+                    // within-bin draw using the fitted moments. For log return, the conditional
+                    // aggregate second moment advances as
+                    // E[(S+r)^2 | path,b] = E[S^2 | path] + 2 E[S | path] E[r | b] + E[r^2 | b].
+                    // For simple return, E[1+R | b] = 1+m1_b and
+                    // E[(1+R)^2 | b] = 1+2m1_b+m2_b.
+                    let (dof, bins) =
+                        head.sample_binned(&h, &conditioning, supports, ROLLOUT_TEMPERATURE);
+                    let r_bins = bins.select(1, DOF_R as i64).reshape([-1]);
+                    let z_first = log_first.index_select(0, &r_bins);
+                    let z_second = log_second.index_select(0, &r_bins);
+                    let (raw_first, raw_second) = if let Some(path_sigma) = path_sigma.as_ref() {
+                        let sigma64 = path_sigma.to_kind(Kind::Double);
+                        (&z_first * &sigma64, &z_second * &sigma64 * &sigma64)
+                    } else {
+                        (z_first, z_second)
+                    };
+                    accumulate_conditional_log_moments(
+                        &mut sum_log_first,
+                        &mut sum_log_second,
+                        raw_first,
+                        raw_second,
+                        &live,
+                    );
+                    let (m1, m2) =
+                        if let Some((first_by_row, second_by_row)) = &standardized_path_moments {
+                            let index = r_bins.unsqueeze(1);
+                            (
+                                first_by_row.gather(1, &index, false).reshape([-1]),
+                                second_by_row.gather(1, &index, false).reshape([-1]),
+                            )
+                        } else {
+                            (
+                                simple_first
+                                    .as_ref()
+                                    .expect("raw supports carry simple-return moments")
+                                    .index_select(0, &r_bins),
+                                simple_second
+                                    .as_ref()
+                                    .expect("raw supports carry simple-return second moments")
+                                    .index_select(0, &r_bins),
+                            )
+                        };
+                    gross_first = &gross_first * (1.0 + &m1 * &live);
+                    gross_second = &gross_second * (1.0 + (2.0 * &m1 + &m2) * &live);
+                    while next_prefix < FORECAST_HORIZONS.len()
+                        && FORECAST_HORIZONS[next_prefix] <= step as usize + 1
+                    {
+                        prefix_gross
+                            .push((gross_first.shallow_clone(), gross_second.shallow_clone()));
+                        next_prefix += 1;
+                    }
+                    let token = trunk
+                        .token_embedding(&dof.unsqueeze(1), &bins.unsqueeze(1), &ids.unsqueeze(1))
+                        .squeeze_dim(1);
+                    h = dynamics.step(&h, &token);
+                }
+                while prefix_gross.len() < FORECAST_HORIZONS.len() {
+                    prefix_gross.push((gross_first.shallow_clone(), gross_second.shallow_clone()));
+                }
+                (
+                    sum_m.view([count, samples_i]),
+                    sum_log_first.view([count, samples_i]),
+                    sum_log_second.view([count, samples_i]),
+                    gross_first.view([count, samples_i]),
+                    gross_second.view([count, samples_i]),
+                    prefix_gross,
+                )
+            });
 
         let root = (samples as f64).sqrt();
         let rb_mu = host_f64(&rb.mean_dim([1i64].as_slice(), false, Kind::Double));
         let rb_sd = host_f64(&rb.std_dim([1i64].as_slice(), true, false));
         let plain_mu = host_f64(&plain.mean_dim([1i64].as_slice(), false, Kind::Double));
         let plain_sd = host_f64(&plain.std_dim([1i64].as_slice(), true, false));
+        let aggregate_log_second =
+            host_f64(&log_raw_second.mean_dim([1i64].as_slice(), false, Kind::Double));
         let simple = &gross_first - 1.0;
         let conditional_second: Tensor = (&gross_second - &gross_first * 2.0 + 1.0).clamp_min(0.0);
         let mean_simple = host_f64(&simple.mean_dim([1i64].as_slice(), false, Kind::Double));
@@ -1177,7 +1399,7 @@ pub fn horizon_laws(
             let exact_mean = beliefs.mean_simple[period.instant][leg.slot];
             let exact_second = beliefs.second_simple[period.instant][leg.slot];
             let one_bar = leg.steps == 1;
-            let sampled_var = plain_sd[index] * plain_sd[index];
+            let sampled_var = (aggregate_log_second[index] - rb_mu[index] * rb_mu[index]).max(0.0);
             let mut prefix_mean_simple = std::array::from_fn(|h| prefix_means[h][index]);
             let mut prefix_second_simple = std::array::from_fn(|h| prefix_seconds[h][index]);
             // H1 is a categorical law whose fitted within-bin simple-return moments are
@@ -1244,22 +1466,59 @@ pub struct HorizonInputs {
     /// Predicted variance of the held aggregate's SIMPLE return, for the independence
     /// diagnostic behind [`HorizonMetrics::leverage_error`].
     pub pred_var: Vec<Vec<f64>>,
-    /// The unconditional-marginal null's fraction. ONE number: every present name shares it,
-    /// which is why its value cannot move the null's book at all — the gross projection is
-    /// scale-free on a constant vector, and a test pins that.
-    pub marginal_kelly: f64,
+    /// The unconditional-marginal null's per-leg fraction. On a raw grid every entry is the
+    /// same; standardized grids condition the same fitted z law on each row's causal sigma.
+    pub marginal_kelly: Vec<Vec<f64>>,
     /// Per-leg law summaries, for the mechanism columns.
     pub laws: Vec<Vec<AggregateLaw>>,
 }
 
+#[derive(Clone, Copy)]
+pub enum SweepMarginals<'a> {
+    Constant(&'a PanelForecast),
+    PerRow(&'a [Vec<ForecastMoment>]),
+}
+
+impl SweepMarginals<'_> {
+    fn at(self, row: usize, slot: usize) -> Result<f64> {
+        match self {
+            Self::Constant(marginal) => Ok(marginal
+                .kelly_f
+                .first()
+                .map_or(0.0, |fraction| f64::from(*fraction))),
+            Self::PerRow(rows) => rows
+                .get(row)
+                .and_then(|values| values.get(slot))
+                .map(|moment| moment.frictionless_kelly)
+                .context("conditional sweep marginal moments do not align with the schedule"),
+        }
+    }
+}
+
+impl<'a> From<&'a PanelForecast> for SweepMarginals<'a> {
+    fn from(value: &'a PanelForecast) -> Self {
+        Self::Constant(value)
+    }
+}
+
+impl<'a> From<&'a [Vec<ForecastMoment>]> for SweepMarginals<'a> {
+    fn from(value: &'a [Vec<ForecastMoment>]) -> Self {
+        Self::PerRow(value)
+    }
+}
+
 /// Assemble the sizing inputs for one construction.
-pub fn build_inputs(
+pub fn build_inputs<'a, M>(
     construction: Construction,
     beliefs: &PanelBeliefs,
     periods: &[Period],
     sampled: Option<&[Vec<AggregateLaw>]>,
-    marginal: &PanelForecast,
-) -> Result<HorizonInputs> {
+    marginal: M,
+) -> Result<HorizonInputs>
+where
+    M: Into<SweepMarginals<'a>>,
+{
+    let marginal = marginal.into();
     let mut kelly = Vec::with_capacity(periods.len());
     let mut pred_var = Vec::with_capacity(periods.len());
     let mut laws = Vec::with_capacity(periods.len());
@@ -1323,7 +1582,15 @@ pub fn build_inputs(
         pred_var.push(v_row);
         laws.push(l_row);
     }
-    let marginal_kelly = marginal.kelly_f.first().map_or(0.0, |f| f64::from(*f));
+    let marginal_kelly = periods
+        .iter()
+        .enumerate()
+        .map(|(p, period)| {
+            (0..period.legs.len())
+                .map(|l| marginal.at(p, l))
+                .collect::<Result<Vec<_>>>()
+        })
+        .collect::<Result<Vec<_>>>()?;
     Ok(HorizonInputs {
         construction,
         kelly,
@@ -1421,10 +1688,27 @@ impl RecedingForecasts {
 
 /// Train-fitted unconditional simple-return law compounded without peeking at evaluation.
 pub fn marginal_horizon_moment(supports: &BarSupports, horizon: usize) -> Result<ForecastMoment> {
+    ensure!(
+        !supports.dof_scaling().is_standardized(),
+        "a standardized marginal law is sigma-conditional; use per-row marginal moments"
+    );
+    marginal_horizon_moment_at(supports, horizon, 1.0)
+}
+
+fn marginal_horizon_moment_at(
+    supports: &BarSupports,
+    horizon: usize,
+    sigma: f64,
+) -> Result<ForecastMoment> {
     ensure!(horizon >= 1, "a marginal horizon is at least one bar");
-    let (first_by_bin, second_by_bin) = supports
-        .simple_return_bin_moments()
-        .context("supports lack fitted simple-return moments; refit the v6 support artifact")?;
+    let (first_by_bin, second_by_bin) = if supports.dof_scaling().is_standardized() {
+        supports.simple_return_bin_moments_at(sigma)?
+    } else {
+        let (first, second) = supports
+            .simple_return_bin_moments()
+            .context("supports lack fitted simple-return moments; refit the support artifact")?;
+        (first.to_vec(), second.to_vec())
+    };
     let masses = supports.bin_masses(DOF_R);
     ensure!(
         masses.len() == first_by_bin.len() && masses.len() == second_by_bin.len(),
@@ -1432,12 +1716,12 @@ pub fn marginal_horizon_moment(supports: &BarSupports, horizon: usize) -> Result
     );
     let first = masses
         .iter()
-        .zip(first_by_bin)
+        .zip(&first_by_bin)
         .map(|(p, m)| p * m)
         .sum::<f64>();
     let second = masses
         .iter()
-        .zip(second_by_bin)
+        .zip(&second_by_bin)
         .map(|(p, m)| p * m)
         .sum::<f64>();
     let gross_first = 1.0 + first;
@@ -1450,6 +1734,60 @@ pub fn marginal_horizon_moment(supports: &BarSupports, horizon: usize) -> Result
         second_simple: second,
         frictionless_kelly: if second > 0.0 { mean / second } else { 0.0 },
     })
+}
+
+fn marginal_horizon_moments(
+    supports: &BarSupports,
+    horizon: usize,
+    periods: &[Period],
+    beliefs: &PanelBeliefs,
+) -> Result<Vec<Vec<ForecastMoment>>> {
+    periods
+        .iter()
+        .map(|period| {
+            period
+                .legs
+                .iter()
+                .map(|leg| {
+                    marginal_horizon_moment_at(
+                        supports,
+                        horizon,
+                        f64::from(beliefs.sigma[period.instant][leg.slot]),
+                    )
+                })
+                .collect()
+        })
+        .collect()
+}
+
+#[derive(Clone, Copy)]
+pub enum MarginalForecasts<'a> {
+    Constant(ForecastMoment),
+    PerRow(&'a [Vec<ForecastMoment>]),
+}
+
+impl MarginalForecasts<'_> {
+    fn at(self, row: usize, slot: usize) -> Result<ForecastMoment> {
+        match self {
+            Self::Constant(moment) => Ok(moment),
+            Self::PerRow(rows) => rows
+                .get(row)
+                .and_then(|values| values.get(slot))
+                .copied()
+                .context("conditional marginal moments do not align with the evaluated panel"),
+        }
+    }
+}
+impl<'a> From<ForecastMoment> for MarginalForecasts<'a> {
+    fn from(value: ForecastMoment) -> Self {
+        Self::Constant(value)
+    }
+}
+
+impl<'a> From<&'a [Vec<ForecastMoment>]> for MarginalForecasts<'a> {
+    fn from(value: &'a [Vec<ForecastMoment>]) -> Self {
+        Self::PerRow(value)
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1502,19 +1840,120 @@ impl RecedingActionRule {
     }
 }
 
-/// Optional causal transformation of the model forecast mean before the unchanged joint solve.
+/// Optional causal transformation of model forecast moments before the unchanged joint solve.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum RecedingSignalRule {
     Raw,
     MeanSignHysteresis { margin_simple: f64 },
+    MomentEma { half_life_bars: usize },
 }
 
 impl RecedingSignalRule {
-    fn margin_simple(self) -> f64 {
+    fn hysteresis_margin(self) -> Option<f64> {
         match self {
-            Self::Raw => 0.0,
-            Self::MeanSignHysteresis { margin_simple } => margin_simple,
+            Self::MeanSignHysteresis { margin_simple } => Some(margin_simple),
+            Self::Raw | Self::MomentEma { .. } => None,
         }
+    }
+}
+
+/// Causal per-symbol state for smoothing forecast first and second simple-return moments.
+///
+/// Symbols absent from an update retain their state. A symbol's first observation, and its first
+/// observation after a panel-clock gap, resets rather than blending across the missing interval.
+#[derive(Clone, Debug)]
+struct MomentEmaState {
+    retention: f64,
+    means: Vec<f64>,
+    seconds: Vec<f64>,
+    initialized: Vec<bool>,
+}
+
+impl MomentEmaState {
+    fn new(symbols: usize, half_life_bars: usize) -> Result<Self> {
+        ensure!(
+            half_life_bars > 0,
+            "moment-EMA half-life must be at least one bar"
+        );
+        let retention = 0.5f64.powf(1.0 / half_life_bars as f64);
+        ensure!(
+            retention.is_finite() && retention > 0.0 && retention < 1.0,
+            "moment-EMA half-life {half_life_bars} does not produce a valid retention"
+        );
+        Ok(Self {
+            retention,
+            means: vec![0.0; symbols],
+            seconds: vec![0.0; symbols],
+            initialized: vec![false; symbols],
+        })
+    }
+
+    fn repair_second(mean: f64, second: f64) -> Result<f64> {
+        ensure!(
+            mean.is_finite() && second.is_finite(),
+            "moment EMA requires finite input moments"
+        );
+        let mean_squared = mean * mean;
+        ensure!(
+            mean_squared.is_finite(),
+            "moment EMA mean squared is not finite"
+        );
+        if second >= mean_squared {
+            return Ok(second);
+        }
+        let tolerance =
+            64.0 * f64::EPSILON * mean_squared.abs().max(second.abs()).max(f64::MIN_POSITIVE);
+        ensure!(
+            mean_squared - second <= tolerance,
+            "forecast second moment {second} is below mean squared {mean_squared}"
+        );
+        Ok(mean_squared)
+    }
+
+    fn update(
+        &mut self,
+        present_symbols: &[u32],
+        elapsed_steps: &[u32],
+        raw_moments: &[ForecastMoment],
+        means: &mut [f64],
+        seconds: &mut [f64],
+    ) -> Result<()> {
+        ensure!(
+            present_symbols.len() == elapsed_steps.len()
+                && raw_moments.len() == present_symbols.len(),
+            "moment-EMA row inputs must have identical lengths"
+        );
+        ensure!(
+            means.len() == self.means.len()
+                && seconds.len() == self.seconds.len()
+                && self.initialized.len() == self.means.len(),
+            "moment-EMA state and output vectors must have identical symbol counts"
+        );
+        let innovation = 1.0 - self.retention;
+        for ((&id, &elapsed), raw) in present_symbols
+            .iter()
+            .zip(elapsed_steps)
+            .zip(raw_moments)
+        {
+            let index = id as usize;
+            ensure!(index < self.means.len(), "moment-EMA symbol id is out of range");
+            let raw_second = Self::repair_second(raw.mean_simple, raw.second_simple)?;
+            if !self.initialized[index] || elapsed > 1 {
+                self.means[index] = raw.mean_simple;
+                self.seconds[index] = raw_second;
+                self.initialized[index] = true;
+            } else {
+                self.means[index] =
+                    self.retention * self.means[index] + innovation * raw.mean_simple;
+                self.seconds[index] =
+                    self.retention * self.seconds[index] + innovation * raw_second;
+            }
+            self.seconds[index] =
+                Self::repair_second(self.means[index], self.seconds[index])?;
+            means[index] = self.means[index];
+            seconds[index] = self.seconds[index];
+        }
+        Ok(())
     }
 }
 
@@ -1621,6 +2060,26 @@ fn apply_receding_action_rule(
     Ok((banded_target, eligible, frozen_count))
 }
 
+/// Maximum peak-to-trough wealth loss on a cumulative log-equity path.
+///
+/// The initial unit wealth is always the first peak, even when `log_equity` omits its leading
+/// zero. Each observation must therefore be the actual next point on one sequential equity path.
+pub fn maximum_drawdown_from_log_equity(log_equity: &[f64]) -> f64 {
+    let mut running_peak = 0.0f64;
+    let mut maximum_drawdown = 0.0f64;
+    for &log_wealth in log_equity {
+        assert!(
+            log_wealth.is_finite(),
+            "maximum drawdown requires a finite log-equity path"
+        );
+        running_peak = running_peak.max(log_wealth);
+        let drawdown = -(log_wealth - running_peak).exp_m1();
+        maximum_drawdown = maximum_drawdown.max(drawdown);
+    }
+    debug_assert!((0.0..=1.0).contains(&maximum_drawdown));
+    maximum_drawdown
+}
+
 #[derive(Clone, Debug)]
 pub struct RecedingRun {
     pub policy: RecedingPolicy,
@@ -1634,6 +2093,10 @@ pub struct RecedingRun {
     /// execution cost. This is an accounting decomposition of the production decisions, not a
     /// separately re-solved frictionless policy.
     pub gross_log_equity: Vec<f64>,
+    /// Per-decision gross wealth multipliers and recorded one-way turnovers. Together they
+    /// define the exact fixed-realized-path flat-cost replay used by the persistence frontier.
+    pub gross_multipliers: Vec<f64>,
+    pub one_way_turnovers: Vec<f64>,
     /// Panel indices actually scored. Boundary rows without a full `horizon` are absent.
     pub decision_instants: Vec<usize>,
     /// Calendar years from the first scored decision to the last. Stored so stdout can use the
@@ -1692,6 +2155,9 @@ impl RecedingRun {
     }
     fn recorded_annual_log_growth(&self) -> f64 {
         self.log_equity.last().copied().unwrap_or(0.0) / self.decision_span_years
+    }
+    pub fn net_maximum_drawdown(&self) -> f64 {
+        maximum_drawdown_from_log_equity(&self.log_equity)
     }
 
     pub fn annual_difference_dispersion(&self, baseline: &Self, panel: &Panel) -> Dispersion {
@@ -1763,28 +2229,39 @@ impl Default for RecedingConfig {
 /// A solver-safe band first obtains that exact incumbent target, freezes only eligible small
 /// moves by zeroing their ADV, and reruns the same joint solver for the remaining coordinates.
 #[allow(clippy::too_many_arguments)]
-pub fn run_receding_book(
+pub fn run_receding_book<'a, M>(
     panel: &Panel,
     moments: &[Vec<ForecastMoment>],
     oracle_periods: &[Period],
-    marginal: ForecastMoment,
+    marginal: M,
     policy: RecedingPolicy,
     action_rule: RecedingActionRule,
     signal_rule: RecedingSignalRule,
     horizon: usize,
     cost: &dyn CostModel,
     config: RecedingConfig,
-) -> Result<RecedingRun> {
+) -> Result<RecedingRun>
+where
+    M: Into<MarginalForecasts<'a>>,
+{
     let band_width = action_rule.absolute_weight();
     ensure!(
         band_width.is_finite() && band_width >= 0.0,
         "receding action-rule width must be finite and nonnegative, got {band_width}"
     );
-    let signal_margin = signal_rule.margin_simple();
-    ensure!(
-        signal_margin.is_finite() && signal_margin >= 0.0,
-        "receding signal-rule margin must be finite and nonnegative, got {signal_margin}"
-    );
+    let signal_margin = signal_rule.hysteresis_margin();
+    if let Some(margin) = signal_margin {
+        ensure!(
+            margin.is_finite() && margin >= 0.0,
+            "receding signal-rule margin must be finite and nonnegative, got {margin}"
+        );
+    }
+    if let RecedingSignalRule::MomentEma { half_life_bars } = signal_rule {
+        ensure!(
+            half_life_bars > 0,
+            "moment-EMA half-life must be at least one bar"
+        );
+    }
     ensure!(
         policy == RecedingPolicy::Model || signal_rule == RecedingSignalRule::Raw,
         "receding signal rules may only transform Model forecasts"
@@ -1796,6 +2273,7 @@ pub fn run_receding_book(
     );
     let names = panel.symbols().len();
     let symbol_ids: Vec<u32> = (0..names as u32).collect();
+    let marginal = marginal.into();
     let mut trailing = TrailingFactorCovariance::new(
         names,
         config.covariance_window,
@@ -1807,10 +2285,16 @@ pub fn run_receding_book(
     let mut one_bar_fallback = vec![0.0; names];
     // Zero means uninitialized; missing symbols deliberately retain their prior nonzero state.
     // Raw and a zero-margin candidate do not allocate, consult or mutate hysteresis state.
-    let mut retained_sign = if signal_margin > 0.0 {
+    let mut retained_sign = if signal_margin.is_some_and(|margin| margin > 0.0) {
         vec![0i8; names]
     } else {
         Vec::new()
+    };
+    let mut moment_ema = match signal_rule {
+        RecedingSignalRule::MomentEma { half_life_bars } => {
+            Some(MomentEmaState::new(names, half_life_bars)?)
+        }
+        RecedingSignalRule::Raw | RecedingSignalRule::MeanSignHysteresis { .. } => None,
     };
     let mut log_wealth: f64 = 0.0;
     let mut observed_until = 0usize;
@@ -1823,6 +2307,8 @@ pub fn run_receding_book(
         actions: 0,
         log_equity: vec![0.0],
         gross_log_equity: vec![0.0],
+        gross_multipliers: Vec::with_capacity(oracle_periods.len()),
+        one_way_turnovers: Vec::with_capacity(oracle_periods.len()),
         decision_instants: Vec::with_capacity(oracle_periods.len()),
         decision_span_years: f64::NAN,
         turnover: 0.0,
@@ -1907,9 +2393,10 @@ pub fn run_receding_book(
                 }
             }
             RecedingPolicy::Marginal => {
-                for &id in &slice.symbols {
-                    means[id as usize] = marginal.mean_simple;
-                    second[id as usize] = marginal.second_simple.max(0.0);
+                for (k, &id) in slice.symbols.iter().enumerate() {
+                    let moment = marginal.at(p, k)?;
+                    means[id as usize] = moment.mean_simple;
+                    second[id as usize] = moment.second_simple.max(0.0);
                 }
             }
             RecedingPolicy::Oracle => {
@@ -1921,15 +2408,34 @@ pub fn run_receding_book(
             }
             RecedingPolicy::EqualWeight | RecedingPolicy::BuyHold => {}
         }
-        if policy == RecedingPolicy::Model && signal_margin > 0.0 {
-            let (retained, flips) = apply_mean_sign_hysteresis(
-                &mut means,
-                &slice.symbols,
-                &mut retained_sign,
-                signal_margin,
-            );
-            run.retained_opposing_signs += retained;
-            run.threshold_flips += flips;
+        if policy == RecedingPolicy::Model {
+            match signal_rule {
+                RecedingSignalRule::Raw => {}
+                RecedingSignalRule::MeanSignHysteresis { margin_simple }
+                    if margin_simple > 0.0 =>
+                {
+                    let (retained, flips) = apply_mean_sign_hysteresis(
+                        &mut means,
+                        &slice.symbols,
+                        &mut retained_sign,
+                        margin_simple,
+                    );
+                    run.retained_opposing_signs += retained;
+                    run.threshold_flips += flips;
+                }
+                RecedingSignalRule::MeanSignHysteresis { .. } => {}
+                RecedingSignalRule::MomentEma { .. } => moment_ema
+                    .as_mut()
+                    .expect("moment-EMA rule initializes causal state")
+                    .update(
+                        &slice.symbols,
+                        panel.elapsed_steps_row(t),
+                        &moments[p],
+                        &mut means,
+                        &mut second,
+                    )
+                    .with_context(|| format!("moment EMA failed at row {t}"))?,
+            }
         }
         ensure!(
             means.iter().chain(&second).all(|value| value.is_finite()),
@@ -2055,10 +2561,11 @@ pub fn run_receding_book(
                 && target_violations
                     .iter()
                     .zip(held_violations)
-                    .all(|(target, held)| *target <= held + 1e-9)
+                    .all(|(target, held)| *target <= held + 2.0 * GROSS_TOLERANCE)
                 && target.iter().zip(&held).all(|(target, held)| {
                     (target.abs() - config.constraints.per_name_cap).max(0.0)
-                        <= (held.abs() - config.constraints.per_name_cap).max(0.0) + 1e-9
+                        <= (held.abs() - config.constraints.per_name_cap).max(0.0)
+                            + 2.0 * GROSS_TOLERANCE
                 }),
             "{} worsened a hard portfolio-constraint violation at row {t}: \
              held={held_violations:?}, target={target_violations:?}",
@@ -2140,6 +2647,8 @@ pub fn run_receding_book(
             .expect("gross curve starts at zero")
             + gross_multiplier.ln();
         run.gross_log_equity.push(gross_log_wealth);
+        run.gross_multipliers.push(gross_multiplier);
+        run.one_way_turnovers.push(turnover);
         run.turnover += turnover;
         run.execution_cost += cost_fraction;
         run.max_gross = run.max_gross.max(held.iter().map(|w| w.abs()).sum::<f64>());
@@ -2248,13 +2757,16 @@ pub struct ScalarMomentAttribution {
 /// turned into a fresh trade. The singleton call into `trade_bench` is intentional: it reuses
 /// that benchmark's expected-log wealth-floor contract without claiming to reproduce its
 /// categorical ruin-domain bracket or independent-window execution policy.
-pub fn scalar_moment_attribution(
+pub fn scalar_moment_attribution<'a, M>(
     panel: &Panel,
     moments: &[Vec<ForecastMoment>],
     periods: &[Period],
-    marginal: ForecastMoment,
+    marginal: M,
     horizon: usize,
-) -> Result<ScalarMomentAttribution> {
+) -> Result<ScalarMomentAttribution>
+where
+    M: Into<MarginalForecasts<'a>>,
+{
     ensure!(
         horizon >= 1,
         "a scalar attribution horizon is at least one bar"
@@ -2263,11 +2775,7 @@ pub fn scalar_moment_attribution(
         moments.len() == periods.len(),
         "scalar moments and realized periods must have identical decision rows"
     );
-    let marginal_fraction = if marginal.second_simple > 0.0 {
-        (marginal.mean_simple / marginal.second_simple).clamp(-LEVERAGE_CAP, LEVERAGE_CAP)
-    } else {
-        0.0
-    };
+    let marginal = marginal.into();
     let mut out = ScalarMomentAttribution {
         decision_instants: Vec::with_capacity(periods.len()),
         model_log_growth: Vec::with_capacity(periods.len()),
@@ -2296,6 +2804,13 @@ pub fn scalar_moment_attribution(
             }
             let model_fraction = if moment.second_simple > 0.0 {
                 (moment.mean_simple / moment.second_simple).clamp(-LEVERAGE_CAP, LEVERAGE_CAP)
+            } else {
+                0.0
+            };
+            let marginal_moment = marginal.at(row, slot)?;
+            let marginal_fraction = if marginal_moment.second_simple > 0.0 {
+                (marginal_moment.mean_simple / marginal_moment.second_simple)
+                    .clamp(-LEVERAGE_CAP, LEVERAGE_CAP)
             } else {
                 0.0
             };
@@ -2338,6 +2853,9 @@ pub struct RecedingAttributionResult {
     pub gross_edge_log_growth_per_year: f64,
     pub model_cost_drag_log_per_year: f64,
     pub edge_cost_contribution_log_per_year: f64,
+    /// Sequential peak-to-trough wealth loss. Undefined for non-self-financing scalar stage 0.
+    pub model_net_maximum_drawdown: f64,
+    pub marginal_net_maximum_drawdown: f64,
     pub model_stage_minus_previous_net_log_growth_per_year: f64,
     pub model_stage_minus_previous_gross_log_growth_per_year: f64,
     pub model_stage_minus_previous_cost_drag_log_per_year: f64,
@@ -2638,6 +3156,8 @@ fn book_attribution_result(
         gross_edge_log_growth_per_year: gross_edge_annual,
         model_cost_drag_log_per_year: model_cost_drag_annual,
         edge_cost_contribution_log_per_year: edge_cost_contribution_annual,
+        model_net_maximum_drawdown: model.net_maximum_drawdown(),
+        marginal_net_maximum_drawdown: marginal.net_maximum_drawdown(),
         model_stage_minus_previous_net_log_growth_per_year: stage_net_change_annual,
         model_stage_minus_previous_gross_log_growth_per_year: stage_gross_change_annual,
         model_stage_minus_previous_cost_drag_log_per_year: stage_cost_drag_change_annual,
@@ -2662,18 +3182,21 @@ fn book_attribution_result(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub fn write_receding_attribution(
+pub fn write_receding_attribution<'a, M>(
     dir: &Path,
     label: &str,
     panel: &Panel,
     moments: &[Vec<ForecastMoment>],
     periods: &[Period],
-    marginal: ForecastMoment,
+    marginal: M,
     horizon: usize,
     production_runs: &[RecedingRun],
     production_cost: &PanelCost,
     config: RecedingConfig,
-) -> Result<Vec<RecedingAttributionResult>> {
+) -> Result<Vec<RecedingAttributionResult>>
+where
+    M: Into<MarginalForecasts<'a>> + Copy,
+{
     let production_model = production_runs
         .iter()
         .find(|run| {
@@ -2807,6 +3330,8 @@ pub fn write_receding_attribution(
         gross_edge_log_growth_per_year: f64::NAN,
         model_cost_drag_log_per_year: f64::NAN,
         edge_cost_contribution_log_per_year: f64::NAN,
+        model_net_maximum_drawdown: f64::NAN,
+        marginal_net_maximum_drawdown: f64::NAN,
         model_stage_minus_previous_net_log_growth_per_year: f64::NAN,
         model_stage_minus_previous_gross_log_growth_per_year: f64::NAN,
         model_stage_minus_previous_cost_drag_log_per_year: f64::NAN,
@@ -3000,6 +3525,14 @@ fn write_receding_attribution_report(
                 values(|r| r.edge_cost_contribution_log_per_year),
             ),
             report_series(
+                "model net maximum drawdown (wealth fraction)",
+                values(|r| r.model_net_maximum_drawdown),
+            ),
+            report_series(
+                "marginal net maximum drawdown (wealth fraction)",
+                values(|r| r.marginal_net_maximum_drawdown),
+            ),
+            report_series(
                 "model stage minus previous net log growth (bps/decision-bar)",
                 values(|r| r.model_stage_minus_previous_net_bps_per_decision_bar.mean),
             ),
@@ -3135,6 +3668,7 @@ pub struct RecedingPolicyFrontierResult {
     pub model_net_log_growth_per_year: f64,
     pub model_gross_log_growth_per_year: f64,
     pub model_cost_drag_log_per_year: f64,
+    pub model_net_maximum_drawdown: f64,
     pub paired_net_gain_log_growth_per_year: f64,
     pub paired_gross_gain_log_growth_per_year: f64,
     pub paired_cost_drag_change_log_per_year: f64,
@@ -3234,6 +3768,7 @@ fn receding_policy_frontier_result(
         model_net_log_growth_per_year: net_annual,
         model_gross_log_growth_per_year: gross_annual,
         model_cost_drag_log_per_year: cost_drag_annual,
+        model_net_maximum_drawdown: run.net_maximum_drawdown(),
         paired_net_gain_log_growth_per_year: paired_net_annual,
         paired_gross_gain_log_growth_per_year: paired_gross_annual,
         paired_cost_drag_change_log_per_year: paired_cost_drag_annual,
@@ -3273,18 +3808,21 @@ fn receding_policy_frontier_result(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub fn write_receding_policy_frontier(
+pub fn write_receding_policy_frontier<'a, M>(
     dir: &Path,
     label: &str,
     panel: &Panel,
     moments: &[Vec<ForecastMoment>],
     periods: &[Period],
-    marginal: ForecastMoment,
+    marginal: M,
     horizon: usize,
     production_runs: &[RecedingRun],
     cost: &dyn CostModel,
     config: RecedingConfig,
-) -> Result<Vec<RecedingPolicyFrontierResult>> {
+) -> Result<Vec<RecedingPolicyFrontierResult>>
+where
+    M: Into<MarginalForecasts<'a>> + Copy,
+{
     ensure!(
         config.constraints.per_name_cap.is_finite() && config.constraints.per_name_cap >= 0.0,
         "policy-frontier per-name cap must be finite and nonnegative"
@@ -3497,6 +4035,10 @@ fn write_receding_policy_frontier_report(
                 values(|r| r.model_cost_drag_log_per_year),
             ),
             report_series(
+                "model net maximum drawdown (wealth fraction)",
+                values(|r| r.model_net_maximum_drawdown),
+            ),
+            report_series(
                 "band minus incumbent net log growth/year",
                 values(|r| r.paired_net_gain_log_growth_per_year),
             ),
@@ -3567,6 +4109,486 @@ fn write_receding_policy_frontier_report(
         ],
     )
 }
+pub const RECEDING_PERSISTENCE_BASE: &str = "pretrain_receding_persistence";
+pub const RECEDING_PERSISTENCE_HALF_LIVES: [usize; 6] = [1, 2, 4, 8, 16, 32];
+
+#[derive(Clone, Debug)]
+pub struct RecedingPersistenceResult {
+    pub candidate: bool,
+    pub half_life_bars: usize,
+    pub loaded_min_bars: usize,
+    pub net_bps_per_decision_bar: Dispersion,
+    pub gross_bps_per_decision_bar: Dispersion,
+    pub cost_drag_bps_per_decision_bar: Dispersion,
+    pub paired_vs_raw_net_bps_per_decision_bar: Dispersion,
+    pub paired_vs_raw_gross_bps_per_decision_bar: Dispersion,
+    pub paired_vs_raw_cost_drag_bps_per_decision_bar: Dispersion,
+    pub paired_vs_marginal_annual_net_growth: Dispersion,
+    pub net_log_growth_per_year: f64,
+    pub gross_log_growth_per_year: f64,
+    pub cost_drag_log_per_year: f64,
+    pub net_maximum_drawdown: f64,
+    pub total_turnover: f64,
+    pub turnover_share_of_raw: f64,
+    pub realized_path_flat_break_even_bps: f64,
+    pub total_execution_cost: f64,
+    pub actions: usize,
+    pub eligible_action_legs: usize,
+    pub action_share_of_eligible: f64,
+    pub reforecasts: usize,
+    pub decision_rows: usize,
+    pub decision_coverage_fraction: f64,
+    pub cost_month_substitutions: usize,
+    pub cost_cross_section_substitutions: usize,
+    pub cost_month_substitution_action_fraction: f64,
+    pub cost_cross_section_substitution_action_fraction: f64,
+    pub configured_gross_cap: f64,
+    pub configured_net_min: f64,
+    pub configured_net_max: f64,
+    pub configured_per_name_cap: f64,
+    pub configured_max_adv_participation: f64,
+    pub max_gross: f64,
+    pub max_abs_net: f64,
+    pub max_name: f64,
+    pub max_participation: f64,
+}
+
+fn fixed_realized_path_flat_growth(run: &RecedingRun, cost_bps: f64) -> f64 {
+    assert!(
+        cost_bps.is_finite() && cost_bps >= 0.0,
+        "fixed-path flat cost must be finite and nonnegative"
+    );
+    assert_eq!(
+        run.gross_multipliers.len(),
+        run.one_way_turnovers.len(),
+        "fixed-path gross multipliers and turnovers must align"
+    );
+    run.gross_multipliers
+        .iter()
+        .zip(&run.one_way_turnovers)
+        .try_fold(0.0, |growth, (&gross, &turnover)| {
+            assert!(
+                gross.is_finite() && gross > 0.0 && turnover.is_finite() && turnover >= 0.0,
+                "fixed-path replay requires positive gross multipliers and nonnegative turnover"
+            );
+            let multiplier = gross - turnover * cost_bps * 1.0e-4;
+            (multiplier > 0.0 && multiplier.is_finite()).then(|| growth + multiplier.ln())
+        })
+        .unwrap_or(f64::NEG_INFINITY)
+}
+
+fn realized_path_flat_break_even_bps(run: &RecedingRun) -> f64 {
+    if fixed_realized_path_flat_growth(run, 0.0) <= 0.0 {
+        return 0.0;
+    }
+    if fixed_realized_path_flat_growth(run, MAX_BREAK_EVEN_BPS) > 0.0 {
+        return f64::INFINITY;
+    }
+    let (mut lo, mut hi) = (0.0, MAX_BREAK_EVEN_BPS);
+    for _ in 0..BREAK_EVEN_ITERATIONS {
+        let mid = 0.5 * (lo + hi);
+        if fixed_realized_path_flat_growth(run, mid) > 0.0 {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    0.5 * (lo + hi)
+}
+
+fn receding_persistence_result(
+    candidate: bool,
+    half_life_bars: usize,
+    loaded_min_bars: usize,
+    constraints: KellyConstraints,
+    run: &RecedingRun,
+    raw: &RecedingRun,
+    marginal: &RecedingRun,
+    panel: &Panel,
+) -> RecedingPersistenceResult {
+    assert_eq!(
+        run.decision_instants, raw.decision_instants,
+        "persistence and raw arms must score exact common decision rows"
+    );
+    assert_eq!(
+        run.decision_instants, marginal.decision_instants,
+        "persistence and marginal arms must score exact common decision rows"
+    );
+    let net = path_bps_dispersion(run, &run.log_equity, panel);
+    let gross = path_bps_dispersion(run, &run.gross_log_equity, panel);
+    let cost_drag =
+        paired_path_bps_dispersion(run, &run.gross_log_equity, run, &run.log_equity, panel);
+    let measured_paired_net =
+        paired_path_bps_dispersion(run, &run.log_equity, raw, &raw.log_equity, panel);
+    let measured_paired_gross = paired_path_bps_dispersion(
+        run,
+        &run.gross_log_equity,
+        raw,
+        &raw.gross_log_equity,
+        panel,
+    );
+    let measured_paired_cost = stage_cost_drag_change_bps_dispersion(run, raw, panel);
+    let (paired_net, paired_gross, paired_cost) = if candidate {
+        (
+            measured_paired_net,
+            measured_paired_gross,
+            measured_paired_cost,
+        )
+    } else {
+        (
+            exactly_zero_dispersion(measured_paired_net),
+            exactly_zero_dispersion(measured_paired_gross),
+            exactly_zero_dispersion(measured_paired_cost),
+        )
+    };
+    let net_annual = run.annual_log_growth(panel);
+    let gross_annual = annual_path_growth(run, &run.gross_log_equity);
+    let cost_annual = gross_annual - net_annual;
+    let raw_net_annual = raw.annual_log_growth(panel);
+    let raw_gross_annual = annual_path_growth(raw, &raw.gross_log_equity);
+    let paired_net_annual = if candidate {
+        net_annual - raw_net_annual
+    } else {
+        0.0
+    };
+    let paired_gross_annual = if candidate {
+        gross_annual - raw_gross_annual
+    } else {
+        0.0
+    };
+    let paired_cost_annual = if candidate {
+        cost_annual - (raw_gross_annual - raw_net_annual)
+    } else {
+        0.0
+    };
+    let tolerance = 1.0e-9;
+    assert!(
+        ((gross.mean - net.mean) - cost_drag.mean).abs() <= tolerance
+            && ((paired_gross.mean - paired_net.mean) - paired_cost.mean).abs() <= tolerance
+            && ((gross_annual - net_annual) - cost_annual).abs() <= tolerance
+            && ((paired_gross_annual - paired_net_annual) - paired_cost_annual).abs()
+                <= tolerance,
+        "receding persistence gross/net/cost accounting identity failed at half-life \
+         {half_life_bars}"
+    );
+    RecedingPersistenceResult {
+        candidate,
+        half_life_bars,
+        loaded_min_bars,
+        net_bps_per_decision_bar: net,
+        gross_bps_per_decision_bar: gross,
+        cost_drag_bps_per_decision_bar: cost_drag,
+        paired_vs_raw_net_bps_per_decision_bar: paired_net,
+        paired_vs_raw_gross_bps_per_decision_bar: paired_gross,
+        paired_vs_raw_cost_drag_bps_per_decision_bar: paired_cost,
+        paired_vs_marginal_annual_net_growth: run.annual_difference_dispersion(marginal, panel),
+        net_log_growth_per_year: net_annual,
+        gross_log_growth_per_year: gross_annual,
+        cost_drag_log_per_year: cost_annual,
+        net_maximum_drawdown: run.net_maximum_drawdown(),
+        total_turnover: run.turnover,
+        turnover_share_of_raw: if raw.turnover > 0.0 {
+            run.turnover / raw.turnover
+        } else if run.turnover > 0.0 {
+            f64::INFINITY
+        } else {
+            1.0
+        },
+        realized_path_flat_break_even_bps: realized_path_flat_break_even_bps(run),
+        total_execution_cost: run.execution_cost,
+        actions: run.actions,
+        eligible_action_legs: run.eligible_action_legs,
+        action_share_of_eligible: if run.eligible_action_legs > 0 {
+            run.actions as f64 / run.eligible_action_legs as f64
+        } else {
+            0.0
+        },
+        reforecasts: run.reforecasts,
+        decision_rows: run.decision_instants.len(),
+        decision_coverage_fraction: if run.reforecasts > 0 {
+            run.decision_instants.len() as f64 / run.reforecasts as f64
+        } else {
+            0.0
+        },
+        cost_month_substitutions: run.cost_month_substitutions,
+        cost_cross_section_substitutions: run.cost_cross_section_substitutions,
+        cost_month_substitution_action_fraction: if run.actions > 0 {
+            run.cost_month_substitutions as f64 / run.actions as f64
+        } else {
+            0.0
+        },
+        cost_cross_section_substitution_action_fraction: if run.actions > 0 {
+            run.cost_cross_section_substitutions as f64 / run.actions as f64
+        } else {
+            0.0
+        },
+        configured_gross_cap: constraints.gross_cap,
+        configured_net_min: constraints.net_min,
+        configured_net_max: constraints.net_max,
+        configured_per_name_cap: constraints.per_name_cap,
+        configured_max_adv_participation: constraints.max_adv_participation,
+        max_gross: run.max_gross,
+        max_abs_net: run.max_abs_net,
+        max_name: run.max_name,
+        max_participation: run.max_participation,
+    }
+}
+
+fn print_receding_persistence_row(horizon: usize, row: &RecedingPersistenceResult) {
+    println!(
+        "receding persistence H={horizon} hl={} min-bars={} \
+         net-ci-low={:.6}bps/bar gross-ci-low={:.6}bps/bar \
+         vs-raw-net-ci-low={:.6}bps/bar vs-marginal-annual-ci-low={:.6} \
+         break-even={:.6}bps max-dd={:.6} turnover={:.6}",
+        row.half_life_bars,
+        row.loaded_min_bars,
+        row.net_bps_per_decision_bar.ci_low,
+        row.gross_bps_per_decision_bar.ci_low,
+        row.paired_vs_raw_net_bps_per_decision_bar.ci_low,
+        row.paired_vs_marginal_annual_net_growth.ci_low,
+        row.realized_path_flat_break_even_bps,
+        row.net_maximum_drawdown,
+        row.total_turnover,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn write_receding_persistence<'a, M>(
+    dir: &Path,
+    label: &str,
+    panel: &Panel,
+    moments: &[Vec<ForecastMoment>],
+    periods: &[Period],
+    marginal_moments: M,
+    horizon: usize,
+    production_runs: &[RecedingRun],
+    cost: &dyn CostModel,
+    config: RecedingConfig,
+    loaded_min_bars: usize,
+) -> Result<Vec<RecedingPersistenceResult>>
+where
+    M: Into<MarginalForecasts<'a>> + Copy,
+{
+    let raw = production_runs
+        .iter()
+        .find(|run| {
+            run.policy == RecedingPolicy::Model
+                && run.horizon == horizon
+                && run.action_rule == RecedingActionRule::Incumbent
+                && run.signal_rule == RecedingSignalRule::Raw
+        })
+        .with_context(|| format!("missing selected-H raw Model run at H={horizon}"))?;
+    let marginal = production_runs
+        .iter()
+        .find(|run| {
+            run.policy == RecedingPolicy::Marginal
+                && run.horizon == horizon
+                && run.action_rule == RecedingActionRule::Incumbent
+                && run.signal_rule == RecedingSignalRule::Raw
+        })
+        .with_context(|| format!("missing selected-H Marginal run at H={horizon}"))?;
+    ensure!(
+        raw.decision_instants == marginal.decision_instants,
+        "selected-H raw Model and Marginal runs must share exact decision rows"
+    );
+    let mut rows = Vec::with_capacity(RECEDING_PERSISTENCE_HALF_LIVES.len() + 1);
+    rows.push(receding_persistence_result(
+        false,
+        0,
+        loaded_min_bars,
+        config.constraints,
+        raw,
+        raw,
+        marginal,
+        panel,
+    ));
+    print_receding_persistence_row(horizon, &rows[0]);
+    for &half_life_bars in &RECEDING_PERSISTENCE_HALF_LIVES {
+        let run = run_receding_book(
+            panel,
+            moments,
+            periods,
+            marginal_moments,
+            RecedingPolicy::Model,
+            RecedingActionRule::Incumbent,
+            RecedingSignalRule::MomentEma { half_life_bars },
+            horizon,
+            cost,
+            config,
+        )?;
+        let row = receding_persistence_result(
+            true,
+            half_life_bars,
+            loaded_min_bars,
+            config.constraints,
+            &run,
+            raw,
+            marginal,
+            panel,
+        );
+        print_receding_persistence_row(horizon, &row);
+        rows.push(row);
+    }
+    ensure!(
+        rows.len() == RECEDING_PERSISTENCE_HALF_LIVES.len() + 1
+            && !rows[0].candidate
+            && rows[0].half_life_bars == 0
+            && rows[1..]
+                .iter()
+                .map(|row| row.half_life_bars)
+                .eq(RECEDING_PERSISTENCE_HALF_LIVES),
+        "persistence report requires raw then the fixed half-life frontier"
+    );
+    write_receding_persistence_report(dir, label, horizon, &rows)?;
+    Ok(rows)
+}
+
+fn write_receding_persistence_report(
+    dir: &Path,
+    label: &str,
+    horizon: usize,
+    rows: &[RecedingPersistenceResult],
+) -> Result<()> {
+    ensure!(
+        rows.len() == RECEDING_PERSISTENCE_HALF_LIVES.len() + 1
+            && !rows[0].candidate
+            && rows[0].half_life_bars == 0
+            && rows[1..]
+                .iter()
+                .map(|row| row.half_life_bars)
+                .eq(RECEDING_PERSISTENCE_HALF_LIVES),
+        "persistence report requires raw then the fixed half-life frontier"
+    );
+    let values =
+        |f: fn(&RecedingPersistenceResult) -> f64| rows.iter().map(f).collect::<Vec<_>>();
+    let dispersion = |f: fn(&RecedingPersistenceResult) -> Dispersion,
+                      field: fn(Dispersion) -> f64| {
+        rows.iter().map(|row| field(f(row))).collect::<Vec<_>>()
+    };
+    let mean = |value: Dispersion| value.mean;
+    let ci_low = |value: Dispersion| value.ci_low;
+    let ci_high = |value: Dispersion| value.ci_high;
+    let mut series = vec![
+        report_series(
+            "candidate row (raw=0, moment EMA=1)",
+            values(|r| r.candidate as u8 as f64),
+        ),
+        report_series(
+            "moment EMA half-life (bars; raw=0)",
+            values(|r| r.half_life_bars as f64),
+        ),
+        report_series(
+            "loaded corpus minimum bars",
+            values(|r| r.loaded_min_bars as f64),
+        ),
+    ];
+    let dispersion_fields: &[(&str, fn(&RecedingPersistenceResult) -> Dispersion)] = &[
+        ("net log growth", |r| r.net_bps_per_decision_bar),
+        ("gross log growth", |r| r.gross_bps_per_decision_bar),
+        ("exact cost drag, gross minus net", |r| {
+            r.cost_drag_bps_per_decision_bar
+        }),
+        ("moment EMA minus raw net log growth", |r| {
+            r.paired_vs_raw_net_bps_per_decision_bar
+        }),
+        ("moment EMA minus raw gross log growth", |r| {
+            r.paired_vs_raw_gross_bps_per_decision_bar
+        }),
+        ("moment EMA minus raw exact cost drag", |r| {
+            r.paired_vs_raw_cost_drag_bps_per_decision_bar
+        }),
+    ];
+    for &(name, getter) in dispersion_fields {
+        series.push(report_series(
+            format!("{name} (bps/decision-bar)"),
+            dispersion(getter, mean),
+        ));
+        series.push(report_series(
+            format!("{name} (bps/decision-bar), daily-block ci low"),
+            dispersion(getter, ci_low),
+        ));
+        series.push(report_series(
+            format!("{name} (bps/decision-bar), daily-block ci high"),
+            dispersion(getter, ci_high),
+        ));
+    }
+    for (suffix, field) in [
+        ("mean", mean as fn(Dispersion) -> f64),
+        ("daily-block ci low", ci_low as fn(Dispersion) -> f64),
+        ("daily-block ci high", ci_high as fn(Dispersion) -> f64),
+    ] {
+        series.push(report_series(
+            format!("frontier row minus marginal net log growth/year, paired {suffix}"),
+            dispersion(|r| r.paired_vs_marginal_annual_net_growth, field),
+        ));
+    }
+    let value_fields: &[(&str, fn(&RecedingPersistenceResult) -> f64)] = &[
+        ("net log growth/year", |r| r.net_log_growth_per_year),
+        ("gross log growth/year", |r| r.gross_log_growth_per_year),
+        ("exact cost drag log/year", |r| r.cost_drag_log_per_year),
+        ("net maximum drawdown (wealth fraction)", |r| {
+            r.net_maximum_drawdown
+        }),
+        ("total one-way turnover", |r| r.total_turnover),
+        ("turnover share of raw", |r| r.turnover_share_of_raw),
+        ("realized-path flat break-even (bps)", |r| {
+            r.realized_path_flat_break_even_bps
+        }),
+        ("total execution cost fraction", |r| r.total_execution_cost),
+        ("executed actions", |r| r.actions as f64),
+        ("eligible causally tradable legs", |r| {
+            r.eligible_action_legs as f64
+        }),
+        ("executed actions / eligible legs", |r| {
+            r.action_share_of_eligible
+        }),
+        ("causal reforecasts", |r| r.reforecasts as f64),
+        ("scored decision rows", |r| r.decision_rows as f64),
+        ("scored decisions / reforecasts", |r| {
+            r.decision_coverage_fraction
+        }),
+        ("PanelCost month-level substitutions", |r| {
+            r.cost_month_substitutions as f64
+        }),
+        ("PanelCost cross-sectional substitutions", |r| {
+            r.cost_cross_section_substitutions as f64
+        }),
+        ("PanelCost month substitutions / actions", |r| {
+            r.cost_month_substitution_action_fraction
+        }),
+        ("PanelCost cross-section substitutions / actions", |r| {
+            r.cost_cross_section_substitution_action_fraction
+        }),
+        ("configured gross cap", |r| r.configured_gross_cap),
+        ("configured net minimum", |r| r.configured_net_min),
+        ("configured net maximum", |r| r.configured_net_max),
+        ("configured per-name cap", |r| r.configured_per_name_cap),
+        ("configured max ADV participation", |r| {
+            r.configured_max_adv_participation
+        }),
+        ("max post-return gross (holding)", |r| r.max_gross),
+        ("max post-return abs net (holding)", |r| r.max_abs_net),
+        ("max post-return per-name (holding)", |r| r.max_name),
+        ("max ADV participation", |r| r.max_participation),
+    ];
+    for &(name, getter) in value_fields {
+        series.push(report_series(name, values(getter)));
+    }
+    write_chart(
+        dir,
+        RECEDING_PERSISTENCE_BASE,
+        format!(
+            "Selected-H Causal Forecast-Moment EMA Persistence Frontier - {label} - H={horizon}; \
+             raw then fixed half-lives [1,2,4,8,16,32], shared cached forecasts, PanelCost, \
+             constraints and decision rows; CIs use matched daily blocks"
+        ),
+        "persistence-grid index",
+        "matched economic level / audit",
+        ScaleKind::Linear,
+        series,
+    )
+}
+
 pub const RECEDING_HYSTERESIS_BASE: &str = "pretrain_receding_hysteresis";
 
 #[derive(Clone, Debug)]
@@ -3582,6 +4604,7 @@ pub struct RecedingHysteresisResult {
     pub net_log_growth_per_year: f64,
     pub gross_log_growth_per_year: f64,
     pub cost_drag_log_per_year: f64,
+    pub net_maximum_drawdown: f64,
     pub paired_net_gain_log_growth_per_year: f64,
     pub paired_gross_gain_log_growth_per_year: f64,
     pub paired_cost_drag_change_log_per_year: f64,
@@ -3701,6 +4724,7 @@ fn receding_hysteresis_result(
         net_log_growth_per_year: net_annual,
         gross_log_growth_per_year: gross_annual,
         cost_drag_log_per_year: cost_drag_annual,
+        net_maximum_drawdown: run.net_maximum_drawdown(),
         paired_net_gain_log_growth_per_year: paired_net_annual,
         paired_gross_gain_log_growth_per_year: paired_gross_annual,
         paired_cost_drag_change_log_per_year: paired_cost_drag_annual,
@@ -3862,6 +4886,10 @@ fn write_receding_hysteresis_report(
             |r: &RecedingHysteresisResult| r.cost_drag_log_per_year,
         ),
         (
+            "net maximum drawdown (wealth fraction)",
+            |r: &RecedingHysteresisResult| r.net_maximum_drawdown,
+        ),
+        (
             "candidate minus raw net log growth/year",
             |r: &RecedingHysteresisResult| r.paired_net_gain_log_growth_per_year,
         ),
@@ -4011,6 +5039,13 @@ pub fn write_receding_reports(
                 .collect(),
         ));
         economic.push(report_series(
+            format!("{} net maximum drawdown (wealth fraction)", policy.name()),
+            policy_runs
+                .iter()
+                .map(|r| r.net_maximum_drawdown())
+                .collect(),
+        ));
+        economic.push(report_series(
             format!("{} turnover", policy.name()),
             policy_runs.iter().map(|r| r.turnover).collect(),
         ));
@@ -4072,6 +5107,12 @@ pub fn write_receding_reports(
     economic.push(report_series(
         format!("SELECTED production H={selected_horizon} model net log growth/year"),
         highlighted(selected_model.annual_log_growth(panel)),
+    ));
+    economic.push(report_series(
+        format!(
+            "SELECTED production H={selected_horizon} model net maximum drawdown (wealth fraction)"
+        ),
+        highlighted(selected_model.net_maximum_drawdown()),
     ));
     let selected_index = FORECAST_HORIZONS
         .iter()
@@ -4180,6 +5221,8 @@ pub struct RecedingArgs {
     pub checkpoint: PathBuf,
     pub gens_dir: PathBuf,
     pub res_secs: u32,
+    /// Requested corpus-universe floor; the loader raises it to the evaluator's causal minimum.
+    pub min_bars: usize,
     pub device: Device,
     pub split_bounds: (i64, i64),
     pub split: Split,
@@ -4206,6 +5249,7 @@ impl RecedingArgs {
             checkpoint,
             gens_dir,
             res_secs: 300,
+            min_bars: DEFAULT_MIN_BARS,
             device: Device::cuda_if_available(),
             split_bounds: crate::data::ingest::PINNED_SPLIT_BOUNDS,
             split: Split::Val,
@@ -4240,7 +5284,7 @@ impl RecedingBench {
     pub fn table(&self) -> String {
         let mut out = format!(
             "every-bar receding Kelly: split={}, {} symbols, {} instants, {} paths, selected production H={} (marked *)\n\
-             sel policy                    H  reforecasts  actions  log-growth/yr  turnover  cost\n",
+             sel policy                    H  reforecasts  actions  log-growth/yr  net-max-dd  turnover  cost\n",
             self.split.as_str(),
             self.symbols,
             self.instants,
@@ -4256,13 +5300,14 @@ impl RecedingBench {
                     ""
                 };
             out.push_str(&format!(
-                "{:<3} {:<24} {:>3} {:>12} {:>8} {:>14.6} {:>9.4} {:>8.5}\n",
+                "{:<3} {:<24} {:>3} {:>12} {:>8} {:>14.6} {:>11.6} {:>9.4} {:>8.5}\n",
                 marker,
                 run.policy.name(),
                 run.horizon,
                 run.reforecasts,
                 run.actions,
                 growth,
+                run.net_maximum_drawdown(),
                 run.turnover,
                 run.execution_cost,
             ));
@@ -4282,10 +5327,13 @@ pub fn validate_receding_split(split: Split, allow_test: bool) -> Result<()> {
     );
     Ok(())
 }
-
-/// The fixed multi-width band frontier is a validation diagnostic, never a locked-test selector.
+/// Fixed policy and signal frontiers are validation diagnostics, never locked-test selectors.
 pub const fn should_write_receding_policy_frontier(split: Split) -> bool {
     matches!(split, Split::Val)
+}
+
+fn receding_corpus_min_bars(requested: usize, panel_config: &PanelConfig) -> usize {
+    requested.max(panel_config.min_history + ADV_TRAILING_BARS)
 }
 /// Production evaluator: one causal panel scan, one common max-H ancestral rollout, then an
 /// every-bar cost-aware solve for every horizon prefix and baseline.
@@ -4320,20 +5368,28 @@ pub fn run_receding_evaluation(args: &RecedingArgs) -> Result<RecedingBench> {
         Split::Train => unreachable!("held-out split checked above"),
     };
     let panel_config = PanelConfig::new(span, args.max_symbols, args.max_instants);
+    let loaded_min_bars = receding_corpus_min_bars(args.min_bars, &panel_config);
+    let (model, scaling) =
+        load_authenticated_checkpoint(&args.checkpoint, args.device, args.res_secs)
+            .with_context(|| format!("loading {}", args.checkpoint.display()))?;
     let corpus = BarCorpus::load_with_bounds(
         &args.bars_dir,
         args.res_secs,
-        panel_config.min_history + ADV_TRAILING_BARS,
+        loaded_min_bars,
         args.split_bounds,
-    )?;
+    )?
+    .with_dof_scaling(scaling);
     ensure!(
         corpus.split_bounds() == args.split_bounds,
         "the corpus did not take the pinned global split bounds"
     );
+    ensure!(
+        corpus.dof_scaling() == model.deployment_supports().dof_scaling(),
+        "checkpoint supports tile {} targets but the evaluation corpus encodes {}",
+        model.deployment_supports().dof_scaling(),
+        corpus.dof_scaling()
+    );
     let panel = Panel::build(&corpus, &panel_config)?;
-    let metadata = world_model_metadata_path(&args.checkpoint);
-    let model = BarWorldModel::load(&args.checkpoint, &metadata, args.device)
-        .with_context(|| format!("loading {}", args.checkpoint.display()))?;
     ensure!(
         model.all_parameters_frozen(),
         "evaluation checkpoint is still trainable"
@@ -4341,10 +5397,17 @@ pub fn run_receding_evaluation(args: &RecedingArgs) -> Result<RecedingBench> {
     let supports = model
         .supports_for(args.res_secs)
         .with_context(|| format!("checkpoint has no {}s supports", args.res_secs))?;
-    // Refuse legacy supports before doing the expensive rollout.
-    supports
-        .simple_return_bin_moments()
-        .context("checkpoint supports lack fitted simple-return moments; refit v6 supports")?;
+    // Refuse incomplete supports before doing the expensive rollout, without reading
+    // sigma-marginalized payoff moments from a standardized artifact.
+    if supports.dof_scaling().is_standardized() {
+        supports
+            .traded_z_law()
+            .context("standardized checkpoint supports lack the measured sub-bin law of z")?;
+    } else {
+        supports
+            .simple_return_bin_moments()
+            .context("checkpoint supports lack fitted simple-return moments; refit v6 supports")?;
+    }
     let beliefs = scan_panel(&model, &corpus, &panel, args.res_secs)?;
     let max_periods = receding_schedule(
         &corpus,
@@ -4378,7 +5441,7 @@ pub fn run_receding_evaluation(args: &RecedingArgs) -> Result<RecedingBench> {
         let moments = forecasts
             .horizon(horizon)
             .expect("the production horizon is present");
-        let marginal = marginal_horizon_moment(supports, horizon)?;
+        let marginal = marginal_horizon_moments(supports, horizon, &max_periods, &beliefs)?;
         let mut oracle = receding_schedule(&corpus, &panel, &beliefs, horizon)?;
         let common_last = max_periods
             .last()
@@ -4398,7 +5461,7 @@ pub fn run_receding_evaluation(args: &RecedingArgs) -> Result<RecedingBench> {
                 &panel,
                 moments,
                 &oracle,
-                marginal,
+                marginal.as_slice(),
                 policy,
                 RecedingActionRule::Incumbent,
                 RecedingSignalRule::Raw,
@@ -4427,8 +5490,9 @@ pub fn run_receding_evaluation(args: &RecedingArgs) -> Result<RecedingBench> {
     let selected_periods = selected_periods
         .as_deref()
         .expect("the selected production periods were retained");
-    let selected_marginal =
-        selected_marginal.expect("the selected production marginal moment was retained");
+    let selected_marginal = selected_marginal
+        .as_deref()
+        .expect("the selected production marginal moments were retained");
     if let Some(margin_bps) = args.mean_sign_hysteresis_bps {
         let margin_simple = margin_bps * 1.0e-4;
         ensure!(
@@ -4479,6 +5543,19 @@ pub fn run_receding_evaluation(args: &RecedingArgs) -> Result<RecedingBench> {
             &runs,
             &cost,
             attribution_config,
+        )?;
+        write_receding_persistence(
+            &args.gens_dir,
+            &args.label,
+            &panel,
+            selected_moments,
+            selected_periods,
+            selected_marginal,
+            args.forecast_horizon,
+            &runs,
+            &cost,
+            attribution_config,
+            loaded_min_bars,
         )?;
     }
     write_receding_attribution(
@@ -4550,7 +5627,7 @@ fn raw_weights(
             let mean = inputs.kelly[index].iter().sum::<f64>() / n as f64;
             out.extend(inputs.kelly[index].iter().map(|f| f - mean));
         }
-        Policy::Marginal => out.extend(std::iter::repeat_n(inputs.marginal_kelly, n)),
+        Policy::Marginal => out.extend(inputs.marginal_kelly[index].iter().copied()),
         Policy::EqualWeight => out.extend(std::iter::repeat_n(1.0, n)),
         Policy::Oracle => {
             out.extend(std::iter::repeat_n(0.0, n));
@@ -5377,21 +6454,27 @@ pub fn run_horizon_sweep(args: &HorizonArgs) -> Result<HorizonFrontier> {
     );
     let (val_start, val_end) = args.split_bounds;
     let config = PanelConfig::new((val_start, val_end), args.max_symbols, args.max_instants);
+    let (model, scaling) =
+        load_authenticated_checkpoint(&args.checkpoint, args.device, args.res_secs)
+            .with_context(|| format!("loading {}", args.checkpoint.display()))?;
     let corpus = BarCorpus::load_with_bounds(
         &args.bars_dir,
         args.res_secs,
         config.min_history + ADV_TRAILING_BARS,
         (val_start, val_end),
-    )?;
+    )?
+    .with_dof_scaling(scaling);
     ensure!(
         corpus.split_bounds() == (val_start, val_end),
         "the corpus did not take the pinned split bounds"
     );
+    ensure!(
+        corpus.dof_scaling() == model.deployment_supports().dof_scaling(),
+        "checkpoint supports tile {} targets but the horizon corpus encodes {}",
+        model.deployment_supports().dof_scaling(),
+        corpus.dof_scaling()
+    );
     let panel = Panel::build(&corpus, &config)?;
-
-    let metadata = world_model_metadata_path(&args.checkpoint);
-    let model = BarWorldModel::load(&args.checkpoint, &metadata, args.device)
-        .with_context(|| format!("loading {}", args.checkpoint.display()))?;
     ensure!(
         model.all_parameters_frozen(),
         "the checkpoint loaded for a horizon sweep is still trainable"
@@ -5408,16 +6491,32 @@ pub fn run_horizon_sweep(args: &HorizonArgs) -> Result<HorizonFrontier> {
         started.elapsed().as_secs_f64(),
         beliefs.bytes() as f64 / (1u64 << 30) as f64
     );
-    let marginal_panel = marginal_forecasts(&panel, supports);
-    let marginal = marginal_panel
-        .first()
-        .cloned()
-        .context("the panel has no instants")?;
+    let raw_marginal = if supports.dof_scaling().is_standardized() {
+        None
+    } else {
+        Some(
+            marginal_forecasts(&panel, supports)
+                .into_iter()
+                .next()
+                .context("the panel has no instants")?,
+        )
+    };
 
     let cost = FlatCost::new(args.cost_bps);
     let mut rows = Vec::new();
     for &k in &HOLD_HORIZONS {
         let periods = schedule(&corpus, &panel, &beliefs, k)?;
+        let conditional_marginal;
+        let marginal = if supports.dof_scaling().is_standardized() {
+            conditional_marginal = marginal_horizon_moments(supports, k, &periods, &beliefs)?;
+            SweepMarginals::PerRow(conditional_marginal.as_slice())
+        } else {
+            SweepMarginals::Constant(
+                raw_marginal
+                    .as_ref()
+                    .expect("raw supports built the raw marginal forecast"),
+            )
+        };
         for &construction in &CONSTRUCTIONS {
             // At k = 1 the aggregate IS the fitted one-bar categorical law: both simple-return
             // moments and the log-return drift/variance are exact cached reductions. Ancestral
@@ -5450,7 +6549,7 @@ pub fn run_horizon_sweep(args: &HorizonArgs) -> Result<HorizonFrontier> {
                     &beliefs,
                     &periods,
                     sampled.as_deref(),
-                    &marginal,
+                    marginal,
                 )?;
                 if replicate == 0 {
                     mechanism = HorizonMechanism::of(&periods, &inputs);
@@ -5714,7 +6813,7 @@ pub fn write_horizon_frontier(dir: &Path, label: &str, frontier: &HorizonFrontie
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::torch::bar_dist::{BAR_CHAIN, BAR_DOF};
+    use crate::torch::bar_dist::{BarDof, StandardizedDof, BAR_CHAIN, BAR_DOF};
     use crate::torch::test_rng;
     use crate::torch::train::portfolio::{
         backtest, BacktestConfig, PanelSlice, PolicyInputs, GROSS_CAPS,
@@ -5927,6 +7026,59 @@ mod tests {
     }
 
     #[test]
+    fn standardized_marginal_requires_and_preserves_row_sigma() {
+        let rows: Vec<StandardizedDof> = (0..4_096)
+            .map(|index| {
+                let z = (index as f32 / 4_095.0 - 0.5) * 6.0;
+                StandardizedDof {
+                    dof: BarDof {
+                        r: z,
+                        s: z.abs(),
+                        u: (index % 17) as f32 / 16.0,
+                        v: (index % 13) as f32 / 12.0,
+                        w: z * 0.1,
+                    },
+                    sigma: if index % 2 == 0 { 0.01 } else { 0.02 },
+                }
+            })
+            .collect();
+        let supports = BarSupports::fit_standardized(&rows);
+        assert!(
+            marginal_horizon_moment(&supports, 1).is_err(),
+            "a standardized marginal must not silently use sigma-marginalized payoff moments"
+        );
+        let sigma = 0.017;
+        let got = marginal_horizon_moment_at(&supports, 1, sigma).expect("conditional marginal");
+        let (first, second) = supports
+            .simple_return_bin_moments_at(sigma)
+            .expect("conditional support moments");
+        let masses = supports.bin_masses(DOF_R);
+        let expected_first: f64 = masses.iter().zip(&first).map(|(p, x)| p * x).sum();
+        let expected_second: f64 = masses.iter().zip(&second).map(|(p, x)| p * x).sum();
+        assert!((got.mean_simple - expected_first).abs() < 1.0e-12);
+        assert!((got.second_simple - expected_second).abs() < 1.0e-12);
+    }
+
+    #[test]
+    fn raw_scan_keeps_unit_sigma_without_allocating_a_duplicate_target() {
+        let _torch_rng_guard = test_rng::exclusive();
+        let fixture = Fixture::new("raw_scan_target", |_, _| {});
+        let beliefs = fixture.beliefs();
+        assert!(
+            beliefs.raw_dof.is_none(),
+            "a raw corpus must use its model input as the realized target"
+        );
+        assert!(
+            beliefs
+                .sigma
+                .iter()
+                .flatten()
+                .all(|sigma| sigma.to_bits() == 1.0f32.to_bits()),
+            "raw scaling must preserve the exact unit divisor"
+        );
+    }
+
+    #[test]
     fn receding_schedule_excludes_boundaries_and_never_shortens_horizon() {
         let _torch_rng_guard = test_rng::exclusive();
         const H: usize = 4;
@@ -6057,6 +7209,39 @@ mod tests {
         // leverage bound.
         assert!(closure_kelly(1.0e-4, 0.0).is_finite());
         assert!(closure_kelly(50.0, 1.0e-5).abs() <= FREE_LEVERAGE);
+    }
+
+    #[test]
+    fn additive_log_moments_preserve_fitted_within_bin_variance() {
+        let mut first = Tensor::zeros([2], (Kind::Double, Device::Cpu));
+        let mut second = Tensor::zeros([2], (Kind::Double, Device::Cpu));
+        let live = Tensor::ones([2], (Kind::Double, Device::Cpu));
+
+        accumulate_conditional_log_moments(
+            &mut first,
+            &mut second,
+            Tensor::from_slice(&[1.0f64, 2.0]),
+            Tensor::from_slice(&[4.0f64, 9.0]),
+            &live,
+        );
+        accumulate_conditional_log_moments(
+            &mut first,
+            &mut second,
+            Tensor::from_slice(&[3.0f64, 4.0]),
+            Tensor::from_slice(&[16.0f64, 25.0]),
+            &live,
+        );
+
+        assert_eq!(host_f64(&first), vec![4.0, 6.0]);
+        assert_eq!(host_f64(&second), vec![26.0, 50.0]);
+        let mean = first.mean(Kind::Double).double_value(&[]);
+        let raw_second = second.mean(Kind::Double).double_value(&[]);
+        assert_eq!(
+            raw_second - mean * mean,
+            13.0,
+            "the aggregate variance must retain the fitted conditional second moments; \
+             replacing them with squared bin representatives would give 1"
+        );
     }
 
     /// The report base has to exist on disk and hold finite values for every registered series,
@@ -6417,24 +7602,49 @@ mod tests {
 
     /// The one-bar law that sizes every stale row, and every step of every rollout, must be
     /// `p(r | strictly past bars)` — never a law that knows any part of the bar it predicts.
+    /// Its log moments must reduce that law against fitted `E[r | bin]` and `E[r² | bin]`,
+    /// rather than geometric representatives which discard within-bin variance.
     ///
     /// `r`'s prefix set is DERIVED from [`BAR_CHAIN`] here rather than assumed, so this test
     /// stays correct under any factorization order. `r` currently HEADS the chain, so that set
     /// is empty, `p(r | past)` is the head's `r` row at ANY prefix, and the property asserted
     /// is exactly that: the row is bit-identical across a sweep of prefix assignments and the
-    /// panel's drift is its mean. A reorder that hands `r` a prefix breaks the sweep and fails
-    /// here rather than silently certifying a teacher-forced law.
+    /// panel's fitted moments reduce that row. A reorder that hands `r` a prefix breaks the
+    /// sweep and fails here rather than silently certifying a teacher-forced law.
     ///
     /// The reference is independent of the path under test: it calls
     /// [`BarEmissionHead::logits`] directly and reduces in `f64`, never touching
     /// [`forecast_r_probs`].
     #[test]
-    fn the_one_bar_drift_uses_no_part_of_the_bar_it_predicts() {
+    fn the_one_bar_log_moments_are_fitted_and_use_no_part_of_the_predicted_bar() {
         let _torch_rng_guard = test_rng::exclusive();
         let fixture = Fixture::new("marginal", |_, _| {});
         let beliefs = fixture.beliefs();
         let supports = fixture.model.supports_for(RES).expect("fixture supports");
-        let centers = supports.centers(DOF_R).to_vec();
+        let centers = supports.centers(DOF_R);
+        let fitted_first = supports
+            .bin_means(DOF_R)
+            .expect("fixture supports carry fitted log means");
+        let fitted_second = supports
+            .bin_second_moments(DOF_R)
+            .expect("fixture supports carry fitted log second moments");
+        let support_mean_gap = centers
+            .iter()
+            .zip(fitted_first)
+            .map(|(center, mean)| (center - mean).abs())
+            .fold(0.0f64, f64::max);
+        let within_bin_variance = fitted_first
+            .iter()
+            .zip(fitted_second)
+            .map(|(mean, second)| (second - mean * mean).max(0.0))
+            .fold(0.0f64, f64::max);
+        assert!(
+            support_mean_gap > 1.0e-6 && within_bin_variance > 1.0e-10,
+            "the support does not distinguish the fitted-moment contract from center decoding: \
+             max mean gap {support_mean_gap:.3e}, max within-bin variance \
+             {within_bin_variance:.3e}"
+        );
+        let center_second: Vec<f64> = centers.iter().map(|center| center * center).collect();
         let head = fixture.model.head();
 
         // `r`'s prefix set, derived rather than assumed: every factor ahead of it in the
@@ -6462,7 +7672,10 @@ mod tests {
             .collect();
 
         let mut checked = 0usize;
-        let mut worst = 0.0f64;
+        let mut worst_mean = 0.0f64;
+        let mut worst_var = 0.0f64;
+        let mut center_mean_gap = 0.0f64;
+        let mut center_var_gap = 0.0f64;
         let mut traded_response = 0.0f64;
         let mut deepest_response = 0.0f64;
         let mut seen = Vec::new();
@@ -6492,7 +7705,7 @@ mod tests {
                         &clocks.time_ids.narrow(1, 0, 1),
                     )
                     .reshape([1, BAR_MODEL_DIM]);
-                let (want, traded_drift, deepest_drift) = tch::no_grad(|| {
+                let (want, center_decoded, traded_drift, deepest_drift) = tch::no_grad(|| {
                     let row_at = |prefix: &Tensor, dof: usize| -> Vec<f64> {
                         Vec::<f64>::try_from(
                             head.logits(&h, &conditioning, prefix)
@@ -6522,25 +7735,41 @@ mod tests {
                         (mass - 1.0).abs() < 1.0e-9,
                         "the reference row at ({t}, {slot}) has mass {mass}"
                     );
-                    let mean: f64 = base.iter().zip(&centers).map(|(p, c)| p * c).sum();
-                    (mean, traded_drift, deepest_drift)
+                    let reduce = |first: &[f64], second: &[f64]| {
+                        let mean: f64 = base.iter().zip(first).map(|(p, x)| p * x).sum();
+                        let raw_second: f64 = base.iter().zip(second).map(|(p, x2)| p * x2).sum();
+                        (mean, (raw_second - mean * mean).max(0.0))
+                    };
+                    let fitted = reduce(fitted_first, fitted_second);
+
+                    let center_decoded = reduce(centers, &center_second);
+                    (fitted, center_decoded, traded_drift, deepest_drift)
                 });
-                let got = beliefs.mu_log[t][slot];
-                worst = worst.max((got - want).abs());
+                let got = (beliefs.mu_log[t][slot], beliefs.var_log[t][slot]);
+                worst_mean = worst_mean.max((got.0 - want.0).abs());
+                worst_var = worst_var.max((got.1 - want.1).abs());
+                center_mean_gap = center_mean_gap.max((got.0 - center_decoded.0).abs());
+                center_var_gap = center_var_gap.max((got.1 - center_decoded.1).abs());
                 traded_response = traded_response.max(traded_drift);
                 deepest_response = deepest_response.max(deepest_drift);
-                seen.push(want);
+                seen.push(want.0);
                 checked += 1;
             }
         }
         assert!(checked >= 8, "only {checked} beliefs were compared");
-        // Both sides are `f32` head logits reduced in `f64`; the quantity is ~1e-4, so 1e-7
-        // absolute is three to four significant figures of agreement while still being four
-        // orders tighter than the ~1e-3 shift a teacher-forced law would introduce.
+        // Both sides reduce the same `f32` head logits in `f64`. These tolerances are loose
+        // relative to their shared arithmetic but tight enough to reject the geometric-center
+        // law on this explicitly nondegenerate fitted support.
         assert!(
-            worst < 1.0e-7,
-            "the panel's one-bar drift disagrees with a direct read of the head's r row by \
-             {worst:.3e} absolute nats, so it is not the law it claims to be"
+            worst_mean < 1.0e-7 && worst_var < 1.0e-9,
+            "the panel's one-bar fitted log moments disagree with a direct reduction of the \
+             head's r row: mean error {worst_mean:.3e} nats, variance error \
+             {worst_var:.3e} nats squared"
+        );
+        assert!(
+            center_mean_gap > 1.0e-7 && center_var_gap > 1.0e-9,
+            "geometric-center decoding unexpectedly matches the fitted reference: mean gap \
+             {center_mean_gap:.3e}, variance gap {center_var_gap:.3e}"
         );
         // The property. Exactly zero, because a prefix-free row is the SAME arithmetic under
         // every prefix — a tolerance here would pass a law that leaked a little.
@@ -6779,7 +8008,7 @@ mod tests {
             construction: Construction::Stale,
             kelly: periods.iter().map(|p| vec![0.0; p.legs.len()]).collect(),
             pred_var: periods.iter().map(|p| vec![1.0e-5; p.legs.len()]).collect(),
-            marginal_kelly: 0.0,
+            marginal_kelly: periods.iter().map(|p| vec![0.0; p.legs.len()]).collect(),
             laws: periods
                 .iter()
                 .map(|p| vec![AggregateLaw::default(); p.legs.len()])
@@ -7138,6 +8367,41 @@ mod tests {
             "the two constructions produce the same gross growth at k=4 ({a} vs {b})"
         );
     }
+    #[test]
+    fn sequential_log_equity_maximum_drawdown_is_path_correct() {
+        let log_path = |wealth: &[f64]| wealth.iter().map(|value| value.ln()).collect::<Vec<_>>();
+        let monotone_gain = log_path(&[1.1, 1.2, 1.5]);
+        assert_eq!(
+            maximum_drawdown_from_log_equity(&monotone_gain),
+            0.0,
+            "new peaks never draw down"
+        );
+
+        let monotone_loss = log_path(&[0.9, 0.8, 0.6]);
+        let loss_drawdown = maximum_drawdown_from_log_equity(&monotone_loss);
+        assert!(
+            (loss_drawdown - 0.4).abs() < 1e-12,
+            "initial unit wealth must remain the first peak: {loss_drawdown}"
+        );
+        let tiny_decline = 1.0e-20;
+        let tiny_drawdown = maximum_drawdown_from_log_equity(&[-tiny_decline]);
+        assert!(
+            tiny_drawdown > 0.0
+                && ((tiny_drawdown - tiny_decline) / tiny_decline).abs() < 1.0e-12,
+            "a tiny representable log-equity decline must not round away: {tiny_drawdown}"
+        );
+
+        let recovered = log_path(&[2.0, 1.0, 1.8, 2.1]);
+        let recovery_drawdown = maximum_drawdown_from_log_equity(&recovered);
+        assert!(
+            (recovery_drawdown - 0.5).abs() < 1e-12,
+            "recovery after the trough must not erase the historical drawdown: {recovery_drawdown}"
+        );
+        for drawdown in [loss_drawdown, recovery_drawdown] {
+            assert!(drawdown.is_finite() && (0.0..=1.0).contains(&drawdown));
+        }
+    }
+
     fn receding_fixture() -> (Panel, Vec<Vec<ForecastMoment>>, Vec<Period>, RecedingConfig) {
         let slices = vec![
             PanelSlice {
@@ -7200,6 +8464,115 @@ mod tests {
             covariance_shrinkage: 0.25,
         };
         (panel, moments, oracle, config)
+    }
+
+    #[test]
+    fn moment_ema_is_causal_per_symbol_and_resets_across_gaps() {
+        let mut state = MomentEmaState::new(2, 1).unwrap();
+        assert_eq!(state.retention, 0.5);
+        let first = [
+            ForecastMoment {
+                mean_simple: 0.02,
+                second_simple: 0.001,
+                frictionless_kelly: 0.0,
+            },
+            ForecastMoment {
+                mean_simple: -0.01,
+                second_simple: 0.0002,
+                frictionless_kelly: 0.0,
+            },
+        ];
+        let mut means = vec![0.0; 2];
+        let mut seconds = vec![0.0; 2];
+        state
+            .update(&[0, 1], &[1, 1], &first, &mut means, &mut seconds)
+            .unwrap();
+        assert_eq!(means, [0.02, -0.01], "first observations reset to raw");
+        assert_eq!(seconds, [0.001, 0.0002]);
+
+        let missing_mean = state.means[1];
+        let missing_second = state.seconds[1];
+        state
+            .update(
+                &[0],
+                &[1],
+                &[ForecastMoment {
+                    mean_simple: 0.04,
+                    second_simple: 0.002,
+                    frictionless_kelly: 0.0,
+                }],
+                &mut means,
+                &mut seconds,
+            )
+            .unwrap();
+        assert!((means[0] - 0.03).abs() < 1.0e-15);
+        assert!((seconds[0] - 0.0015).abs() < 1.0e-15);
+        assert_eq!(state.means[1], missing_mean, "missing mean state changed");
+        assert_eq!(
+            state.seconds[1], missing_second,
+            "missing second-moment state changed"
+        );
+        assert!(seconds[0].is_finite() && seconds[0] >= means[0] * means[0]);
+
+        state
+            .update(
+                &[0],
+                &[2],
+                &[ForecastMoment {
+                    mean_simple: -0.03,
+                    second_simple: 0.001,
+                    frictionless_kelly: 0.0,
+                }],
+                &mut means,
+                &mut seconds,
+            )
+            .unwrap();
+        assert_eq!(means[0], -0.03, "a gap must reset rather than blend");
+        assert_eq!(seconds[0], 0.001);
+    }
+
+    #[test]
+    fn moment_ema_repairs_only_second_moment_roundoff() {
+        let mean = 0.5f64;
+        let mean_squared = mean * mean;
+        assert!(MomentEmaState::new(1, 0).is_err());
+        assert!(
+            MomentEmaState::new(1, usize::MAX).is_err(),
+            "a half-life whose retention rounds to one must be rejected"
+        );
+        let one_ulp_low = f64::from_bits(mean_squared.to_bits() - 1);
+        assert_eq!(
+            MomentEmaState::repair_second(mean, one_ulp_low).unwrap(),
+            mean_squared
+        );
+        assert!(MomentEmaState::repair_second(mean, mean_squared - 1.0e-6).is_err());
+        assert!(MomentEmaState::repair_second(f64::NAN, mean_squared).is_err());
+    }
+
+    #[test]
+    fn receding_minimum_bars_defaults_to_the_deployment_universe_and_honors_causal_floor() {
+        let args = RecedingArgs::defaults(PathBuf::new(), PathBuf::new(), PathBuf::new());
+        assert_eq!(args.min_bars, DEFAULT_MIN_BARS);
+        let panel_config = PanelConfig::new((1, 2), 48, 7_800);
+        let causal_minimum = panel_config.min_history + ADV_TRAILING_BARS;
+        assert!(
+            causal_minimum < DEFAULT_MIN_BARS,
+            "the deployment universe floor must not regress to the smaller causal-only floor"
+        );
+        assert_eq!(
+            receding_corpus_min_bars(1, &panel_config),
+            causal_minimum,
+            "an explicitly smaller universe floor must still satisfy causal history"
+        );
+        assert_eq!(
+            receding_corpus_min_bars(DEFAULT_MIN_BARS, &panel_config),
+            DEFAULT_MIN_BARS.max(causal_minimum)
+        );
+        assert_eq!(
+            receding_corpus_min_bars(causal_minimum + 7, &panel_config),
+            causal_minimum + 7,
+            "a stricter caller-supplied universe floor must reach the loader unchanged"
+        );
     }
     #[test]
     fn mean_sign_hysteresis_is_causal_strict_and_preserves_moment_variance() {
@@ -7326,6 +8699,50 @@ mod tests {
         assert_eq!(zero.retained_opposing_signs, 0);
         assert_eq!(zero.threshold_flips, 0);
     }
+
+    #[test]
+    fn moment_ema_matches_raw_only_on_its_causal_initialization_row() {
+        let (panel, mut moments, oracle, config) = receding_fixture();
+        moments[1][0].mean_simple = -0.003;
+        moments[2][0].mean_simple = 0.003;
+        let cost = FlatCost::new(0.0);
+        let raw = run_receding_book(
+            &panel,
+            &moments,
+            &oracle,
+            ForecastMoment::default(),
+            RecedingPolicy::Model,
+            RecedingActionRule::Incumbent,
+            RecedingSignalRule::Raw,
+            1,
+            &cost,
+            config,
+        )
+        .unwrap();
+        let ema = run_receding_book(
+            &panel,
+            &moments,
+            &oracle,
+            ForecastMoment::default(),
+            RecedingPolicy::Model,
+            RecedingActionRule::Incumbent,
+            RecedingSignalRule::MomentEma { half_life_bars: 1 },
+            1,
+            &cost,
+            config,
+        )
+        .unwrap();
+        assert_eq!(ema.decision_instants, raw.decision_instants);
+        assert_eq!(
+            ema.gross_log_equity[1].to_bits(),
+            raw.gross_log_equity[1].to_bits(),
+            "the first present observation initializes EMA exactly to raw"
+        );
+        assert_ne!(
+            ema.gross_log_equity, raw.gross_log_equity,
+            "later consecutive observations must use causal persistence rather than raw"
+        );
+    }
     #[test]
     fn receding_signal_rule_rejects_invalid_or_non_model_configuration() {
         let (panel, moments, oracle, config) = receding_fixture();
@@ -7349,11 +8766,37 @@ mod tests {
             &moments,
             &oracle,
             ForecastMoment::default(),
+            RecedingPolicy::Model,
+            RecedingActionRule::Incumbent,
+            RecedingSignalRule::MomentEma { half_life_bars: 0 },
+            1,
+            &FlatCost::new(0.0),
+            config,
+        )
+        .is_err());
+        assert!(run_receding_book(
+            &panel,
+            &moments,
+            &oracle,
+            ForecastMoment::default(),
             RecedingPolicy::Marginal,
             RecedingActionRule::Incumbent,
             RecedingSignalRule::MeanSignHysteresis {
                 margin_simple: 8.0e-4,
             },
+            1,
+            &FlatCost::new(0.0),
+            config,
+        )
+        .is_err());
+        assert!(run_receding_book(
+            &panel,
+            &moments,
+            &oracle,
+            ForecastMoment::default(),
+            RecedingPolicy::Marginal,
+            RecedingActionRule::Incumbent,
+            RecedingSignalRule::MomentEma { half_life_bars: 1 },
             1,
             &FlatCost::new(0.0),
             config,
@@ -7429,6 +8872,10 @@ mod tests {
         assert_eq!(rows[1].max_gross, config.constraints.gross_cap + 0.05);
         assert_eq!(rows[1].max_abs_net, config.constraints.net_max.abs() + 0.04);
         assert_eq!(rows[1].max_name, config.constraints.per_name_cap + 0.03);
+        assert!(rows.iter().all(|row| {
+            row.net_maximum_drawdown.is_finite()
+                && (0.0..=1.0).contains(&row.net_maximum_drawdown)
+        }));
         for dispersion in [
             rows[0].paired_net_gain_bps_per_decision_bar,
             rows[0].paired_gross_gain_bps_per_decision_bar,
@@ -7454,10 +8901,223 @@ mod tests {
             series.label == "configured mean-sign margin (simple return)"
                 && series.values == vec![0.0, margin_simple as f32]
         }));
+        let drawdown = series
+            .iter()
+            .find(|series| series.label == "net maximum drawdown (wealth fraction)")
+            .expect("serialized hysteresis drawdown");
+        assert_eq!(
+            drawdown.values,
+            rows.iter()
+                .map(|row| row.net_maximum_drawdown as f32)
+                .collect::<Vec<_>>()
+        );
+        assert!(drawdown
+            .values
+            .iter()
+            .all(|value| value.is_finite() && (0.0..=1.0).contains(value)));
     }
 
     #[test]
-    fn locked_test_never_writes_the_validation_band_frontier() {
+    fn receding_persistence_round_trips_fixed_order_and_gate_series() {
+        assert!(
+            shared::report::PRETRAIN_REPORT_BASES.contains(&RECEDING_PERSISTENCE_BASE),
+            "the persistence writer must use the canonical pretrain report registry"
+        );
+        let dir = scratch_dir("receding_persistence");
+        let (panel, moments, oracle, config) = receding_fixture();
+        let cost = FlatCost::new(3.0);
+        let raw = run_receding_book(
+            &panel,
+            &moments,
+            &oracle,
+            ForecastMoment::default(),
+            RecedingPolicy::Model,
+            RecedingActionRule::Incumbent,
+            RecedingSignalRule::Raw,
+            1,
+            &cost,
+            config,
+        )
+        .unwrap();
+        let marginal = run_receding_book(
+            &panel,
+            &moments,
+            &oracle,
+            ForecastMoment::default(),
+            RecedingPolicy::Marginal,
+            RecedingActionRule::Incumbent,
+            RecedingSignalRule::Raw,
+            1,
+            &cost,
+            config,
+        )
+        .unwrap();
+        let rows = write_receding_persistence(
+            &dir,
+            "fixture",
+            &panel,
+            &moments,
+            &oracle,
+            ForecastMoment::default(),
+            1,
+            &[raw.clone(), marginal],
+            &cost,
+            config,
+            DEFAULT_MIN_BARS,
+        )
+        .unwrap();
+        assert_eq!(rows.len(), RECEDING_PERSISTENCE_HALF_LIVES.len() + 1);
+        assert!(!rows[0].candidate);
+        assert_eq!(rows[0].half_life_bars, 0);
+        assert_eq!(
+            rows[1..]
+                .iter()
+                .map(|row| row.half_life_bars)
+                .collect::<Vec<_>>(),
+            RECEDING_PERSISTENCE_HALF_LIVES
+        );
+        assert!(rows.iter().all(|row| {
+            row.decision_rows == raw.decision_instants.len()
+                && row.reforecasts == raw.reforecasts
+                && row.loaded_min_bars == DEFAULT_MIN_BARS
+        }));
+        for row in &rows {
+            assert!(
+                ((row.gross_bps_per_decision_bar.mean
+                    - row.net_bps_per_decision_bar.mean)
+                    - row.cost_drag_bps_per_decision_bar.mean)
+                    .abs()
+                    <= 1.0e-9
+            );
+            assert!(
+                ((row.paired_vs_raw_gross_bps_per_decision_bar.mean
+                    - row.paired_vs_raw_net_bps_per_decision_bar.mean)
+                    - row.paired_vs_raw_cost_drag_bps_per_decision_bar.mean)
+                    .abs()
+                    <= 1.0e-9
+            );
+        }
+        for dispersion in [
+            rows[0].paired_vs_raw_net_bps_per_decision_bar,
+            rows[0].paired_vs_raw_gross_bps_per_decision_bar,
+            rows[0].paired_vs_raw_cost_drag_bps_per_decision_bar,
+        ] {
+            assert_eq!(
+                (
+                    dispersion.mean,
+                    dispersion.se,
+                    dispersion.ci_low,
+                    dispersion.ci_high
+                ),
+                (0.0, 0.0, 0.0, 0.0)
+            );
+        }
+
+        let report =
+            read_report(&dir.join(format!("{RECEDING_PERSISTENCE_BASE}.report.bin"))).unwrap();
+        assert_eq!(report.x_label.as_deref(), Some("persistence-grid index"));
+        let ReportKind::MultiLine { series } = report.kind else {
+            panic!("persistence evidence must be a multiline report")
+        };
+        assert!(series.iter().all(|series| series.values.len() == rows.len()));
+        let half_lives = series
+            .iter()
+            .find(|series| series.label == "moment EMA half-life (bars; raw=0)")
+            .expect("serialized persistence half-life order");
+        assert_eq!(
+            half_lives.values,
+            std::iter::once(0.0)
+                .chain(
+                    RECEDING_PERSISTENCE_HALF_LIVES
+                        .iter()
+                        .map(|&value| value as f32)
+                )
+                .collect::<Vec<_>>()
+        );
+        for required in [
+            "candidate row (raw=0, moment EMA=1)",
+            "loaded corpus minimum bars",
+            "net log growth (bps/decision-bar), daily-block ci low",
+            "gross log growth (bps/decision-bar), daily-block ci low",
+            "moment EMA minus raw net log growth (bps/decision-bar), daily-block ci low",
+            "moment EMA minus raw gross log growth (bps/decision-bar), daily-block ci low",
+            "moment EMA minus raw exact cost drag (bps/decision-bar), daily-block ci low",
+            "frontier row minus marginal net log growth/year, paired daily-block ci low",
+            "realized-path flat break-even (bps)",
+            "net maximum drawdown (wealth fraction)",
+            "total one-way turnover",
+            "turnover share of raw",
+            "executed actions",
+            "eligible causally tradable legs",
+            "executed actions / eligible legs",
+            "PanelCost month substitutions / actions",
+            "PanelCost cross-section substitutions / actions",
+            "configured gross cap",
+            "configured net minimum",
+            "configured net maximum",
+            "configured per-name cap",
+            "configured max ADV participation",
+            "max post-return gross (holding)",
+            "max post-return abs net (holding)",
+            "max post-return per-name (holding)",
+            "max ADV participation",
+        ] {
+            assert!(
+                series.iter().any(|series| series.label == required),
+                "missing persistence manifest gate series {required}"
+            );
+        }
+    }
+
+    #[test]
+    fn realized_path_flat_break_even_solves_the_compounded_fixed_path() {
+        let (panel, moments, oracle, config) = receding_fixture();
+        let mut run = run_receding_book(
+            &panel,
+            &moments,
+            &oracle,
+            ForecastMoment::default(),
+            RecedingPolicy::Model,
+            RecedingActionRule::Incumbent,
+            RecedingSignalRule::Raw,
+            1,
+            &FlatCost::new(0.0),
+            config,
+        )
+        .unwrap();
+
+        run.gross_multipliers = vec![1.01];
+        run.one_way_turnovers = vec![0.0];
+        assert_eq!(realized_path_flat_break_even_bps(&run), f64::INFINITY);
+
+        run.gross_multipliers = vec![1.0];
+        assert_eq!(realized_path_flat_break_even_bps(&run), 0.0);
+
+        run.gross_multipliers = vec![0.99];
+        run.one_way_turnovers = vec![1.0];
+        assert_eq!(
+            realized_path_flat_break_even_bps(&run),
+            0.0,
+            "a path losing before flat costs has zero break-even"
+        );
+
+        run.gross_multipliers = vec![1.10];
+        let one_row = realized_path_flat_break_even_bps(&run);
+        assert!(
+            (one_row - 1_000.0).abs() < 1.0e-6,
+            "the exact one-row root is 1000 bps, not ln(1.1)*1e4"
+        );
+
+        run.gross_multipliers = vec![1.02, 0.99];
+        run.one_way_turnovers = vec![0.5, 0.25];
+        let compounded = realized_path_flat_break_even_bps(&run);
+        assert!(compounded > 0.0 && compounded < MAX_BREAK_EVEN_BPS);
+        assert!(fixed_realized_path_flat_growth(&run, compounded * 0.999) > 0.0);
+        assert!(fixed_realized_path_flat_growth(&run, compounded * 1.001) < 0.0);
+    }
+
+    #[test]
+    fn locked_test_never_writes_validation_frontiers() {
         assert!(should_write_receding_policy_frontier(Split::Val));
         assert!(!should_write_receding_policy_frontier(Split::Test));
     }
@@ -7720,6 +9380,10 @@ mod tests {
             assert!(arm.frozen_action_legs <= arm.eligible_action_legs);
             assert!((0.0..=1.0).contains(&arm.frozen_eligible_leg_fraction));
             assert!(
+                arm.model_net_maximum_drawdown.is_finite()
+                    && (0.0..=1.0).contains(&arm.model_net_maximum_drawdown)
+            );
+            assert!(
                 ((arm.model_gross_bps_per_decision_bar.mean
                     - arm.model_net_bps_per_decision_bar.mean)
                     - arm.model_cost_drag_bps_per_decision_bar.mean)
@@ -7768,6 +9432,17 @@ mod tests {
                 .find(|row| row.label == label)
                 .unwrap_or_else(|| panic!("missing frontier audit series {label}"))
         };
+        let drawdown = exact_series("model net maximum drawdown (wealth fraction)");
+        assert_eq!(
+            drawdown.values,
+            arms.iter()
+                .map(|arm| arm.model_net_maximum_drawdown as f32)
+                .collect::<Vec<_>>()
+        );
+        assert!(drawdown
+            .values
+            .iter()
+            .all(|value| value.is_finite() && (0.0..=1.0).contains(value)));
         for (label, expected) in [
             ("configured gross cap", config.constraints.gross_cap),
             ("configured net minimum", config.constraints.net_min),
@@ -8531,6 +10206,16 @@ mod tests {
                     },
                     model_cost_drag_log_per_year: if scalar { f64::NAN } else { 1.0 },
                     edge_cost_contribution_log_per_year: if scalar { f64::NAN } else { 0.25 },
+                    model_net_maximum_drawdown: if scalar {
+                        f64::NAN
+                    } else {
+                        index as f64 / 10.0
+                    },
+                    marginal_net_maximum_drawdown: if scalar {
+                        f64::NAN
+                    } else {
+                        index as f64 / 20.0
+                    },
                     model_stage_minus_previous_net_log_growth_per_year: if adjacent {
                         index as f64 * 0.2
                     } else {
@@ -8603,6 +10288,16 @@ mod tests {
                 .find(|row| row.label == label)
                 .unwrap_or_else(|| panic!("missing adjacent-rung series {label}"))
         };
+        for label in [
+            "model net maximum drawdown (wealth fraction)",
+            "marginal net maximum drawdown (wealth fraction)",
+        ] {
+            let drawdown = adjacent_series(label);
+            assert!(drawdown.values[0].is_nan());
+            assert!(drawdown.values[1..]
+                .iter()
+                .all(|value| value.is_finite() && (0.0..=1.0).contains(value)));
+        }
         let adjacent_net =
             adjacent_series("model stage minus previous net log growth (bps/decision-bar)");
         let adjacent_gross =
@@ -8634,7 +10329,7 @@ mod tests {
             "model total execution cost fraction",
             "model gross log growth (bps/decision-bar)",
             "model exact cost drag, gross minus net (bps/decision-bar)",
-            "max gross",
+            "max post-return gross (holding)",
             "mean H-horizon factor variance",
         ] {
             assert!(
@@ -8683,6 +10378,11 @@ mod tests {
                         signal_rule: RecedingSignalRule::Raw,
                         log_equity: vec![0.0, 0.001 * horizon as f64, 0.003 * horizon as f64],
                         gross_log_equity: vec![0.0, 0.001 * horizon as f64, 0.003 * horizon as f64],
+                        gross_multipliers: vec![
+                            (0.001 * horizon as f64).exp(),
+                            (0.002 * horizon as f64).exp(),
+                        ],
+                        one_way_turnovers: vec![0.05, 0.05],
                         decision_instants: (first_decision..instants).collect(),
                         decision_span_years,
                         turnover: 0.1,
@@ -8757,6 +10457,19 @@ mod tests {
                 .find(|row| row.label == "forecast horizon")
                 .expect("the fixed comparison grid remains in every selected report");
             assert_eq!(grid.values, expected_grid);
+            for policy in RECEDING_POLICIES {
+                let drawdown = series
+                    .iter()
+                    .find(|row| {
+                        row.label
+                            == format!("{} net maximum drawdown (wealth fraction)", policy.name())
+                    })
+                    .expect("per-policy sequential drawdown series");
+                assert!(drawdown
+                    .values
+                    .iter()
+                    .all(|value| value.is_finite() && (0.0..=1.0).contains(value)));
+            }
         }
 
         let report_model_h1 = h1_series
@@ -8785,6 +10498,20 @@ mod tests {
             selected_line.contains(&format!("{stdout_growth:>14.6}")),
             "stdout selected row must print the decision-span report value: {selected_line}"
         );
+        let stdout_drawdown = selected_run.net_maximum_drawdown();
+        assert!(
+            selected_line.contains(&format!("{stdout_drawdown:>11.6}")),
+            "stdout selected row must print net maximum drawdown: {selected_line}"
+        );
+        let report_drawdown = h1_series
+            .iter()
+            .find(|row| row.label == "model net maximum drawdown (wealth fraction)")
+            .expect("model drawdown report row")
+            .values[0] as f64;
+        assert!(
+            (stdout_drawdown - report_drawdown).abs()
+                <= f64::from(f32::EPSILON) * stdout_drawdown.abs().max(1.0)
+        );
 
         let selected_h1 = h1_series
             .iter()
@@ -8794,6 +10521,30 @@ mod tests {
             .iter()
             .find(|row| row.label == "SELECTED production H=100 model net log growth/year")
             .expect("H100 selected production metric");
+        for (series, horizon, expected_index) in [
+            (&h1_series, 1, 0),
+            (&h100_series, 100, FORECAST_HORIZONS.len() - 1),
+        ] {
+            let selected_drawdown = series
+                .iter()
+                .find(|row| {
+                    row.label
+                        == format!(
+                            "SELECTED production H={horizon} model net maximum drawdown (wealth fraction)"
+                        )
+                })
+                .expect("selected production drawdown");
+            let finite = selected_drawdown
+                .values
+                .iter()
+                .copied()
+                .enumerate()
+                .filter(|(_, value)| value.is_finite())
+                .collect::<Vec<_>>();
+            assert_eq!(finite.len(), 1);
+            assert_eq!(finite[0].0, expected_index);
+            assert!((0.0..=1.0).contains(&finite[0].1));
+        }
         let h1_finite: Vec<(usize, f32)> = selected_h1
             .values
             .iter()

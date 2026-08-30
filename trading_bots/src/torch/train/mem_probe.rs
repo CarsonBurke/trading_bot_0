@@ -95,7 +95,8 @@ use crate::torch::world_model::{world_model_metadata_path, BarWorldModel};
 
 use super::pretrain::{
     evaluate, load_corpus, parse_checkpoint_at_step, pinned_blocks, ramp_token_weights,
-    stage_contexts, CorpusFlags, PinnedSet, EVAL_WINDOW_SEED, RAMP_STAGES,
+    stage_contexts, CorpusFlags, PinnedSet, TradedSizing, DIRECT_MAX_HORIZON, EVAL_WINDOW_SEED,
+    RAMP_STAGES,
 };
 use super::pretrain_stats::{
     block_bootstrap, calendar_month, Dispersion, BOOTSTRAP_DRAWS, BOOTSTRAP_SEED,
@@ -366,7 +367,7 @@ pub fn mem_probe(args: MemProbeArgs) -> Result<()> {
             device,
             false,
             scoring,
-            None,
+            TradedSizing::CONTROL,
             // `full: false`, so no path is retained at all and the budget is inert. Stated as
             // the campaign default rather than 0 so this call reads identically to every other.
             TRADE_WINDOWS,
@@ -379,7 +380,7 @@ pub fn mem_probe(args: MemProbeArgs) -> Result<()> {
             device,
             false,
             scoring,
-            None,
+            TradedSizing::CONTROL,
             TRADE_WINDOWS,
         )?;
         let (symbol_paired_gap, symbols_paired) =
@@ -415,11 +416,12 @@ pub fn mem_probe(args: MemProbeArgs) -> Result<()> {
     // ---------------------------------------------------------------------
     // The one-repetition contrast.
     // ---------------------------------------------------------------------
-    let plan = PassPlan::new(
+    let plan = PassPlan::new_with_future(
         &corpus,
         Split::Train,
         &stage_contexts(),
         &ramp_token_weights(&args.batch_ramp),
+        DIRECT_MAX_HORIZON as usize,
         args.train_seed,
     )
     .context("failed rebuilding the run's training partition")?;
@@ -780,7 +782,7 @@ fn measure_arm(
             device,
             true,
             scoring,
-            None,
+            TradedSizing::CONTROL,
             // The campaign default, deliberately, NOT `chunk.len()`. This module's chunking
             // exists because the retention cap was 256; keeping the cap at 256 and the chunk at
             // `TRADE_WINDOWS` leaves the memorization probe measuring exactly what it measured

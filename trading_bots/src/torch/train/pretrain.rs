@@ -32,7 +32,8 @@
 //! Momentum warmup replaces LR warmup, and orthogonalization replaces clipping.
 
 use anyhow::{anyhow, bail, ensure, Context, Result};
-use nvml_wrapper::Nvml;
+use nvml_wrapper::{error::NvmlError, Device as NvmlDevice, Nvml};
+use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fs::{self, File};
 use std::path::{Path, PathBuf};
@@ -43,15 +44,15 @@ use tch::{autocast, nn, Device, Kind, Reduction, Tensor};
 use crate::torch::bar_dist::{
     bar_categorical_kl, bar_crps_from_logits, bar_nll_decomposition, bar_nll_from_logits,
     bar_nll_terms, bar_pit_from_logits, bar_supports_format_version, BarScoring, BarSupports,
-    BarSupportsProvenance, BAR_DOF, BAR_DOF_NAMES, BAR_EMISSION_ADAMW_NAME_SUBSTRINGS,
-    BAR_SUPPORTS_FORMAT_VERSION, BAR_SUPPORTS_MOMENTS_VERSION, DOF_R, DOF_S, DOF_U, DOF_V,
-    NUM_BAR_BINS,
+    BarSupportsProvenance, DofScaling, BAR_DOF, BAR_DOF_NAMES, BAR_EMISSION_ADAMW_NAME_SUBSTRINGS,
+    BAR_SUPPORTS_FORMAT_VERSION, BAR_SUPPORTS_MOMENTS_VERSION, BAR_SUPPORTS_SEMANTICS_CONTRACT,
+    DOF_R, DOF_S, DOF_U, DOF_V, NUM_BAR_BINS,
 };
-use crate::torch::cuda::cfg::configure_cuda;
+use crate::torch::cuda::cfg::{configure_cuda, disable_autograd_multithreading};
 use crate::torch::dataset::{
     iso_ms, mix64, time_ids_without_market, BarBatch, BarCorpus, BarSampler, CorpusAnomalies,
     CoverageAudit, PassCensus, PassLayout, PassLedger, PassPlan, Split, WindowRef,
-    BAR_TIME_CARDINALITY, BAR_TIME_CONDITIONING,
+    BAR_TIME_CARDINALITY, BAR_TIME_CONDITIONING, BAR_TIME_FEATURES,
 };
 use crate::torch::hashing::file_sha256;
 use crate::torch::load::load_var_store_partial;
@@ -66,8 +67,9 @@ use crate::torch::world_model::{
     world_model_optimizer_path, world_model_supports_path, BarModules,
     BarOptimizerAblationProvenance, BarOptimizerProvenance, BarPretrainRecovery,
     BarRowLearnedLrProvenance, BarSupportSet, BarTrainingProvenance, BarWorldModel,
-    BarWorldModelMetadata, RolloutMode, BAR_ARCHITECTURE, BAR_LAYERS, BAR_MAX_CONTEXT,
-    BAR_MODEL_DIM,
+    BarWorldModelMetadata, RolloutMode, BAR_ARCHITECTURE, BAR_DIRECT_STAGE_COUNT,
+    BAR_DIRECT_T2_STAGE_MULTIPLIER, BAR_DIRECT_T3_STAGE_MULTIPLIER, BAR_LAYERS, BAR_MAX_CONTEXT,
+    BAR_MODEL_DIM, BAR_PRETRAIN_RECOVERY_VERSION,
 };
 use shared::{
     paths::RUNS_PATH,
@@ -80,15 +82,15 @@ use super::pretrain_aux::{
     AuxiliaryConfig, AuxiliaryReport, AuxiliaryStream, AUXILIARY_HELDOUT_CONTEXT,
 };
 use super::pretrain_reports::{
-    belief_effective_rank, EpochBoundary, EpochMetrics, HeldOutBaselines, PitHistogram,
-    PretrainReporter, RivalSelection, SnapshotInput, StepMetrics, TestBattery, UnmeasuredMetric,
-    AUX_SHARE_WARN, AUX_SHARE_WARN_STREAK, DEPLOYED_CONTEXT_METRICS, MIN_FAN_SAMPLES,
-    ROLLOUT_HORIZONS,
+    belief_effective_rank, EpochBoundary, EpochMetrics, HeldOutBaselines, NllAccumulator,
+    PitHistogram, PretrainReporter, RivalSelection, SnapshotInput, StepMetrics, TestBattery,
+    UnmeasuredMetric, AUX_SHARE_WARN, AUX_SHARE_WARN_STREAK, DEPLOYED_CONTEXT_METRICS,
+    MIN_FAN_SAMPLES, ROLLOUT_HORIZONS,
 };
 use super::pretrain_stats::{
     block_bootstrap, block_bootstrap_conditional_difference, calendar_month, window_scores_path,
-    ConditionalNllStats, Dispersion, TradeSummary, WindowScore, WindowScores, BOOTSTRAP_DRAWS,
-    BOOTSTRAP_SEED, WINDOW_SCORES_FORMAT_VERSION,
+    CalibrationSlopes, ConditionalNllStats, Dispersion, TradeSummary, WindowScore, WindowScores,
+    BOOTSTRAP_DRAWS, BOOTSTRAP_SEED, WINDOW_SCORES_FORMAT_VERSION,
 };
 use super::smd_idbd::{
     PretrainOptimizer, PretrainOptimizerAblation, SMD_BETA_MAX, SMD_BETA_MIN, SMD_BETA_UPDATE_CLIP,
@@ -102,7 +104,7 @@ pub const BAR_CONTEXT_RAMP_START: i64 = 896;
 
 /// Number of ramp stages. Batch size and context both step at each stage boundary,
 /// which sits at an equal fraction of total steps.
-pub(super) const RAMP_STAGES: usize = 3;
+pub(super) const RAMP_STAGES: usize = BAR_DIRECT_STAGE_COUNT;
 /// DECLARED batch-size multipliers per stage — the ceiling the ramp aims at, never the ramp
 /// it runs.
 ///
@@ -114,6 +116,22 @@ pub(super) const RAMP_STAGES: usize = 3;
 /// `batch 24->72` and then run at 24 for all 13,832 steps under a reactive memory hold,
 /// with the learning-rate plateau bumps of a batch it never used.
 const BATCH_RAMP: [usize; RAMP_STAGES] = [1, 2, 3];
+/// Persistent direct-complete-bar schedule. Every promotable context continues optimizing the
+/// treatment objectives; h1-only updates cannot overwrite an unsupervised horizon head.
+pub const DIRECT_T2_STAGE_MULTIPLIER: [f64; RAMP_STAGES] = BAR_DIRECT_T2_STAGE_MULTIPLIER;
+pub const DIRECT_T3_STAGE_MULTIPLIER: [f64; RAMP_STAGES] = BAR_DIRECT_T3_STAGE_MULTIPLIER;
+pub const DIRECT_MAX_HORIZON: i64 = 3;
+
+pub fn direct_horizon_weights(stage: usize, base_t2: f64, base_t3: f64) -> (f64, f64) {
+    assert!(
+        stage < RAMP_STAGES,
+        "invalid direct-objective stage {stage}"
+    );
+    (
+        base_t2 * DIRECT_T2_STAGE_MULTIPLIER[stage],
+        base_t3 * DIRECT_T3_STAGE_MULTIPLIER[stage],
+    )
+}
 /// Exponent relating a stage's batch multiplier to its learning-rate plateau bump.
 ///
 /// Not a uniform square root. modded-nanogpt uses `(16/8)**0.6` for the 2x step and
@@ -221,6 +239,8 @@ const ADAMW_EPS: f64 = 1e-10;
 const ADAMW_WEIGHT_DECAY: f64 = 0.005;
 /// Betas for attention weight scalars, the embedding shortcut, and the PoPE phase bias.
 const ADAMW_SCALAR_BETAS: (f64, f64) = (0.9, 0.99);
+/// Primary batches accumulated into each production AdamW update.
+const ADAMW_UPDATE_EVERY: usize = 2;
 /// Residual and post-branch lambdas use the reference scalar-momentum group.
 const ADAMW_RESID_POST_BETAS: (f64, f64) = (0.9, 0.95);
 /// The embedding tables retain the modded-nanogpt table recipe.
@@ -317,10 +337,11 @@ pub const EVAL_WINDOW_SEED: u64 = 0xE7A1_5E7D_0001;
 /// deployed profitability.
 ///
 /// Promotion is therefore economic-primary: after the first measured usable artifact, only a
-/// statistically resolved improvement in the moment-correct quadratic-Kelly edge may displace
-/// the incumbent. A statistically resolved conditional-NLL regression vetoes that edge-led
-/// move, and the likelihood of `r`, the traded factor, is an independent veto. NLL improvement
-/// never drives promotion, and unresolved or non-improving edge leaves the incumbent standing.
+/// statistically resolved improvement in the active, artifact-recorded sizing rule's edge may
+/// displace the incumbent. A statistically resolved conditional-NLL regression vetoes that
+/// edge-led move, and the likelihood of `r`, the traded factor, is an independent veto. NLL
+/// improvement never drives promotion, and unresolved or non-improving edge leaves the
+/// incumbent standing.
 ///
 /// The `bardist_v2` evidence was recorded under the legacy fixed-support mixed-measure
 /// diagnostic, not categorical NLL: its negative levels include a finite-bin measure constant
@@ -360,9 +381,9 @@ pub const EVAL_WINDOW_SEED: u64 = 0xE7A1_5E7D_0001;
 /// runs at.
 const SELECTION_METRIC: &str =
     "paired economics-primary selection on the pinned val windows at the fixed diagnostic \
-     context: after the first measured usable artifact, promote only a net moment-correct \
-     quadratic Kelly edge improvement over the unconditional-marginal null at the 0.25x \
-     leverage cap that clears 2.0 paired standard errors. A significant regression in \
+     context: after the first measured usable artifact, promote only a net edge improvement \
+     under the artifact-recorded sizing rule over the unconditional-marginal null at the \
+     0.25x leverage cap that clears 2.0 paired standard errors. A significant regression in \
      conditional nll_bar or nll_dof[r] vetoes that edge-led promotion; conditional-NLL \
      improvement never drives promotion, and unresolved or non-improving edge promotes \
      nothing. The independent-window ruler is model-quality evidence, not proof of deployed \
@@ -448,18 +469,16 @@ const FORECAST_POSITION_STRIDE: i64 = 8;
 
 /// Default optimizer steps between step-tagged crash-recovery checkpoints.
 ///
-/// Job 2856 ran 13831 steps in 3 epochs — 4610 steps per epoch — and produced its first
-/// promoted checkpoint at step 9221, because promotion is gated on the deployed context and
-/// the memory-aware ramp held the batch. An OOM at step 9220 would have destroyed two epochs
-/// of compute. 512 steps is ~11% of an epoch there and ~4% of the shortest ramp stage, so the
-/// worst case a crash can cost is a ninth of an epoch, while the write itself — a 128 MiB
-/// `vs.save` plus two small sidecars — lands about once per two minutes at that run's 4.5
-/// step/s and is invisible beside the optimizer. Zero still disables the path entirely, for
-/// the smoke runs whose whole point is to leave nothing behind.
-pub const DEFAULT_CHECKPOINT_EVERY: usize = 512;
-/// Step-tagged checkpoints kept on disk. Three bounds the rolling window at ~400 MiB of
-/// weights while still surviving a crash that corrupts the newest file mid-write. Epoch
-/// artifacts and `pretrain_best*.ot` are named differently and are never pruned.
+/// The production direct-MTP campaign sustains about 4.5 optimizer steps/s. A 2,048-step
+/// interval therefore lands every 455 seconds (7.6 minutes), inside the 5–10 minute recovery
+/// target while preserving the fixed step grid required by the equal-cadence checkpoint
+/// analysis. Each event commits one roughly 312 MiB canonical recovery bundle and publishes
+/// `pretrain_last` as hardlinks, so increasing durability no longer doubles serialization or
+/// write volume. Zero still disables periodic recovery for smoke runs.
+pub const DEFAULT_CHECKPOINT_EVERY: usize = 2048;
+/// Periodic step-tagged checkpoints kept on disk. Three preserves the equal-cadence analysis
+/// window while bounding recovery data; an off-grid semantic final bundle is retained in
+/// addition. Epoch artifacts and `pretrain_best*.ot` are named differently and never pruned.
 const RETAINED_STEP_CHECKPOINTS: usize = 3;
 
 /// Step-tagged checkpoints exempted from pruning because they BRACKET THE FIRST PASS
@@ -489,9 +508,9 @@ const RETAINED_STEP_CHECKPOINTS: usize = 3;
 /// random init".
 ///
 /// Three anchors: two tight around the boundary to carry the discontinuity, and one earlier
-/// in-plateau anchor to establish the all-fresh trend the kink is measured against. Cost is a
-/// fixed 3 x 128 MiB, so the pruner stays crash insurance with a bounded footprint rather
-/// than an archive.
+/// in-plateau anchor to establish the all-fresh trend the kink is measured against. Cost is
+/// fixed at three recovery bundles (about 3 x 312 MiB), so the pruner stays crash insurance
+/// with a bounded footprint rather than an archive.
 ///
 /// REQUIRES `epochs * F > 1` for the run's own `F` = `--lr-plateau-fraction`, i.e. the first
 /// pass boundary must fall strictly inside the plateau. The condition is evaluated against the
@@ -508,9 +527,9 @@ const PLATEAU_ANCHOR_CHECKPOINTS: usize = 3;
 /// Returned in PRIORITY order — the straddling pair first, then the all-fresh baseline —
 /// because the pair carries the discontinuity and the baseline only calibrates the trend it is
 /// measured against. At `--epochs 3` and the default plateau fraction,
-/// `steps_per_epoch = 10365` and [`DEFAULT_CHECKPOINT_EVERY`] `= 512` this returns 10240,
-/// 10752, 5120: the last cadence step before the boundary, the first one after it, and the
-/// midpoint of the first pass.
+/// `steps_per_epoch = 10365` and [`DEFAULT_CHECKPOINT_EVERY`] `= 2048` this returns 10240,
+/// 12288, 6144: the last cadence step before the boundary, the first one after it, and the
+/// cadence point nearest the midpoint of the first pass.
 ///
 /// Empty — deliberately, rather than retaining artifacts that cannot answer the question —
 /// when the boundary is not strictly inside the plateau (a single-pass run has no repetition,
@@ -604,6 +623,11 @@ pub struct PretrainArgs {
     pub support_samples: usize,
     /// Recursive unverified dynamics-draft training depth.
     pub dyn_horizon: usize,
+    /// Base weights for direct complete-bar categorical Hard NLL at t+2 and t+3.
+    /// Defaults are zero; the fixed stage schedule multiplies them by `0.5` and `0.25`
+    /// respectively throughout the run.
+    pub direct_t2_weight: f64,
+    pub direct_t3_weight: f64,
     /// Weight on the NextLat latent term, applied UNCHANGED at every step of the run.
     ///
     /// `dyn` is meaned over every element of `[B, T, BAR_MODEL_DIM]` (see
@@ -735,6 +759,10 @@ pub struct PretrainArgs {
     /// anything this cannot see: it compares REALIZED batch and step count and refuses the
     /// pair, because both of those runs requested 24.
     pub exact_batch: bool,
+    /// Finish the canonical Train/Val campaign artifacts without constructing or scoring
+    /// any Test-split evaluation set. This is deliberately outside the recovery contract:
+    /// it changes only terminal measurement policy, never training state or cursor lineage.
+    pub defer_test: bool,
     /// Fraction of the run held at the flat learning-rate plateau before the linear decay to
     /// [`LR_FLOOR_MULTIPLIER`]. Defaults to [`LR_PLATEAU_FRACTION`]; must lie strictly inside
     /// `(0, 1)`.
@@ -765,6 +793,24 @@ pub struct PretrainArgs {
     pub ablation_lr: f64,
     /// Schraudolph SMD meta learning rate, used only by `smd-idbd`.
     pub smd_meta_lr: f64,
+    /// Use the historical global second-order surrogate instead of the default
+    /// second-cumulant expected-log rule. This is a reproducibility opt-out.
+    pub quadratic_kelly: bool,
+    /// Size the traded book on the out-of-sample recalibrated conditional mean. Default off,
+    /// for the same reason. See [`trade_bench::SizingRule::recalibrated`] for why its effect
+    /// is a function of how far the run annealed, and [`SHRINK_FIT_WINDOWS`] for the slice the
+    /// recalibration is fitted on.
+    pub mean_shrink: bool,
+    /// Fit the bin supports on, and train the head against, VOLATILITY-STANDARDIZED targets:
+    /// `z_r = r / sigma_t` and `z_s = s / (BAR_RANGE_TO_SIGMA * sigma_t)` for a causal
+    /// Garman-Klass HAR `sigma_t`. Default off.
+    ///
+    /// This CHANGES THE BIN GEOMETRY, so `supports_sha256` differs and no NLL, CRPS, PIT or
+    /// bin-occupancy quantity is comparable against a control run — only
+    /// `model_growth_difference` and the realized-return economics survive, which is what
+    /// `--allow-geometry-change` exists to select. Requires a supports artifact fitted with
+    /// the same flag; the run refuses a mismatched one rather than reinterpreting its bins.
+    pub vol_standardize_targets: bool,
 }
 
 impl PretrainArgs {
@@ -776,6 +822,19 @@ impl PretrainArgs {
             split_bounds: self.split_bounds,
             derive_split_bounds: self.derive_split_bounds,
             min_dollar_volume: self.min_dollar_volume,
+            dof_scaling: if self.vol_standardize_targets {
+                DofScaling::VolStandardized
+            } else {
+                DofScaling::Raw
+            },
+        }
+    }
+
+    /// Which reduction of the predictive law the traded book is sized on.
+    fn sizing_rule(&self) -> trade_bench::SizingRule {
+        trade_bench::SizingRule {
+            cumulant_log: !self.quadratic_kelly,
+            recalibrated: self.mean_shrink,
         }
     }
 }
@@ -794,6 +853,13 @@ pub struct CorpusFlags {
     pub split_bounds: Option<(i64, i64)>,
     pub derive_split_bounds: bool,
     pub min_dollar_volume: f64,
+    /// The target parametrization every encode through this corpus applies.
+    ///
+    /// Belongs to the corpus flags rather than to the trainer because it decides what the
+    /// TARGETS ARE, exactly as `min_bars` decides which bars exist: a checkpoint scored on a
+    /// corpus with a different scaling is being scored in a different space, and the same
+    /// reproduction discipline has to cover both.
+    pub dof_scaling: DofScaling,
 }
 
 // ---------------------------------------------------------------------------
@@ -1350,9 +1416,20 @@ fn probe_shape_used_bytes(
                 supports,
                 growth_support,
                 &sample.dof,
+                &sample.sigma,
                 &sample.time_ids,
+                sample.direct_time_ids.as_ref(),
+                sample.direct_valid.as_ref(),
                 context,
                 args.dyn_horizon as i64,
+                direct_horizon_weights(
+                    stage_contexts()
+                        .iter()
+                        .position(|candidate| *candidate == context)
+                        .unwrap_or(0),
+                    args.direct_t2_weight,
+                    args.direct_t3_weight,
+                ),
                 args.lambda_dyn,
                 args.lambda_kl,
                 BarScoring::Hard,
@@ -1604,10 +1681,33 @@ fn resolve_ramp(
 // Entry point
 // ---------------------------------------------------------------------------
 
+fn initialize_cuda_autograd(device: Device) -> Result<()> {
+    let Device::Cuda(index) = device else {
+        return Ok(());
+    };
+    let device_count = tch::Cuda::device_count();
+    ensure!(
+        index < device_count as usize,
+        "selected CUDA device {index} is outside the {device_count} visible devices"
+    );
+
+    let probe = Tensor::ones([1], (Kind::Float, device)).set_requires_grad(true);
+    probe.square().sum(Kind::Float).backward();
+    let gradient = probe.grad();
+    ensure!(
+        gradient.defined() && gradient.device() == device,
+        "CUDA autograd preflight did not produce a gradient on {device:?}"
+    );
+    println!("CUDA autograd ready on device {index} of {device_count}");
+    Ok(())
+}
+
 pub fn pretrain(args: PretrainArgs) -> Result<()> {
     // Before any tensor work in the process, which is the only time torch accepts it.
     configure_threads();
-    build_trainer(args, RUNS_PATH, Device::cuda_if_available())?.run_training()
+    let device = Device::cuda_if_available();
+    let _autograd_guard = device.is_cuda().then(disable_autograd_multithreading);
+    build_trainer(args, RUNS_PATH, device)?.run_training()
 }
 
 /// Refuse to reinterpret initialization weights trained under another predictive contract.
@@ -1633,9 +1733,11 @@ fn validate_recorded_pretrain_scoring(recorded: Option<&str>) -> Result<()> {
     Ok(())
 }
 
-fn validate_pretrain_weights_contract(weights: Option<&str>) -> Result<()> {
+fn validate_pretrain_weights_contract(
+    weights: Option<&str>,
+) -> Result<Option<BarWorldModelMetadata>> {
     let Some(weights) = weights else {
-        return Ok(());
+        return Ok(None);
     };
     let metadata_path = world_model_metadata_path(Path::new(weights));
     ensure!(
@@ -1649,12 +1751,57 @@ fn validate_pretrain_weights_contract(weights: Option<&str>) -> Result<()> {
             metadata_path.display()
         )
     })?;
+    metadata
+        .validate_checkpoint(weights)
+        .context("initialization weights do not match their metadata")?;
+    metadata
+        .validate_supports(weights)
+        .context("initialization supports do not match their metadata")?;
     validate_recorded_pretrain_scoring(
         metadata
             .training
             .as_ref()
             .map(|training| training.scoring.as_str()),
-    )
+    )?;
+    Ok(Some(metadata))
+}
+
+fn authenticated_support_scaling(
+    weights: &Path,
+    metadata: &BarWorldModelMetadata,
+    resolution_secs: u32,
+) -> Result<DofScaling> {
+    ensure!(
+        metadata.res_secs == resolution_secs,
+        "checkpoint was trained for {}s bars but --resolution-secs is {resolution_secs}",
+        metadata.res_secs
+    );
+    let support_path = world_model_supports_path(weights, resolution_secs);
+    let supports = BarSupports::load(&support_path)
+        .with_context(|| format!("loading authenticated supports {}", support_path.display()))?;
+    let scaling = supports.dof_scaling();
+    let training = metadata.training.as_ref().with_context(|| {
+        format!(
+            "{} has no training provenance, so its target scaling cannot be authenticated",
+            weights.display()
+        )
+    })?;
+    ensure!(
+        training.dof_scaling == scaling,
+        "checkpoint training provenance records {} targets but its authenticated deployment \
+         supports tile {scaling} targets",
+        training.dof_scaling
+    );
+    Ok(scaling)
+}
+fn preflight_checkpoint_scaling(weights: &Path, resolution_secs: u32) -> Result<DofScaling> {
+    let metadata_path = world_model_metadata_path(weights);
+    let metadata = BarWorldModelMetadata::load(&metadata_path)
+        .with_context(|| format!("loading checkpoint metadata {}", metadata_path.display()))?;
+    metadata.validate_schema()?;
+    metadata.validate_checkpoint(weights)?;
+    metadata.validate_supports(weights)?;
+    authenticated_support_scaling(weights, &metadata, resolution_secs)
 }
 
 #[derive(Clone)]
@@ -1680,6 +1827,8 @@ fn preflight_resume(args: &PretrainArgs) -> Result<Option<PretrainResume>> {
         .pretrain_recovery
         .clone()
         .context("checkpoint is weights-only and has no exact pretraining recovery contract")?;
+    validate_resume_ramp_footprint(&recovery, false, None)
+        .context("recovery checkpoint has invalid VRAM guard provenance")?;
     let optimizer = world_model_optimizer_path(&checkpoint);
     let expected_optimizer_hash = metadata
         .optimizer_checkpoint_sha256
@@ -1740,10 +1889,17 @@ fn preflight_resume(args: &PretrainArgs) -> Result<Option<PretrainResume>> {
         "--exact-batch mismatch with resume checkpoint"
     );
     ensure!(
+        args.quadratic_kelly == recovery.quadratic_kelly
+            && args.mean_shrink == recovery.mean_shrink,
+        "sizing-rule arguments mismatch with resume checkpoint"
+    );
+    ensure!(
         args.dyn_horizon == recovery.dyn_horizon
             && args.lambda_dyn.to_bits() == recovery.lambda_dyn.to_bits()
-            && args.lambda_kl.to_bits() == recovery.lambda_kl.to_bits(),
-        "dynamics objective arguments mismatch with resume checkpoint"
+            && args.lambda_kl.to_bits() == recovery.lambda_kl.to_bits()
+            && args.direct_t2_weight.to_bits() == recovery.direct_t2_weight.to_bits()
+            && args.direct_t3_weight.to_bits() == recovery.direct_t3_weight.to_bits(),
+        "dynamics/direct objective arguments mismatch with resume checkpoint"
     );
     ensure!(
         args.auxiliary_resolutions == recovery.auxiliary_resolutions,
@@ -1805,10 +1961,33 @@ fn preflight_resume(args: &PretrainArgs) -> Result<Option<PretrainResume>> {
 /// instead of an accident of the machine the suite runs on.
 fn build_trainer(mut args: PretrainArgs, runs_root: &str, device: Device) -> Result<Trainer> {
     validate_args(&args)?;
-    validate_pretrain_weights_contract(args.weights.as_deref())?;
+    let warm_start_metadata = validate_pretrain_weights_contract(args.weights.as_deref())?;
     let resume = preflight_resume(&args)?;
+    // Initialization and exact-resume checkpoints own the target geometry. Operator flags still
+    // choose the corpus and split, but cannot reinterpret authenticated supports.
+    let checkpoint_scaling = if let Some(resume) = &resume {
+        Some(authenticated_support_scaling(
+            &resume.checkpoint,
+            &resume.metadata,
+            args.resolution_secs,
+        )?)
+    } else if let (Some(weights), Some(metadata)) =
+        (args.weights.as_deref(), warm_start_metadata.as_ref())
+    {
+        Some(authenticated_support_scaling(
+            Path::new(weights),
+            metadata,
+            args.resolution_secs,
+        )?)
+    } else {
+        None
+    };
+    if let Some(scaling) = checkpoint_scaling {
+        args.vol_standardize_targets = scaling.is_standardized();
+    }
     if device.is_cuda() {
         configure_cuda();
+        initialize_cuda_autograd(device)?;
     }
 
     tch::manual_seed(args.seed as i64);
@@ -1879,6 +2058,7 @@ fn build_trainer(mut args: PretrainArgs, runs_root: &str, device: Device) -> Res
     );
 
     let (supports, supports_frozen) = fit_supports(&corpus, &args, &corpus_fingerprint)?;
+    let supports_sha256 = supports_digest(&supports, &run.weights)?;
     let supports_dev = supports.to_device(device);
     // Before the capacity probe, because the detached diagnostic is part of the measured
     // step footprint. Construction also validates the fitted raw-payoff law before the run.
@@ -1887,18 +2067,6 @@ fn build_trainer(mut args: PretrainArgs, runs_root: &str, device: Device) -> Res
 
     let mut vs = nn::VarStore::new(device);
     let modules = BarModules::new(&vs.root());
-    if let Some(path) = args.weights.as_deref().or_else(|| {
-        resume
-            .as_ref()
-            .and_then(|resume| resume.checkpoint.to_str())
-    }) {
-        let summary = load_var_store_partial(&mut vs, path)
-            .map_err(|err| anyhow!("failed loading {path}: {err}"))?;
-        summary
-            .require_complete()
-            .map_err(|err| anyhow!("incomplete initialization from {path}: {err}"))?;
-        println!("initialized {} tensors from {path}", summary.loaded);
-    }
 
     let named = named_trainable_variables(&vs);
     let mut optimizer = match args.optimizer_ablation {
@@ -1910,15 +2078,6 @@ fn build_trainer(mut args: PretrainArgs, runs_root: &str, device: Device) -> Res
             PretrainOptimizer::smd_idbd(&named, args.ablation_lr, args.smd_meta_lr)
         }
     };
-    if let Some(resume) = &resume {
-        let expected_primary_steps =
-            i64::try_from(resume.next_step).context("resume step exceeds i64")?;
-        optimizer.load_state_strict(
-            &resume.optimizer,
-            &resume.metadata.optimizer_initialized_adamw,
-            expected_primary_steps,
-        )?;
-    }
 
     let (train_samplers, eval) = build_samplers(&corpus, &args)?;
 
@@ -2046,6 +2205,41 @@ fn build_trainer(mut args: PretrainArgs, runs_root: &str, device: Device) -> Res
             .collect(),
     )
     .context("failed building the resolution-keyed support set")?;
+    if let (Some(weights), Some(metadata)) = (args.weights.as_deref(), warm_start_metadata.as_ref())
+    {
+        metadata
+            .validate_support_geometry(weights, &support_set_dev)
+            .context("initialization support geometry is incompatible with this run")?;
+    }
+    if let Some(path) = args.weights.as_deref().or_else(|| {
+        resume
+            .as_ref()
+            .and_then(|resume| resume.checkpoint.to_str())
+    }) {
+        let summary = load_var_store_partial(&mut vs, path)
+            .map_err(|err| anyhow!("failed loading {path}: {err}"))?;
+        summary
+            .require_complete()
+            .map_err(|err| anyhow!("incomplete initialization from {path}: {err}"))?;
+        println!("initialized {} tensors from {path}", summary.loaded);
+    }
+    if let Some(resume) = &resume {
+        let expected_primary_steps =
+            i64::try_from(resume.next_step).context("resume step exceeds i64")?;
+        optimizer.load_state_strict(
+            &resume.optimizer,
+            &resume.metadata.optimizer_initialized_adamw,
+            expected_primary_steps,
+        )?;
+        let restored_pending = match &optimizer {
+            PretrainOptimizer::Production(optimizer) => optimizer.adamw_accumulation_pending(),
+            _ => false,
+        };
+        ensure!(
+            restored_pending == resume.recovery.adamw_accumulation_pending,
+            "optimizer AdamW accumulation state disagrees with recovery metadata"
+        );
+    }
     // One registered base carries every resolution's audit, so the corpus report states what was
     // actually loaded instead of the deployment resolution alone.
     let corpus_audits: Vec<CorpusAnomalies> = std::iter::once(corpus.scan_anomalies())
@@ -2077,11 +2271,12 @@ fn build_trainer(mut args: PretrainArgs, runs_root: &str, device: Device) -> Res
     // so the plan needs the ramp that will execute, and the step count is then whatever it
     // takes to issue every window the plan assigned — not a bar-token target divided by an
     // average step size, which is what let a run label 71% of a pass "one epoch".
-    let pass = PassPlan::new(
+    let pass = PassPlan::new_with_future(
         &corpus,
         Split::Train,
         &stage_contexts(),
         &ramp_token_weights(&derived_batch_ramp),
+        args.dyn_horizon.max(DIRECT_MAX_HORIZON as usize),
         args.seed,
     )
     .context("failed partitioning the training split across the ramp contexts")?;
@@ -2167,7 +2362,38 @@ fn build_trainer(mut args: PretrainArgs, runs_root: &str, device: Device) -> Res
     } else {
         (RAMP_STAGES - 1, 0)
     };
-    let _ = current_stage;
+    let has_future_batch_increase = (stage_step == 0
+        && current_stage > 0
+        && schedule.batch_ramp[current_stage] > schedule.batch_ramp[current_stage - 1])
+        || ((current_stage + 1)..RAMP_STAGES)
+            .any(|stage| schedule.batch_ramp[stage] > schedule.batch_ramp[current_stage]);
+    let activation_bytes_per_token = if let Some(resume) = &resume {
+        if device.is_cuda() {
+            validate_resume_ramp_footprint(
+                &resume.recovery,
+                has_future_batch_increase,
+                device_identity(device).as_deref(),
+            )?
+        } else if resume.recovery.activation_bytes_per_token > 0.0 {
+            Some(resume.recovery.activation_bytes_per_token)
+        } else {
+            None
+        }
+    } else {
+        capacity.as_ref().map(|capacity| capacity.per_token_bytes)
+    };
+    let activation_device = if let Some(resume) = &resume {
+        (!resume.recovery.activation_device.is_empty())
+            .then(|| resume.recovery.activation_device.clone())
+    } else if activation_bytes_per_token.is_some() {
+        device_identity(device)
+    } else {
+        None
+    };
+    ensure!(
+        activation_bytes_per_token.is_none() || activation_device.is_some(),
+        "measured activation footprint has no stable device identity"
+    );
     let completed_passes = epoch;
 
     // ONE scoring rule for the whole run. Every reference below is recomputed in it, so a
@@ -2235,6 +2461,16 @@ fn build_trainer(mut args: PretrainArgs, runs_root: &str, device: Device) -> Res
     // artifact instead of in a log line.
     CorpusAnomalies::write_report_of(&corpus_audits, &run.gens)
         .context("failed writing the corpus anomaly report")?;
+    // What the target parametrization does to the split every reported number is scored on,
+    // measured once before step zero. Handed to the reporter rather than logged because the
+    // question it answers — did standardization raise the worst symbol's effective resolution
+    // and close the spread — is a comparison between two runs, and only a registered base is
+    // comparable. Written on the control too, for exactly that reason.
+    let geometry = corpus
+        .audit_target_geometry(&supports, Split::Val)
+        .context("failed auditing the target geometry of the evaluation split")?;
+    println!("{}", geometry.summary());
+    reporter.set_target_geometry(geometry);
     // Taken before the trainer owns the set, and re-checked at every boundary.
     let snapshot_window_fingerprint = pinned_fingerprint(&eval.snapshot);
     Ok(Trainer {
@@ -2242,6 +2478,7 @@ fn build_trainer(mut args: PretrainArgs, runs_root: &str, device: Device) -> Res
         device,
         schedule,
         next_step,
+        last_recovery_step: None,
         run,
         supports,
         supports_dev,
@@ -2259,6 +2496,7 @@ fn build_trainer(mut args: PretrainArgs, runs_root: &str, device: Device) -> Res
         baselines,
         corpus_fingerprint,
         supports_frozen,
+        supports_sha256,
         symbol_count: corpus.symbols().len(),
         pass_ledger,
         pass_layout,
@@ -2279,10 +2517,10 @@ fn build_trainer(mut args: PretrainArgs, runs_root: &str, device: Device) -> Res
         nll_rule_scores: None,
         nll_rule_step: 0,
         nll_rule_promotions: 0,
+        last_selection: SelectionLedger::unmeasured(),
+        degenerate_bootstrap_warned: Cell::new(false),
         promotions: 0,
-        train_nll_sum: 0.0,
-        train_nll_dof_sum: [0.0; BAR_DOF],
-        train_steps: 0,
+        train_nll: NllAccumulator::default(),
         aux_share_streak: 0,
         aux,
         aux_heldout,
@@ -2290,11 +2528,11 @@ fn build_trainer(mut args: PretrainArgs, runs_root: &str, device: Device) -> Res
         aux_steps: 0,
         aux_bars_seen: 0,
         vram_baseline_bytes: None,
-        // Seeded from the startup probe so the FIRST stage transition is gated on a measured
-        // figure. Before this the runtime probe only ran four steps into stage 0, so the
-        // transition into stage 1 — the one two runs died at — was taken on `None`, i.e. with
-        // the guard disabled.
-        activation_bytes_per_token: capacity.as_ref().map(|c| c.per_token_bytes),
+        // Seeded from the startup probe or the authenticated recovery footprint so every future
+        // batch increase remains guarded. A CUDA resume with no same-device measurement is
+        // rejected above rather than silently running the transition with this set to `None`.
+        activation_bytes_per_token,
+        activation_device,
         capacity,
         derived_batch_ramp,
         requested_batch,
@@ -2303,12 +2541,73 @@ fn build_trainer(mut args: PretrainArgs, runs_root: &str, device: Device) -> Res
         selection_context: 0,
         best_by_context: BTreeMap::new(),
         diagnostic_best: None,
+        sizing_shrink: None,
         epoch_started: Instant::now(),
         epoch_start_bars,
         epoch_dyn_identity_sum: 0.0,
         epoch_dyn_identity_steps: 0,
         snapshot_window_fingerprint,
     })
+}
+
+/// Load a checkpoint through the authenticated artifact path and return the target geometry its
+/// deployment supports actually tile.
+///
+/// Checkpoint consumers call this before opening a corpus. Corpus flags still select the files,
+/// liquidity gate and split instants, but they cannot re-declare the model's target space.
+pub(super) fn load_authenticated_checkpoint(
+    weights: &Path,
+    device: Device,
+    resolution_secs: u32,
+) -> Result<(BarWorldModel, DofScaling)> {
+    let metadata = world_model_metadata_path(weights);
+    ensure!(
+        metadata.exists(),
+        "no metadata sidecar beside {}; copy {} next to the weights",
+        weights.display(),
+        metadata.display()
+    );
+    let world = BarWorldModel::load(weights, &metadata, device)?;
+    ensure!(
+        world.metadata().res_secs == resolution_secs,
+        "checkpoint was trained for {}s bars but --resolution-secs is {}",
+        world.metadata().res_secs,
+        resolution_secs
+    );
+    let scaling = world.deployment_supports().dof_scaling();
+    let trained = world.metadata().training.as_ref().with_context(|| {
+        format!(
+            "{} has no authenticated training provenance, so its target scaling cannot be \
+             checked against its deployment supports",
+            weights.display()
+        )
+    })?;
+    ensure!(
+        trained.dof_scaling == scaling,
+        "checkpoint training provenance records {} targets but its authenticated deployment \
+         supports tile {scaling} targets",
+        trained.dof_scaling
+    );
+    Ok((world, scaling))
+}
+
+/// Load the corpus selected by `flags` in the authenticated checkpoint's target geometry.
+pub(super) fn load_checkpoint_corpus(
+    weights: &Path,
+    device: Device,
+    flags: &CorpusFlags,
+) -> Result<(BarWorldModel, BarCorpus)> {
+    let (world, scaling) = load_authenticated_checkpoint(weights, device, flags.resolution_secs)?;
+    let mut inferred = flags.clone();
+    inferred.dof_scaling = scaling;
+    let corpus = load_corpus(&inferred)?;
+    ensure!(
+        corpus.dof_scaling() == world.deployment_supports().dof_scaling(),
+        "authenticated checkpoint supports tile {} targets but the resulting corpus encodes {}",
+        world.deployment_supports().dof_scaling(),
+        corpus.dof_scaling()
+    );
+    Ok((world, corpus))
 }
 
 /// Arguments of the standalone candle-rollout entry point.
@@ -2359,25 +2658,7 @@ pub fn pretrain_candles(args: CandleArgs) -> Result<()> {
 
     let device = Device::cuda_if_available();
     let weights = Path::new(&args.weights);
-    let metadata = world_model_metadata_path(weights);
-    ensure!(
-        metadata.exists(),
-        "no metadata sidecar beside {}; copy {} next to the weights",
-        weights.display(),
-        metadata.display()
-    );
-    // The real load path: it hash-checks the checkpoint and every supports sidecar
-    // against the metadata, so a torn copy or a mismatched support set fails here
-    // rather than producing a plausible-looking picture of the wrong output space.
-    let world = BarWorldModel::load(weights, &metadata, device)?;
-    ensure!(
-        world.metadata().res_secs == args.corpus.resolution_secs,
-        "checkpoint was trained for {}s bars but --resolution-secs is {}",
-        world.metadata().res_secs,
-        args.corpus.resolution_secs
-    );
-
-    let corpus = load_corpus(&args.corpus)?;
+    let (world, corpus) = load_checkpoint_corpus(weights, device, &args.corpus)?;
     let fingerprint = corpus.identity_fingerprint();
     if let Some(trained) = world.metadata().training.as_ref() {
         if trained.corpus_fingerprint != fingerprint {
@@ -2448,12 +2729,30 @@ pub struct TradeArgs {
     /// Pinned windows to draw. The bench trades the first
     /// [`trade_bench::TRADE_WINDOWS`] of them, and the count is part of the pin, so this
     /// must equal the run's `--validation-windows` to trade the run's own windows.
+    ///
+    /// Under `--mean-shrink` the surplus beyond the traded prefix is what the recalibration is
+    /// fitted on, so the draw must be wide enough to leave a block-disjoint remainder.
     pub windows: usize,
+    /// Windows of the block-disjoint remainder to fit the recalibration on under
+    /// `--mean-shrink`. Truncated to what the remainder actually holds, so asking for more
+    /// than exists is safe. Unused without that flag, and it costs a second evaluation pass.
+    pub fit_windows: usize,
     /// Conditioning context. Must match the context the checkpoint was selected at, or the
     /// bench measures positional extrapolation rather than forecasting.
     pub context: i64,
     /// Evaluation batch, in windows.
     pub batch_size: usize,
+    /// Use the historical global second-order surrogate instead of the default
+    /// second-cumulant expected-log rule. This is the explicit pre-A1 reproducibility path;
+    /// the active rule is priced against its same-bars alternative on the loaded checkpoint.
+    pub quadratic_kelly: bool,
+    /// Size on the out-of-sample recalibrated conditional mean.
+    ///
+    /// Costs a second evaluation pass, on the block-disjoint surplus of the same draw, because
+    /// the slope has to come from windows this bench will never trade — the whole content of
+    /// the fix is that the correction is out-of-sample, and a slope fitted on the traded slice
+    /// would be a curve-fit dressed as a calibration. It is equally free of retraining.
+    pub mean_shrink: bool,
     pub corpus: CorpusFlags,
 }
 
@@ -2473,22 +2772,7 @@ pub fn pretrain_trade(args: TradeArgs) -> Result<()> {
 
     let device = Device::cuda_if_available();
     let weights = Path::new(&args.weights);
-    let metadata = world_model_metadata_path(weights);
-    ensure!(
-        metadata.exists(),
-        "no metadata sidecar beside {}; copy {} next to the weights",
-        weights.display(),
-        metadata.display()
-    );
-    let world = BarWorldModel::load(weights, &metadata, device)?;
-    ensure!(
-        world.metadata().res_secs == args.corpus.resolution_secs,
-        "checkpoint was trained for {}s bars but --resolution-secs is {}",
-        world.metadata().res_secs,
-        args.corpus.resolution_secs
-    );
-
-    let corpus = load_corpus(&args.corpus)?;
+    let (world, corpus) = load_checkpoint_corpus(weights, device, &args.corpus)?;
     let fingerprint = corpus.identity_fingerprint();
     if let Some(trained) = world.metadata().training.as_ref() {
         if trained.corpus_fingerprint != fingerprint {
@@ -2520,7 +2804,79 @@ pub fn pretrain_trade(args: TradeArgs) -> Result<()> {
             anyhow!("the checkpoint records a scoring rule this build cannot parse: {reason}")
         })?
         .unwrap_or_default();
-    let set = PinnedSet::pinned(&corpus, args.split, args.context, args.windows)?;
+    let mut set = PinnedSet::pinned(&corpus, args.split, args.context, args.windows)?;
+    // Block ids over the WHOLE draw, so `(symbol, calendar month)` has one id in both slices
+    // and disjointness is a statement about the same partition.
+    let blocks_all = pinned_blocks(&set);
+    let traded_count = trade_bench::TRADE_WINDOWS.min(set.windows.len());
+    // PASS 1, only under `--mean-shrink`: the slope, on windows this bench will never trade.
+    //
+    // An in-sample recalibration is worse than none, so the fit slice is taken from the
+    // block-disjoint surplus of the same draw rather than from the traded prefix. The traded
+    // prefix itself is untouched by this pass, which is what keeps the arm's positions
+    // comparable bar for bar against the control's.
+    let shrink = if args.mean_shrink {
+        let fit_indices =
+            trade_bench::disjoint_fit_windows(&blocks_all, traded_count, args.fit_windows);
+        ensure!(
+            fit_indices.len() >= 2,
+            "only {} of the {} drawn windows are block-disjoint from the {traded_count} traded \
+             ones, which is not enough to fit a calibration slope with an interval; raise \
+             --windows or --fit-windows",
+            fit_indices.len(),
+            set.windows.len()
+        );
+        let fit_blocks: Vec<u64> = fit_indices.iter().map(|index| blocks_all[*index]).collect();
+        ensure!(
+            trade_bench::blocks_disjoint(&fit_blocks, &blocks_all[..traded_count]),
+            "the calibration fit slice shares a (symbol, calendar month) block with the traded \
+             slice, so the recalibration would be fitted on the regime it is spent in"
+        );
+        let all_windows = std::mem::take(&mut set.windows);
+        let fit_windows: Vec<WindowRef> = fit_indices
+            .iter()
+            .map(|index| all_windows[*index])
+            .collect();
+        let fit_count = fit_windows.len();
+        set.windows = fit_windows;
+        let fit_stats = evaluate(
+            world.modules(),
+            world.deployment_supports(),
+            &set,
+            args.batch_size,
+            device,
+            true,
+            scoring,
+            TradedSizing::CONTROL,
+            fit_count,
+        )?;
+        set.windows = all_windows;
+        let calibration =
+            trade_bench::mean_calibration(&fit_stats.trade_paths.windows, &fit_blocks);
+        let fitted = calibration.shrink().ok_or_else(|| {
+            anyhow!(
+                "the calibration regression degenerated on the fit slice of {}; there is no \
+                 slope to recalibrate with",
+                weights.display()
+            )
+        })?;
+        let distinct_blocks = {
+            let mut ids = fit_blocks.clone();
+            ids.sort_unstable();
+            ids.dedup();
+            ids.len()
+        };
+        println!(
+            "mean recalibration fitted on {fit_count} windows over {distinct_blocks} blocks, \
+             block-DISJOINT from the {traded_count} traded ones"
+        );
+        for line in calibration.report_lines() {
+            println!("  fit slice: {line}");
+        }
+        Some(fitted)
+    } else {
+        None
+    };
     let stats = evaluate(
         world.modules(),
         world.deployment_supports(),
@@ -2529,7 +2885,13 @@ pub fn pretrain_trade(args: TradeArgs) -> Result<()> {
         device,
         true,
         scoring,
-        None,
+        TradedSizing {
+            rule: trade_bench::SizingRule {
+                cumulant_log: !args.quadratic_kelly,
+                recalibrated: args.mean_shrink,
+            },
+            shrink,
+        },
         trade_bench::TRADE_WINDOWS,
     )?;
     let mut blocks = pinned_blocks(&set);
@@ -2932,7 +3294,27 @@ pub fn pretrain_calibration(args: CalibrationArgs) -> Result<()> {
         .map(|entry| parse_checkpoint_at_step(entry))
         .collect::<Result<Vec<_>>>()?;
 
-    let corpus = load_corpus(&args.corpus)?;
+    // A dry run measures only the selected population and intentionally opens no checkpoint;
+    // target geometry is therefore immaterial. Every scoring run authenticates the first
+    // checkpoint before corpus construction and uses its deployment support as the authority.
+    let mut first_world = None;
+    let corpus = if args.dry_run {
+        load_corpus(&args.corpus)?
+    } else {
+        let first = Path::new(&requested[0].0);
+        let (world, corpus) = load_checkpoint_corpus(first, device, &args.corpus)?;
+        let scaling = world.deployment_supports().dof_scaling();
+        for (path, _) in requested.iter().skip(1) {
+            let other = preflight_checkpoint_scaling(Path::new(path), args.corpus.resolution_secs)?;
+            ensure!(
+                other == scaling,
+                "mixed checkpoint target geometry: the first authenticated checkpoint uses \
+                 {scaling}, but {path} uses {other}"
+            );
+        }
+        first_world = Some(world);
+        corpus
+    };
     let mut set = PinnedSet::pinned(&corpus, args.split, args.context, args.windows)?;
     // Block ids are assigned over the WHOLE drawn set, so a `(symbol, month)` has one id in
     // both slices and disjointness is a statement about the same partition.
@@ -3092,21 +3474,22 @@ pub fn pretrain_calibration(args: CalibrationArgs) -> Result<()> {
     }
 
     let mut points: Vec<super::pretrain_reports::CalibrationPoint> = Vec::new();
-    for (path, step) in &requested {
+    for (checkpoint_index, (path, step)) in requested.iter().enumerate() {
         let weights = Path::new(path);
-        let metadata = world_model_metadata_path(weights);
+        let world = if checkpoint_index == 0 {
+            first_world
+                .take()
+                .expect("the non-dry calibration path authenticated its first checkpoint")
+        } else {
+            load_authenticated_checkpoint(weights, device, args.corpus.resolution_secs)?.0
+        };
         ensure!(
-            metadata.exists(),
-            "no metadata sidecar beside {}; copy {} next to the weights",
+            world.deployment_supports().dof_scaling() == corpus.dof_scaling(),
+            "mixed checkpoint target geometry: the first authenticated checkpoint and corpus \
+             use {}, but {} uses {}",
+            corpus.dof_scaling(),
             weights.display(),
-            metadata.display()
-        );
-        let world = BarWorldModel::load(weights, &metadata, device)?;
-        ensure!(
-            world.metadata().res_secs == args.corpus.resolution_secs,
-            "checkpoint was trained for {}s bars but --resolution-secs is {}",
-            world.metadata().res_secs,
-            args.corpus.resolution_secs
+            world.deployment_supports().dof_scaling()
         );
         if let Some(trained) = world.metadata().training.as_ref() {
             ensure!(
@@ -3137,7 +3520,7 @@ pub fn pretrain_calibration(args: CalibrationArgs) -> Result<()> {
             device,
             true,
             scoring,
-            None,
+            TradedSizing::CONTROL,
             fit_windows.len(),
         )?;
         let fit_calibration =
@@ -3163,7 +3546,7 @@ pub fn pretrain_calibration(args: CalibrationArgs) -> Result<()> {
             device,
             true,
             scoring,
-            Some(shrink),
+            TradedSizing::diagnostic(shrink),
             traded_windows.len(),
         )?;
         let config = BenchConfig::new(
@@ -3703,6 +4086,13 @@ fn validate_args(args: &PretrainArgs) -> Result<()> {
         "dynamics loss weights must be non-negative"
     );
     ensure!(
+        args.direct_t2_weight.is_finite()
+            && args.direct_t2_weight >= 0.0
+            && args.direct_t3_weight.is_finite()
+            && args.direct_t3_weight >= 0.0,
+        "direct t+2/t+3 weights must be finite and non-negative"
+    );
+    ensure!(
         args.validation_windows > 0,
         "--validation-windows must be positive; promotion needs a held-out set"
     );
@@ -3799,7 +4189,86 @@ pub(super) fn load_corpus(args: &CorpusFlags) -> Result<BarCorpus> {
             None => BarCorpus::load(dir, args.resolution_secs, args.min_bars),
         }
     };
-    corpus.with_context(|| format!("failed to load bar corpus from {}", args.data_dir))
+    let corpus =
+        corpus.with_context(|| format!("failed to load bar corpus from {}", args.data_dir))?;
+    // Selected here and only here, while the corpus is still uniquely owned, so every sampler,
+    // pinned set and supports fit built from it agrees on the target parametrization.
+    Ok(corpus.with_dof_scaling(args.dof_scaling))
+}
+/// CPU-only support-fit entry point used to publish campaign geometry before training arms.
+#[derive(Clone, Debug)]
+pub struct FitSupportsArgs {
+    pub output_supports: String,
+    pub samples: usize,
+    pub seed: u64,
+    pub corpus: CorpusFlags,
+}
+
+pub fn fit_bar_supports(args: FitSupportsArgs) -> Result<()> {
+    ensure!(args.samples > 0, "--samples must be positive");
+    configure_threads();
+    let corpus = load_corpus(&args.corpus)?;
+    let fingerprint = corpus.identity_fingerprint();
+    let path = PathBuf::from(&args.output_supports);
+    let existed = path.exists();
+    let (supports, frozen) = fit_supports_at(
+        &corpus,
+        &path,
+        SupportsFit {
+            samples: args.samples,
+            seed: args.seed,
+            freeze: false,
+        },
+        &fingerprint,
+    )?;
+    ensure!(
+        !frozen,
+        "a fit-only pass never accepts frozen foreign provenance"
+    );
+    ensure!(
+        supports.bin_means_measured(),
+        "{} carries no fitted per-bin moments",
+        path.display()
+    );
+    let format_version = bar_supports_format_version(&path)?;
+    let sha256 = file_sha256(&path)?;
+    let recorded = supports.provenance().ok_or_else(|| {
+        anyhow!(
+            "{} passed fit authentication without persisted provenance",
+            path.display()
+        )
+    })?;
+    let stored_seed = recorded.fit_seed.ok_or_else(|| {
+        anyhow!(
+            "{} passed fit authentication without a persisted fit seed",
+            path.display()
+        )
+    })?;
+    let stored_scaling = recorded.scaling_contract.as_deref().ok_or_else(|| {
+        anyhow!(
+            "{} passed fit authentication without a persisted scaling contract",
+            path.display()
+        )
+    })?;
+    let stored_semantics = recorded.support_semantics.as_deref().ok_or_else(|| {
+        anyhow!(
+            "{} passed fit authentication without persisted support semantics",
+            path.display()
+        )
+    })?;
+    println!(
+        "{} bar supports at {}: format v{format_version}, scaling {} ({stored_scaling}), \
+         support semantics {stored_semantics}, sha256 {sha256}, corpus {}, split {:?}, samples {}, \
+         seed {}",
+        if existed { "validated" } else { "fitted" },
+        path.display(),
+        supports.dof_scaling(),
+        &recorded.corpus_fingerprint[..12.min(recorded.corpus_fingerprint.len())],
+        recorded.split_bounds,
+        recorded.sample_count,
+        stored_seed,
+    );
+    Ok(())
 }
 
 /// The split instants this run will use: `--split-bounds` if given, otherwise the campaign
@@ -3917,13 +4386,14 @@ impl SupportsFit {
     }
 }
 
-/// [`fit_supports`] against an explicit path and explicit scalars.
+/// Fit or load supports against an explicit destination and explicit scalars.
 ///
 /// Exists so an auxiliary resolution's supports go through THIS provenance check rather than a
 /// second implementation: `--supports` names one file and can only ever mean the deployment
-/// resolution, so the auxiliary always passes its own `bar_supports.<res>.json`. Takes the three
-/// scalars it needs rather than [`PretrainArgs`] so fitting a resolution's supports is reachable
-/// without standing up a whole run.
+/// resolution, so the auxiliary always passes its own `bar_supports.<res>.json`. A new fit stays
+/// in memory until provenance is attached, then atomically replaces exactly this destination.
+/// Takes the three scalars it needs rather than [`PretrainArgs`] so fitting a resolution's
+/// supports is reachable without standing up a whole run.
 pub(super) fn fit_supports_at(
     corpus: &BarCorpus,
     path: &Path,
@@ -3939,12 +4409,24 @@ pub(super) fn fit_supports_at(
             path.display(),
             supports.num_bins()
         );
+        ensure!(
+            supports.dof_scaling() == corpus.dof_scaling(),
+            "cached supports {} tile the {} target space but this corpus encodes {}. The bins \
+             would be applied to quantities they were never fitted over, which is not a scale \
+             error but a category error — every bin id, every nats figure and every per-bin \
+             Kelly moment would describe a different population. Fit this arm's own supports, \
+             or drop --vol-standardize-targets",
+            path.display(),
+            supports.dof_scaling(),
+            corpus.dof_scaling()
+        );
         let frozen = require_supports_provenance(
             supports.provenance(),
             path,
             corpus_fingerprint,
             corpus.split_bounds(),
-            fit.freeze,
+            fit,
+            corpus.dof_scaling(),
         )?;
         return Ok((supports, frozen));
     }
@@ -3955,8 +4437,9 @@ pub(super) fn fit_supports_at(
         path.display()
     );
     println!(
-        "fitting {}s bin supports from {} training bars (seed 0x{:X})",
+        "fitting {}s bin supports over {} targets from {} training bars (seed 0x{:X})",
         corpus.res_secs(),
+        corpus.dof_scaling(),
         fit.samples,
         fit.seed
     );
@@ -3967,73 +4450,178 @@ pub(super) fn fit_supports_at(
                 corpus_fingerprint: corpus_fingerprint.to_owned(),
                 split_bounds: corpus.split_bounds(),
                 sample_count: fit.samples,
+                fit_seed: Some(fit.seed),
+                scaling_contract: Some(corpus.dof_scaling().scaling_contract().to_owned()),
+                support_semantics: Some(BAR_SUPPORTS_SEMANTICS_CONTRACT.to_owned()),
                 fitted_utc: chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string(),
             });
-    // `BarCorpus::fit_supports` already persisted the provenance-free object, so rewrite it
-    // with the stamp attached rather than leaving an unverifiable artifact on disk.
-    supports
-        .save(path)
-        .with_context(|| format!("failed writing {}", path.display()))?;
+    persist_supports_atomically(&supports, path)?;
     Ok((supports, false))
 }
 
-/// Decide whether cached supports may be used against this corpus.
+/// SHA-256 of the run's bin supports as they are PERSISTED, which is the identity of the
+/// discretization every nats figure the run produces is measured in.
 ///
-/// Three cases, and only one of them is silent:
-/// * provenance matches -> reuse, log it;
-/// * provenance mismatches or is absent, `--freeze-supports` given -> reuse under a loud
-///   warning and return `true` so the fact reaches the checkpoint metadata;
-/// * otherwise -> hard error.
+/// Staged through [`BarSupports::save`] and hashed with the same [`file_sha256`] that
+/// [`BarWorldModelMetadata::supports_sha256`] is built from (`world_model.rs:511-519`), so the
+/// digest a per-window vector carries is the digest the checkpoint metadata records beside the
+/// weights rather than a second hash of the same idea. Taken once: the supports are fitted
+/// before the first step and never refitted, so a run has exactly one geometry.
+fn supports_digest(supports: &BarSupports, weights: &Path) -> Result<String> {
+    let staged = temporary_sibling(&weights.join("bin_geometry.digest.json"));
+    supports.save(&staged).with_context(|| {
+        format!(
+            "failed staging {} to identify this run's bin geometry",
+            staged.display()
+        )
+    })?;
+    let digest = file_sha256(&staged);
+    let _ = fs::remove_file(&staged);
+    digest
+}
+
+/// Write a fully stamped support artifact beside its destination, then publish it with one
+/// rename. A unique sibling lets concurrent fits fail or commit independently rather than
+/// sharing an unstamped or partially written cache.
+fn persist_supports_atomically(supports: &BarSupports, path: &Path) -> Result<()> {
+    let mut temporary_name = path.file_name().unwrap_or_default().to_os_string();
+    temporary_name.push(format!(".{}.tmp", uuid::Uuid::new_v4()));
+    let temporary = path.with_file_name(temporary_name);
+    let persist = (|| -> Result<()> {
+        supports
+            .save(&temporary)
+            .with_context(|| format!("failed staging {}", path.display()))?;
+        File::open(&temporary)
+            .with_context(|| format!("failed opening staged supports {}", temporary.display()))?
+            .sync_all()
+            .with_context(|| format!("failed syncing staged supports {}", temporary.display()))?;
+        fs::rename(&temporary, path)
+            .with_context(|| format!("failed committing supports {}", path.display()))?;
+        if let Some(parent) = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
+            File::open(parent)
+                .with_context(|| format!("failed opening support directory {}", parent.display()))?
+                .sync_all()
+                .with_context(|| {
+                    format!("failed syncing support directory {}", parent.display())
+                })?;
+        }
+        Ok(())
+    })();
+    if persist.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    persist
+}
+
+/// Decide whether cached supports may be used against this exact fit request.
 ///
-/// Freezing is the right call for an ablation campaign: refitting mid-campaign moves the
-/// `nll_bar` scale and makes every prior run incomparable. The point of this function is
-/// that the freeze is a decision somebody took, not a file that happened to be there.
+/// A campaign fit is authenticated only when every input that can move the output geometry is
+/// recorded and equal: corpus, split, sample count, seed, target scaling contract, and support
+/// fitting semantics. Missing fields on an older artifact remain readable for diagnostics but are
+/// mismatches here. `--freeze-supports` is the explicit training-only escape hatch; the
+/// `fit-bar-supports` entry point never sets it.
 fn require_supports_provenance(
     provenance: Option<&BarSupportsProvenance>,
     path: &Path,
     corpus_fingerprint: &str,
     split_bounds: (i64, i64),
-    freeze: bool,
+    fit: SupportsFit,
+    scaling: DofScaling,
 ) -> Result<bool> {
+    let expected_scaling = scaling.scaling_contract();
     let complaint = match provenance {
-        Some(recorded) if recorded.corpus_fingerprint == corpus_fingerprint => {
+        Some(recorded)
+            if recorded.corpus_fingerprint == corpus_fingerprint
+                && recorded.split_bounds == split_bounds
+                && recorded.sample_count == fit.samples
+                && recorded.fit_seed == Some(fit.seed)
+                && recorded.scaling_contract.as_deref() == Some(expected_scaling)
+                && recorded.support_semantics.as_deref()
+                    == Some(BAR_SUPPORTS_SEMANTICS_CONTRACT) =>
+        {
             println!(
-                "reusing bin supports {} — fitted {} from {} train DOF on this exact corpus",
+                "reusing authenticated bin supports {} — fitted {} from {} train DOF with seed \
+                 {} under scaling contract {:?} and support semantics {:?}",
                 path.display(),
                 recorded.fitted_utc,
-                recorded.sample_count
+                recorded.sample_count,
+                recorded.fit_seed.expect("matched seed is present"),
+                recorded
+                    .scaling_contract
+                    .as_deref()
+                    .expect("matched scaling contract is present"),
+                recorded
+                    .support_semantics
+                    .as_deref()
+                    .expect("matched support semantics are present"),
             );
+            return Ok(false);
+        }
+        Some(recorded) => {
+            let mut mismatches = Vec::new();
+            if recorded.corpus_fingerprint != corpus_fingerprint {
+                mismatches.push(format!(
+                    "corpus {} != {}",
+                    &recorded.corpus_fingerprint[..12.min(recorded.corpus_fingerprint.len())],
+                    &corpus_fingerprint[..12.min(corpus_fingerprint.len())],
+                ));
+            }
             if recorded.split_bounds != split_bounds {
-                // Same corpus content, different instants: possible only when one side
-                // pinned --split-bounds. The fit region differs, so say so.
-                println!(
-                    "  note: supports were fitted against split {} | {}, this run uses {} | {}",
+                mismatches.push(format!(
+                    "split {} | {} != {} | {}",
                     iso_ms(recorded.split_bounds.0),
                     iso_ms(recorded.split_bounds.1),
                     iso_ms(split_bounds.0),
                     iso_ms(split_bounds.1),
-                );
+                ));
             }
-            return Ok(false);
+            if recorded.sample_count != fit.samples {
+                mismatches.push(format!(
+                    "sample count {} != {}",
+                    recorded.sample_count, fit.samples
+                ));
+            }
+            if recorded.fit_seed != Some(fit.seed) {
+                mismatches.push(format!(
+                    "fit seed {} != {}",
+                    recorded
+                        .fit_seed
+                        .map_or_else(|| "<absent>".to_owned(), |seed| seed.to_string()),
+                    fit.seed
+                ));
+            }
+            if recorded.scaling_contract.as_deref() != Some(expected_scaling) {
+                mismatches.push(format!(
+                    "scaling contract {:?} != {:?}",
+                    recorded.scaling_contract.as_deref(),
+                    expected_scaling
+                ));
+            }
+            if recorded.support_semantics.as_deref() != Some(BAR_SUPPORTS_SEMANTICS_CONTRACT) {
+                mismatches.push(format!(
+                    "support semantics {:?} != {:?}",
+                    recorded.support_semantics.as_deref(),
+                    BAR_SUPPORTS_SEMANTICS_CONTRACT
+                ));
+            }
+            format!(
+                "do not authenticate this request: {}",
+                mismatches.join("; ")
+            )
         }
-        Some(recorded) => format!(
-            "were fitted on corpus {} (split {} | {}), but this run loaded corpus {}",
-            &recorded.corpus_fingerprint[..12.min(recorded.corpus_fingerprint.len())],
-            iso_ms(recorded.split_bounds.0),
-            iso_ms(recorded.split_bounds.1),
-            &corpus_fingerprint[..12.min(corpus_fingerprint.len())],
-        ),
-        None => "carry no provenance at all, so nothing can confirm which corpus, split or \
-                 fit produced them"
+        None => "carry no provenance at all, so nothing can confirm which corpus, split, sample \
+                 count, seed, scaling contract, or support semantics produced them"
             .to_owned(),
     };
     ensure!(
-        freeze,
+        fit.freeze,
         "cached supports {} {complaint}. They define the output space and therefore the \
          nll_bar scale, so reusing them silently would make this run's number incomparable \
-         to the fit it claims. Pass --freeze-supports to reuse them deliberately (the right \
-         call mid-campaign, and it is recorded in the checkpoint), or delete the file to \
-         refit.",
+         to the fit it claims. Pass --freeze-supports to reuse them deliberately during \
+         training (the decision is recorded in the checkpoint), or choose a new fit output.",
         path.display()
     );
     println!(
@@ -4049,8 +4637,17 @@ fn build_samplers(
     corpus: &BarCorpus,
     args: &PretrainArgs,
 ) -> Result<(Vec<BarSampler>, EvaluationSets)> {
+    let future_bars = args.dyn_horizon.max(DIRECT_MAX_HORIZON as usize) as i64;
     let train = (0..RAMP_STAGES)
-        .map(|stage| BarSampler::new(corpus, Split::Train, stage_context(stage), args.seed))
+        .map(|stage| {
+            BarSampler::new_with_future(
+                corpus,
+                Split::Train,
+                stage_context(stage),
+                future_bars,
+                args.seed,
+            )
+        })
         .collect::<Vec<_>>();
     let eval = EvaluationSets::new(corpus, args)?;
     Ok((train, eval))
@@ -4060,6 +4657,24 @@ fn build_samplers(
 // Pinned evaluation sets
 // ---------------------------------------------------------------------------
 
+/// Validation windows the in-run mean recalibration is fitted on, drawn from the diagnostic
+/// set and block-disjoint from the [`trade_bench::TRADE_WINDOWS`] the bench trades.
+///
+/// Matches the offline `pretrain-calibration` command's `--fit-windows` default, so an in-run
+/// slope and an offline slope on the same checkpoint are estimates of the same quantity at the
+/// same precision rather than two numbers that happen to have the same name. The extra pass
+/// costs one sixteenth of a 4096-window validation, and it runs only under `--mean-shrink`.
+const SHRINK_FIT_WINDOWS: usize = 256;
+
+/// Fewest fit windows a recalibration may be estimated from before the run refuses.
+///
+/// A Mincer-Zarnowitz slope is a two-parameter regression whose standard error is what decides
+/// whether the correction is a correction or a resampling of noise, and applying a slope fitted
+/// on a handful of symbol-months would be worse than applying none. The floor is a quarter of
+/// the target: below that the block bootstrap behind the reported interval has too few distinct
+/// blocks to resolve anything, and silently sizing on it is the failure this refuses.
+const MIN_SHRINK_FIT_WINDOWS: usize = SHRINK_FIT_WINDOWS / 4;
+
 /// Every held-out set, all pinned by [`EVAL_WINDOW_SEED`] so they are byte-identical across
 /// runs, across seeds and across ablations.
 ///
@@ -4068,18 +4683,34 @@ fn build_samplers(
 /// * `promotion` runs at the deployed context, and is the only input to checkpoint
 ///   selection.
 /// * `snapshot` supplies the candle pictures and the rollout diagnostics.
-/// * `test` and `test_snapshot` are touched exactly once, by the terminal battery,
-///   and never inform any decision during the run. `test_diagnostic` is the same split at
-///   the fixed diagnostic context, for the run that never reached the deployed one: the
-///   terminal number has to be measured at the context the checkpoint was selected at, or it
-///   measures positional extrapolation instead of generalization.
+/// * `test` owns all terminal Test sets when measurement is authorized. Under
+///   `--defer-test` it is [`TestEvaluationSets::Deferred`], so no Test sampler or pinned
+///   window exists. Otherwise its sets are touched exactly once by the terminal battery and
+///   never inform a decision during the run.
 struct EvaluationSets {
     diagnostic: PinnedSet,
     promotion: PinnedSet,
     snapshot: PinnedSet,
-    test: PinnedSet,
-    test_diagnostic: PinnedSet,
-    test_snapshot: PinnedSet,
+    test: TestEvaluationSets,
+    /// Windows of the DIAGNOSTIC draw the mean recalibration is fitted on, block-disjoint from
+    /// the prefix the bench trades. `None` unless `--mean-shrink` asked for a fit.
+    ///
+    /// The fit slice is drawn from the same set the recalibration is spent on and then
+    /// restricted to windows sharing no `(symbol, calendar month)` block with the traded
+    /// prefix, so the two halves cannot share a symbol-month regime. That is stronger than
+    /// window-level disjointness and it is the same construction the offline
+    /// `pretrain-calibration` command already uses — an in-sample recalibration is worse than
+    /// none, because it fits the noise it then sizes on.
+    shrink_fit: Option<PinnedSet>,
+}
+
+enum TestEvaluationSets {
+    Deferred,
+    Prepared {
+        deployed: PinnedSet,
+        diagnostic: PinnedSet,
+        snapshot: PinnedSet,
+    },
 }
 
 /// A pinned held-out window set. `pub(super)` so the sibling audit modules — the directional
@@ -4104,7 +4735,18 @@ impl PinnedSet {
         context: i64,
         count: usize,
     ) -> Result<Self> {
-        let sampler = BarSampler::new(corpus, split, context, EVAL_WINDOW_SEED);
+        Self::pinned_with_future(corpus, split, context, 1, count)
+    }
+
+    fn pinned_with_future(
+        corpus: &BarCorpus,
+        split: Split,
+        context: i64,
+        future_bars: i64,
+        count: usize,
+    ) -> Result<Self> {
+        let sampler =
+            BarSampler::new_with_future(corpus, split, context, future_bars, EVAL_WINDOW_SEED);
         let windows = sampler.pinned_windows(count);
         ensure!(
             !windows.is_empty(),
@@ -4118,28 +4760,64 @@ impl PinnedSet {
         })
     }
 }
-
 impl EvaluationSets {
     fn new(corpus: &BarCorpus, args: &PretrainArgs) -> Result<Self> {
+        let future_bars = args.dyn_horizon.max(DIRECT_MAX_HORIZON as usize) as i64;
         let build = |split: Split, context: i64, count: usize| -> Result<PinnedSet> {
-            PinnedSet::pinned(corpus, split, context, count)
+            PinnedSet::pinned_with_future(corpus, split, context, future_bars, count)
         };
         let deployed = stage_context(RAMP_STAGES - 1);
         ensure!(
             args.diagnostic_context > SNAPSHOT_HORIZON,
             "--diagnostic-context must exceed the {SNAPSHOT_HORIZON}-bar snapshot horizon"
         );
-        Ok(Self {
-            diagnostic: build(Split::Val, args.diagnostic_context, args.validation_windows)?,
-            promotion: build(Split::Val, deployed, args.validation_windows)?,
-            snapshot: build(Split::Val, args.diagnostic_context, args.snapshot_windows)?,
-            test: build(Split::Test, deployed, args.validation_windows)?,
-            test_diagnostic: build(
-                Split::Test,
-                args.diagnostic_context,
+        let diagnostic = build(Split::Val, args.diagnostic_context, args.validation_windows)?;
+        let promotion = build(Split::Val, deployed, args.validation_windows)?;
+        let snapshot = build(Split::Val, args.diagnostic_context, args.snapshot_windows)?;
+        let test = if args.defer_test {
+            TestEvaluationSets::Deferred
+        } else {
+            TestEvaluationSets::Prepared {
+                deployed: build(Split::Test, deployed, args.validation_windows)?,
+                diagnostic: build(
+                    Split::Test,
+                    args.diagnostic_context,
+                    args.validation_windows,
+                )?,
+                snapshot: build(Split::Test, args.diagnostic_context, args.snapshot_windows)?,
+            }
+        };
+        let shrink_fit = if args.mean_shrink {
+            let mut fit = build(Split::Val, args.diagnostic_context, args.validation_windows)?;
+            let blocks = pinned_blocks(&diagnostic);
+            let indices = trade_bench::disjoint_fit_windows(
+                &blocks,
+                trade_bench::TRADE_WINDOWS,
+                SHRINK_FIT_WINDOWS,
+            );
+            ensure!(
+                indices.len() >= MIN_SHRINK_FIT_WINDOWS,
+                "--mean-shrink needs at least {MIN_SHRINK_FIT_WINDOWS} validation windows \
+                 sharing no (symbol, calendar month) block with the {} the bench trades, and \
+                 the {} drawn windows leave only {}; raise --validation-windows",
+                trade_bench::TRADE_WINDOWS,
                 args.validation_windows,
-            )?,
-            test_snapshot: build(Split::Test, args.diagnostic_context, args.snapshot_windows)?,
+                indices.len(),
+            );
+            fit.windows = indices
+                .into_iter()
+                .map(|index| fit.windows[index])
+                .collect();
+            Some(fit)
+        } else {
+            None
+        };
+        Ok(Self {
+            diagnostic,
+            promotion,
+            snapshot,
+            test,
+            shrink_fit,
         })
     }
 }
@@ -4152,6 +4830,7 @@ impl EvaluationSets {
 /// every scalar gate. The routings must exactly partition the VarStore: a
 /// parameter that matches no list would be silently frozen, and a parameter
 /// matching more than one would be routed by precedence rather than by intent.
+
 fn build_optimizer(named: &[(String, Tensor)], row_learned_lr: bool) -> Result<Muon> {
     let muon: Vec<String> = bar_muon_name_substrings()
         .iter()
@@ -4220,7 +4899,7 @@ fn build_optimizer(named: &[(String, Tensor)], row_learned_lr: bool) -> Result<M
         // Preserve the reference cadence: each AdamW update consumes the gradients retained
         // across two primary batches. This keeps embeddings/scalars unchanged while the head
         // recovery is isolated to initialization, momentum, decay, and objective semantics.
-        adamw_every: 2,
+        adamw_every: ADAMW_UPDATE_EVERY,
         quadratic_lr_weight_decay: true,
         cautious_weight_decay: true,
         adamw_beta_overrides: beta_overrides,
@@ -4456,12 +5135,24 @@ fn temporary_sibling(path: &Path) -> PathBuf {
     path.with_file_name(name)
 }
 
+/// The two per-traded-window economic vectors of one evaluation pass, in BPS per bar and in
+/// pinned order. Kept together because they are two reductions of a single re-capped solve
+/// and separating them would invite a caller to compute one without the other.
+#[derive(Clone, Debug, Default)]
+struct WindowEconomics {
+    selection_edge_bps: Vec<f64>,
+    model_growth_bps: Vec<f64>,
+}
+
 struct Trainer {
     args: PretrainArgs,
     device: Device,
     schedule: Schedule,
     /// First global target step not yet applied. Zero for a fresh run.
     next_step: usize,
+    /// Most recent recovery bundle committed by this process. Terminal publication consults
+    /// this so a final step already written on the periodic grid is never serialized again.
+    last_recovery_step: Option<usize>,
     run: RunDir,
     supports: BarSupports,
     supports_dev: BarSupports,
@@ -4495,6 +5186,14 @@ struct Trainer {
     corpus_fingerprint: String,
     /// Supports were reused under `--freeze-supports` despite mismatched provenance.
     supports_frozen: bool,
+    /// SHA-256 of this run's persisted bin supports: the identity of the DISCRETIZATION every
+    /// nats figure in the run is measured in.
+    ///
+    /// Fixed for the life of the run — the supports are fitted once at startup and never
+    /// refitted — so it is taken once rather than at every artifact. Recorded on every
+    /// per-window vector so `pretrain-compare` can refuse a pair whose supports were refitted;
+    /// nothing else on that artifact is a function of the bin geometry.
+    supports_sha256: String,
     /// Symbols the corpus held after the liquidity gate, recorded in the checkpoint.
     symbol_count: usize,
     /// The corpus partition this run's epochs are passes over. Owns the per-stage window
@@ -4553,11 +5252,18 @@ struct Trainer {
     nll_rule_step: usize,
     nll_rule_promotions: usize,
     promotions: usize,
-    /// Training NLL accumulated since the last epoch report, so the reported train
-    /// curve is an average over the interval rather than one noisy minibatch.
-    train_nll_sum: f64,
-    train_nll_dof_sum: [f64; BAR_DOF],
-    train_steps: usize,
+    /// The most recent eligible selection decision, verbatim, including the interval it was
+    /// taken on. `promotions` and `selection_context` record what the rule DID; this records
+    /// what it read, which is the only thing that separates "refused a measured candidate"
+    /// from "could not measure one".
+    last_selection: SelectionLedger,
+    /// Latch for the degenerate-bootstrap warning, which is a property of the pinned set and
+    /// therefore identical at every read: said once per run, not once per validation.
+    degenerate_bootstrap_warned: Cell<bool>,
+    /// Training NLL accumulated since the last epoch report. Numerators from every optimizer
+    /// step share one exact scored-target denominator, so context ramps and short stage tails
+    /// affect this `nats/bar` curve only through the number of targets they contributed.
+    train_nll: NllAccumulator,
     /// Consecutive steps an AUXILIARY term has held more than [`AUX_SHARE_WARN`] of the
     /// objective's magnitude. One step is minibatch noise; [`AUX_SHARE_WARN_STREAK`] of
     /// them is the objective, and the run says so.
@@ -4591,6 +5297,8 @@ struct Trainer {
     /// refreshed by [`Trainer::probe_activation_footprint`] once per ramp stage, so the
     /// runtime guard is armed at the FIRST stage transition rather than only after it.
     activation_bytes_per_token: Option<f64>,
+    /// Device identity bound to `activation_bytes_per_token` when that measurement exists.
+    activation_device: Option<String>,
     /// The startup capacity measurement the ramp was derived from. `None` off CUDA or without
     /// NVML, in which case the run keeps the declared [`BATCH_RAMP`] under the runtime hold.
     capacity: Option<CapacityModel>,
@@ -4619,6 +5327,18 @@ struct Trainer {
     best_by_context: BTreeMap<i64, f64>,
     /// The diagnostic-context best artifact, once one exists.
     diagnostic_best: Option<PathBuf>,
+    /// The mean recalibration the sizing path applies, refitted on
+    /// [`EvaluationSets::shrink_fit`] at every validation. `None` on every control run and
+    /// until the first fit.
+    ///
+    /// Refitted rather than fitted once because the slope is a property of the WEIGHTS: it
+    /// measured `1.0058` at peak learning rate and `0.6653` fully annealed on the same recipe,
+    /// so a slope fitted at step 0 and applied at step 10000 would be sizing on a correction
+    /// for a model that no longer exists. Held on the trainer rather than recomputed per
+    /// consumer so the terminal Test battery sizes under the SAME recalibration the promotion
+    /// decision was taken under, and so the applied slope is one recorded number rather than
+    /// several re-derivations that could disagree.
+    sizing_shrink: Option<MeanShrink>,
     /// Wall clock and bar-token count at the START of the epoch now in progress.
     ///
     /// An epoch's cost is measured as a delta between two boundaries rather than divided
@@ -4643,9 +5363,20 @@ struct Trainer {
 /// One optimizer step's losses, already reduced to host scalars.
 struct StepLoss {
     nll_bar: f64,
-    nll_dof: [f64; BAR_DOF],
+    nll_bar_numerator: f64,
+    nll_dof_numerators: [f64; BAR_DOF],
+    nll_target_count: u64,
     dyn_loss: f64,
     kl_loss: f64,
+    direct_nll: [f64; 2],
+    direct_nll_dof: [[f64; BAR_DOF]; 2],
+    direct_target_count: [u64; 2],
+    direct_weights: [f64; 2],
+    direct_objective_share: f64,
+    shared_grad_alignment: f64,
+    shared_grad_conflict: f64,
+    forward_wall_secs: f64,
+    step_wall_secs: f64,
     /// Training-batch mean raw-payoff growth diagnostic in nats per bar under the deployed
     /// leverage cap. It is detached and never enters `total`.
     growth_diagnostic: f64,
@@ -4869,6 +5600,16 @@ fn fmt_incumbent_nats(value: f64) -> String {
     }
 }
 
+fn resumed_batch_ramp_transition(
+    next_step: usize,
+    stage: usize,
+    stage_step: usize,
+    batch_ramp: &[usize; RAMP_STAGES],
+) -> Option<(usize, usize)> {
+    (next_step > 0 && stage_step == 0 && stage > 0 && batch_ramp[stage] > batch_ramp[stage - 1])
+        .then(|| (stage - 1, stage))
+}
+
 impl Trainer {
     /// Consumes the trainer: `PretrainReporter::finish` takes the reporter by value,
     /// which makes reporting a promotion after the terminal battery a compile error.
@@ -4889,6 +5630,14 @@ impl Trainer {
         // free memory and makes the first stage probe under-attribute its activations.
         crate::torch::cuda::empty_cache();
         self.vram_baseline_bytes = device_used_bytes(self.device);
+        if let Some((previous, stage)) = resumed_batch_ramp_transition(
+            self.next_step,
+            self.schedule.stage(self.next_step),
+            self.stage_step,
+            &self.schedule.batch_ramp,
+        ) {
+            self.hold_batch_if_short_of_vram(self.next_step, previous, stage);
+        }
 
         for step in self.next_step..self.schedule.total_steps {
             let stage = self.schedule.stage(step);
@@ -4961,20 +5710,20 @@ impl Trainer {
             // index is byte-identical in ordering to a run with no auxiliary stream up to the
             // shared parameter state, which is what makes the A/B a single-variable comparison.
             self.auxiliary_steps(step)?;
-            // The ACTUAL windows drawn, not the planned batch: the last step of every stage is
-            // short, and counting it as full would overstate the pass by up to one batch per
-            // stage and make the bar-token ledger disagree with the coverage ledger.
-            let bar_tokens = batch as u64 * self.schedule.context(step) as u64;
+            // The exact denominator of the scalar NLL reduction. It comes back from
+            // `optimizer_step`, where `[B, T]` is flattened for the mean, rather than being
+            // reconstructed from the planned batch (the final draw of a stage is short).
+            let bar_tokens = loss.nll_target_count;
             self.bars_seen += bar_tokens;
             // AFTER the step, not at the stage banner: this is the longest context the run has
             // actually optimized at, which is what promotion is allowed to be measured at.
             self.reached_context = self.reached_context.max(self.schedule.context(step));
 
-            self.train_nll_sum += loss.nll_bar;
-            for (acc, value) in self.train_nll_dof_sum.iter_mut().zip(loss.nll_dof) {
-                *acc += value;
-            }
-            self.train_steps += 1;
+            self.train_nll.push(
+                loss.nll_bar_numerator,
+                loss.nll_dof_numerators,
+                loss.nll_target_count,
+            );
             // Epoch-scoped, so the boundary line reports the mean over the pass rather than
             // whatever the last minibatch happened to give. Non-finite steps are skipped:
             // `dyn_vs_identity` is NaN when the identity baseline is degenerate, and one
@@ -4992,14 +5741,24 @@ impl Trainer {
             let mut metrics = StepMetrics::nan();
             metrics.epoch = self.epoch;
             metrics.step = step;
-            metrics.nll_bar = loss.nll_bar;
-            metrics.nll_dof = loss.nll_dof;
+            metrics.nll_bar_numerator = loss.nll_bar_numerator;
+            metrics.nll_dof_numerators = loss.nll_dof_numerators;
+            metrics.nll_target_count = loss.nll_target_count;
             metrics.dyn_loss = loss.dyn_loss;
             metrics.kl_loss = loss.kl_loss;
             metrics.total_loss = loss.total;
             metrics.nll_share = nll_share;
             metrics.dyn_share = dyn_share;
+            metrics.direct_target_count = loss.direct_target_count;
             metrics.kl_share = kl_share;
+            metrics.direct_nll = loss.direct_nll;
+            metrics.direct_nll_dof = loss.direct_nll_dof;
+            metrics.direct_weights = loss.direct_weights;
+            metrics.direct_objective_share = loss.direct_objective_share;
+            metrics.shared_grad_alignment = loss.shared_grad_alignment;
+            metrics.shared_grad_conflict = loss.shared_grad_conflict;
+            metrics.forward_wall_secs = loss.forward_wall_secs;
+            metrics.step_wall_secs = loss.step_wall_secs;
             metrics.growth_loss = loss.growth_diagnostic;
             // Existing report base retained: raw-payoff growth is excluded from optimization.
             metrics.growth_share = 0.0;
@@ -5089,6 +5848,20 @@ impl Trainer {
                     loss.grad_norm,
                     (step + 1) as f64 / elapsed.max(1e-9)
                 );
+                println!(
+                    "  direct complete bars | h2 {:.4} x{:.4} | h3 {:.4} x{:.4} | objective \
+                     share {:.1}% | shared-grad cosine {:.4} conflict {:.1}% | forward {:.4}s \
+                     step {:.4}s",
+                    loss.direct_nll[0],
+                    loss.direct_weights[0],
+                    loss.direct_nll[1],
+                    loss.direct_weights[1],
+                    100.0 * loss.direct_objective_share,
+                    loss.shared_grad_alignment,
+                    100.0 * loss.shared_grad_conflict,
+                    loss.forward_wall_secs,
+                    loss.step_wall_secs,
+                );
             }
 
             // An epoch is a PASS, and a pass is a fixed partition of the corpus, so the
@@ -5124,18 +5897,13 @@ impl Trainer {
             }
         }
 
-        // `pretrain_last.ot` means the weights after the FINAL optimizer step, and this is the
-        // only place that can honestly say so. It used to be written inside `validate`, i.e.
-        // only at validation boundaries, which quietly made it the last VALIDATED step: job
-        // 2884 was killed by SIGTERM at step 30780 of 31095 with its newest validation at step
-        // 30000, so the file held step-30000 weights — the same weights the step-30000
-        // promotion had just written into `pretrain_best.ot`, which from the outside read as
-        // the two files being aliases of each other. Written here, and every
-        // `checkpoint_every` steps by `write_step_artifacts`, it is never staler than the
-        // newest `pretrain_step_*.ot` and a completed run's copy is exactly the last step.
+        // `pretrain_last.ot` means the weights after the FINAL optimizer step. Finalization uses
+        // the same canonical tagged-bundle path as periodic recovery: when the final step was
+        // already committed on the cadence grid this is a no-op, otherwise it serializes one
+        // final `pretrain_step_<step>` bundle and aliases `last` to it.
         if self.schedule.total_steps > 0 {
             let final_step = self.schedule.total_steps - 1;
-            let last = self.write_last_checkpoint(final_step)?;
+            let last = self.write_step_artifacts(final_step)?;
             println!(
                 "pretrain finished: {} holds the weights after the FINAL optimizer step \
                  {final_step}, recorded as `global_step` in its metadata. It carries NO \
@@ -5289,6 +6057,14 @@ impl Trainer {
             "no checkpoint was ever promoted; there is nothing for the planner to load"
         );
 
+        if self.args.defer_test {
+            println!(
+                "pretrain finished: Test evaluation DEFERRED by --defer-test; no Test windows \
+                 were constructed or scored, and the terminal Test dynamics guard was not run"
+            );
+            return self.reporter.finish_deferred_test();
+        }
+
         let (battery, dyn_identity) = self.test_battery()?;
         // Finalize the report BEFORE the verdict. A run whose dynamics head failed the
         // guard is exactly the run someone needs the full report for, and a hard failure
@@ -5321,7 +6097,7 @@ impl Trainer {
         // model that never trained past 896 bars on 2048-bar windows measures positional
         // extrapolation, not generalization, and it would be the one number in the run nobody
         // could interpret.
-        let set = self.test_set();
+        let set = self.test_set()?;
         let stats = evaluate(
             world.modules(),
             world.deployment_supports(),
@@ -5330,11 +6106,18 @@ impl Trainer {
             self.device,
             true,
             BarScoring::Hard,
-            None,
+            self.traded_sizing(),
             trade_bench::TRADE_WINDOWS,
         )?;
+        let direct = evaluate_direct_horizons(
+            world.modules(),
+            world.deployment_supports(),
+            set,
+            self.args.batch_size,
+            self.device,
+        );
         let dispersion = self.dispersion(set, &stats);
-        let window = pinned_snapshot_window(&self.eval.test_snapshot, self.device);
+        let window = pinned_snapshot_window(self.test_snapshot()?, self.device);
         let exact = rollout_nll(
             world.modules(),
             world.supports(),
@@ -5402,6 +6185,14 @@ impl Trainer {
         battery.crps_dof = stats.crps_dof;
         battery.rollout_nll_exact = exact;
         battery.rollout_nll_dynamics = dynamics;
+        battery.direct_nll = direct.nll;
+        battery.direct_nll_dof = direct.nll_dof;
+        battery.direct_crps_dof = direct.crps_dof;
+        battery.direct_dir_acc = direct.dir_acc;
+        battery.direct_valid_fraction = direct.valid_fraction;
+        battery.direct_vs_exact_delta = std::array::from_fn(|slot| {
+            direct.direct_on_exact_rows_nll[slot] - direct.exact_nll[slot]
+        });
         battery.pit = stats.pit;
         battery.dir_acc = stats.dir_acc;
         battery.corpus_fingerprint = self.corpus_fingerprint.clone();
@@ -5489,7 +6280,7 @@ impl Trainer {
             self.device,
             true,
             BarScoring::Hard,
-            None,
+            self.traded_sizing(),
             trade_bench::TRADE_WINDOWS,
         )?;
         let trade = self.trade(set, &stats);
@@ -5509,9 +6300,9 @@ impl Trainer {
         println!(
             "test split RULE COMPARISON on {} independent windows at context {}: ECONOMICS-PRIMARY \
              pick (step {}) edge@{SELECTION_CAP:.2}x {promoted_edge:+.4} bps/bar, 4x edge {:+.4}, \
-             quarter-quadratic-Kelly sharpe {:+.2}, conditional nll {:.4}; legacy NLL-only \
+             active-rule quarter-Kelly sharpe {:+.2}, conditional nll {:.4}; legacy NLL-only \
              comparator (step {}) edge@{SELECTION_CAP:.2}x {:+.4}, 4x edge {:+.4}, \
-             quarter-quadratic-Kelly sharpe {:+.2}, conditional nll {:.4}. Economics-primary \
+             active-rule quarter-Kelly sharpe {:+.2}, conditional nll {:.4}. Economics-primary \
              minus comparator: edge {:+.4} bps/bar, conditional nll {:+.4} nats/bar. These are \
              independent-window diagnostics that fed neither decision and do not prove deployed \
              profitability.",
@@ -5588,18 +6379,37 @@ impl Trainer {
         step: usize,
         stream: Option<usize>,
     ) -> Result<StepLoss> {
+        let step_started = Instant::now();
         let dof = &sample.dof;
         let time_ids = &sample.time_ids;
-        let context = dof.size()[1] - 1;
+        let batch = dof.size()[0];
+        let context = if stream.is_none() {
+            dof.size()[1] - self.args.dyn_horizon.max(DIRECT_MAX_HORIZON as usize) as i64
+        } else {
+            dof.size()[1] - 1
+        };
         let horizon = self.args.dyn_horizon as i64;
+        ensure!(batch > 0, "optimizer step {step} received an empty batch");
         ensure!(
             horizon < context,
             "--dyn-horizon {horizon} does not fit in a {context}-bar context"
         );
+        let nll_target_count = (batch as u64)
+            .checked_mul(context as u64)
+            .context("scored target-bar count overflowed u64")?;
         // NextLat weights are constant throughout the run. Raw-payoff growth is evaluated
         // below only as a detached diagnostic and has no weight.
         let lambda_dyn = self.args.lambda_dyn;
         let lambda_kl = self.args.lambda_kl;
+        let direct_weights = if stream.is_none() {
+            direct_horizon_weights(
+                self.schedule.stage(step),
+                self.args.direct_t2_weight,
+                self.args.direct_t3_weight,
+            )
+        } else {
+            (0.0, 0.0)
+        };
         let (supports, growth_support) = match stream {
             None => (&self.supports_dev, &self.growth_supports[0]),
             Some(index) => (
@@ -5607,6 +6417,7 @@ impl Trainer {
                 &self.growth_supports[1 + index],
             ),
         };
+        let forward_started = Instant::now();
 
         self.optimizer.zero_grad();
         let graph = autocast(self.device.is_cuda(), || {
@@ -5615,15 +6426,28 @@ impl Trainer {
                 supports,
                 growth_support,
                 dof,
+                &sample.sigma,
                 time_ids,
+                sample.direct_time_ids.as_ref(),
+                sample.direct_valid.as_ref(),
                 context,
                 horizon,
+                direct_weights,
                 lambda_dyn,
                 lambda_kl,
                 BarScoring::Hard,
                 self.device,
             )
         });
+        let forward_wall_secs = forward_started.elapsed().as_secs_f64();
+        let (shared_grad_alignment, shared_grad_conflict) = if stream.is_none()
+            && self.args.validate_every > 0
+            && step % self.args.validate_every == 0
+        {
+            shared_gradient_diagnostics(&self.vs, &graph)
+        } else {
+            (f64::NAN, f64::NAN)
+        };
         // Backward first so the gradient norm and optimizer diagnostics can join every loss
         // in one device-to-host transfer. Only the explicit SMD arm builds a gradient graph
         // and an exact Pearlmutter HVP; production and fixed SGD take ordinary backward.
@@ -5643,7 +6467,29 @@ impl Trainer {
         let grad_norm = metrics[STEP_METRIC_GRAD_NORM];
         let nll_value = metrics[STEP_METRIC_NLL];
         let mut nll_dof = [f64::NAN; BAR_DOF];
+        let direct_nll = [
+            metrics[STEP_METRIC_DIRECT_T2],
+            metrics[STEP_METRIC_DIRECT_T3],
+        ];
+        let mut direct_nll_dof = [[f64::NAN; BAR_DOF]; 2];
+        direct_nll_dof[0].copy_from_slice(&metrics[STEP_METRIC_DIRECT_T2_DOF]);
+        direct_nll_dof[1].copy_from_slice(&metrics[STEP_METRIC_DIRECT_T3_DOF]);
+        let direct_target_count = std::array::from_fn(|horizon| {
+            graph.direct_target_count[horizon].double_value(&[]).round() as u64
+        });
+        for (horizon, count) in direct_target_count.iter().copied().enumerate() {
+            ensure!(
+                count <= nll_target_count,
+                "direct h{} ordinary-row count {count} exceeds {nll_target_count} primary rows",
+                horizon + 2
+            );
+        }
         nll_dof.copy_from_slice(&metrics[STEP_METRIC_NLL_DOF]);
+        // `bar_nll_from_logits` means the total and each factor over the same flattened
+        // `[B * T]` target rows. Multiplying its exact host scalar by that integral count
+        // carries the matching numerator without changing the attached loss graph.
+        let nll_bar_numerator = nll_value * nll_target_count as f64;
+        let nll_dof_numerators = nll_dof.map(|value| value * nll_target_count as f64);
         let dyn_value = metrics[STEP_METRIC_DYN];
         let kl_value = metrics[STEP_METRIC_KL];
         let growth_value = metrics[STEP_METRIC_GROWTH_DIAGNOSTIC];
@@ -5672,9 +6518,24 @@ impl Trainer {
             None => StepKind::Primary,
             Some(_) => StepKind::Auxiliary,
         })?;
+        let attached = [
+            nll_value,
+            direct_weights.0 * direct_nll[0],
+            direct_weights.1 * direct_nll[1],
+            lambda_dyn * dyn_value,
+            lambda_kl * kl_value,
+        ];
+        let attached_magnitude: f64 = attached.iter().map(|value| value.abs()).sum();
+        let direct_objective_share = if attached_magnitude > 0.0 {
+            (attached[1].abs() + attached[2].abs()) / attached_magnitude
+        } else {
+            f64::NAN
+        };
         Ok(StepLoss {
             nll_bar: nll_value,
-            nll_dof,
+            nll_bar_numerator,
+            nll_dof_numerators,
+            nll_target_count,
             dyn_loss: dyn_value,
             kl_loss: kl_value,
             growth_diagnostic: growth_value,
@@ -5682,12 +6543,29 @@ impl Trainer {
             total,
             // Hard categorical NLL has no support-measure offset: the reported primary loss
             // is exactly the quantity whose magnitude enters this denominator.
-            shares: loss_shares(nll_value, lambda_dyn * dyn_value, lambda_kl * kl_value),
+            shares: if attached_magnitude > 0.0 {
+                (
+                    attached[0].abs() / attached_magnitude,
+                    attached[3].abs() / attached_magnitude,
+                    attached[4].abs() / attached_magnitude,
+                )
+            } else {
+                (f64::NAN, f64::NAN, f64::NAN)
+            },
             belief_autocorr: autocorr,
             // A zero-init dynamics MLP is exactly the identity, so the ratio starts at 1.0
             // by construction and any departure is the MLP doing something. A degenerate
             // baseline — beliefs already frozen — would divide by zero, so it reports NaN
             // and the chart skips the point rather than plotting an artefact.
+            direct_nll,
+            direct_nll_dof,
+            direct_target_count,
+            direct_weights: [direct_weights.0, direct_weights.1],
+            direct_objective_share,
+            shared_grad_alignment,
+            shared_grad_conflict,
+            forward_wall_secs,
+            step_wall_secs: step_started.elapsed().as_secs_f64(),
             dyn_vs_identity: if identity > 0.0 {
                 dyn_value / identity
             } else {
@@ -5701,6 +6579,74 @@ impl Trainer {
                 .try_into()
                 .expect("SMD metric slice has fixed width"),
         })
+    }
+
+    /// The sizing declaration every pass of this run that forms a book uses.
+    ///
+    /// One accessor rather than a literal per call site, so the promotion decision, the
+    /// diagnostic panel and the terminal Test battery cannot end up sized under three
+    /// different rules — which would make the run's own numbers incomparable to each other
+    /// before anybody tried to compare them across runs.
+    fn traded_sizing(&self) -> TradedSizing {
+        TradedSizing {
+            rule: self.args.sizing_rule(),
+            shrink: self.sizing_shrink,
+        }
+    }
+
+    /// Refit the mean recalibration on the block-disjoint fit slice, at the CURRENT weights.
+    ///
+    /// A no-op without `--mean-shrink`, which is what keeps a control run's validation cost
+    /// and arithmetic unchanged. Under the flag it costs one extra
+    /// [`SHRINK_FIT_WINDOWS`]-window pass per validation, ~6% of the validation it precedes.
+    ///
+    /// # Why the fit has to happen HERE
+    ///
+    /// The slope is a property of the weights, not of the recipe: `1.0058 ± 0.0355` at peak
+    /// learning rate and `0.6653 ± 0.0286` fully annealed on the same run. A recalibration
+    /// fitted once at startup and applied for the rest of the run would be correcting a model
+    /// that no longer exists, and its error would grow monotonically with annealing — largest
+    /// exactly at the operating point every production checkpoint is promoted from.
+    ///
+    /// A degenerate regression is a REFUSAL, not a fallback to the identity. Silently sizing on
+    /// the raw mean under a `--mean-shrink` label would produce a control run wearing an arm's
+    /// name, and the campaign would then attribute the control's number to the arm.
+    fn refit_sizing_shrink(&mut self, step: usize, eval_batch: usize) -> Result<()> {
+        let Some(fit) = self.eval.shrink_fit.as_ref() else {
+            return Ok(());
+        };
+        let windows = fit.windows.len();
+        let stats = evaluate(
+            &self.modules,
+            &self.supports_dev,
+            fit,
+            eval_batch,
+            self.device,
+            true,
+            BarScoring::Hard,
+            TradedSizing::CONTROL,
+            windows,
+        )?;
+        let blocks = pinned_blocks(fit);
+        let calibration = trade_bench::mean_calibration(&stats.trade_paths.windows, &blocks);
+        let shrink = calibration.shrink().ok_or_else(|| {
+            anyhow!(
+                "the mean-calibration regression degenerated on the {windows}-window \
+                 block-disjoint fit slice at step {step}, so --mean-shrink has no recalibration \
+                 to size on; sizing on the raw mean under a recalibrated label would be a \
+                 silent control run"
+            )
+        })?;
+        println!(
+            "step {step}: sizing recalibration refitted on {windows} block-disjoint windows: \
+             mu -> {:+.6e} + {:.4} mu (t against 1.0 = {:+.2}, R2 {:.4})",
+            shrink.alpha,
+            shrink.beta,
+            calibration.mean.slope_t_against_one(),
+            calibration.mean.r2,
+        );
+        self.sizing_shrink = Some(shrink);
+        Ok(())
     }
 
     /// The fixed-context diagnostic panel, then the deployed-context promotion decision,
@@ -5718,6 +6664,7 @@ impl Trainer {
     /// NaN that reads exactly like a measured catastrophe.
     fn validate(&mut self, step: usize, epoch_boundary: bool, final_step: bool) -> Result<()> {
         let eval_batch = self.args.batch_size;
+        self.refit_sizing_shrink(step, eval_batch)?;
         let diagnostic = evaluate(
             &self.modules,
             &self.supports_dev,
@@ -5726,7 +6673,7 @@ impl Trainer {
             self.device,
             true,
             BarScoring::Hard,
-            None,
+            self.traded_sizing(),
             trade_bench::TRADE_WINDOWS,
         )?;
         self.print_diagnostic(step, &diagnostic);
@@ -5735,7 +6682,7 @@ impl Trainer {
         // what watching the economics costs — see `EPOCH_BOUNDARY_OVERHEAD_WARN`.
         let bench_started = Instant::now();
         let trade = self.trade(&self.eval.diagnostic, &diagnostic);
-        let bench_secs = bench_started.elapsed().as_secs_f64();
+        let mut bench_secs = bench_started.elapsed().as_secs_f64();
         for line in trade.report_lines() {
             println!("step {step}: {line}");
         }
@@ -5755,9 +6702,9 @@ impl Trainer {
                 &self.eval.promotion,
                 eval_batch,
                 self.device,
-                false,
+                true,
                 BarScoring::Hard,
-                None,
+                self.traded_sizing(),
                 trade_bench::TRADE_WINDOWS,
             )?;
             Some((PromotionTarget::Deployed, stats, false))
@@ -5841,7 +6788,14 @@ impl Trainer {
         // stage has trained at, so a best-so-far at that context is available from step 0 —
         // months before the deployed-context selection can say anything. It is a separate
         // artifact under its own name: the planner still loads `pretrain_best.ot`.
-        let diagnostic_scores = self.window_scores(&self.eval.diagnostic, &diagnostic, step);
+        // `trade` is the bench of THIS pass over THESE windows, so its Mincer-Zarnowitz fit is
+        // the calibration of the vector being written and costs nothing extra to record.
+        let diagnostic_scores = self.window_scores(
+            &self.eval.diagnostic,
+            &diagnostic,
+            step,
+            Some(&trade.calibration),
+        );
         self.keep_context_best(step, &diagnostic, &diagnostic_scores)?;
         // The epoch artifact and the snapshots that picture it are the two halves of one
         // record, so the artifact path is carried to the snapshot writer rather than
@@ -5918,10 +6872,29 @@ impl Trainer {
             // read ELIGIBLE — the planner must not load weights selected outside the
             // positional range they run at — and is what the artifact's metadata and the
             // terminal battery are measured at. It is not the comparison.
-            // ---------------------------------------------------------------------------
-            let scores = self.window_scores(set, &stats, step);
+            // Promotion artifacts must carry the saturation, ruin and calibration evidence for
+            // the exact windows they score. Reuse the diagnostic bench when the terminal
+            // fallback selects that panel; otherwise bench the deployed panel once here.
+            let promotion_trade = if target == PromotionTarget::Diagnostic {
+                trade
+            } else {
+                let started = Instant::now();
+                let measured = self.trade(set, &stats);
+                bench_secs += started.elapsed().as_secs_f64();
+                measured
+            };
+            let mut scores =
+                self.window_scores(set, &stats, step, Some(&promotion_trade.calibration));
+            scores.trade = promotion_trade
+                .measured()
+                .then(|| TradeSummary::from(&promotion_trade));
             let selection_nll = diagnostic_scores.conditional_nll();
-            let candidate_edge = self.selection_edge_windows(&diagnostic.trade_paths);
+            // Read back off the vector that was just persisted, not recomputed: the decision
+            // and the artifact a cross-run comparison reads must be the same numbers.
+            let candidate_edge = diagnostic_scores
+                .selection_edge_bps
+                .clone()
+                .expect("window_scores records the per-window selection edge on every pass");
             let edge_level = self.bootstrap_traded(&self.eval.diagnostic, &candidate_edge);
             let edge_gain = self.selection_edge_gain(&self.eval.diagnostic, &candidate_edge);
             let nll_delta = self.conditional_difference(&self.eval.diagnostic, &diagnostic_scores);
@@ -5929,8 +6902,13 @@ impl Trainer {
             // The historical comparator selects on the deployed pass, so its descriptive edge
             // must come from that same ruler. Mixing in the diagnostic edge would make the
             // checkpoint metadata claim two measurements shared a context when they did not.
-            let nll_rule_edge = self.selection_edge_windows(&stats.trade_paths);
-            let nll_rule_edge_level = self.bootstrap_traded(set, &nll_rule_edge);
+            let nll_rule_edge_level = self.bootstrap_traded(
+                set,
+                scores
+                    .selection_edge_bps
+                    .as_deref()
+                    .expect("window_scores records the per-window selection edge on every pass"),
+            );
             let candidate_usable = selection_nll.is_finite()
                 && edge_level.mean.is_finite()
                 && edge_level.se.is_finite()
@@ -6126,6 +7104,13 @@ impl Trainer {
         }
 
         let (exact, dynamics) = self.rollout_diagnostics();
+        let direct = evaluate_direct_horizons(
+            &self.modules,
+            &self.supports_dev,
+            &self.eval.diagnostic,
+            eval_batch,
+            self.device,
+        );
         // Pictures of the artifact written a few lines above, on the SAME pinned scene at
         // every boundary. Previously this depicted `pretrain_best.ot` and was skipped until
         // the first promotion existed, which is why a 13831-step run left exactly one
@@ -6138,12 +7123,10 @@ impl Trainer {
         }
         let snapshot_secs = snapshot_started.elapsed().as_secs_f64();
 
-        let train_scale = 1.0 / self.train_steps.max(1) as f64;
         let mut metrics = EpochMetrics::nan();
         metrics.epoch = self.epoch;
         metrics.global_step = step;
-        metrics.train_nll_bar = self.train_nll_sum * train_scale;
-        metrics.train_nll_dof = self.train_nll_dof_sum.map(|v| v * train_scale);
+        self.train_nll.write_epoch(&mut metrics);
         metrics.val_nll_bar = deployed_pass_measured
             .then_some(promotion_nll)
             .unwrap_or(f64::NAN);
@@ -6157,6 +7140,14 @@ impl Trainer {
         metrics.effective_rank = diagnostic.effective_rank;
         metrics.rollout_nll_exact = exact;
         metrics.rollout_nll_dynamics = dynamics;
+        metrics.direct_nll = direct.nll;
+        metrics.direct_nll_dof = direct.nll_dof;
+        metrics.direct_crps_dof = direct.crps_dof;
+        metrics.direct_dir_acc = direct.dir_acc;
+        metrics.direct_valid_fraction = direct.valid_fraction;
+        metrics.direct_vs_exact_delta = std::array::from_fn(|slot| {
+            direct.direct_on_exact_rows_nll[slot] - direct.exact_nll[slot]
+        });
         metrics.best_val_nll_bar = self.best_val_nll_bar;
         if deployed_pass_measured {
             metrics.val_nll_bar_se = dispersion.se;
@@ -6194,6 +7185,7 @@ impl Trainer {
         // LEDGER rather than a step count. A refusal that leaves no trace is a rule nobody
         // can audit.
         metrics.selection = ledger;
+        self.last_selection = ledger;
         // Bar-tokens consumed per bar ONE PASS can reach. The denominator is the partition's
         // covered-bar count, not the raw split, so an on-plan run reads exactly 1.000 per
         // epoch instead of sitting permanently below 1 because the unreachable head and
@@ -6255,9 +7247,7 @@ impl Trainer {
         metrics.planned_effective_epochs = self.args.epochs as f64;
         self.reporter.record_epoch(&metrics)?;
 
-        self.train_nll_sum = 0.0;
-        self.train_nll_dof_sum = [0.0; BAR_DOF];
-        self.train_steps = 0;
+        self.train_nll = NllAccumulator::default();
 
         println!(
             "step {step}: unique_bar_reuse {:.4} ({} bar-tokens consumed / {} bar-tokens in one \
@@ -6578,19 +7568,36 @@ impl Trainer {
     /// They are written TOGETHER because the alternative was measured to be a trap. `last`
     /// used to be written only from `validate`, on the validation cadence, while the tagged
     fn recovery_contract(&self) -> BarPretrainRecovery {
+        let adamw_accumulation_pending = match &self.optimizer {
+            PretrainOptimizer::Production(optimizer) => optimizer.adamw_accumulation_pending(),
+            _ => false,
+        };
+        let activation_bytes_per_token = self.activation_bytes_per_token.unwrap_or(0.0);
         BarPretrainRecovery {
+            format_version: BAR_PRETRAIN_RECOVERY_VERSION,
             total_steps: self.schedule.total_steps,
             stage_steps: self.schedule.stage_steps.to_vec(),
             derived_batch_ramp: self.derived_batch_ramp.to_vec(),
             base_batch: self.schedule.base_batch,
             requested_batch: self.requested_batch,
             exact_batch: self.args.exact_batch,
+            quadratic_kelly: self.args.quadratic_kelly,
+            mean_shrink: self.args.mean_shrink,
             epochs: self.args.epochs,
             steps_override: self.args.steps,
             dyn_horizon: self.args.dyn_horizon,
             lambda_dyn: self.args.lambda_dyn,
             lambda_kl: self.args.lambda_kl,
+            direct_t2_weight: self.args.direct_t2_weight,
+            direct_t3_weight: self.args.direct_t3_weight,
             auxiliary_resolutions: self.args.auxiliary_resolutions.clone(),
+            adamw_accumulation_pending,
+            activation_bytes_per_token,
+            activation_device: if activation_bytes_per_token > 0.0 {
+                self.activation_device.clone().unwrap_or_default()
+            } else {
+                String::new()
+            },
             checkpoint_every: self.args.checkpoint_every,
             validate_every: self.args.validate_every,
             ablation_lr: self.args.ablation_lr,
@@ -6598,8 +7605,8 @@ impl Trainer {
         }
     }
 
-    /// Commit a recoverable weight/optimizer/metadata bundle. Metadata is renamed last and
-    /// hashes both preceding files, so every interrupted replacement is rejected on resume.
+    /// Commit a recoverable weights/supports/optimizer/metadata bundle. Metadata is renamed
+    /// last and authenticates every payload, so interrupted replacement is rejected on resume.
     fn write_recovery_checkpoint(&self, weights: &Path, step: usize) -> Result<PathBuf> {
         let res = self.args.resolution_secs;
         let supports_path = world_model_supports_path(weights, res);
@@ -6665,29 +7672,82 @@ impl Trainer {
         Ok(metadata_path)
     }
 
-    /// snapshot is written every `checkpoint_every` steps — a much finer one. That left a
-    /// directory listing in which `pretrain_step_30720.ot` was a genuinely later state than
-    /// `pretrain_last.ot`, which is the opposite of what the name promises. Writing both here
-    /// makes `last` provably no older than the newest `pretrain_step_*.ot`.
-    fn write_step_artifacts(&self, step: usize) -> Result<()> {
-        let path = self.run.weights.join(format!("pretrain_step_{step}.ot"));
-        self.write_recovery_checkpoint(&path, step)?;
-        self.prune_step_checkpoints()?;
-        self.write_last_checkpoint(step)?;
+    /// Publish an immutable canonical recovery bundle under `pretrain_last` without copying or
+    /// serializing any payload. All four temporary hardlinks are staged before publication.
+    /// We replace metadata last, after syncing the first three directory entries, so readers
+    /// either authenticate the previous bundle or the new one; an interrupted mixed bundle
+    /// fails closed against the metadata hashes while its tagged source remains intact.
+    fn publish_recovery_alias(&self, source: &Path, destination: &Path) -> Result<()> {
+        let res = self.args.resolution_secs;
+        let sources = [
+            source.to_path_buf(),
+            world_model_optimizer_path(source),
+            world_model_supports_path(source, res),
+            world_model_metadata_path(source),
+        ];
+        let destinations = [
+            destination.to_path_buf(),
+            world_model_optimizer_path(destination),
+            world_model_supports_path(destination, res),
+            world_model_metadata_path(destination),
+        ];
+        let staged: [PathBuf; 4] =
+            std::array::from_fn(|index| temporary_sibling(&destinations[index]));
+
+        for ((source, destination), staged) in
+            sources.iter().zip(destinations.iter()).zip(staged.iter())
+        {
+            if staged.exists() {
+                fs::remove_file(staged)
+                    .with_context(|| format!("failed removing stale alias {}", staged.display()))?;
+            }
+            fs::hard_link(source, staged).with_context(|| {
+                format!(
+                    "failed staging recovery alias {} from {} for {}",
+                    staged.display(),
+                    source.display(),
+                    destination.display()
+                )
+            })?;
+        }
+
+        for (staged, destination) in staged[..3].iter().zip(destinations[..3].iter()) {
+            fs::rename(staged, destination).with_context(|| {
+                format!("failed publishing recovery alias {}", destination.display())
+            })?;
+        }
+        let parent = destination
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .context("recovery alias has no parent directory")?;
+        File::open(parent)?.sync_all()?;
+
+        fs::rename(&staged[3], &destinations[3]).with_context(|| {
+            format!(
+                "failed publishing recovery metadata alias {}",
+                destinations[3].display()
+            )
+        })?;
+        File::open(parent)?.sync_all()?;
         Ok(())
     }
 
-    /// `pretrain_last.ot`: the weights and optimizer state after optimizer step `step`.
-    ///
-    /// It carries NO held-out scores — no `.windows.json` sidecar — and its metadata records
-    /// `selection_context = 0`, so the file itself states that no decision chose it. The
-    /// recovery contract preserves model, optimizer, data cursor and schedule state; a resumed
-    /// run starts a new reporting and promotion ledger. `global_step` identifies the next
-    /// sample and schedule position exactly.
-    fn write_last_checkpoint(&self, step: usize) -> Result<PathBuf> {
-        let path = self.run.weights.join("pretrain_last.ot");
-        self.write_recovery_checkpoint(&path, step)?;
-        Ok(path)
+    /// Commit one canonical `pretrain_step_<step>` bundle, publish `pretrain_last` as
+    /// hardlinks to the exact same bytes, then prune old tagged bundles. Publishing first
+    /// guarantees `last` remains recoverable even when pruning fails. The committed-step guard
+    /// makes terminal finalization a no-op when the cadence already wrote that exact state.
+    fn write_step_artifacts(&mut self, step: usize) -> Result<PathBuf> {
+        let last = self.run.weights.join("pretrain_last.ot");
+        if self.last_recovery_step == Some(step) {
+            return Ok(last);
+        }
+
+        let tagged = self.run.weights.join(format!("pretrain_step_{step}.ot"));
+        self.write_recovery_checkpoint(&tagged, step)?;
+        self.publish_recovery_alias(&tagged, &last)?;
+        self.last_recovery_step = Some(step);
+        self.prune_step_checkpoints()?;
+        Ok(last)
     }
 
     /// Every epoch boundary leaves one artifact, unconditionally, with its held-out numbers
@@ -6922,18 +7982,18 @@ impl Trainer {
         Ok(())
     }
 
-    /// Keep the newest [`RETAINED_STEP_CHECKPOINTS`] step-tagged checkpoints plus the
-    /// [`PLATEAU_ANCHOR_CHECKPOINTS`] pass-boundary anchors, and delete the rest, sidecars
-    /// included.
+    /// Keep the newest [`RETAINED_STEP_CHECKPOINTS`] PERIODIC step-tagged checkpoints plus the
+    /// [`PLATEAU_ANCHOR_CHECKPOINTS`] pass-boundary anchors and an off-grid semantic final
+    /// bundle; delete the rest, sidecars included.
     ///
-    /// A 128 MiB artifact every [`DEFAULT_CHECKPOINT_EVERY`] steps would be 3.5 GiB over a
-    /// 13831-step run. The epoch artifacts and `pretrain_best*.ot` are named differently and
-    /// are never touched here: this window is crash insurance with a bounded footprint, not an
-    /// archive.
+    /// The terminal state is always recoverable, but an off-grid final tag must not consume one
+    /// of the equally spaced cadence points used by LR-disentanglement analysis. Thus a typical
+    /// completed run retains three periodic bundles plus its final bundle. The epoch artifacts
+    /// and `pretrain_best*.ot` are named differently and are never touched here.
     ///
-    /// The anchors are the one exception and they are exempt PRECISELY BECAUSE they are the
-    /// oldest artifacts on disk — a newest-N window deletes them first, which is how
-    /// `bardist_v2` ended up with a repetition question and no artifact able to answer it. See
+    /// The anchors are the other exception and are exempt PRECISELY BECAUSE they are the oldest
+    /// artifacts on disk — a newest-N window deletes them first, which is how `bardist_v2`
+    /// ended up with a repetition question and no artifact able to answer it. See
     /// [`PLATEAU_ANCHOR_CHECKPOINTS`].
     fn prune_step_checkpoints(&self) -> Result<()> {
         let mut tagged: Vec<(usize, PathBuf)> = Vec::new();
@@ -6958,20 +8018,34 @@ impl Trainer {
                 tagged.push((tag, path));
             }
         }
-        if tagged.len() <= RETAINED_STEP_CHECKPOINTS {
-            return Ok(());
-        }
         tagged.sort_unstable_by_key(|(tag, _)| *tag);
-        let tags: Vec<usize> = tagged.iter().map(|(tag, _)| *tag).collect();
+        let cadence_tags: Vec<usize> = tagged
+            .iter()
+            .map(|(tag, _)| *tag)
+            .filter(|tag| {
+                self.args.checkpoint_every > 0 && *tag > 0 && *tag % self.args.checkpoint_every == 0
+            })
+            .collect();
         let anchors = plateau_anchor_tags(
-            &tags,
+            &cadence_tags,
             self.schedule.steps_per_epoch,
             self.schedule.total_steps,
             self.schedule.lr_plateau_fraction,
         );
-        let newest_from = tagged.len() - RETAINED_STEP_CHECKPOINTS;
-        for (index, (tag, path)) in tagged.into_iter().enumerate() {
-            if index >= newest_from || anchors.contains(&tag) {
+        let newest_cadence: HashSet<usize> = cadence_tags
+            .iter()
+            .rev()
+            .take(RETAINED_STEP_CHECKPOINTS)
+            .copied()
+            .collect();
+        let off_grid_final = self.schedule.total_steps.checked_sub(1).filter(|tag| {
+            self.args.checkpoint_every == 0 || *tag == 0 || *tag % self.args.checkpoint_every != 0
+        });
+        for (tag, path) in tagged {
+            if newest_cadence.contains(&tag)
+                || anchors.contains(&tag)
+                || off_grid_final == Some(tag)
+            {
                 continue;
             }
             for sidecar in [
@@ -7019,7 +8093,8 @@ impl Trainer {
 
             train_seed: self.args.seed,
             selection_metric: format!(
-                "{selection_metric}; predictive scoring contract: {}",
+                "{selection_metric}; sizing rule: {}; predictive scoring contract: {}",
+                self.traded_sizing().rule.label(),
                 BarScoring::Hard.report_contract()
             ),
             selection_weights: SELECTION_WEIGHTS,
@@ -7038,6 +8113,9 @@ impl Trainer {
                 .provenance()
                 .map(|p| p.corpus_fingerprint.clone()),
             scoring: BarScoring::Hard.to_string(),
+            sizing_rule: self.traded_sizing().rule.label().to_owned(),
+            direct_t2_weight: self.args.direct_t2_weight,
+            direct_t3_weight: self.args.direct_t3_weight,
             // The context this artifact's selection was actually taken at, beside the one it
             // is meant to be deployed at. They differ only when the ramp never got there, and
             // that difference is the difference between a deployable artifact and one that is
@@ -7098,6 +8176,10 @@ impl Trainer {
                     }
                 }),
             }),
+            // From the SUPPORTS rather than from the flag: the artifact is what the head was
+            // actually trained against, and `fit_supports_at` has already refused any pairing
+            // where the two disagree.
+            dof_scaling: self.supports.dof_scaling(),
         }
     }
 
@@ -7114,12 +8196,27 @@ impl Trainer {
     /// Falls back to the deployed-context set when nothing was promoted yet, which cannot
     /// happen on the battery path — `run_training` refuses to reach it with zero promotions —
     /// but keeps this a total function rather than a panic waiting for a refactor.
-    fn test_set(&self) -> &PinnedSet {
-        if self.selection_context == self.eval.test_diagnostic.context {
-            &self.eval.test_diagnostic
+    fn test_set(&self) -> Result<&PinnedSet> {
+        let TestEvaluationSets::Prepared {
+            deployed,
+            diagnostic,
+            ..
+        } = &self.eval.test
+        else {
+            anyhow::bail!("Test evaluation was deferred and no Test windows were constructed")
+        };
+        Ok(if self.selection_context == diagnostic.context {
+            diagnostic
         } else {
-            &self.eval.test
-        }
+            deployed
+        })
+    }
+
+    fn test_snapshot(&self) -> Result<&PinnedSet> {
+        let TestEvaluationSets::Prepared { snapshot, .. } = &self.eval.test else {
+            anyhow::bail!("Test evaluation was deferred and no Test windows were constructed")
+        };
+        Ok(snapshot)
     }
 
     /// Paired per-window difference of one scalar against an incumbent vector, block
@@ -7225,8 +8322,8 @@ impl Trainer {
         })
     }
 
-    /// Per-window net Kelly edge over the unconditional-marginal null at [`SELECTION_CAP`], in
-    /// BPS per bar, one entry per traded window.
+    /// Per-traded-window economics of one pass at [`SELECTION_CAP`], in BPS per bar, in
+    /// pinned order over the traded prefix.
     ///
     /// The fractions are re-clamped from the already-solved uncapped optimum exactly as the
     /// charted cap curve does — same helper, so the promotion criterion and the chart a reader
@@ -7234,9 +8331,14 @@ impl Trainer {
     /// model-independent, so subtracting it changes no paired difference between two
     /// checkpoints; it is subtracted anyway so the LEVEL this rule records in the metadata is
     /// the same "edge" the cap curve prints.
-    fn selection_edge_windows(&self, paths: &ChunkPaths) -> Vec<f64> {
+    ///
+    /// Both legs are returned, and both are persisted, because they survive different things.
+    /// The null is built from the bin supports, so the differenced edge is only comparable
+    /// WITHIN one geometry; the model leg is pure realized-return arithmetic and is the only
+    /// economic ruler that still means the same thing after an arm refits them.
+    fn selection_economics(&self, paths: &ChunkPaths) -> WindowEconomics {
         if paths.is_empty() {
-            return Vec::new();
+            return WindowEconomics::default();
         }
         let free_marginal =
             trade_bench::marginal_position(&self.supports_dev, trade_bench::FREE_LEVERAGE);
@@ -7254,11 +8356,14 @@ impl Trainer {
             SELECTION_CAP,
             cost,
         );
-        model
-            .iter()
-            .zip(null.iter())
-            .map(|(model, null)| (model - null) * 1.0e4)
-            .collect()
+        WindowEconomics {
+            selection_edge_bps: model
+                .iter()
+                .zip(null.iter())
+                .map(|(model, null)| (model - null) * 1.0e4)
+                .collect(),
+            model_growth_bps: model.iter().map(|model| model * 1.0e4).collect(),
+        }
     }
 
     /// Block-bootstrapped mean of a per-traded-window quantity.
@@ -7272,7 +8377,28 @@ impl Trainer {
         }
         let mut blocks = self.blocks(set);
         blocks.truncate(values.len());
-        block_bootstrap(values, &blocks, BOOTSTRAP_DRAWS, BOOTSTRAP_SEED)
+        let dispersion = block_bootstrap(values, &blocks, BOOTSTRAP_DRAWS, BOOTSTRAP_SEED);
+        // A missing standard error is not a small one, and it does not fail here: it travels
+        // up to `candidate_usable`, turns every economics-primary read into `Unmeasurable`,
+        // and presents as a promotion that quietly never happens. Diagnosing that from the
+        // refusal alone costs an afternoon, so the cause is stated where it arises.
+        if !dispersion.se.is_finite() && !self.degenerate_bootstrap_warned.replace(true) {
+            println!(
+                "WARNING: the traded prefix of the {}-bar pinned set spans {} distinct \
+                 (symbol, calendar month) resampling unit(s) over {} traded window(s), and a \
+                 block bootstrap needs at least two, so it reports NO standard error. Every \
+                 rule gated on that interval — the economics-primary promotion above all — can \
+                 then only read UNMEASURABLE, which is a refusal to measure and never evidence \
+                 against the candidate. The unit is the TICKER-MONTH, so what buys another one \
+                 is a window on a different symbol or in a different month: raise \
+                 --validation-windows if the draw does not yet cover every ticker-month in the \
+                 split, and widen the evaluation span if it already does. Said once per run.",
+                set.context,
+                dispersion.blocks,
+                values.len(),
+            );
+        }
+        dispersion
     }
 
     /// Paired per-window difference of the economic criterion against the incumbent, in bps/bar.
@@ -7461,7 +8587,7 @@ impl Trainer {
                 self.device,
                 false,
                 scoring,
-                None,
+                TradedSizing::CONTROL,
                 trade_bench::TRADE_WINDOWS,
             )
             .with_context(|| format!("failed evaluating the {res}s auxiliary held-out set"))?;
@@ -7510,7 +8636,7 @@ impl Trainer {
             for _ in 0..fire_count {
                 let Some((stage, sample, drawn)) = self.aux[index].draw(device) else {
                     // Only reachable under `--steps`, which can end a pass mid-partition.
-                    continue;
+                    break;
                 };
                 let loss = self.optimizer_step(&sample, step, Some(index))?;
                 let context = self.aux[index].context(stage);
@@ -7536,7 +8662,21 @@ impl Trainer {
 
     /// The per-window vector of one evaluation, in a form another run can be paired
     /// against.
-    fn window_scores(&self, set: &PinnedSet, stats: &EvalStats, step: usize) -> WindowScores {
+    ///
+    /// The economics are taken HERE, not at the promotion decision, because this is the only
+    /// point every validation passes through: the decision is gated on the deployed context
+    /// and a run held below it never reaches one, so an arm that computed its edge there would
+    /// leave no economic vector on disk at all. Building it here also means the decision reads
+    /// back the exact bytes the artifact carries rather than a second computation of the same
+    /// idea. `calibration` rides in from the bench the caller already ran; a pass that ran no
+    /// bench records its absence rather than paying for a second fit.
+    fn window_scores(
+        &self,
+        set: &PinnedSet,
+        stats: &EvalStats,
+        step: usize,
+        calibration: Option<&trade_bench::MeanCalibration>,
+    ) -> WindowScores {
         let windows = set
             .windows
             .iter()
@@ -7549,6 +8689,13 @@ impl Trainer {
                 conditional_nll: stats.window_conditional_nll_stats[index],
             })
             .collect();
+        let economics = self.selection_economics(&stats.trade_paths);
+        // The bench trades a PREFIX of the pinned set, so the blocking is the pinned blocking
+        // truncated to it, exactly as `bootstrap_traded` does. Persisted rather than left to a
+        // consumer to re-derive, so a cross-run interval is taken over the same resampling
+        // units this run's own selection rule read.
+        let mut traded_blocks = self.blocks(set);
+        traded_blocks.truncate(economics.selection_edge_bps.len());
         let scores = WindowScores {
             format_version: WINDOW_SCORES_FORMAT_VERSION,
             run: self
@@ -7565,6 +8712,7 @@ impl Trainer {
             split_bounds: self.split_bounds(),
             marginal_nll_bar: self.marginal_nll_bar,
             scoring: Some(BarScoring::Hard.to_string()),
+            sizing_rule: Some(stats.sizing_rule.label().to_owned()),
             windows,
             // Attached by the epoch-boundary writer, which is the only caller that has a
             // bench for these exact windows.
@@ -7575,6 +8723,17 @@ impl Trainer {
             // disagree on it — see `WindowScores::realized_batch`.
             realized_batch: Some(self.args.batch_size),
             realized_steps: Some(self.schedule.total_steps),
+            supports_sha256: Some(self.supports_sha256.clone()),
+            selection_edge_bps: Some(economics.selection_edge_bps),
+            model_growth_bps: Some(economics.model_growth_bps),
+            traded_blocks: Some(traded_blocks),
+            calibration: calibration
+                .filter(|fit| fit.measured())
+                .map(|fit| CalibrationSlopes {
+                    mean_beta: fit.mean.beta.into(),
+                    mean_beta_se: fit.mean.beta_se.into(),
+                    variance_beta: fit.variance.beta.into(),
+                }),
         };
         assert_eq!(
             scores.conditional_nll(),
@@ -7617,7 +8776,7 @@ impl Trainer {
             self.device,
             false,
             BarScoring::Hard,
-            None,
+            TradedSizing::CONTROL,
             trade_bench::TRADE_WINDOWS,
         )?;
         let drift = (reloaded.nll_bar - expected_nll).abs();
@@ -7757,6 +8916,7 @@ impl Trainer {
         }
         let per_token = activations / tokens;
         self.activation_bytes_per_token = Some(per_token);
+        self.activation_device = device_identity(self.device);
         println!(
             "step {step}: ramp stage {} activation footprint {:.2} GiB over {tokens:.0} \
              bar-tokens ({:.0} B/token); {:.2} GiB free on the device",
@@ -7947,6 +9107,9 @@ pub(super) struct EvalStats {
     /// Per-window Kelly positions for the trading bench, over the first
     /// [`trade_bench::TRADE_WINDOWS`] windows of the set. Empty unless `full`.
     pub(super) trade_paths: ChunkPaths,
+    /// Rule that generated `trade_paths`, carried beside the vectors so persistence cannot
+    /// relabel quadratic economics as cumulant (or vice versa) from trainer arguments.
+    sizing_rule: trade_bench::SizingRule,
 }
 
 /// `(symbol, calendar month)` block id of every window in a pinned set, so windows of one
@@ -7975,6 +9138,229 @@ pub(super) fn pinned_blocks(set: &PinnedSet) -> Vec<u64> {
 ///
 /// Order matters as much as membership. The trading bench trades the first
 /// [`trade_bench::TRADE_WINDOWS`] windows of the set and the candle snapshots picture the
+
+#[derive(Clone, Debug)]
+struct DirectEvalDiagnostics {
+    nll: [f64; 2],
+    nll_dof: [[f64; BAR_DOF]; 2],
+    crps_dof: [[f64; BAR_DOF]; 2],
+    dir_acc: [f64; 2],
+    exact_nll: [f64; 2],
+    direct_on_exact_rows_nll: [f64; 2],
+    valid_fraction: [f64; 2],
+}
+
+fn direct_exact_belief_context(context: i64) -> i64 {
+    assert!(
+        (1..=BAR_MAX_CONTEXT).contains(&context),
+        "direct evaluation context must be in 1..={BAR_MAX_CONTEXT}, got {context}"
+    );
+    (context + DIRECT_MAX_HORIZON - 1).min(BAR_MAX_CONTEXT)
+}
+
+fn direct_exact_comparator_context(context: i64, belief_context: i64, horizon: usize) -> i64 {
+    assert!(
+        (2..=DIRECT_MAX_HORIZON as usize).contains(&horizon),
+        "direct exact comparator horizon must be 2 or 3, got {horizon}"
+    );
+    let offset = horizon as i64 - 1;
+    assert!(
+        belief_context >= context && belief_context > offset,
+        "direct exact comparator belief span {belief_context} cannot cover context {context} at horizon {horizon}"
+    );
+    context.min(belief_context - offset)
+}
+
+fn evaluate_direct_horizons(
+    modules: &BarModules,
+    supports: &BarSupports,
+    set: &PinnedSet,
+    batch: usize,
+    device: Device,
+) -> DirectEvalDiagnostics {
+    let mut rows = [0.0; 2];
+    let mut possible_rows = 0.0;
+    let mut nll = [0.0; 2];
+    let mut exact_nll = [0.0; 2];
+    let mut exact_rows = [0.0; 2];
+    let mut direct_on_exact_rows_nll = [0.0; 2];
+    let mut nll_dof = [[0.0; BAR_DOF]; 2];
+    let mut crps_dof = [[0.0; BAR_DOF]; 2];
+    let mut dir_hits = [0.0; 2];
+    let mut dir_total = [0.0; 2];
+    tch::no_grad(|| {
+        for chunk in set.windows.chunks(batch.max(1)) {
+            let sample = set.sampler.batch_of(chunk, device);
+            let direct_time_ids = sample
+                .direct_time_ids
+                .as_ref()
+                .expect("direct evaluation sampler must carry forecast-safe h2/h3 clocks");
+            let direct_valid = sample
+                .direct_valid
+                .as_ref()
+                .expect("direct evaluation sampler must carry ordinary-row masks");
+            let exact_target_time_all =
+                set.sampler
+                    .one_step_forecast_time_ids(chunk, (set.context + 2) as usize, device);
+            let context = set.context;
+            let exact_belief_context = direct_exact_belief_context(context);
+            let bins = supports.bin_ids(&sample.dof);
+            let beliefs_all = modules.trunk.forward(
+                &sample.dof.narrow(1, 0, exact_belief_context),
+                &bins.narrow(1, 0, exact_belief_context),
+                &sample.time_ids.narrow(1, 0, exact_belief_context),
+                0,
+                false,
+            );
+            let beliefs = beliefs_all.narrow(1, 0, context);
+            let current_time = sample.time_ids.narrow(1, 0, context);
+            possible_rows += (chunk.len() as i64 * context) as f64;
+            for (slot, horizon) in [2usize, 3].into_iter().enumerate() {
+                let indices = direct_valid
+                    .select(2, slot as i64)
+                    .reshape([-1])
+                    .nonzero()
+                    .squeeze_dim(1);
+                let chunk_rows = indices.size()[0] as f64;
+                if chunk_rows == 0.0 {
+                    continue;
+                }
+                rows[slot] += chunk_rows;
+                let target = sample
+                    .dof
+                    .narrow(1, horizon as i64, context)
+                    .reshape([-1, BAR_DOF as i64])
+                    .index_select(0, &indices);
+                let target_bins = bins
+                    .narrow(1, horizon as i64, context)
+                    .reshape([-1, BAR_DOF as i64])
+                    .index_select(0, &indices);
+                let target_time = direct_time_ids
+                    .select(2, slot as i64)
+                    .reshape([-1, BAR_TIME_FEATURES as i64])
+                    .index_select(0, &indices);
+                let decision_beliefs = beliefs
+                    .reshape([-1, BAR_MODEL_DIM])
+                    .index_select(0, &indices);
+                let decision_time = current_time
+                    .reshape([-1, BAR_TIME_FEATURES as i64])
+                    .index_select(0, &indices);
+                let conditioning = modules
+                    .trunk
+                    .forecast_conditioning(&target_time, &decision_time);
+                let logits = modules.head.direct_logits(
+                    &decision_beliefs,
+                    &conditioning,
+                    &target_bins,
+                    horizon,
+                );
+                let targets = supports.targets_from_class_ids(&target_bins, BarScoring::Hard);
+                let (batch_nll, batch_dof) = bar_nll_from_logits(&logits, &targets);
+                nll[slot] += batch_nll.double_value(&[]) * chunk_rows;
+                let values = dof_array(&batch_dof);
+                for dof in 0..BAR_DOF {
+                    nll_dof[slot][dof] += values[dof] * chunk_rows;
+                }
+
+                let exact_context =
+                    direct_exact_comparator_context(context, exact_belief_context, horizon);
+                let exact_indices = direct_valid
+                    .select(2, slot as i64)
+                    .narrow(1, 0, exact_context)
+                    .reshape([-1])
+                    .nonzero()
+                    .squeeze_dim(1);
+                let paired_rows = exact_indices.size()[0] as f64;
+                if paired_rows > 0.0 {
+                    exact_rows[slot] += paired_rows;
+                    let paired_target_bins = bins
+                        .narrow(1, horizon as i64, exact_context)
+                        .reshape([-1, BAR_DOF as i64])
+                        .index_select(0, &exact_indices);
+                    let paired_target_time = direct_time_ids
+                        .select(2, slot as i64)
+                        .narrow(1, 0, exact_context)
+                        .reshape([-1, BAR_TIME_FEATURES as i64])
+                        .index_select(0, &exact_indices);
+                    let paired_decision_beliefs = beliefs
+                        .narrow(1, 0, exact_context)
+                        .reshape([-1, BAR_MODEL_DIM])
+                        .index_select(0, &exact_indices);
+                    let paired_decision_time = current_time
+                        .narrow(1, 0, exact_context)
+                        .reshape([-1, BAR_TIME_FEATURES as i64])
+                        .index_select(0, &exact_indices);
+                    let paired_conditioning = modules
+                        .trunk
+                        .forecast_conditioning(&paired_target_time, &paired_decision_time);
+                    let paired_direct_logits = modules.head.direct_logits(
+                        &paired_decision_beliefs,
+                        &paired_conditioning,
+                        &paired_target_bins,
+                        horizon,
+                    );
+                    let paired_targets =
+                        supports.targets_from_class_ids(&paired_target_bins, BarScoring::Hard);
+                    let (paired_direct_nll, _) =
+                        bar_nll_from_logits(&paired_direct_logits, &paired_targets);
+                    direct_on_exact_rows_nll[slot] +=
+                        paired_direct_nll.double_value(&[]) * paired_rows;
+
+                    let exact_beliefs = beliefs_all
+                        .narrow(1, horizon as i64 - 1, exact_context)
+                        .reshape([-1, BAR_MODEL_DIM])
+                        .index_select(0, &exact_indices);
+                    let exact_current_time = sample
+                        .time_ids
+                        .narrow(1, horizon as i64 - 1, exact_context)
+                        .reshape([-1, BAR_TIME_FEATURES as i64])
+                        .index_select(0, &exact_indices);
+                    let exact_target_time = exact_target_time_all
+                        .narrow(1, horizon as i64 - 1, exact_context)
+                        .reshape([-1, BAR_TIME_FEATURES as i64])
+                        .index_select(0, &exact_indices);
+                    let exact_conditioning = modules
+                        .trunk
+                        .forecast_conditioning(&exact_target_time, &exact_current_time);
+                    let quadraticits = modules.head.logits(
+                        &exact_beliefs,
+                        &exact_conditioning,
+                        &paired_target_bins,
+                    );
+                    let (exact_batch_nll, _) = bar_nll_from_logits(&quadraticits, &paired_targets);
+                    exact_nll[slot] += exact_batch_nll.double_value(&[]) * paired_rows;
+                }
+
+                let crps = dof_array(&bar_crps_from_logits(&logits, &target, supports));
+                for dof in 0..BAR_DOF {
+                    crps_dof[slot][dof] += crps[dof] * chunk_rows;
+                }
+                let probabilities = logits.select(-2, DOF_R as i64).softmax(-1, Kind::Double);
+                let centers = Tensor::from_slice(supports.centers(DOF_R))
+                    .to_device(device)
+                    .to_kind(Kind::Double);
+                let (hits, total) = direction_counts_from_law(
+                    &probabilities,
+                    &centers,
+                    &target.select(-1, DOF_R as i64).to_kind(Kind::Double),
+                );
+                dir_hits[slot] += hits;
+                dir_total[slot] += total;
+            }
+        }
+    });
+    DirectEvalDiagnostics {
+        nll: std::array::from_fn(|slot| nll[slot] / rows[slot]),
+        nll_dof: std::array::from_fn(|slot| nll_dof[slot].map(|value| value / rows[slot])),
+        crps_dof: std::array::from_fn(|slot| crps_dof[slot].map(|value| value / rows[slot])),
+        dir_acc: std::array::from_fn(|slot| dir_hits[slot] / dir_total[slot]),
+        exact_nll: std::array::from_fn(|slot| exact_nll[slot] / exact_rows[slot]),
+        direct_on_exact_rows_nll: std::array::from_fn(|slot| {
+            direct_on_exact_rows_nll[slot] / exact_rows[slot]
+        }),
+        valid_fraction: rows.map(|count| count / possible_rows),
+    }
+}
 /// first few, so a permuted set is a different scene and a different bench even though it
 /// holds the same windows.
 fn pinned_fingerprint(set: &PinnedSet) -> u64 {
@@ -8237,6 +9623,43 @@ pub(super) enum EvaluationTrunk<'a> {
     Recirculated(&'a crate::torch::world_model::RecirculationConfig),
 }
 
+/// How an evaluation pass sizes its traded book.
+///
+/// One struct rather than two arguments because the two are not independent: a recalibrated
+/// rule with no fitted recalibration is refused by [`trade_bench::window_paths`], and a
+/// recalibration with a control rule is a diagnostic column rather than a decision. Keeping
+/// them adjacent is what makes that pairing checkable at the call site instead of at the
+/// bottom of the bench.
+#[derive(Clone, Copy, Debug, Default)]
+pub(super) struct TradedSizing {
+    /// Which reduction of the predictive law chooses the position.
+    pub(super) rule: trade_bench::SizingRule,
+    /// The mean recalibration to reduce a second fraction under, and to SIZE on when `rule`
+    /// asks for it. Fitted on a slice block-disjoint from the one it is spent on — see
+    /// [`EvaluationSets::shrink_fit`] — which is why it is an argument rather than something
+    /// this pass could derive from the windows it is scoring.
+    pub(super) shrink: Option<MeanShrink>,
+}
+
+impl TradedSizing {
+    /// The second-order surrogate on the raw conditional mean, with no recalibration column at
+    /// all. Every published economic number of this repo was measured here.
+    pub(super) const CONTROL: Self = Self {
+        rule: trade_bench::SizingRule::CONTROL,
+        shrink: None,
+    };
+
+    /// A recalibration measured BESIDE a control decision: the fraction the recalibrated law
+    /// would have chosen, without letting it choose. What the offline calibration experiment
+    /// scores, and what [`trade_bench::shrunk_bench`] consumes.
+    fn diagnostic(shrink: MeanShrink) -> Self {
+        Self {
+            rule: trade_bench::SizingRule::CONTROL,
+            shrink: Some(shrink),
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) fn evaluate_with_trunk(
     modules: &BarModules,
@@ -8248,7 +9671,17 @@ pub(super) fn evaluate_with_trunk(
     trunk: EvaluationTrunk<'_>,
 ) -> Result<EvalStats> {
     evaluate_impl(
-        modules, supports, set, batch, device, false, scoring, None, 0, trunk, true,
+        modules,
+        supports,
+        set,
+        batch,
+        device,
+        false,
+        scoring,
+        TradedSizing::CONTROL,
+        0,
+        trunk,
+        true,
     )
 }
 
@@ -8257,10 +9690,9 @@ pub(super) fn evaluate_with_trunk(
 /// the calibration diagnostics; promotion only needs the NLL, and the diagnostics
 /// it does not compute are returned as NaN rather than zero.
 ///
-/// `shrink` asks the trading bench to reduce a SECOND moment-correct quadratic fraction per
-/// bar after an affine mean recalibration fitted elsewhere — on windows disjoint from this
-/// set, which is why it is an argument rather than something this function could derive.
-/// `None` on every path but the calibration experiment.
+/// `sizing` declares which reduction of the predictive law chooses the traded position, and
+/// supplies the mean recalibration available to it. [`TradedSizing::CONTROL`] on every path
+/// that is not measuring a sizing arm, which keeps those passes bit-identical.
 ///
 /// `trade_budget` is how many of the set's windows retain per-bar trading paths, counted from
 /// the front. It is an ARGUMENT rather than [`trade_bench::TRADE_WINDOWS`] read in place because
@@ -8282,7 +9714,7 @@ pub(super) fn evaluate(
     device: Device,
     full: bool,
     scoring: BarScoring,
-    shrink: Option<MeanShrink>,
+    sizing: TradedSizing,
     trade_budget: usize,
 ) -> Result<EvalStats> {
     evaluate_impl(
@@ -8293,7 +9725,7 @@ pub(super) fn evaluate(
         device,
         full,
         scoring,
-        shrink,
+        sizing,
         trade_budget,
         EvaluationTrunk::Parallel,
         false,
@@ -8309,11 +9741,23 @@ fn evaluate_impl(
     device: Device,
     full: bool,
     scoring: BarScoring,
-    shrink: Option<MeanShrink>,
+    sizing: TradedSizing,
     trade_budget: usize,
     trunk: EvaluationTrunk<'_>,
     focused_diagnostics: bool,
 ) -> Result<EvalStats> {
+    // THE universal guard on target space. Every checkpoint-scoring path in the crate reaches
+    // this function, and a support fitted over one parametrization applied to batches encoded
+    // in another produces bin ids, nats and per-bin Kelly moments that are all quietly about a
+    // different population. Neither object can detect it alone, and here both are in scope.
+    ensure!(
+        supports.dof_scaling() == set.sampler.dof_scaling(),
+        "these supports tile the {} target space but the pinned set encodes {}. Pass \
+         --vol-standardize-targets to score a standardized checkpoint, or drop it to score a \
+         raw one",
+        supports.dof_scaling(),
+        set.sampler.dof_scaling()
+    );
     let mut nll_dof_sum = [0.0f64; BAR_DOF];
     let mut crps_dof_sum = [0.0f64; BAR_DOF];
     let mut class_dof_sum = [0.0f64; BAR_DOF];
@@ -8341,7 +9785,11 @@ fn evaluate_impl(
     // re-deriving it per chunk would be 170 identical derivations and would leave open the
     // question of whether the null moved.
     let trade_setup = if full {
-        Some(TradeSetup::new(supports, device, trade_bench::LEVERAGE_CAP).with_shrink(shrink))
+        Some(
+            TradeSetup::new(supports, device, trade_bench::LEVERAGE_CAP)
+                .with_shrink(sizing.shrink)
+                .with_sizing_rule(sizing.rule),
+        )
     } else {
         None
     };
@@ -8349,8 +9797,16 @@ fn evaluate_impl(
 
     for (chunk_index, chunk) in set.windows.chunks(batch.max(1)).enumerate() {
         let sample = set.sampler.batch_of(chunk, device);
-        let context = sample.dof.size()[1] - 1;
+        let context = set.context;
         let rows = chunk.len() as f64;
+        // Predictive losses are measured in the artifact's target geometry. Economics,
+        // calibration, and realized-volatility diagnostics are always paid on the original
+        // raw bar: standardized z may be clamped and is not an invertible outcome ledger.
+        let realized_target = sample
+            .raw_dof
+            .as_ref()
+            .unwrap_or(&sample.dof)
+            .narrow(1, 1, context);
 
         let (per_window, live, extras, focused) = tch::no_grad(|| {
             let input = sample.dof.narrow(1, 0, context);
@@ -8447,6 +9903,10 @@ fn evaluate_impl(
                     // beliefs and selects the realized `r` itself, so no part of the bar
                     // being bet on can reach the position. The budget makes the bench cost
                     // a fixed prefix of the pinned set rather than the whole pass.
+                    //
+                    // `sigma` is the target rows' causal divisor. Under standardized targets it
+                    // parameterizes the PREDICTIVE payoff law at decision time; realized
+                    // outcomes come from `realized_target`, the unclipped raw bar DOF.
                     trade: trade_setup
                         .as_ref()
                         .map(|setup| {
@@ -8455,7 +9915,8 @@ fn evaluate_impl(
                                     &modules.head,
                                     &beliefs,
                                     &conditioning,
-                                    &target,
+                                    &realized_target,
+                                    Some(&sample.sigma.narrow(1, 1, context)),
                                     trade_budget.saturating_sub(trade_paths.len()),
                                 )
                                 .expect("the evaluation loop shapes its own beliefs and targets")
@@ -8557,6 +10018,7 @@ fn evaluate_impl(
         nll_bar_conditional: nll_dof_conditional.iter().sum(),
         nll_dof_conditional,
         trade_paths,
+        sizing_rule: sizing.rule,
         nll_dof_class: if full {
             class_dof_sum.map(|v| v * scale)
         } else {
@@ -8842,6 +10304,9 @@ struct TrainingGraph {
     nll: Tensor,
     nll_dof: Tensor,
     dyn_loss: Tensor,
+    direct_nll: [Tensor; 2],
+    direct_nll_dof: [Tensor; 2],
+    direct_target_count: [Tensor; 2],
     kl_loss: Tensor,
     /// Detached raw-payoff diagnostic under the deployed cap, including the explicit
     /// bankruptcy-domain continuation.
@@ -8858,15 +10323,23 @@ struct TrainingGraph {
 ///
 /// Shared verbatim by [`Trainer::optimizer_step`] and [`probe_capacity`] so the capacity
 /// probe measures the graph and detached diagnostics the run actually executes.
+///
+/// `sigma` is the batch's `[B, T]` causal volatility column, aligned with `dof`. Only the
+/// detached growth diagnostic reads it, because only a payoff is denominated in money; the
+/// likelihood scores the parametrization the supports were fitted on, whichever that is.
 #[allow(clippy::too_many_arguments)]
 fn forward_losses(
     modules: &BarModules,
     supports: &BarSupports,
     growth_support: &GrowthSupport,
     dof: &Tensor,
+    sigma: &Tensor,
     time_ids: &Tensor,
+    direct_time_ids: Option<&Tensor>,
+    direct_valid: Option<&Tensor>,
     context: i64,
     horizon: i64,
+    direct_weights: (f64, f64),
     lambda_dyn: f64,
     lambda_kl: f64,
     scoring: BarScoring,
@@ -8874,13 +10347,7 @@ fn forward_losses(
 ) -> TrainingGraph {
     let input = dof.narrow(1, 0, context);
     let target = dof.narrow(1, 1, context);
-    // `prepare`/`locate` are elementwise, so binning commutes with narrowing: one pass over
-    // `[B, T + 1, BAR_DOF]` serves the trunk's input, the head's teacher-forced target and
-    // every dynamics horizon. Hard and density scoring narrow these integer IDs directly;
-    // only smoothed scoring returns to the observations to construct probability rows.
     let bins = supports.bin_ids(dof);
-    // One transformer pass. Every dynamics horizon reuses this belief sequence, shifted, so
-    // recursion costs only MLP evaluations.
     let beliefs = modules.trunk.forward(
         &input,
         &bins.narrow(1, 0, context),
@@ -8894,12 +10361,8 @@ fn forward_losses(
     let conditioning = modules
         .trunk
         .forecast_conditioning(&target_time, &current_time);
-    let logits = modules
-        .head
-        .logits(&beliefs, &conditioning, &bins.narrow(1, 1, context));
-    // The caller's score and targets are one contract. Production pretraining always passes
-    // Hard; diagnostic tests may exercise the other target laws explicitly. Reuse the bin IDs.
     let target_bins = bins.narrow(1, 1, context);
+    let logits = modules.head.logits(&beliefs, &conditioning, &target_bins);
     let targets = if scoring.is_smoothed() {
         supports.targets(&target, scoring)
     } else {
@@ -8907,11 +10370,75 @@ fn forward_losses(
     };
     let (nll, nll_dof) = bar_nll_from_logits(&logits, &targets);
 
+    let direct = if let (Some(direct_time_ids), Some(direct_valid)) =
+        (direct_time_ids, direct_valid)
+    {
+        assert!(
+            dof.size()[1] >= context + DIRECT_MAX_HORIZON,
+            "direct supervision needs context+{DIRECT_MAX_HORIZON} target bars"
+        );
+        assert_eq!(
+            direct_time_ids.size(),
+            [dof.size()[0], context, 2, BAR_TIME_FEATURES as i64],
+            "direct supervision clocks must be [batch, context, h2+h3, features]"
+        );
+        assert_eq!(
+            direct_valid.size(),
+            [dof.size()[0], context, 2],
+            "direct ordinary-row mask must be [batch, context, h2+h3]"
+        );
+        [2usize, 3usize].map(|direct_horizon| {
+            let slot = direct_horizon as i64 - 2;
+            let target_bins = bins.narrow(1, direct_horizon as i64, context);
+            let target_time = direct_time_ids.select(2, slot);
+            let direct_conditioning = modules
+                .trunk
+                .forecast_conditioning(&target_time, &current_time);
+            let direct_logits = modules.head.direct_logits(
+                &beliefs,
+                &direct_conditioning,
+                &target_bins,
+                direct_horizon,
+            );
+            let direct_targets = supports.targets_from_class_ids(&target_bins, BarScoring::Hard);
+            let terms =
+                bar_nll_terms(&direct_logits, &direct_targets).reshape([-1, BAR_DOF as i64]);
+            let valid = direct_valid
+                .select(2, slot)
+                .reshape([-1, 1])
+                .to_kind(Kind::Float);
+            let count = valid.sum(Kind::Float);
+            let per_dof = (terms * valid).sum_dim_intlist([0i64].as_slice(), false, Kind::Float)
+                / count.clamp_min(1.0);
+            (per_dof.sum(Kind::Float), per_dof, count)
+        })
+    } else {
+        assert!(
+            direct_time_ids.is_none() && direct_valid.is_none(),
+            "direct clocks and ordinary-row masks must be present together"
+        );
+        assert_eq!(
+            direct_weights,
+            (0.0, 0.0),
+            "direct objective weights require forecast-safe h2/h3 supervision"
+        );
+        // Auxiliary-resolution streams deliberately keep their legacy one-future-bar windows.
+        // Their direct weights are structurally zero, and these finite placeholders keep the
+        // shared packed-metric safety check valid; only deployment-stream metrics are reported.
+        [(); 2].map(|_| {
+            (
+                Tensor::zeros([], (Kind::Float, device)),
+                Tensor::zeros([BAR_DOF as i64], (Kind::Float, device)),
+                Tensor::zeros([], (Kind::Float, device)),
+            )
+        })
+    };
+    let [(direct_t2, direct_t2_dof, direct_t2_count), (direct_t3, direct_t3_dof, direct_t3_count)] =
+        direct;
+
     let (dyn_loss, kl_loss, identity) = dynamics_losses(
         modules, dof, &bins, time_ids, &beliefs, context, horizon, device,
     );
-    // Training-batch diagnostic only. `raw_payoff_diagnostic` itself enforces `no_grad`;
-    // the explicit scope makes the objective boundary visible at assembly too.
     let growth::GrowthDiagnostic {
         value: growth_diagnostic,
         stats: growth_stats,
@@ -8921,15 +10448,28 @@ fn forward_losses(
             &beliefs,
             &conditioning,
             &target.select(-1, DOF_R as i64),
+            &sigma.narrow(1, 1, context),
             growth_support,
         )
     });
     let autocorr = belief_autocorrelation(&beliefs);
-    let loss = &nll + lambda_dyn * &dyn_loss + lambda_kl * &kl_loss;
+    let loss = if direct_weights.0 == 0.0 && direct_weights.1 == 0.0 {
+        // Preserve the exact legacy scalar/autograd graph for the control while still
+        // executing both direct branches above for matched compute and diagnostics.
+        &nll + lambda_dyn * &dyn_loss + lambda_kl * &kl_loss
+    } else {
+        &nll + direct_weights.0 * &direct_t2
+            + direct_weights.1 * &direct_t3
+            + lambda_dyn * &dyn_loss
+            + lambda_kl * &kl_loss
+    };
     TrainingGraph {
         loss,
         nll,
         nll_dof,
+        direct_nll: [direct_t2, direct_t3],
+        direct_nll_dof: [direct_t2_dof, direct_t3_dof],
+        direct_target_count: [direct_t2_count, direct_t3_count],
         dyn_loss,
         kl_loss,
         growth_diagnostic,
@@ -9175,6 +10715,7 @@ fn belief_autocorrelation(beliefs: &Tensor) -> Tensor {
 ///
 /// The shares are returned in objective order: `(nll, dyn, kl)`. Raw-payoff growth has
 /// fixed share zero in the retained report base because it is diagnostic-only.
+#[cfg(test)]
 fn loss_shares(nll: f64, weighted_dyn: f64, weighted_kl: f64) -> (f64, f64, f64) {
     let total = nll.abs() + weighted_dyn.abs() + weighted_kl.abs();
     if !(total > 0.0) || !total.is_finite() {
@@ -9191,20 +10732,153 @@ fn loss_shares(nll: f64, weighted_dyn: f64, weighted_kl: f64) -> (f64, f64, f64)
 /// which case the ramp simply never holds — the same behaviour as before the check existed.
 static NVML: LazyLock<Option<Nvml>> = LazyLock::new(|| Nvml::init().ok());
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum NvmlDeviceSelector {
+    Ordinal(u32),
+    Uuid(String),
+}
+
+fn nvml_selector_for_visible(
+    visible_ordinal: usize,
+    cuda_visible_devices: Option<&str>,
+) -> Option<NvmlDeviceSelector> {
+    let Some(visible) = cuda_visible_devices else {
+        return u32::try_from(visible_ordinal)
+            .ok()
+            .map(NvmlDeviceSelector::Ordinal);
+    };
+    let token = visible.split(',').nth(visible_ordinal)?.trim();
+    if token.starts_with("GPU-") {
+        Some(NvmlDeviceSelector::Uuid(token.to_owned()))
+    } else if token.starts_with("MIG-") {
+        None
+    } else {
+        token.parse::<u32>().ok().map(NvmlDeviceSelector::Ordinal)
+    }
+}
+
+fn nvml_pci_rank(
+    visible_ordinal: usize,
+    selected_ordinal: u32,
+    physical_device_count: u32,
+    pci_bus_order: bool,
+) -> Option<usize> {
+    if physical_device_count == 1 && visible_ordinal == 0 {
+        return Some(0);
+    }
+    if physical_device_count <= 1 || !pci_bus_order {
+        return None;
+    }
+    let rank = usize::try_from(selected_ordinal).ok()?;
+    (rank < physical_device_count as usize).then_some(rank)
+}
+
+fn sort_pci_devices(devices: &mut [(u32, u32, u32, String)]) {
+    devices.sort_by(|left, right| {
+        (left.0, left.1, left.2, left.3.as_str()).cmp(&(
+            right.0,
+            right.1,
+            right.2,
+            right.3.as_str(),
+        ))
+    });
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MigModePolicy {
+    Disabled,
+    Enabled,
+    Unsupported,
+    Ambiguous,
+}
+
+fn mig_mode_allows_physical_device(policy: MigModePolicy) -> bool {
+    matches!(policy, MigModePolicy::Disabled | MigModePolicy::Unsupported)
+}
+
+fn nvml_device_for_cuda(device: Device) -> Option<NvmlDevice<'static>> {
+    let Device::Cuda(visible_ordinal) = device else {
+        return None;
+    };
+    let visible = match std::env::var("CUDA_VISIBLE_DEVICES") {
+        Ok(value) => Some(value),
+        Err(std::env::VarError::NotPresent) => None,
+        Err(std::env::VarError::NotUnicode(_)) => return None,
+    };
+    let selector = nvml_selector_for_visible(visible_ordinal, visible.as_deref())?;
+    let nvml = NVML.as_ref()?;
+    let resolved = match selector {
+        NvmlDeviceSelector::Uuid(uuid) => nvml.device_by_uuid(uuid).ok(),
+        NvmlDeviceSelector::Ordinal(selected_ordinal) => {
+            let count = nvml.device_count().ok()?;
+            let pci_bus_order =
+                std::env::var("CUDA_DEVICE_ORDER").is_ok_and(|order| order.trim() == "PCI_BUS_ID");
+            let rank = nvml_pci_rank(visible_ordinal, selected_ordinal, count, pci_bus_order)?;
+            let mut devices = (0..count)
+                .map(|index| {
+                    let pci = nvml.device_by_index(index).ok()?.pci_info().ok()?;
+                    Some((pci.domain, pci.bus, pci.device, pci.bus_id))
+                })
+                .collect::<Option<Vec<_>>>()?;
+            sort_pci_devices(&mut devices);
+            nvml.device_by_pci_bus_id(devices.get(rank)?.3.as_str())
+                .ok()
+        }
+    }?;
+    let mig_policy = match resolved.mig_mode() {
+        Ok(mode) if mode.current != 0 => MigModePolicy::Enabled,
+        Ok(_) => MigModePolicy::Disabled,
+        Err(NvmlError::NotSupported) => MigModePolicy::Unsupported,
+        Err(_) => MigModePolicy::Ambiguous,
+    };
+    mig_mode_allows_physical_device(mig_policy).then_some(resolved)
+}
+
+fn device_identity(device: Device) -> Option<String> {
+    let device = nvml_device_for_cuda(device)?;
+    Some(format!("{}:{}", device.uuid().ok()?, device.name().ok()?))
+}
+
+fn validate_resume_ramp_footprint(
+    recovery: &BarPretrainRecovery,
+    has_future_batch_increase: bool,
+    current_device: Option<&str>,
+) -> Result<Option<f64>> {
+    let measured = recovery.activation_bytes_per_token;
+    ensure!(
+        measured == 0.0 || measured.is_finite() && measured > 0.0,
+        "recovery activation footprint must be zero or finite and positive"
+    );
+    ensure!(
+        (measured == 0.0) == recovery.activation_device.is_empty(),
+        "recovery activation footprint and device provenance must be present together"
+    );
+    if !has_future_batch_increase {
+        return Ok((measured > 0.0).then_some(measured));
+    }
+    ensure!(
+        measured > 0.0,
+        "recovery has a future batch ramp increase but no measured activation footprint; \
+         refusing to resume with the VRAM guard disabled"
+    );
+    let current_device = current_device
+        .context("cannot authenticate the recovery VRAM footprint for this CUDA device")?;
+    ensure!(
+        recovery.activation_device == current_device,
+        "recovery VRAM footprint was measured on {}, but resume uses {}; refusing to disable or \
+         miscalibrate the future ramp guard",
+        recovery.activation_device,
+        current_device
+    );
+    Ok(Some(measured))
+}
+
 /// `(free, used)` device bytes from NVML. `None` off CUDA or without NVML.
 ///
 /// Device-wide, deliberately: the card is shared, so what a ramp step has to fit into is
 /// what the OTHER tenants have left, not what this process believes it allocated.
 fn device_memory(device: Device) -> Option<(u64, u64)> {
-    let Device::Cuda(index) = device else {
-        return None;
-    };
-    let info = NVML
-        .as_ref()?
-        .device_by_index(index as u32)
-        .ok()?
-        .memory_info()
-        .ok()?;
+    let info = nvml_device_for_cuda(device)?.memory_info().ok()?;
     Some((info.free, info.used))
 }
 
@@ -9226,7 +10900,6 @@ fn rollout_nll(
     mode: RolloutMode,
     scoring: BarScoring,
 ) -> [f64; ROLLOUT_HORIZONS.len()] {
-    // Selection and every reported horizon are on the deployment resolution.
     let deployment = supports.only();
     let mut out = [f64::NAN; ROLLOUT_HORIZONS.len()];
     let steps = window.future_dof.size()[1];
@@ -9243,7 +10916,7 @@ fn rollout_nll(
             belief_time_ids,
             mode,
         );
-        for (slot, horizon) in out.iter_mut().zip(ROLLOUT_HORIZONS) {
+        for (&horizon, slot) in ROLLOUT_HORIZONS.iter().zip(&mut out) {
             let index = horizon as i64 - 1;
             if index >= steps {
                 continue;
@@ -9291,12 +10964,18 @@ fn dof_array(per_dof: &Tensor) -> [f64; BAR_DOF] {
 const STEP_METRIC_TOTAL: usize = 0;
 const STEP_METRIC_NLL: usize = 1;
 const STEP_METRIC_NLL_DOF: std::ops::Range<usize> = 2..2 + BAR_DOF;
-const STEP_METRIC_DYN: usize = 2 + BAR_DOF;
-const STEP_METRIC_KL: usize = 3 + BAR_DOF;
-const STEP_METRIC_GROWTH_DIAGNOSTIC: usize = 4 + BAR_DOF;
-const STEP_METRIC_GROWTH_STATS: std::ops::Range<usize> =
-    5 + BAR_DOF..5 + BAR_DOF + growth::GROWTH_STAT_COUNT;
-const STEP_METRIC_IDENTITY: usize = 5 + BAR_DOF + growth::GROWTH_STAT_COUNT;
+const STEP_METRIC_DIRECT_T2: usize = STEP_METRIC_NLL_DOF.end;
+const STEP_METRIC_DIRECT_T2_DOF: std::ops::Range<usize> =
+    STEP_METRIC_DIRECT_T2 + 1..STEP_METRIC_DIRECT_T2 + 1 + BAR_DOF;
+const STEP_METRIC_DIRECT_T3: usize = STEP_METRIC_DIRECT_T2_DOF.end;
+const STEP_METRIC_DIRECT_T3_DOF: std::ops::Range<usize> =
+    STEP_METRIC_DIRECT_T3 + 1..STEP_METRIC_DIRECT_T3 + 1 + BAR_DOF;
+const STEP_METRIC_DYN: usize = STEP_METRIC_DIRECT_T3_DOF.end;
+const STEP_METRIC_KL: usize = STEP_METRIC_DYN + 1;
+const STEP_METRIC_GROWTH_DIAGNOSTIC: usize = STEP_METRIC_KL + 1;
+const STEP_METRIC_GROWTH_STATS: std::ops::Range<usize> = STEP_METRIC_GROWTH_DIAGNOSTIC + 1
+    ..STEP_METRIC_GROWTH_DIAGNOSTIC + 1 + growth::GROWTH_STAT_COUNT;
+const STEP_METRIC_IDENTITY: usize = STEP_METRIC_GROWTH_STATS.end;
 const STEP_METRIC_AUTOCORR: usize = STEP_METRIC_IDENTITY + 1;
 const STEP_METRIC_GRAD_NORM: usize = STEP_METRIC_AUTOCORR + 1;
 const STEP_METRIC_BASE_COUNT: usize = STEP_METRIC_GRAD_NORM + 1;
@@ -9322,6 +11001,10 @@ fn pack_step_metrics(
         flat_f32(&graph.loss),
         flat_f32(&graph.nll),
         flat_f32(&graph.nll_dof),
+        flat_f32(&graph.direct_nll[0]),
+        flat_f32(&graph.direct_nll_dof[0]),
+        flat_f32(&graph.direct_nll[1]),
+        flat_f32(&graph.direct_nll_dof[1]),
         flat_f32(&graph.dyn_loss),
         flat_f32(&graph.kl_loss),
         flat_f32(&graph.growth_diagnostic),
@@ -9422,6 +11105,49 @@ fn global_grad_norm_tensor(vs: &nn::VarStore, device: Device) -> Tensor {
                 .sum(Kind::Float)
                 .sqrt()
         }
+    })
+}
+
+/// Cosine alignment and coordinate-level sign conflict between primary h1 NLL and the
+/// unweighted direct h2+h3 objective over parameters shared by both branches.
+fn shared_gradient_diagnostics(vs: &nn::VarStore, graph: &TrainingGraph) -> (f64, f64) {
+    let parameters: Vec<Tensor> = named_trainable_variables(vs)
+        .into_iter()
+        .filter(|(name, _)| {
+            !name.contains("bar_dyn")
+                && !BAR_EMISSION_ADAMW_NAME_SUBSTRINGS
+                    .iter()
+                    .any(|needle| name.contains(needle))
+        })
+        .map(|(_, tensor)| tensor)
+        .collect();
+    let primary = Tensor::run_backward(&[graph.nll.shallow_clone()], &parameters, true, false);
+    let direct_loss = &graph.direct_nll[0] + &graph.direct_nll[1];
+    let direct = Tensor::run_backward(&[direct_loss], &parameters, true, false);
+    tch::no_grad(|| {
+        let dots: Vec<Tensor> = primary
+            .iter()
+            .zip(&direct)
+            .map(|(a, b)| (a * b).sum(Kind::Float))
+            .collect();
+        let p2: Vec<Tensor> = primary
+            .iter()
+            .map(|g| g.square().sum(Kind::Float))
+            .collect();
+        let d2: Vec<Tensor> = direct.iter().map(|g| g.square().sum(Kind::Float)).collect();
+        let conflicts: Vec<Tensor> = primary
+            .iter()
+            .zip(&direct)
+            .map(|(a, b)| (a * b).lt(0.0).to_kind(Kind::Float).sum(Kind::Float))
+            .collect();
+        let dot = Tensor::stack(&dots, 0).sum(Kind::Float);
+        let denom = Tensor::stack(&p2, 0).sum(Kind::Float).sqrt()
+            * Tensor::stack(&d2, 0).sum(Kind::Float).sqrt();
+        let alignment = (&dot / denom.clamp_min(1e-30)).double_value(&[]);
+        let conflict = (Tensor::stack(&conflicts, 0).sum(Kind::Float)
+            / parameters.iter().map(Tensor::numel).sum::<usize>() as f64)
+            .double_value(&[]);
+        (alignment, conflict)
     })
 }
 
@@ -9528,15 +11254,27 @@ fn print_banner(
          parameters ({:?})",
         NUM_BAR_BINS, by_group
     );
-    println!(
-        "corpus         {} symbols, {} unique bars at {}s ({} train / {} val / {} test)",
-        corpus.symbols().len(),
-        corpus.unique_bars(),
-        args.resolution_secs,
-        corpus.split_bars(Split::Train),
-        corpus.split_bars(Split::Val),
-        corpus.split_bars(Split::Test),
-    );
+    if args.defer_test {
+        println!(
+            "corpus         {} symbols, {} unique bars at {}s ({} train / {} val / Test \
+             DEFERRED — count not queried)",
+            corpus.symbols().len(),
+            corpus.unique_bars(),
+            args.resolution_secs,
+            corpus.split_bars(Split::Train),
+            corpus.split_bars(Split::Val),
+        );
+    } else {
+        println!(
+            "corpus         {} symbols, {} unique bars at {}s ({} train / {} val / {} test)",
+            corpus.symbols().len(),
+            corpus.unique_bars(),
+            args.resolution_secs,
+            corpus.split_bars(Split::Train),
+            corpus.split_bars(Split::Val),
+            corpus.split_bars(Split::Test),
+        );
+    }
     let (train_val, val_test) = corpus.split_bounds();
     // The corpus is live and these instants are percentiles of it, so two runs a week apart
     // score different windows unless the bounds are pinned. Print the identity of the data
@@ -9604,18 +11342,28 @@ fn print_banner(
          `dyn` and `kl` are attached NextLat terms (arXiv 2511.05963); `dyn` is smooth_l1 \
          to the stop-gradient belief, meaned over every element of [B, T, {BAR_MODEL_DIM}] \
          exactly as the reference reduces it. Raw-payoff growth is EXCLUDED FROM THE OPTIMIZER \
-         and DIAGNOSTIC-ONLY: under no_grad it evaluates the moment-correct quadratic Kelly \
-         fraction E[R]/E[R²] of the prefix-free p(r|PAST), clamped at {:.1}x, against raw \
-         realized returns with exact -log1p(f_hat R) above the bankruptcy join and the \
-         finite continuation below it. Its retained report objective share is fixed at zero. \
+         and DIAGNOSTIC-ONLY: under no_grad it sizes the prefix-free p(r|PAST) with `{}`, \
+         clamped at {:.1}x, against raw realized returns with exact -log1p(f_hat R) above the \
+         bankruptcy join and the finite continuation below it. Its retained report objective \
+         share is fixed at zero. \
          The run warns when an attached auxiliary holds more than {:.0}% of the objective \
          for {} consecutive steps.",
         args.lambda_dyn,
         args.lambda_kl,
         args.dyn_horizon,
+        args.sizing_rule().label(),
         trade_bench::LEVERAGE_CAP,
         AUX_SHARE_WARN * 100.0,
         AUX_SHARE_WARN_STREAK,
+    );
+    println!(
+        "direct bars    h[t] -> ordinary 300s bar[t+2] base {:e} x {:?}; h[t] -> ordinary \
+         300s bar[t+3] base {:e} x {:?}. Both branches execute in treatment and zero-weight \
+         control; target clock/current market/target same-bar prefix only.",
+        args.direct_t2_weight,
+        DIRECT_T2_STAGE_MULTIPLIER,
+        args.direct_t3_weight,
+        DIRECT_T3_STAGE_MULTIPLIER,
     );
     // This is a contract, not a runtime choice: diagnostics may evaluate another rule, but
     // every optimizer step, promotion guard, reference line, and new checkpoint uses Hard.
@@ -9637,8 +11385,9 @@ fn print_banner(
         args.seed,
     );
     println!(
-        "selection      {SELECTION_METRIC}; predictive scoring contract: {}, weights \
-         {SELECTION_WEIGHTS:?}",
+        "selection      {SELECTION_METRIC}; sizing rule: {}; predictive scoring contract: {}, \
+         weights {SELECTION_WEIGHTS:?}",
+        args.sizing_rule().label(),
         BarScoring::Hard.report_contract(),
     );
     println!(
@@ -9703,6 +11452,7 @@ fn print_banner(
 
     // The deployment resolution owns every number below: these are properties of one
     // fitted support, and blending them across timeframes would report a floor no
+
     // single corpus pays.
     let deployment = supports
         .get(args.resolution_secs)
@@ -9738,6 +11488,133 @@ mod tests {
     use shared::bars::{write_bar_file, PackedBar, FILE_EXTENSION};
 
     const TEST_RES: u32 = 300;
+    #[test]
+    fn resume_runs_the_guard_only_at_an_unentered_increasing_batch_boundary() {
+        let ramp = [1, 2, 2];
+        assert_eq!(
+            resumed_batch_ramp_transition(0, 0, 0, &ramp),
+            None,
+            "fresh startup uses the ordinary stage-entry path"
+        );
+        assert_eq!(
+            resumed_batch_ramp_transition(12, 1, 2, &ramp),
+            None,
+            "a mid-stage resume must not replay its transition"
+        );
+        assert_eq!(
+            resumed_batch_ramp_transition(10, 1, 0, &ramp),
+            Some((0, 1)),
+            "the first unentered step of a larger batch must replay the guard"
+        );
+        assert_eq!(
+            resumed_batch_ramp_transition(20, 2, 0, &ramp),
+            None,
+            "a boundary whose batch does not increase needs no batch hold"
+        );
+    }
+    #[test]
+    fn cuda_visible_mapping_refuses_ambiguous_nvml_ordinals() {
+        assert_eq!(
+            nvml_selector_for_visible(2, None),
+            Some(NvmlDeviceSelector::Ordinal(2))
+        );
+        assert_eq!(
+            nvml_selector_for_visible(0, Some("3,1")),
+            Some(NvmlDeviceSelector::Ordinal(3))
+        );
+        assert_eq!(
+            nvml_selector_for_visible(1, Some("3, 1")),
+            Some(NvmlDeviceSelector::Ordinal(1))
+        );
+        assert_eq!(
+            nvml_selector_for_visible(1, Some("GPU-aaaa,GPU-bbbb")),
+            Some(NvmlDeviceSelector::Uuid("GPU-bbbb".to_owned()))
+        );
+        assert_eq!(nvml_selector_for_visible(0, Some("MIG-aaaa")), None);
+        assert_eq!(nvml_selector_for_visible(2, Some("3,1")), None);
+        assert_eq!(nvml_selector_for_visible(0, Some("")), None);
+        assert_eq!(nvml_selector_for_visible(0, Some("-1")), None);
+        assert_eq!(nvml_selector_for_visible(0, Some("not-a-device")), None);
+
+        assert_eq!(
+            nvml_pci_rank(0, 7, 1, false),
+            Some(0),
+            "one physical device is unambiguous regardless of its external ordinal"
+        );
+        assert_eq!(nvml_pci_rank(1, 0, 1, true), None);
+        assert_eq!(
+            nvml_pci_rank(0, 1, 4, false),
+            None,
+            "multi-GPU numeric ordinals are unsafe without PCI_BUS_ID ordering"
+        );
+        assert_eq!(nvml_pci_rank(0, 1, 4, true), Some(1));
+        assert_eq!(nvml_pci_rank(0, 4, 4, true), None);
+
+        let mut devices = vec![
+            (0, 0x65, 0, "0000:65:00.0".to_owned()),
+            (0, 0x01, 0, "0000:01:00.0".to_owned()),
+            (1, 0x01, 0, "0001:01:00.0".to_owned()),
+        ];
+        sort_pci_devices(&mut devices);
+        assert_eq!(
+            devices
+                .iter()
+                .map(|device| device.3.as_str())
+                .collect::<Vec<_>>(),
+            vec!["0000:01:00.0", "0000:65:00.0", "0001:01:00.0"]
+        );
+        assert!(mig_mode_allows_physical_device(MigModePolicy::Disabled));
+        assert!(mig_mode_allows_physical_device(MigModePolicy::Unsupported));
+        assert!(!mig_mode_allows_physical_device(MigModePolicy::Enabled));
+        assert!(!mig_mode_allows_physical_device(MigModePolicy::Ambiguous));
+    }
+
+    #[test]
+    fn resumed_future_batch_ramp_requires_an_authenticated_armed_footprint() {
+        let mut recovery = BarPretrainRecovery {
+            format_version: BAR_PRETRAIN_RECOVERY_VERSION,
+            total_steps: 90,
+            stage_steps: vec![10, 20, 60],
+            derived_batch_ramp: vec![1, 2, 3],
+            base_batch: 8,
+            requested_batch: 8,
+            exact_batch: false,
+            quadratic_kelly: false,
+            mean_shrink: false,
+            epochs: 1,
+            steps_override: None,
+            dyn_horizon: 1,
+            lambda_dyn: 1.0,
+            lambda_kl: 1.0,
+            direct_t2_weight: 0.0,
+            direct_t3_weight: 0.0,
+            auxiliary_resolutions: Vec::new(),
+            adamw_accumulation_pending: false,
+            activation_bytes_per_token: 480_000.0,
+            activation_device: "GPU-1234:Test GPU".to_owned(),
+            checkpoint_every: DEFAULT_CHECKPOINT_EVERY,
+            validate_every: 1000,
+            ablation_lr: 1e-3,
+            smd_meta_lr: 1e5,
+        };
+        assert_eq!(
+            validate_resume_ramp_footprint(&recovery, true, Some("GPU-1234:Test GPU"))
+                .expect("same-device footprint arms the guard"),
+            Some(480_000.0)
+        );
+
+        recovery.activation_bytes_per_token = 0.0;
+        recovery.activation_device.clear();
+        assert!(
+            validate_resume_ramp_footprint(&recovery, true, Some("GPU-1234:Test GPU")).is_err()
+        );
+
+        recovery.activation_bytes_per_token = 480_000.0;
+        recovery.activation_device = "GPU-other:Other GPU".to_owned();
+        assert!(
+            validate_resume_ramp_footprint(&recovery, true, Some("GPU-1234:Test GPU")).is_err()
+        );
+    }
 
     #[test]
     fn pretraining_initialization_requires_recorded_hard_contract() {
@@ -9821,6 +11698,7 @@ mod tests {
 
     #[test]
     fn emission_heads_retain_reference_cadence_with_decay_free_head_momentum() {
+        let _torch_rng_guard = test_rng::exclusive();
         cap_torch_threads();
         tch::manual_seed(0xAD_A4);
         let vs = nn::VarStore::new(Device::Cpu);
@@ -10388,7 +12266,16 @@ mod tests {
             optimizer_ablation: None,
             ablation_lr: 1e-3,
             smd_meta_lr: 0.05,
+            // Exercise the historical quadratic control in these generic fixtures; sizing-rule
+            // behavior has focused coverage in `trade_bench`.
+            quadratic_kelly: true,
+            mean_shrink: false,
+            // Raw targets, so every existing fixture keeps fitting and scoring the geometry it
+            // always did. The standardized path has its own coverage in `bar_dist`.
+            vol_standardize_targets: false,
             dyn_horizon: 1,
+            direct_t2_weight: 0.0,
+            direct_t3_weight: 0.0,
             lambda_dyn: 1.0,
             lambda_kl: 1.0,
             validation_windows: 3,
@@ -10415,6 +12302,7 @@ mod tests {
             // production default: absent here means "behave exactly as before", which is the
             // correct absent value for a flag that only ever REJECTS a reduction.
             exact_batch: false,
+            defer_test: false,
             // The recipe default, so every trainer test in this file exercises the schedule
             // every persisted run was produced under.
             lr_plateau_fraction: LR_PLATEAU_FRACTION,
@@ -10440,6 +12328,7 @@ mod tests {
         let dir = PathBuf::from(".");
         let mut args = test_args(0x5EED, &dir);
         args.optimizer_ablation = Some(PretrainOptimizerAblation::SmdIdbd);
+        args.exact_batch = true;
         validate_args(&args).expect("the isolated primary-resolution SMD arm is valid");
 
         args.sdlr = true;
@@ -10474,9 +12363,13 @@ mod tests {
             uuid::Uuid::new_v4()
         ));
         let mut args = test_args(0x5EED, &dir);
-        // One window per pinned set and no ancestral samples beyond the minimum: this test is
-        // about the control flow, and the model is a 512-wide 10-layer transformer on CPU.
-        args.validation_windows = 1;
+        // FOUR validation windows, not one. The economics-primary rule cannot promote on a
+        // bench whose traded prefix collapses to a single `(symbol, month)` resampling unit:
+        // the block bootstrap reports no standard error, `candidate_usable` fails, and the
+        // forced final-step promotion this test exists to check never fires. Four windows over
+        // a three-symbol fixture span several units. Snapshots stay at one: they are pictures,
+        // not measurements, and the model is a 512-wide 10-layer transformer on CPU.
+        args.validation_windows = 4;
         args.snapshot_windows = 1;
         // CPU, explicitly: this asserts validation and promotion bookkeeping, none of which
         // is device-dependent, and it must never allocate on a card another tenant owns.
@@ -10520,6 +12413,59 @@ mod tests {
         assert!(
             diag_best.exists(),
             "a run held below the deployed context must still have a defensible best"
+        );
+        // The economic vectors and the geometry digest are what make a below-deployed arm
+        // JUDGEABLE, and they are exactly what used to be missing: the edge was computed only
+        // inside the `deployed_ready` branch, which this run never enters. They now ride in
+        // via `window_scores`, which every validation calls before `keep_context_best`.
+        let diag_scores = WindowScores::load(&window_scores_path(&diag_best))
+            .expect("the diagnostic best must carry a loadable per-window vector");
+        assert_eq!(diag_scores.format_version, WINDOW_SCORES_FORMAT_VERSION);
+        assert_eq!(
+            diag_scores.supports_sha256.as_deref(),
+            Some(trainer.supports_sha256.as_str()),
+            "the vector must name the bin geometry it was scored in, or `pretrain-compare` \
+             cannot refuse a refitted-support pair"
+        );
+        let edge = diag_scores
+            .selection_edge_bps
+            .as_deref()
+            .expect("a stage-0 validation must record its per-window selection edge");
+        let growth = diag_scores
+            .model_growth_bps
+            .as_deref()
+            .expect("a stage-0 validation must record its per-window model growth");
+        let traded = diag_scores
+            .traded_blocks
+            .as_deref()
+            .expect("a stage-0 validation must record its traded prefix's blocking");
+        assert_eq!(edge.len(), growth.len());
+        assert_eq!(
+            edge.len(),
+            traded.len(),
+            "the economic vectors are indexed by the traded prefix, so a blocking of a \
+             different length would misalign them window for window"
+        );
+        assert!(
+            traded.len() <= diag_scores.windows.len(),
+            "the bench trades a PREFIX of the pinned set"
+        );
+        assert!(
+            edge.iter().chain(growth).all(|value| value.is_finite()),
+            "a non-finite economic value would make the artifact unloadable and the arm \
+             unjudgeable"
+        );
+        // The MZ slope is dimensionless, so it is the one calibration ruler that survives a
+        // change of bin geometry. It is worth nothing to the campaign unless it is recorded
+        // at the same cadence as the economics, which is every validation.
+        let calibration = diag_scores
+            .calibration
+            .as_ref()
+            .expect("a stage-0 validation must record the bench's Mincer-Zarnowitz fit");
+        assert!(
+            calibration.mean_beta.0.is_finite() && calibration.mean_beta_se.0.is_finite(),
+            "an unmeasured slope must be absent, never a NaN that reads as a measured \
+             miscalibration: {calibration:?}"
         );
         let best_at_diag = trainer
             .best_by_context
@@ -10589,6 +12535,25 @@ mod tests {
         trainer
             .validate(last, false, true)
             .expect("final validation");
+        // The precondition, asserted before the consequence it causes. A forced promotion is
+        // reachable only through `candidate_usable`, which needs a finite standard error on the
+        // traded prefix. If the fixture ever shrinks below two resampling units this fails here,
+        // naming the reason, instead of failing below as a bare `promotions != 1` whose cause is
+        // three call layers away. `Unmeasurable` is "no comparison was made" and is a different
+        // state from every `Refused*` outcome, which mean one was made and the candidate lost.
+        assert_ne!(
+            trainer.last_selection.outcome,
+            SelectionOutcome::Unmeasurable,
+            "the bench produced no interval to decide on, so nothing below is a test of the \
+             promotion rule: {:?}",
+            trainer.last_selection
+        );
+        assert!(
+            trainer.last_selection.edge_se_bps.is_finite(),
+            "the economic criterion must be decided against a measured standard error, not a \
+             NaN that silently disables the rule: {:?}",
+            trainer.last_selection
+        );
         assert_eq!(
             trainer.promotions, 1,
             "the final step must promote at the reached context rather than leave nothing"
@@ -10888,8 +12853,8 @@ mod tests {
     /// the probe releases the allocator pool, and on CPU there is no pool to release and no
     /// NVML to read, which is why the reading is `None` while the passes still run.
     ///
-    /// Driven at a short context on a full-size model: the invariant is context-independent
-    /// and a 2048-bar CPU pass is not a unit test.
+    /// Driven at the first context the training ramp actually executes. The invariant is
+    /// context-independent, and a deployed 2048-bar CPU pass is not a unit test.
     #[test]
     fn the_capacity_probe_leaves_no_trace_in_the_run_it_measures() {
         let _torch_rng_guard = test_rng::exclusive();
@@ -10936,6 +12901,11 @@ mod tests {
         let sample = sampler.batch_of(&refs, trainer.device);
         let growth_support = GrowthSupport::new(&trainer.supports_dev, trainer.device)
             .expect("the test support carries the growth diagnostic");
+        let context = stage_context(0);
+        assert_eq!(
+            context, BAR_CONTEXT_RAMP_START,
+            "the trace-free probe must exercise the first executed ramp context"
+        );
         let reading = probe_shape_used_bytes(
             &trainer.modules,
             &trainer.supports_dev,
@@ -10943,7 +12913,7 @@ mod tests {
             &sample,
             &trainer.args,
             &mut trainer.optimizer,
-            128,
+            context,
             trainer.device,
         )
         .expect("the selected optimizer backward must succeed");
@@ -11003,18 +12973,21 @@ mod tests {
         let mut args = test_args(0x5EED, &dir);
         args.validation_windows = 1;
         args.snapshot_windows = 1;
+        args.checkpoint_every = 100;
         // Pruning is a decision about file names; the device is irrelevant and a visible card
         // would only mean allocating on someone else's GPU to rename files.
         let trainer =
             build_trainer(args, &runs.display().to_string(), Device::Cpu).expect("trainer builds");
         let weights = trainer.run.weights.clone();
         // Stand-in artifacts: pruning is a decision about file NAMES, and a real
-        // `write_checkpoint` here would move a gigabyte of weights to say nothing more.
-        let tags = [100usize, 200, 300, 400, 500];
+        // `write_checkpoint` here would move a gigabyte of weights to say nothing more. The
+        // fixture has nine total steps, so step 8 is its off-grid semantic final checkpoint.
+        let tags = [7usize, 8, 100, 200, 300, 400, 500];
         for tag in tags {
             let path = weights.join(format!("pretrain_step_{tag}.ot"));
             std::fs::write(&path, b"weights").expect("step artifact");
             std::fs::write(world_model_metadata_path(&path), b"{}").expect("metadata");
+            std::fs::write(world_model_optimizer_path(&path), b"optimizer").expect("optimizer");
             std::fs::write(
                 world_model_supports_path(&path, trainer.args.resolution_secs),
                 b"{}",
@@ -11041,27 +13014,31 @@ mod tests {
             .collect();
         assert_eq!(
             kept,
-            vec![300, 400, 500],
-            "the newest {RETAINED_STEP_CHECKPOINTS} step checkpoints and no others must \
-             survive. `test_args` is a single-pass run, so `plateau_anchor_tags` returns \
-             nothing and exempts nothing: a one-pass run has no repetition boundary to \
-             bracket. Anchors widening this window is asserted separately."
+            vec![8, 300, 400, 500],
+            "the off-grid semantic final step must survive IN ADDITION TO the newest \
+             {RETAINED_STEP_CHECKPOINTS} periodic checkpoints. `test_args` is a single-pass \
+             run, so `plateau_anchor_tags` returns nothing and exempts no additional cadence \
+             points."
         );
-        for tag in [100usize, 200] {
+        for tag in [7usize, 100, 200] {
             let path = weights.join(format!("pretrain_step_{tag}.ot"));
             assert!(
                 !world_model_metadata_path(&path).exists()
+                    && !world_model_optimizer_path(&path).exists()
                     && !window_scores_path(&path).exists()
                     && !world_model_supports_path(&path, trainer.args.resolution_secs).exists(),
                 "pruning must take the sidecars with the weights, or the directory fills with \
                  orphans that name a file that no longer exists"
             );
         }
-        for tag in [300usize, 400, 500] {
+        for tag in [8usize, 300, 400, 500] {
             let path = weights.join(format!("pretrain_step_{tag}.ot"));
             assert!(
-                world_model_metadata_path(&path).exists() && window_scores_path(&path).exists(),
-                "a retained checkpoint must keep the sidecars that make it loadable"
+                world_model_metadata_path(&path).exists()
+                    && world_model_optimizer_path(&path).exists()
+                    && world_model_supports_path(&path, trainer.args.resolution_secs).exists()
+                    && window_scores_path(&path).exists(),
+                "a retained checkpoint must keep every sidecar that makes it loadable"
             );
         }
         for name in spared {
@@ -11092,7 +13069,7 @@ mod tests {
         // boundary is inside the plateau with 2073 steps of margin.
         assert_eq!(
             plateau_anchor_tags(&cadence, 10365, 31095, LR_PLATEAU_FRACTION),
-            vec![10240, 10752, 5120],
+            vec![10240, 12288, 6144],
             "the straddling pair comes first because it carries the discontinuity, then the \
              all-fresh baseline at the midpoint of the first pass"
         );
@@ -11125,20 +13102,20 @@ mod tests {
         // boundary 2073 steps inside it, and the anchors come back.
         assert_eq!(
             plateau_anchor_tags(&cadence, 10365, 20730, 0.60),
-            vec![10240, 10752, 5120],
+            vec![10240, 12288, 6144],
             "at F = 0.60 a two-epoch run identifies repetition, and --lr-plateau-fraction is \
              what makes that reachable"
         );
 
         // Cadence wrote nothing after the boundary: no post-repetition side, no kink.
-        let short: Vec<usize> = (1..=20).map(|k| k * DEFAULT_CHECKPOINT_EVERY).collect();
+        let short: Vec<usize> = (1..=5).map(|k| k * DEFAULT_CHECKPOINT_EVERY).collect();
         assert!(
             plateau_anchor_tags(&short, 10365, 31095, LR_PLATEAU_FRACTION).is_empty(),
             "without an artifact past the boundary there is no discontinuity to measure"
         );
 
         // A random init is never an anchor: it would measure "learned to predict at all".
-        let with_zero = vec![0usize, 10240, 10752];
+        let with_zero = vec![0usize, 10240, 12288];
         assert!(
             !plateau_anchor_tags(&with_zero, 10365, 31095, LR_PLATEAU_FRACTION).contains(&0),
             "step 0 is an untrained model and must never anchor a trend"
@@ -11172,6 +13149,7 @@ mod tests {
             uuid::Uuid::new_v4()
         ));
         let mut args = test_args(0x5EED, &dir);
+        args.checkpoint_every = 1;
         args.validation_windows = 1;
         args.snapshot_windows = 1;
         // CPU, explicitly: this is bookkeeping about which weights land in which file, none of
@@ -11179,18 +13157,14 @@ mod tests {
         let mut trainer =
             build_trainer(args, &runs.display().to_string(), Device::Cpu).expect("trainer builds");
         let weights = trainer.run.weights.clone();
-        // The fixture's ramp never reaches the deployed context, so the promotion this needs is
-        // the forced one `validate` takes on its final step. That is also the promotion that
-        // produced the defect, because it writes `best` from the LIVE weights.
-        trainer.reached_context = trainer.eval.diagnostic.context;
-        trainer
-            .validate(0, false, true)
-            .expect("the promoting validation runs");
-        assert_eq!(
-            trainer.promotions, 1,
-            "the scenario is meaningless without a promotion for `last` to be confused with"
-        );
+        // Seed the incumbent artifact directly from the live weights. Promotion eligibility is
+        // a separate statistical contract and can legitimately refuse this tiny corpus; this
+        // checkpoint test needs only the exact ordering that exposed job 2884: an immutable
+        // selected artifact, further optimizer steps, then recovery publication.
         let best = weights.join("pretrain_best.ot");
+        trainer
+            .write_checkpoint(&best, 0, trainer.eval.diagnostic.context, None)
+            .expect("seed selected artifact");
         let promoted = checkpoint_parameters(&best);
 
         // Optimizer steps AFTER the promotion. `optimizer_step` takes its context from the
@@ -11199,7 +13173,7 @@ mod tests {
             let sampler = &trainer.train_samplers[0];
             sampler.batch_of(&sampler.batch_refs(0, 0, 1), trainer.device)
         };
-        for step in 4..7 {
+        for step in 0..7 {
             trainer
                 .optimizer_step(&sample, step, None)
                 .expect("optimizer step");
@@ -11220,6 +13194,25 @@ mod tests {
         trainer.write_step_artifacts(6).expect("step artifacts");
 
         let last = weights.join("pretrain_last.ot");
+        let tagged = weights.join("pretrain_step_6.ot");
+        assert_recovery_aliases(&tagged, &last, trainer.args.resolution_secs);
+        let first_hashes = recovery_hashes(&last, trainer.args.resolution_secs);
+        #[cfg(unix)]
+        let first_identities = recovery_identities(&last, trainer.args.resolution_secs);
+        trainer
+            .write_step_artifacts(6)
+            .expect("publishing the already committed terminal step is a no-op");
+        assert_eq!(
+            recovery_hashes(&last, trainer.args.resolution_secs),
+            first_hashes,
+            "terminal finalization must not rewrite an already committed cadence bundle"
+        );
+        #[cfg(unix)]
+        assert_eq!(
+            recovery_identities(&last, trainer.args.resolution_secs),
+            first_identities,
+            "a no-op terminal publication must preserve every inode"
+        );
         let written = checkpoint_parameters(&last);
         assert_eq!(
             max_abs_parameter_diff(&written, &live),
@@ -11235,10 +13228,7 @@ mod tests {
              {differs}; infinity would mean the comparison is impossible, not that it passed"
         );
         assert_eq!(
-            max_abs_parameter_diff(
-                &written,
-                &checkpoint_parameters(&weights.join("pretrain_step_6.ot"))
-            ),
+            max_abs_parameter_diff(&written, &checkpoint_parameters(&tagged)),
             0.0,
             "`last` and the step-tagged snapshot of the same step must be the same weights, or a \
              directory listing can again show a step file NEWER than `last`"
@@ -11254,6 +13244,30 @@ mod tests {
         // artifact itself.
         let metadata = BarWorldModelMetadata::load(&world_model_metadata_path(&last))
             .expect("the last checkpoint's metadata reads back");
+        assert_eq!(
+            metadata.checkpoint_sha256,
+            file_sha256(&last).expect("hash last weights")
+        );
+        let optimizer_hash =
+            file_sha256(&world_model_optimizer_path(&last)).expect("hash last optimizer");
+        assert_eq!(
+            metadata
+                .optimizer_checkpoint_sha256
+                .as_ref()
+                .expect("recovery metadata authenticates optimizer"),
+            &optimizer_hash
+        );
+        assert_eq!(
+            metadata
+                .supports_sha256
+                .get(&trainer.args.resolution_secs)
+                .expect("recovery metadata authenticates supports"),
+            &file_sha256(&world_model_supports_path(
+                &last,
+                trainer.args.resolution_secs
+            ))
+            .expect("hash last supports")
+        );
         let provenance = metadata
             .training
             .as_ref()
@@ -11273,7 +13287,86 @@ mod tests {
              nobody ever reported"
         );
 
+        // Advance once more. The old immutable tag must remain byte-identical while all four
+        // `last` names move through metadata-last, fail-closed replacement to the new bundle.
+        let step_six_hashes = recovery_hashes(&tagged, trainer.args.resolution_secs);
+        trainer
+            .optimizer_step(&sample, 7, None)
+            .expect("next optimizer step");
+        let advanced_live = live_parameters(&trainer.vs);
+        trainer
+            .write_step_artifacts(7)
+            .expect("next recovery publication");
+        let advanced_tagged = weights.join("pretrain_step_7.ot");
+        assert_recovery_aliases(&advanced_tagged, &last, trainer.args.resolution_secs);
+        assert_eq!(
+            recovery_hashes(&tagged, trainer.args.resolution_secs),
+            step_six_hashes,
+            "advancing `last` must not mutate or rewrite the prior immutable tagged bundle"
+        );
+        assert_eq!(
+            max_abs_parameter_diff(&checkpoint_parameters(&last), &advanced_live),
+            0.0,
+            "the atomically advanced alias must hold the newly completed optimizer step"
+        );
+        let advanced_metadata = BarWorldModelMetadata::load(world_model_metadata_path(&last))
+            .expect("advanced metadata reads back");
+        assert_eq!(
+            advanced_metadata
+                .training
+                .as_ref()
+                .and_then(|training| training.global_step),
+            Some(7),
+            "metadata is the commit marker and must advance with the other three aliases"
+        );
+        #[cfg(unix)]
+        assert!(
+            recovery_identities(&last, trainer.args.resolution_secs)
+                .iter()
+                .zip(first_identities.iter())
+                .all(|(advanced, previous)| advanced != previous),
+            "every `last` path must replace the previous bundle's inode"
+        );
+
         std::fs::remove_dir_all(&runs).ok();
+    }
+
+    fn recovery_bundle_paths(weights: &Path, resolution_secs: u32) -> [PathBuf; 4] {
+        [
+            weights.to_path_buf(),
+            world_model_optimizer_path(weights),
+            world_model_supports_path(weights, resolution_secs),
+            world_model_metadata_path(weights),
+        ]
+    }
+
+    fn recovery_hashes(weights: &Path, resolution_secs: u32) -> [String; 4] {
+        recovery_bundle_paths(weights, resolution_secs)
+            .map(|path| file_sha256(&path).expect("recovery artifact hashes"))
+    }
+
+    fn assert_recovery_aliases(tagged: &Path, last: &Path, resolution_secs: u32) {
+        assert_eq!(
+            recovery_hashes(tagged, resolution_secs),
+            recovery_hashes(last, resolution_secs),
+            "tagged and last names must expose byte-identical recovery bundles"
+        );
+        #[cfg(unix)]
+        assert_eq!(
+            recovery_identities(tagged, resolution_secs),
+            recovery_identities(last, resolution_secs),
+            "each last artifact must be a hardlink to its canonical tagged source"
+        );
+    }
+
+    #[cfg(unix)]
+    fn recovery_identities(weights: &Path, resolution_secs: u32) -> [(u64, u64); 4] {
+        use std::os::unix::fs::MetadataExt;
+
+        recovery_bundle_paths(weights, resolution_secs).map(|path| {
+            let metadata = fs::metadata(&path).expect("recovery artifact metadata");
+            (metadata.dev(), metadata.ino())
+        })
     }
 
     /// Parameters as libtorch wrote them, keyed by name. `Tensor::load_multi` reads the
@@ -11355,16 +13448,30 @@ mod tests {
         assert_eq!(train_b[0].seed(), 0x5EED + 1);
         assert_ne!(train_a[0].seed(), train_b[0].seed());
 
+        let TestEvaluationSets::Prepared {
+            deployed: test_a,
+            diagnostic: test_diagnostic_a,
+            snapshot: test_snapshot_a,
+        } = &eval_a.test
+        else {
+            panic!("default evaluation must prepare the terminal Test sets");
+        };
+        let TestEvaluationSets::Prepared {
+            deployed: test_b,
+            diagnostic: test_diagnostic_b,
+            snapshot: test_snapshot_b,
+        } = &eval_b.test
+        else {
+            panic!("default evaluation must prepare the terminal Test sets");
+        };
+
         for (name, a, b) in [
             ("promotion", &eval_a.promotion, &eval_b.promotion),
             ("diagnostic", &eval_a.diagnostic, &eval_b.diagnostic),
             ("snapshot", &eval_a.snapshot, &eval_b.snapshot),
-            ("test", &eval_a.test, &eval_b.test),
-            (
-                "test_snapshot",
-                &eval_a.test_snapshot,
-                &eval_b.test_snapshot,
-            ),
+            ("test", test_a, test_b),
+            ("test_diagnostic", test_diagnostic_a, test_diagnostic_b),
+            ("test_snapshot", test_snapshot_a, test_snapshot_b),
         ] {
             assert_eq!(
                 a.sampler.seed(),
@@ -11377,6 +13484,21 @@ mod tests {
                 a.windows, b.windows,
                 "{name} windows moved when the training seed changed"
             );
+        }
+    }
+
+    #[test]
+    fn deferred_test_evaluation_constructs_only_validation_sets() {
+        let (_fx, corpus) = corpus_fixture("deferred_test_sets");
+        let dir = PathBuf::from(corpus.dir());
+        let mut args = test_args(0x5EED, &dir);
+        args.defer_test = true;
+
+        let eval = EvaluationSets::new(&corpus, &args).expect("validation sets should build");
+        assert!(matches!(eval.test, TestEvaluationSets::Deferred));
+        for set in [&eval.diagnostic, &eval.promotion, &eval.snapshot] {
+            assert_eq!(set.sampler.split(), Split::Val);
+            assert!(!set.windows.is_empty());
         }
     }
 
@@ -11422,50 +13544,206 @@ mod tests {
         }
     }
 
-    /// SETUP-PROV-010. Supports may only be reused when they provably belong to this
-    /// corpus, or when the operator says so out loud.
+    /// A custom `--supports` fit publishes only its requested, authenticated artifact. It must
+    /// neither create the corpus's conventional cache as an intermediate nor replace an existing
+    /// authenticated cache; fitting at the conventional path must remain reusable without a
+    /// freeze override.
     #[test]
-    fn cached_supports_are_refused_unless_their_provenance_matches() {
+    fn support_fits_persist_once_at_the_authenticated_requested_destination() {
+        let (_fx, corpus) = corpus_fixture("support_destination");
+        let fingerprint = corpus.identity_fingerprint();
+        let default_path = corpus.supports_path();
+        let custom_dir = PathBuf::from(corpus.dir()).join("explicit");
+        let custom_path = custom_dir.join("requested-supports.json");
+        let fit = SupportsFit {
+            samples: 2_048,
+            seed: 0x5EED,
+            freeze: false,
+        };
+
+        assert!(!default_path.exists());
+        assert!(!custom_path.exists());
+        let (custom, custom_frozen) =
+            fit_supports_at(&corpus, &custom_path, fit, &fingerprint).expect("custom supports fit");
+        assert!(!custom_frozen);
+        assert!(
+            custom_path.is_file(),
+            "the requested artifact must be published"
+        );
+        assert!(
+            !default_path.exists(),
+            "a custom fit must not create the conventional cache as an intermediate"
+        );
+        let loaded_custom = BarSupports::load(&custom_path).expect("custom artifact reloads");
+        assert_eq!(loaded_custom.provenance(), custom.provenance());
+        assert!(!require_supports_provenance(
+            loaded_custom.provenance(),
+            &custom_path,
+            &fingerprint,
+            corpus.split_bounds(),
+            fit,
+            corpus.dof_scaling(),
+        )
+        .expect("custom artifact is authenticated"));
+        let persisted: serde_json::Value =
+            serde_json::from_slice(&fs::read(&custom_path).expect("read support JSON"))
+                .expect("parse support JSON");
+        assert_eq!(
+            persisted["provenance"]["sample_count"],
+            serde_json::json!(fit.samples)
+        );
+        assert_eq!(
+            persisted["provenance"]["fit_seed"],
+            serde_json::json!(fit.seed)
+        );
+        for mismatch in [
+            SupportsFit {
+                seed: fit.seed ^ 1,
+                ..fit
+            },
+            SupportsFit {
+                samples: fit.samples + 1,
+                ..fit
+            },
+        ] {
+            assert!(
+                fit_supports_at(&corpus, &custom_path, mismatch, &fingerprint).is_err(),
+                "a different requested seed or sample count must not validate an existing fit"
+            );
+        }
+        assert_eq!(
+            fs::read_dir(&custom_dir)
+                .expect("custom destination directory")
+                .count(),
+            1,
+            "atomic publication must not leave a staging artifact"
+        );
+
+        fit_supports_at(&corpus, &default_path, fit, &fingerprint).expect("default supports fit");
+        let loaded_default = BarSupports::load(&default_path).expect("default artifact reloads");
+        assert!(!require_supports_provenance(
+            loaded_default.provenance(),
+            &default_path,
+            &fingerprint,
+            corpus.split_bounds(),
+            fit,
+            corpus.dof_scaling(),
+        )
+        .expect("default artifact is authenticated"));
+        let default_before_custom_refit =
+            fs::read(&default_path).expect("snapshot authenticated default artifact");
+
+        let second_custom_path = custom_dir.join("second-requested-supports.json");
+        fit_supports_at(&corpus, &second_custom_path, fit, &fingerprint)
+            .expect("second custom supports fit");
+        assert!(second_custom_path.is_file());
+        assert_eq!(
+            fs::read(&default_path).expect("default artifact remains readable"),
+            default_before_custom_refit,
+            "a custom fit must not replace an existing conventional cache"
+        );
+    }
+
+    /// SETUP-PROV-010. Supports may only be reused when every fit input is authenticated, or
+    /// when the training operator deliberately freezes the mismatched geometry.
+    #[test]
+    fn cached_supports_are_refused_unless_their_complete_provenance_matches() {
         let path = Path::new("long_data/bars/bar_supports.300.json");
         let mine = "a".repeat(64);
         let theirs = "b".repeat(64);
         let bounds = (1_700_000_000_000i64, 1_710_000_000_000i64);
+        let fit = SupportsFit {
+            samples: 4_000_000,
+            seed: 0x5EED,
+            freeze: false,
+        };
         let stamped = |fingerprint: &str| BarSupportsProvenance {
             corpus_fingerprint: fingerprint.to_owned(),
             split_bounds: bounds,
-            sample_count: 4_000_000,
+            sample_count: fit.samples,
+            fit_seed: Some(fit.seed),
+            scaling_contract: Some(DofScaling::Raw.scaling_contract().to_owned()),
+            support_semantics: Some(BAR_SUPPORTS_SEMANTICS_CONTRACT.to_owned()),
             fitted_utc: "2026-08-15T00:00:00Z".to_owned(),
         };
 
-        // Matching provenance: reused, and not flagged as a deliberate freeze.
         let matched = stamped(&mine);
-        assert!(
-            !require_supports_provenance(Some(&matched), path, &mine, bounds, false)
-                .expect("a matching fingerprint is reusable")
-        );
+        assert!(!require_supports_provenance(
+            Some(&matched),
+            path,
+            &mine,
+            bounds,
+            fit,
+            DofScaling::Raw,
+        )
+        .expect("complete matching provenance is reusable"));
 
-        // A different corpus is a hard error by default — this is the case that used to
-        // pass on a bin-count check alone.
         let foreign = stamped(&theirs);
-        let refused = require_supports_provenance(Some(&foreign), path, &mine, bounds, false)
-            .expect_err("a foreign fingerprint must be refused");
+        let refused =
+            require_supports_provenance(Some(&foreign), path, &mine, bounds, fit, DofScaling::Raw)
+                .expect_err("a foreign fingerprint must be refused");
         let message = format!("{refused:#}");
         assert!(
             message.contains("--freeze-supports"),
-            "the error must name the way to proceed deliberately: {message}"
+            "the error must name the deliberate training override: {message}"
         );
 
-        // A provenance-free legacy artifact is equally unverifiable, so equally refused.
-        assert!(require_supports_provenance(None, path, &mine, bounds, false).is_err());
-
-        // With the flag, both are accepted AND reported as frozen, so the checkpoint can
-        // record that comparability was bought deliberately.
+        let mut seedless = stamped(&mine);
+        seedless.fit_seed = None;
+        assert!(require_supports_provenance(
+            Some(&seedless),
+            path,
+            &mine,
+            bounds,
+            fit,
+            DofScaling::Raw,
+        )
+        .is_err());
+        assert!(require_supports_provenance(
+            Some(&matched),
+            path,
+            &mine,
+            bounds,
+            SupportsFit {
+                seed: fit.seed ^ 1,
+                ..fit
+            },
+            DofScaling::Raw,
+        )
+        .is_err());
+        assert!(require_supports_provenance(
+            Some(&matched),
+            path,
+            &mine,
+            bounds,
+            SupportsFit {
+                samples: fit.samples - 1,
+                ..fit
+            },
+            DofScaling::Raw,
+        )
+        .is_err());
         assert!(
-            require_supports_provenance(Some(&foreign), path, &mine, bounds, true)
-                .expect("--freeze-supports accepts a mismatch")
+            require_supports_provenance(None, path, &mine, bounds, fit, DofScaling::Raw,).is_err()
         );
-        assert!(require_supports_provenance(None, path, &mine, bounds, true)
-            .expect("--freeze-supports accepts a legacy artifact"));
+
+        let frozen = SupportsFit {
+            freeze: true,
+            ..fit
+        };
+        assert!(require_supports_provenance(
+            Some(&foreign),
+            path,
+            &mine,
+            bounds,
+            frozen,
+            DofScaling::Raw,
+        )
+        .expect("--freeze-supports accepts a mismatch during training"));
+        assert!(
+            require_supports_provenance(None, path, &mine, bounds, frozen, DofScaling::Raw,)
+                .expect("--freeze-supports accepts a legacy artifact during training")
+        );
     }
 
     /// Pinned instants must survive to the corpus unchanged, or a campaign that thinks it
@@ -11725,27 +14003,45 @@ mod tests {
             loss: scalar(1.0),
             nll: scalar(2.0),
             nll_dof: Tensor::from_slice(&[3.0f32, 4.0, 5.0, 6.0, 7.0]),
-            dyn_loss: scalar(8.0),
-            kl_loss: scalar(9.0),
-            growth_diagnostic: scalar(10.0),
-            growth_stats: Tensor::from_slice(&[11.0f32, 12.0, 13.0]),
-            identity: scalar(14.0),
-            autocorr: scalar(15.0),
+            direct_nll: [scalar(8.0), scalar(14.0)],
+            direct_nll_dof: [
+                Tensor::from_slice(&[9.0f32, 10.0, 11.0, 12.0, 13.0]),
+                Tensor::from_slice(&[15.0f32, 16.0, 17.0, 18.0, 19.0]),
+            ],
+            direct_target_count: [scalar(29.0), scalar(30.0)],
+            dyn_loss: scalar(20.0),
+            kl_loss: scalar(21.0),
+            growth_diagnostic: scalar(22.0),
+            growth_stats: Tensor::from_slice(&[23.0f32, 24.0, 25.0]),
+            identity: scalar(26.0),
+            autocorr: scalar(27.0),
         };
-        let packed = pack_step_metrics(&graph, &scalar(16.0), None, None);
+        let packed = pack_step_metrics(&graph, &scalar(28.0), None, None);
         assert_eq!(packed.size(), [STEP_METRIC_BASE_COUNT as i64]);
         let read = read_packed_step_metrics(&packed);
         assert_eq!(
             &read[..STEP_METRIC_BASE_COUNT],
             &[
-                1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0, 13.0, 14.0, 15.0,
-                16.0,
+                1.0, // total loss
+                2.0, // one-step NLL
+                3.0, 4.0, 5.0, 6.0, 7.0, // one-step NLL by geometry DOF
+                8.0, // direct t+2 NLL
+                9.0, 10.0, 11.0, 12.0, 13.0, // direct t+2 NLL by geometry DOF
+                14.0, // direct t+3 NLL
+                15.0, 16.0, 17.0, 18.0, 19.0, // direct t+3 NLL by geometry DOF
+                20.0, // dynamics loss
+                21.0, // KL loss
+                22.0, // growth diagnostic
+                23.0, 24.0, 25.0, // growth statistics
+                26.0, // identity baseline
+                27.0, // autocorrelation
+                28.0, // gradient norm
             ]
         );
         assert!(read[STEP_METRIC_ROW_LR].iter().all(|value| value.is_nan()));
 
         let row_lr = Tensor::arange(ROW_LR_METRIC_COUNT as i64, (Kind::Float, Device::Cpu));
-        let packed = pack_step_metrics(&graph, &scalar(16.0), Some(&row_lr), None);
+        let packed = pack_step_metrics(&graph, &scalar(28.0), Some(&row_lr), None);
         assert_eq!(packed.size(), [STEP_METRIC_ROW_LR.end as i64]);
         let read = read_packed_step_metrics(&packed);
         assert_eq!(
@@ -11756,7 +14052,7 @@ mod tests {
         );
 
         let smd = Tensor::arange(SMD_METRIC_COUNT as i64, (Kind::Float, Device::Cpu));
-        let packed = pack_step_metrics(&graph, &scalar(16.0), None, Some(&smd));
+        let packed = pack_step_metrics(&graph, &scalar(28.0), None, Some(&smd));
         assert_eq!(packed.size(), [STEP_METRIC_COUNT as i64]);
         let read = read_packed_step_metrics(&packed);
         assert!(read[STEP_METRIC_ROW_LR].iter().all(|value| value.is_nan()));
@@ -12145,6 +14441,266 @@ mod tests {
         (dof, time_ids)
     }
 
+    /// The causal volatility column a [`DofScaling::Raw`] batch carries: identically one on
+    /// every bar, because that is the divisor the raw path applies. Passing it keeps the
+    /// control's growth diagnostic bit-for-bit what it was before the column existed.
+    fn raw_sigma(dof: &Tensor) -> Tensor {
+        let [batch, len, _] = dof.size().try_into().expect("a [B, L, BAR_DOF] window");
+        Tensor::ones([batch, len], (Kind::Float, dof.device()))
+    }
+
+    #[test]
+    fn direct_horizon_stage_weights_remain_active_through_deployed_context() {
+        let schedule = equal_stages(300, 8, BATCH_RAMP);
+        let mut reached_deployed_stage = false;
+        for step in 0..schedule.total_steps {
+            let stage = schedule.stage(step);
+            reached_deployed_stage |= stage == RAMP_STAGES - 1;
+            assert_eq!(direct_horizon_weights(stage, 2.0, 4.0), (1.0, 1.0));
+        }
+        assert!(reached_deployed_stage);
+    }
+
+    #[test]
+    fn direct_exact_comparator_slices_fit_diagnostic_and_deployed_boundaries() {
+        for (context, expected_beliefs, expected_pairs) in
+            [(896, 898, [896, 896]), (2048, 2048, [2047, 2046])]
+        {
+            let belief_context = direct_exact_belief_context(context);
+            assert_eq!(belief_context, expected_beliefs);
+            let beliefs = Tensor::zeros([1, belief_context, 1], (Kind::Float, Device::Cpu));
+            for (slot, horizon) in [2usize, 3].into_iter().enumerate() {
+                let paired_context =
+                    direct_exact_comparator_context(context, belief_context, horizon);
+                assert_eq!(paired_context, expected_pairs[slot]);
+                let slice = beliefs.narrow(1, horizon as i64 - 1, paired_context);
+                assert_eq!(slice.size(), [1, paired_context, 1]);
+            }
+        }
+    }
+
+    #[test]
+    fn direct_logits_obey_decision_time_and_same_target_prefix_causality() {
+        let _torch_rng_guard = test_rng::exclusive();
+        tch::manual_seed(0xD123);
+        let vs = nn::VarStore::new(Device::Cpu);
+        let modules = BarModules::new(&vs.root());
+        let supports = synthetic_supports();
+        let (dof, time_ids) = synthetic_window(1, 4, 0xCA11);
+        // Wake the same-bar prefix table so the structural mask is observable.
+        let prefix_values = Tensor::arange(
+            vs.variables()["bar_prefix_embed_direct_h2"].numel() as i64,
+            (Kind::Float, Device::Cpu),
+        )
+        .reshape(vs.variables()["bar_prefix_embed_direct_h2"].size())
+            / vs.variables()["bar_prefix_embed_direct_h2"].numel() as f64;
+        tch::no_grad(|| {
+            for name in ["bar_prefix_embed_direct_h2", "bar_prefix_embed_direct_h3"] {
+                vs.variables()[name].shallow_clone().copy_(&prefix_values);
+            }
+        });
+        let logits = |dof: &Tensor, time_ids: &Tensor, target_bins: &Tensor| {
+            let input = dof.narrow(1, 0, 1);
+            let input_bins = supports.bin_ids(&input);
+            let h = modules
+                .trunk
+                .forward(&input, &input_bins, &time_ids.narrow(1, 0, 1), 0, false);
+            let conditioning = modules
+                .trunk
+                .forecast_conditioning(&time_ids.narrow(1, 2, 1), &time_ids.narrow(1, 0, 1));
+            modules
+                .head
+                .direct_logits(&h, &conditioning, target_bins, 2)
+        };
+        let target_bins = supports.bin_ids(&dof.narrow(1, 2, 1));
+        let base = logits(&dof, &time_ids, &target_bins);
+
+        let intervening = dof.copy();
+        let _ = intervening.narrow(1, 1, 1).fill_(9.0);
+        let intervening_logits = logits(&intervening, &time_ids, &target_bins);
+        assert_eq!(
+            (&base - &intervening_logits).abs().max().double_value(&[]),
+            0.0,
+            "an intervening realized bar leaked into direct h2"
+        );
+
+        let future_market = time_ids.copy();
+        for slot in crate::torch::dataset::BAR_TIME_MARKET {
+            let _ = future_market
+                .narrow(1, 2, 1)
+                .narrow(-1, slot as i64, 1)
+                .fill_(1);
+        }
+        let future_market_logits = logits(&dof, &future_market, &target_bins);
+        assert_eq!(
+            (&base - future_market_logits).abs().max().double_value(&[]),
+            0.0,
+            "target-bar market observations leaked into direct h2"
+        );
+
+        let shifted_clock = time_ids.copy();
+        let _ = shifted_clock
+            .narrow(1, 2, 1)
+            .narrow(-1, crate::torch::dataset::TIME_MINUTE as i64, 1)
+            .fill_(1);
+        assert!(
+            (&base - logits(&dof, &shifted_clock, &target_bins))
+                .abs()
+                .max()
+                .double_value(&[])
+                > 0.0,
+            "the target clock did not reach direct h2"
+        );
+
+        let changed_prefix = target_bins.copy();
+        let _ = changed_prefix.narrow(-1, DOF_R as i64, 1).fill_(17);
+        let changed = logits(&dof, &time_ids, &changed_prefix);
+        assert_eq!(
+            (&base.select(-2, DOF_R as i64) - &changed.select(-2, DOF_R as i64))
+                .abs()
+                .max()
+                .double_value(&[]),
+            0.0,
+            "r logits may not condition on their own target"
+        );
+        assert!(
+            (&base.select(-2, DOF_S as i64) - changed.select(-2, DOF_S as i64))
+                .abs()
+                .max()
+                .double_value(&[])
+                > 0.0,
+            "changing target r did not reach later same-target factors"
+        );
+        let logits_h3 = |dof: &Tensor, time_ids: &Tensor| {
+            let input = dof.narrow(1, 0, 1);
+            let h = modules.trunk.forward(
+                &input,
+                &supports.bin_ids(&input),
+                &time_ids.narrow(1, 0, 1),
+                0,
+                false,
+            );
+            let conditioning = modules
+                .trunk
+                .forecast_conditioning(&time_ids.narrow(1, 3, 1), &time_ids.narrow(1, 0, 1));
+            modules.head.direct_logits(
+                &h,
+                &conditioning,
+                &supports.bin_ids(&dof.narrow(1, 3, 1)),
+                3,
+            )
+        };
+        let h3_base = logits_h3(&dof, &time_ids);
+        let h3_intervening = dof.copy();
+        let _ = h3_intervening.narrow(1, 1, 2).fill_(7.0);
+        assert_eq!(
+            (&h3_base - logits_h3(&h3_intervening, &time_ids))
+                .abs()
+                .max()
+                .double_value(&[]),
+            0.0,
+            "intervening realized bars leaked into direct h3"
+        );
+        let h3_future_market = time_ids.copy();
+        for slot in crate::torch::dataset::BAR_TIME_MARKET {
+            let _ = h3_future_market
+                .narrow(1, 3, 1)
+                .narrow(-1, slot as i64, 1)
+                .fill_(1);
+        }
+        assert_eq!(
+            (&h3_base - logits_h3(&dof, &h3_future_market))
+                .abs()
+                .max()
+                .double_value(&[]),
+            0.0,
+            "target-bar market observations leaked into direct h3"
+        );
+        let h3_changed_prefix = dof.copy();
+        let _ = h3_changed_prefix
+            .narrow(1, 3, 1)
+            .narrow(-1, DOF_R as i64, 1)
+            .fill_(17.0);
+        let h3_changed = logits_h3(&h3_changed_prefix, &time_ids);
+        assert_eq!(
+            (&h3_base.select(-2, DOF_R as i64) - &h3_changed.select(-2, DOF_R as i64))
+                .abs()
+                .max()
+                .double_value(&[]),
+            0.0,
+            "direct h3 r logits may not condition on their own target"
+        );
+        assert!(
+            (&h3_base.select(-2, DOF_S as i64) - h3_changed.select(-2, DOF_S as i64))
+                .abs()
+                .max()
+                .double_value(&[])
+                > 0.0,
+            "changing direct h3 target r did not reach later same-target factors"
+        );
+    }
+
+    #[test]
+
+    fn zero_direct_weights_preserve_primary_scalar_and_shared_gradients_exactly() {
+        let _torch_rng_guard = test_rng::exclusive();
+        tch::manual_seed(0xD0F0);
+        let vs = nn::VarStore::new(Device::Cpu);
+        let modules = BarModules::new(&vs.root());
+        let supports = synthetic_supports();
+        let growth_support = GrowthSupport::new(&supports, Device::Cpu).expect("growth");
+        let context = 8;
+        let (dof, time_ids) = synthetic_window(2, context + DIRECT_MAX_HORIZON, 0xA11);
+        let direct_time_ids = Tensor::stack(
+            &[
+                time_ids.narrow(1, 2, context),
+                time_ids.narrow(1, 3, context),
+            ],
+            2,
+        );
+        let direct_valid = Tensor::ones([2, context, 2], (Kind::Bool, Device::Cpu));
+        let graph = forward_losses(
+            &modules,
+            &supports,
+            &growth_support,
+            &dof,
+            &raw_sigma(&dof),
+            &time_ids,
+            Some(&direct_time_ids),
+            Some(&direct_valid),
+            context,
+            1,
+            (0.0, 0.0),
+            0.0,
+            0.0,
+            BarScoring::Hard,
+            Device::Cpu,
+        );
+        assert_eq!(
+            graph.loss.double_value(&[]).to_bits(),
+            graph.nll.double_value(&[]).to_bits()
+        );
+        let parameters: Vec<Tensor> = named_trainable_variables(&vs)
+            .into_iter()
+            .filter(|(name, _)| {
+                !name.contains("bar_dyn")
+                    && !BAR_EMISSION_ADAMW_NAME_SUBSTRINGS
+                        .iter()
+                        .any(|needle| name.contains(needle))
+            })
+            .map(|(_, tensor)| tensor)
+            .collect();
+        let control = Tensor::run_backward(&[graph.loss.shallow_clone()], &parameters, true, false);
+        let primary = Tensor::run_backward(&[graph.nll.shallow_clone()], &parameters, false, false);
+        for (control, primary) in control.iter().zip(&primary) {
+            assert_eq!(
+                (control - primary).abs().max().double_value(&[]),
+                0.0,
+                "zero direct weights changed a primary shared-parameter gradient"
+            );
+        }
+    }
+
     /// The auxiliary weights are the CONFIGURED ones at the first step, the middle step and
     /// the last step alike. There is no schedule on them, by design — see
     /// [`Args::lambda_dyn`].
@@ -12193,9 +14749,13 @@ mod tests {
                 &supports,
                 &growth_support,
                 &dof,
+                &raw_sigma(&dof),
                 &time_ids,
+                None,
+                None,
                 context,
                 horizon,
+                (0.0, 0.0),
                 lambda_dyn,
                 lambda_kl,
                 BarScoring::Density,
@@ -12261,9 +14821,13 @@ mod tests {
             &supports,
             &growth_support,
             &dof,
+            &raw_sigma(&dof),
             &time_ids,
+            None,
+            None,
             context,
             horizon,
+            (0.0, 0.0),
             0.0,
             0.0,
             BarScoring::Density,

@@ -55,8 +55,11 @@ pub const CI_MASS: f64 = 0.95;
 
 /// Schema of the persisted per-window vector. v2 replaces the mean-of-window conditional
 /// score with the numerator and denominator of every per-DOF conditional ratio, so a pooled
-/// point estimate and every bootstrap resample measure the same estimand.
-pub const WINDOW_SCORES_FORMAT_VERSION: u32 = 2;
+/// point estimate and every bootstrap resample measure the same estimand. v3 adds the two
+/// per-window economic vectors and the traded prefix's blocking, without which no ablation
+/// arm can be judged economically, plus the bin-geometry digest that lets
+/// [`paired_comparison`] refuse a pair whose supports were refitted.
+pub const WINDOW_SCORES_FORMAT_VERSION: u32 = 3;
 
 /// `z` for a two-sided 95% interval times `sqrt(2)`, i.e. the multiple of the paired
 /// standard error a difference must clear to be detectable at 80% power.
@@ -699,6 +702,29 @@ impl From<&trade_bench::TailPoint> for TradeTailSummary {
     }
 }
 
+/// The Mincer-Zarnowitz calibration of the traded law, reduced to the three numbers a
+/// cross-run comparison needs.
+///
+/// A slope is a ratio of a realized quantity to a predicted one, so it is DIMENSIONLESS and
+/// invariant to the bin geometry the prediction was decoded through. That makes it the one
+/// calibration ruler that still means the same thing after an arm refits the supports, which
+/// is why it is persisted at every validation rather than only by the offline
+/// `pretrain-calibration` command.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct CalibrationSlopes {
+    /// Slope of realized `r` on the traded conditional mean. `1.0` is perfect calibration;
+    /// below one says the forecast moves more than the outcome it predicts, which is
+    /// exactly the overstated edge a Kelly bettor pays for quadratically.
+    pub mean_beta: JsonF64,
+    /// Block-bootstrap standard error of [`Self::mean_beta`], over the traded prefix's
+    /// `(symbol, month)` blocks.
+    pub mean_beta_se: JsonF64,
+    /// Slope of the realized squared residual on the predicted variance. Below one says the
+    /// predicted variance is too large, i.e. the law is under-confident and under-leverages;
+    /// above one says it is too confident. A mean-only recalibration cannot correct either.
+    pub variance_beta: JsonF64,
+}
+
 /// A run's per-window held-out vector, with everything needed to decide whether another
 /// run's vector is comparable to it.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -724,6 +750,13 @@ pub struct WindowScores {
     /// the binning, so pairing across them would difference two different quantities.
     #[serde(default)]
     pub scoring: Option<String>,
+    /// Position-sizing rule active when the artifact was scored.
+    ///
+    /// This is artifact identity and may deliberately differ between an A/B pair: sizing
+    /// policy is the treatment in A1, not a comparability precondition. `None` on artifacts
+    /// written before the rule was persisted.
+    #[serde(default)]
+    pub sizing_rule: Option<String>,
     pub windows: Vec<WindowScore>,
     /// The Kelly trading bench measured on THIS pass, when the caller ran one.
     ///
@@ -755,6 +788,50 @@ pub struct WindowScores {
     pub realized_batch: Option<usize>,
     #[serde(default)]
     pub realized_steps: Option<usize>,
+    /// SHA-256 of the bin supports this run was scored against, i.e. the identity of the
+    /// DISCRETIZATION every nats figure here lives in.
+    ///
+    /// The same digest [`crate::torch::world_model::BarWorldModelMetadata::supports_sha256`]
+    /// records beside the weights. Nothing else on this struct is a function of the bin
+    /// geometry — not the corpus fingerprint, not the split instants, not the scoring rule,
+    /// which is a rule NAME — so without this a run whose supports were refitted pairs
+    /// cleanly against one whose were not and returns a meaningless nats difference with a
+    /// tight interval. `None` on a pre-v3 vector, which is NOT "same geometry":
+    /// [`paired_comparison`] refuses it rather than assuming.
+    #[serde(default)]
+    pub supports_sha256: Option<String>,
+    /// Per-window net Kelly edge over the unconditional-marginal null at the selection cap,
+    /// in BPS per bar, over the TRADED PREFIX of [`Self::windows`] in pinned order.
+    ///
+    /// This is the vector selection itself reads, persisted so a cross-run comparison can
+    /// re-difference it instead of differencing two already-collapsed aggregates. The null
+    /// leg is built from the bin supports, so the DIFFERENCE is only meaningful within one
+    /// [`Self::supports_sha256`]; [`Self::model_growth_bps`] is the leg that is not.
+    ///
+    /// `None` on a pre-v3 vector, which is NOT "no edge".
+    #[serde(default)]
+    pub selection_edge_bps: Option<Vec<f64>>,
+    /// The MODEL LEG ALONE of the same measurement: net log growth per bar of the capped
+    /// model policy at the same cap and cost, in BPS, with no null subtracted.
+    ///
+    /// Pure realized-return arithmetic over the positions the model took, so it is the only
+    /// economic ruler that survives a change of bin geometry and the only one an arm that
+    /// refits the supports may be judged on. `None` on a pre-v3 vector.
+    #[serde(default)]
+    pub model_growth_bps: Option<Vec<f64>>,
+    /// `(symbol, calendar month)` block ids of the traded prefix, in the same order as the
+    /// two vectors above.
+    ///
+    /// [`Self::symbol_month_blocks`] truncated to the traded length, persisted rather than
+    /// re-derived so a consumer bootstraps the economics over exactly the resampling units
+    /// the run's own selection used. `None` on a pre-v3 vector.
+    #[serde(default)]
+    pub traded_blocks: Option<Vec<u64>>,
+    /// Mincer-Zarnowitz calibration of the traded law on THIS pass.
+    ///
+    /// Absent — not zeroed — on a pass that ran no bench, and on every pre-v3 vector.
+    #[serde(default)]
+    pub calibration: Option<CalibrationSlopes>,
 }
 
 impl WindowScores {
@@ -883,18 +960,56 @@ impl WindowScores {
 // Paired comparison
 // ---------------------------------------------------------------------------
 
+/// Which sign of a `candidate - baseline` difference favours the candidate.
+///
+/// The predictive and economic differences below run in OPPOSITE directions — an NLL is a
+/// loss and an edge is a gain — and a comparator whose reader has to remember which is which
+/// is a comparator that will eventually be read backwards. So no difference is printed
+/// without its own direction, and [`Self::advantage`] is the one place the flip happens.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BetterWhen {
+    /// Loss-like, so a NEGATIVE difference favours the candidate: every nats figure.
+    Negative,
+    /// Gain-like, so a POSITIVE difference favours the candidate: every bps figure.
+    Positive,
+}
+
+impl BetterWhen {
+    /// The candidate's advantage over the baseline in "more is better" orientation,
+    /// whatever the raw difference's sign convention is.
+    pub fn advantage(self, difference: f64) -> f64 {
+        match self {
+            Self::Negative => -difference,
+            Self::Positive => difference,
+        }
+    }
+
+    fn direction(self) -> &'static str {
+        match self {
+            Self::Negative => "NEGATIVE is better",
+            Self::Positive => "POSITIVE is better",
+        }
+    }
+}
+
 /// Two runs differenced window by window.
 #[derive(Clone, Debug)]
 pub struct PairedComparison {
     pub baseline_run: String,
     pub candidate_run: String,
+    /// Sizing identities are displayed but never required to match: a sizing rule may be the
+    /// deliberate treatment.
+    pub baseline_sizing_rule: Option<String>,
+    pub candidate_sizing_rule: Option<String>,
     pub windows: usize,
     /// Scoring rule both runs were measured under. Every nats figure below is in that
     /// rule's units and is comparable to nothing measured under another.
     pub scoring: String,
     pub baseline_mean: f64,
     pub candidate_mean: f64,
-    /// `candidate - baseline`; negative means the candidate is better.
+    /// `candidate - baseline` in nats/bar. NEGATIVE means the candidate is better; see
+    /// [`BetterWhen::Negative`], and contrast the two economic differences below, whose
+    /// convention is the opposite one.
     pub difference: Dispersion,
     /// Same difference on the conditional metric, which excludes the encoding tautology.
     pub conditional_difference: Dispersion,
@@ -906,14 +1021,99 @@ pub struct PairedComparison {
     pub correlation: f64,
     /// Windows on which the candidate scored worse.
     pub worse_windows: usize,
+    /// `candidate - baseline` on [`WindowScores::selection_edge_bps`], in BPS per bar over
+    /// the traded prefix, block-bootstrapped over that prefix's own `(symbol, month)` units.
+    ///
+    /// POSITIVE means the candidate is better — the OPPOSITE of [`Self::difference`],
+    /// because an edge is a gain and a negative log-likelihood is a loss. See
+    /// [`BetterWhen::Positive`].
+    ///
+    /// `None` when either side is a pre-v3 vector or recorded no traded windows. Valid only
+    /// within one bin geometry, which [`paired_comparison`] has already enforced.
+    pub edge_difference: Option<Dispersion>,
+    /// The same paired difference on [`WindowScores::model_growth_bps`], the model leg with
+    /// no support-derived null subtracted. POSITIVE means the candidate is better.
+    ///
+    /// This is the economic difference that stays meaningful when an arm changes the bin
+    /// geometry, because nothing about it is decoded through the supports.
+    pub model_growth_difference: Option<Dispersion>,
+    /// The two runs' bin geometries, when they DIFFER and the operator asserted
+    /// [`GeometryPolicy::ModelGrowthOnly`], as `(baseline, candidate)`.
+    ///
+    /// Every nats field above, and [`Self::edge_difference`], is then withheld:
+    /// `Dispersion::nan()`, `NaN`, or `None`. [`Self::predictive_measured`] is the predicate
+    /// to read before touching any of them. `None` on every ordinary comparison, because
+    /// [`GeometryPolicy::Require`] refuses a geometry change rather than reporting one — so
+    /// this being `Some` is itself the record that an operator asserted the change.
+    pub geometry_change: Option<(String, String)>,
 }
 
 impl PairedComparison {
+    /// True when the nats figures were measured, i.e. the two runs shared one bin geometry.
+    ///
+    /// Read this before [`Self::difference`], [`Self::conditional_difference`],
+    /// [`Self::dof_difference`], the two means or [`Self::correlation`]: a
+    /// [`GeometryPolicy::ModelGrowthOnly`] comparison leaves every one of them unmeasured.
+    pub fn predictive_measured(&self) -> bool {
+        self.geometry_change.is_none()
+    }
+
     /// True when zero lies outside the difference's 95% interval.
     pub fn significant(&self) -> bool {
-        self.difference.ci_low.is_finite()
-            && self.difference.ci_high.is_finite()
-            && (self.difference.ci_low > 0.0 || self.difference.ci_high < 0.0)
+        Self::resolvable(&self.difference)
+    }
+
+    fn resolvable(dispersion: &Dispersion) -> bool {
+        dispersion.ci_low.is_finite()
+            && dispersion.ci_high.is_finite()
+            && (dispersion.ci_low > 0.0 || dispersion.ci_high < 0.0)
+    }
+
+    /// One difference line: the interval, the direction its sign is read in, the candidate's
+    /// advantage in "more is better" orientation, and the MDE the interval implies.
+    ///
+    /// A difference that does not exist prints WHY. Skipping the row would let a stale
+    /// artifact, or a metric withheld across a geometry change, read as an arm with no
+    /// economic effect.
+    fn write_difference(
+        f: &mut fmt::Formatter<'_>,
+        label: &str,
+        units: &str,
+        difference: Option<&Dispersion>,
+        better: BetterWhen,
+    ) -> fmt::Result {
+        let Some(difference) = difference else {
+            return Self::write_withheld(
+                f,
+                label,
+                units,
+                &format!("pre-v{WINDOW_SCORES_FORMAT_VERSION} artifact, or a pass with no traded windows"),
+            );
+        };
+        writeln!(
+            f,
+            "  {label} [{units}, candidate - baseline, {}] {difference}; candidate advantage \
+             {:+.4}, MDE {:.4}, verdict: {}",
+            better.direction(),
+            better.advantage(difference.mean),
+            difference.minimum_detectable_effect(),
+            if Self::resolvable(difference) {
+                "SIGNIFICANT at 95%"
+            } else {
+                "not distinguishable from zero"
+            }
+        )
+    }
+
+    /// A metric this comparison may not state, and the reason. One uniform form, so a reader
+    /// or a driver sees an explicit verdict per metric rather than a missing line.
+    fn write_withheld(
+        f: &mut fmt::Formatter<'_>,
+        label: &str,
+        units: &str,
+        reason: &str,
+    ) -> fmt::Result {
+        writeln!(f, "  {label} [{units}]: NOT COMPARABLE ({reason})")
     }
 }
 
@@ -926,54 +1126,141 @@ impl fmt::Display for PairedComparison {
         )?;
         writeln!(
             f,
-            "  baseline  {:<28} {:.4} nats/bar",
-            self.baseline_run, self.baseline_mean
+            "  sizing rule: baseline {}; candidate {}",
+            self.baseline_sizing_rule.as_deref().unwrap_or("unrecorded"),
+            self.candidate_sizing_rule
+                .as_deref()
+                .unwrap_or("unrecorded")
         )?;
-        writeln!(
-            f,
-            "  candidate {:<28} {:.4} nats/bar",
-            self.candidate_run, self.candidate_mean
-        )?;
-        writeln!(
-            f,
-            "  paired delta (candidate - baseline) {}",
-            self.difference
-        )?;
-        writeln!(
-            f,
-            "  conditional delta (u,v scored only where s != 0) {}",
-            self.conditional_difference
-        )?;
-        for (dof, name) in BAR_DOF_NAMES.iter().enumerate() {
-            writeln!(f, "  delta {name:<2} {}", self.dof_difference[dof])?;
-        }
-        writeln!(
-            f,
-            "  per-window correlation {:.4}, candidate worse on {} of {} windows",
-            self.correlation, self.worse_windows, self.windows
-        )?;
-        writeln!(
-            f,
-            "  detectable at 80% power: {:.4} nats; verdict: {}",
-            self.difference.minimum_detectable_effect(),
-            if self.significant() {
-                "SIGNIFICANT at 95%"
-            } else {
-                "not distinguishable from zero"
+        match &self.geometry_change {
+            None => {
+                writeln!(
+                    f,
+                    "  baseline  {:<28} {:.4} nats/bar",
+                    self.baseline_run, self.baseline_mean
+                )?;
+                writeln!(
+                    f,
+                    "  candidate {:<28} {:.4} nats/bar",
+                    self.candidate_run, self.candidate_mean
+                )?;
+                writeln!(
+                    f,
+                    "  paired delta [nats/bar, candidate - baseline, {}] {}",
+                    BetterWhen::Negative.direction(),
+                    self.difference
+                )?;
+                writeln!(
+                    f,
+                    "  conditional delta (u,v scored only where s != 0) {}",
+                    self.conditional_difference
+                )?;
+                for (dof, name) in BAR_DOF_NAMES.iter().enumerate() {
+                    writeln!(f, "  delta {name:<2} {}", self.dof_difference[dof])?;
+                }
+                writeln!(
+                    f,
+                    "  per-window correlation {:.4}, candidate worse on {} of {} windows",
+                    self.correlation, self.worse_windows, self.windows
+                )?;
+                writeln!(
+                    f,
+                    "  detectable at 80% power: {:.4} nats; verdict: {}",
+                    self.difference.minimum_detectable_effect(),
+                    if self.significant() {
+                        "SIGNIFICANT at 95%"
+                    } else {
+                        "not distinguishable from zero"
+                    }
+                )?;
+                // The economics print with the opposite sign convention spelled out on every
+                // line, because these are the only rows an economic ablation may be culled on
+                // and reading one of them backwards inverts the decision.
+                Self::write_difference(
+                    f,
+                    "selection edge delta",
+                    "bps/bar",
+                    self.edge_difference.as_ref(),
+                    BetterWhen::Positive,
+                )?;
             }
+            // Named at the point of use, because months from now the ledger has to be
+            // readable without the conversation that produced this row.
+            Some((baseline_supports, candidate_supports)) => {
+                writeln!(
+                    f,
+                    "  BIN GEOMETRY CHANGED and --allow-geometry-change was given: baseline \
+                     supports {baseline_supports}, candidate supports {candidate_supports}. \
+                     Every quantity decoded through the bins is WITHHELD rather than \
+                     corrected, because no correction makes two discretizations' log \
+                     densities comparable and a corrected number would look usable. `model \
+                     growth delta` is the ONLY valid cull metric below."
+                )?;
+                for (label, units) in [
+                    ("paired delta", "nats/bar"),
+                    ("conditional delta", "nats/bar"),
+                    ("per-DOF deltas", "nats/bar"),
+                    ("per-window correlation", "unitless"),
+                    // Its null leg is `marginal_position(&supports, ..)`, so it is as
+                    // support-derived as the nats rows and is a CULL metric — the single most
+                    // likely way someone would judge a geometry arm on a meaningless number.
+                    ("selection edge delta", "bps/bar"),
+                ] {
+                    Self::write_withheld(f, label, units, "forbidden across bin geometries")?;
+                }
+            }
+        }
+        Self::write_difference(
+            f,
+            "model growth delta",
+            "bps/bar",
+            self.model_growth_difference.as_ref(),
+            BetterWhen::Positive,
         )
     }
 }
 
+/// Whether a comparison may proceed across a change of bin geometry.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GeometryPolicy {
+    /// Refuse the pair outright. The default, and the only correct choice for an arm that did
+    /// not deliberately refit the supports.
+    Require,
+    /// Proceed on the geometry-free quantities ALONE, for an arm whose treatment IS the
+    /// discretization.
+    ///
+    /// Every figure that passes through the supports is WITHHELD, never adjusted: the nats
+    /// levels and deltas, all five per-DOF deltas, the per-window correlation, and the
+    /// selection edge, whose null leg is `marginal_position(&supports, ..)`. There is no
+    /// correction that makes two discretizations' log densities comparable, and a corrected
+    /// number would be worse than none because it would look usable. What survives is
+    /// [`PairedComparison::model_growth_difference`], which is realized-return arithmetic
+    /// over the positions taken and never touches a bin.
+    ModelGrowthOnly,
+}
+
 /// Difference two runs' per-window vectors on the identical pinned windows.
 ///
-/// Refuses anything that is not actually a pairing: a different corpus, different split
-/// instants, a different evaluation seed, a different context, or a window list that does
-/// not match element for element. Every one of those silently turns a paired comparison back
-/// into an unpaired one, whose minimum detectable effect is an order of magnitude worse.
+/// Refuses anything that is not actually a pairing: a different corpus, a different bin
+/// geometry, different split instants, a different evaluation seed, a different context, a
+/// different traded prefix, or a window list that does not match element for element. Every
+/// one of those silently turns a paired comparison back into an unpaired one, whose minimum
+/// detectable effect is an order of magnitude worse — or, for the geometry, into no
+/// measurement of the model at all.
 pub fn paired_comparison(
     baseline: &WindowScores,
     candidate: &WindowScores,
+) -> Result<PairedComparison> {
+    paired_comparison_with(baseline, candidate, GeometryPolicy::Require)
+}
+
+/// [`paired_comparison`] with an explicit bin-geometry policy. Every other refusal is
+/// unchanged: `geometry` relaxes the supports check ALONE, and only in the direction of
+/// reporting less.
+pub fn paired_comparison_with(
+    baseline: &WindowScores,
+    candidate: &WindowScores,
+    geometry: GeometryPolicy,
 ) -> Result<PairedComparison> {
     ensure!(
         baseline.corpus_fingerprint == candidate.corpus_fingerprint,
@@ -1005,6 +1292,42 @@ pub fn paired_comparison(
         baseline.eval_window_seed,
         candidate.eval_window_seed
     );
+    // The deepest refusal here, and the one nothing else on the artifact stands in for.
+    // `corpus_fingerprint` names the BARS and `scoring` names the RULE; neither is a function
+    // of the discretization the rule is evaluated on, so a refitted-support arm passes every
+    // other check and returns a meaningless nats difference with a tight interval. Precedent:
+    // `mem_probe::assert_one_geometry`, which already refuses this for checkpoints.
+    let geometry_change = match (
+        baseline.supports_sha256.as_deref(),
+        candidate.supports_sha256.as_deref(),
+    ) {
+        (Some(a), Some(b)) if a == b => None,
+        (Some(a), Some(b)) => match geometry {
+            GeometryPolicy::Require => bail!(
+                "REFUSING to pair: the two runs were scored against DIFFERENT BIN GEOMETRIES \
+                 — baseline supports {a}, candidate supports {b}. An NLL is the log mass the \
+                 model put on the bin the outcome fell in, so refitting the supports moves \
+                 the whole scale by a binning-dependent constant, and differencing across the \
+                 two measures the discretization rather than the model. If the discretization \
+                 IS the treatment, re-run with --allow-geometry-change, which reports the \
+                 model growth leg alone; otherwise re-score one arm against the other's \
+                 supports with --supports <path> --freeze-supports."
+            ),
+            GeometryPolicy::ModelGrowthOnly => Some((a.to_owned(), b.to_owned())),
+        },
+        // Unknown geometry is never treated as matching, under EITHER policy: the operator
+        // can assert that the supports changed, but nobody can assert what they were.
+        (None, _) | (_, None) => bail!(
+            "REFUSING to pair: at least one per-window vector does not record the bin \
+             geometry it was scored against (baseline {:?}, candidate {:?}). It was written \
+             before format v{WINDOW_SCORES_FORMAT_VERSION}, so whether the two arms share a \
+             discretization cannot be established from the artifact — and assuming they do is \
+             exactly what would let a refitted-support arm read as a real gain. Re-score that \
+             arm rather than assuming.",
+            baseline.supports_sha256,
+            candidate.supports_sha256
+        ),
+    };
     let scoring = match (baseline.scoring.as_deref(), candidate.scoring.as_deref()) {
         (Some(a), Some(b)) if a == b => a.to_owned(),
         (Some(a), Some(b)) => bail!(
@@ -1088,19 +1411,33 @@ pub fn paired_comparison(
         .zip(base_nll.iter())
         .map(|(c, b)| c - b)
         .collect();
-    let difference = block_bootstrap(&deltas, &blocks, BOOTSTRAP_DRAWS, BOOTSTRAP_SEED);
+    // Across a bin-geometry change every nats figure is WITHHELD rather than computed. There
+    // is no correction that makes two discretizations' log densities comparable, and a number
+    // in these fields would be read as one; `Dispersion::nan()` is the house idiom for a
+    // quantity this pass did not measure. `PairedComparison::predictive_measured` reports it.
+    let predictive = geometry_change.is_none();
+    let difference = if predictive {
+        block_bootstrap(&deltas, &blocks, BOOTSTRAP_DRAWS, BOOTSTRAP_SEED)
+    } else {
+        Dispersion::nan()
+    };
 
-    let base_conditional = baseline.conditional_nll_stats();
-    let cand_conditional = candidate.conditional_nll_stats();
-    let conditional_difference = block_bootstrap_conditional_difference(
-        &base_conditional,
-        &cand_conditional,
-        &blocks,
-        BOOTSTRAP_DRAWS,
-        BOOTSTRAP_SEED,
-    );
+    let conditional_difference = if predictive {
+        block_bootstrap_conditional_difference(
+            &baseline.conditional_nll_stats(),
+            &candidate.conditional_nll_stats(),
+            &blocks,
+            BOOTSTRAP_DRAWS,
+            BOOTSTRAP_SEED,
+        )
+    } else {
+        Dispersion::nan()
+    };
 
     let dof_difference = std::array::from_fn(|dof| {
+        if !predictive {
+            return Dispersion::nan();
+        }
         let per_dof: Vec<f64> = candidate
             .nll_dof(dof)
             .iter()
@@ -1109,20 +1446,137 @@ pub fn paired_comparison(
             .collect();
         block_bootstrap(&per_dof, &blocks, BOOTSTRAP_DRAWS, BOOTSTRAP_SEED)
     });
+    // The bench trades a PREFIX of the pinned set, so two arms can agree on every pinned
+    // window and still have priced two different books. Refused rather than reported as an
+    // absent difference: "not recorded" reads as "this arm had no economic effect", which is
+    // the same silent-invalid-comparison hazard the geometry check above exists for.
+    let traded_blocks = match (
+        baseline.traded_blocks.as_deref(),
+        candidate.traded_blocks.as_deref(),
+    ) {
+        (Some(a), Some(b)) if a == b => a,
+        (Some(a), Some(b)) => bail!(
+            "REFUSING to pair: the two runs traded different prefixes of the identical pinned \
+             set — baseline {} windows, candidate {}. The per-window economic vectors are \
+             indexed by that prefix, so differencing them would subtract one arm's window i \
+             from a different bar of the other's. Re-score both arms with the same \
+             --validation-windows.",
+            a.len(),
+            b.len()
+        ),
+        (None, _) | (_, None) => bail!(
+            "REFUSING to pair: at least one per-window vector does not record its traded \
+             prefix's blocking (baseline {:?} entries, candidate {:?}). It was written before \
+             format v{WINDOW_SCORES_FORMAT_VERSION}, so the two economic vectors cannot be \
+             aligned window for window; re-score that arm rather than assuming they line up.",
+            baseline.traded_blocks.as_ref().map(Vec::len),
+            candidate.traded_blocks.as_ref().map(Vec::len)
+        ),
+    };
+    // The edge's null leg is `marginal_position(&supports, ..)`, so it is as support-derived
+    // as the nats rows and is withheld with them. It is also a CULL metric, which makes it the
+    // most dangerous row to leave standing across a geometry change.
+    let edge_difference = predictive
+        .then(|| {
+            traded_difference(
+                "selection_edge_bps",
+                baseline.selection_edge_bps.as_deref(),
+                candidate.selection_edge_bps.as_deref(),
+                traded_blocks,
+            )
+        })
+        .transpose()?
+        .flatten();
+    let model_growth_difference = traded_difference(
+        "model_growth_bps",
+        baseline.model_growth_bps.as_deref(),
+        candidate.model_growth_bps.as_deref(),
+        traded_blocks,
+    )?;
 
     Ok(PairedComparison {
         baseline_run: baseline.run.clone(),
         candidate_run: candidate.run.clone(),
+        baseline_sizing_rule: baseline.sizing_rule.clone(),
+        candidate_sizing_rule: candidate.sizing_rule.clone(),
         windows: base_nll.len(),
         scoring,
-        baseline_mean: base_nll.iter().sum::<f64>() / base_nll.len() as f64,
-        candidate_mean: cand_nll.iter().sum::<f64>() / cand_nll.len() as f64,
+        baseline_mean: if predictive {
+            base_nll.iter().sum::<f64>() / base_nll.len() as f64
+        } else {
+            f64::NAN
+        },
+        candidate_mean: if predictive {
+            cand_nll.iter().sum::<f64>() / cand_nll.len() as f64
+        } else {
+            f64::NAN
+        },
         difference,
         conditional_difference,
         dof_difference,
-        correlation: pearson(&base_nll, &cand_nll),
-        worse_windows: deltas.iter().filter(|d| **d > 0.0).count(),
+        correlation: if predictive {
+            pearson(&base_nll, &cand_nll)
+        } else {
+            f64::NAN
+        },
+        worse_windows: if predictive {
+            deltas.iter().filter(|d| **d > 0.0).count()
+        } else {
+            0
+        },
+        edge_difference,
+        model_growth_difference,
+        geometry_change,
     })
+}
+
+/// Paired difference of one per-traded-window economic vector, in BPS per bar.
+///
+/// Bootstrapped over the traded prefix's OWN `(symbol, month)` ids, persisted by the writer
+/// rather than re-derived here, so the interval is bit for bit the object the run's selection
+/// rule read. `Ok(None)` only when neither side recorded the vector or the prefix is empty;
+/// anything else that would misalign the two books is an error, because a missing economic
+/// difference reads as an arm with no economic effect.
+fn traded_difference(
+    field: &str,
+    baseline: Option<&[f64]>,
+    candidate: Option<&[f64]>,
+    blocks: &[u64],
+) -> Result<Option<Dispersion>> {
+    let (baseline, candidate) = match (baseline, candidate) {
+        (Some(baseline), Some(candidate)) => (baseline, candidate),
+        (None, None) => return Ok(None),
+        (baseline, candidate) => bail!(
+            "REFUSING to pair: only one of the two runs recorded `{field}` (baseline {}, \
+             candidate {}). Comparing an arm that priced its windows against one that did not \
+             would report the missing side as no economic effect; re-score that arm.",
+            baseline.map_or("absent", |_| "present"),
+            candidate.map_or("absent", |_| "present")
+        ),
+    };
+    ensure!(
+        baseline.len() == blocks.len() && candidate.len() == blocks.len(),
+        "REFUSING to pair: `{field}` does not span the recorded traded prefix — baseline {} \
+         values, candidate {}, blocking {}. The vector is indexed by the traded prefix, so a \
+         length that disagrees with it is misaligned window for window.",
+        baseline.len(),
+        candidate.len(),
+        blocks.len()
+    );
+    if blocks.is_empty() {
+        return Ok(None);
+    }
+    let deltas: Vec<f64> = candidate
+        .iter()
+        .zip(baseline)
+        .map(|(candidate, baseline)| candidate - baseline)
+        .collect();
+    Ok(Some(block_bootstrap(
+        &deltas,
+        blocks,
+        BOOTSTRAP_DRAWS,
+        BOOTSTRAP_SEED,
+    )))
 }
 
 fn pearson(a: &[f64], b: &[f64]) -> f64 {
@@ -1151,9 +1605,20 @@ fn pearson(a: &[f64], b: &[f64]) -> f64 {
 /// Load two persisted vectors and print their paired comparison. This is the entry point
 /// behind `trading_bot pretrain-compare`.
 pub fn compare_runs(baseline: &Path, candidate: &Path) -> Result<PairedComparison> {
+    compare_runs_with(baseline, candidate, GeometryPolicy::Require)
+}
+
+/// [`compare_runs`] with an explicit bin-geometry policy, for an arm whose treatment IS the
+/// discretization. See [`GeometryPolicy::ModelGrowthOnly`] for what such a comparison may
+/// still say.
+pub fn compare_runs_with(
+    baseline: &Path,
+    candidate: &Path,
+    geometry: GeometryPolicy,
+) -> Result<PairedComparison> {
     let baseline = WindowScores::load(baseline)?;
     let candidate = WindowScores::load(candidate)?;
-    paired_comparison(&baseline, &candidate)
+    paired_comparison_with(&baseline, &candidate, geometry)
 }
 
 #[cfg(test)]
@@ -1414,7 +1879,11 @@ mod tests {
                 }
             })
             .collect();
-        WindowScores {
+        // The bench trades a PREFIX of the pinned set, so the fixture does too: a fixture
+        // whose economics spanned all 64 windows would never exercise the truncation every
+        // real artifact carries.
+        const TRADED: usize = 40;
+        let mut scored = WindowScores {
             format_version: WINDOW_SCORES_FORMAT_VERSION,
             run: run.to_owned(),
             global_step: 9000,
@@ -1425,6 +1894,7 @@ mod tests {
             split_bounds: (1_600_000_000_000, 1_650_000_000_000),
             marginal_nll_bar: 21.6686,
             scoring: Some("density".to_owned()),
+            sizing_rule: Some(trade_bench::SizingRule::CONTROL.label().to_owned()),
             windows,
             trade: None,
             // Set, because a real run always sets them: a fixture that left them absent
@@ -1432,7 +1902,31 @@ mod tests {
             // the comparison.
             realized_batch: Some(23),
             realized_steps: Some(10818),
-        }
+            supports_sha256: Some("a".repeat(64)),
+            // The economics run the OPPOSITE way from the nats — `offset` below zero is a
+            // better NLL, so the same arm has to show a HIGHER edge — and the two vectors are
+            // given different magnitudes so no test can pass by reading one for the other.
+            selection_edge_bps: Some(
+                (0..TRADED)
+                    .map(|i| 0.38 + (i % 5) as f64 * 0.01 - offset)
+                    .collect(),
+            ),
+            model_growth_bps: Some(
+                (0..TRADED)
+                    .map(|i| 0.50 + (i % 5) as f64 * 0.01 - 2.0 * offset)
+                    .collect(),
+            ),
+            traded_blocks: None,
+            calibration: Some(CalibrationSlopes {
+                mean_beta: 0.71.into(),
+                mean_beta_se: 0.04.into(),
+                variance_beta: 0.62.into(),
+            }),
+        };
+        let mut traded = scored.symbol_month_blocks();
+        traded.truncate(TRADED);
+        scored.traded_blocks = Some(traded);
+        scored
     }
 
     /// The pairing must recover a constant shift exactly, and must refuse a comparison whose
@@ -1454,6 +1948,20 @@ mod tests {
         assert!(paired.significant() || paired.difference.se.is_nan());
         assert!((paired.correlation - 1.0).abs() < 1e-9);
         assert_eq!(paired.worse_windows, 0);
+
+        // Sizing is artifact identity, not a refusal: this A/B deliberately changes policy.
+        let mut other_sizing = candidate.clone();
+        other_sizing.sizing_rule = Some(trade_bench::SizingRule::CUMULANT_LOG.label().to_owned());
+        let sized = paired_comparison(&baseline, &other_sizing)
+            .expect("a deliberate sizing-policy comparison remains pairable");
+        assert_eq!(sized.baseline_sizing_rule, baseline.sizing_rule);
+        assert_eq!(sized.candidate_sizing_rule, other_sizing.sizing_rule);
+        let rendered = sized.to_string();
+        assert!(rendered.contains("sizing rule: baseline"), "{rendered}");
+        assert!(
+            rendered.contains("second-cumulant expected-log approximation"),
+            "{rendered}"
+        );
 
         let other_corpus = scores("cand", "ee", -0.25);
         assert!(paired_comparison(&baseline, &other_corpus).is_err());
@@ -1503,6 +2011,183 @@ mod tests {
                 .to_string();
             assert!(err.contains("actually executed"), "{err}");
         }
+    }
+
+    /// Nothing else on a per-window vector is a function of the bin geometry, so a run whose
+    /// supports were refitted clears every other check and returns a meaningless nats
+    /// difference with a tight interval. Both the mismatch and the un-recorded case have to
+    /// be refusals; treating absent as equal is what makes the failure silent.
+    #[test]
+    fn pairing_refuses_a_changed_bin_geometry_and_an_unrecorded_one() {
+        let baseline = scores("base", "ff", 0.0);
+
+        let mut refitted = scores("cand", "ff", -0.25);
+        refitted.supports_sha256 = Some("b".repeat(64));
+        let err = paired_comparison(&baseline, &refitted)
+            .expect_err("two bin geometries must not be paired")
+            .to_string();
+        assert!(err.contains("DIFFERENT BIN GEOMETRIES"), "{err}");
+        // The message has to NAME both hashes, or the reader cannot tell which arm moved.
+        assert!(err.contains(&"a".repeat(64)), "{err}");
+        assert!(err.contains(&"b".repeat(64)), "{err}");
+        // And it has to name the escape hatch, so a geometry-CHANGING arm is re-judged on the
+        // one ruler that survives rather than discarded.
+        assert!(err.contains("--allow-geometry-change"), "{err}");
+
+        for (base_geometry, candidate_geometry) in [
+            (None, Some("a".repeat(64))),
+            (Some("a".repeat(64)), None),
+            (None, None),
+        ] {
+            let mut old_baseline = scores("base", "ff", 0.0);
+            old_baseline.supports_sha256 = base_geometry;
+            let mut old_candidate = scores("cand", "ff", -0.25);
+            old_candidate.supports_sha256 = candidate_geometry;
+            // Unknown geometry is refused under BOTH policies: an operator can assert that
+            // the supports changed, but nobody can assert what they were.
+            for policy in [GeometryPolicy::Require, GeometryPolicy::ModelGrowthOnly] {
+                let err = paired_comparison_with(&old_baseline, &old_candidate, policy)
+                    .expect_err("an unrecorded bin geometry must not be assumed equal")
+                    .to_string();
+                assert!(err.contains("does not record the bin geometry"), "{err}");
+            }
+        }
+    }
+
+    /// Wave E changes the discretization on purpose, so the pair MUST still yield the model
+    /// growth leg — that is the entire reason both economic vectors are persisted. Everything
+    /// decoded through the bins must be withheld, and the selection edge counts as decoded
+    /// through them because its null leg is support-derived.
+    #[test]
+    fn an_asserted_geometry_change_reports_the_model_leg_and_withholds_the_rest() {
+        let baseline = scores("base", "ff", 0.0);
+        let mut refitted = scores("cand", "ff", -0.25);
+        refitted.supports_sha256 = Some("b".repeat(64));
+
+        let paired = paired_comparison_with(&baseline, &refitted, GeometryPolicy::ModelGrowthOnly)
+            .expect("an asserted geometry change is comparable on the model leg");
+        assert!(!paired.predictive_measured());
+        assert_eq!(
+            paired.geometry_change,
+            Some(("a".repeat(64), "b".repeat(64)))
+        );
+
+        // Withheld, not computed: a number here would be read as a measurement.
+        assert!(paired.difference.mean.is_nan());
+        assert!(paired.conditional_difference.mean.is_nan());
+        assert!(paired.dof_difference.iter().all(|d| d.mean.is_nan()));
+        assert!(paired.baseline_mean.is_nan() && paired.candidate_mean.is_nan());
+        assert!(paired.correlation.is_nan());
+        assert!(!paired.significant());
+        assert!(
+            paired.edge_difference.is_none(),
+            "the selection edge's null leg is support-derived, so it cannot survive a \
+             geometry change"
+        );
+
+        // The one ruler that does survive, with the same value it has within one geometry:
+        // the model leg never touches a bin.
+        let growth = paired
+            .model_growth_difference
+            .expect("the model leg is valid across geometries");
+        assert!((growth.mean - 0.50).abs() < 1e-9, "{}", growth.mean);
+
+        let printed = paired.to_string();
+        assert!(printed.contains("BIN GEOMETRY CHANGED"), "{printed}");
+        // The banner must name both hashes and the only valid cull metric, so the ledger is
+        // readable years later without this conversation.
+        assert!(printed.contains(&"a".repeat(64)), "{printed}");
+        assert!(printed.contains(&"b".repeat(64)), "{printed}");
+        assert!(printed.contains("ONLY valid cull metric"), "{printed}");
+        assert_eq!(
+            printed
+                .matches("NOT COMPARABLE (forbidden across bin geometries)")
+                .count(),
+            5,
+            "every suppressed metric needs an explicit verdict, never a missing line: \
+             {printed}"
+        );
+        // And the surviving row is still printed with its sign convention.
+        assert!(printed.contains("model growth delta [bps/bar"), "{printed}");
+        assert!(printed.contains("POSITIVE is better"), "{printed}");
+
+        // The default policy still refuses the identical pair.
+        assert!(paired_comparison(&baseline, &refitted).is_err());
+    }
+
+    /// The economics and the nats run in OPPOSITE directions, and the whole campaign culls on
+    /// these two numbers. A sign flip here would invert every economic verdict, so the
+    /// convention is pinned by construction: the fixture's candidate is better on all three
+    /// metrics at once, which means a NEGATIVE nats difference and POSITIVE economic ones.
+    #[test]
+    fn the_economic_differences_are_positive_when_the_candidate_is_better() {
+        let baseline = scores("base", "ff", 0.0);
+        let candidate = scores("cand", "ff", -0.25);
+        let paired = paired_comparison(&baseline, &candidate).expect("comparable");
+
+        assert!(
+            paired.difference.mean < 0.0,
+            "the better arm must score LOWER in nats: {}",
+            paired.difference.mean
+        );
+        let edge = paired.edge_difference.expect("v3 vectors carry an edge");
+        let growth = paired
+            .model_growth_difference
+            .expect("v3 vectors carry a model leg");
+        // The fixture shifts the edge by +0.25 bps and the model leg by +0.50 on every traded
+        // window, so the two are distinguishable and neither can be standing in for the other.
+        assert!((edge.mean - 0.25).abs() < 1e-9, "{}", edge.mean);
+        assert!((growth.mean - 0.50).abs() < 1e-9, "{}", growth.mean);
+        assert!(BetterWhen::Positive.advantage(edge.mean) > 0.0);
+        assert!(BetterWhen::Positive.advantage(growth.mean) > 0.0);
+        // Both conventions must agree that this candidate won.
+        assert!(BetterWhen::Negative.advantage(paired.difference.mean) > 0.0);
+
+        // Blocked over the TRADED prefix, not the pinned set: 40 windows, and the prefix's own
+        // symbol-month grouping rather than all 64 windows' worth.
+        assert_eq!(edge.samples, 40);
+        assert_eq!(edge.blocks, {
+            let mut blocks = baseline.symbol_month_blocks();
+            blocks.truncate(40);
+            blocks
+                .iter()
+                .collect::<std::collections::BTreeSet<_>>()
+                .len()
+        });
+
+        let printed = paired.to_string();
+        assert!(printed.contains("selection edge delta"), "{printed}");
+        assert!(printed.contains("model growth delta"), "{printed}");
+        assert!(printed.contains("POSITIVE is better"), "{printed}");
+        assert!(printed.contains("NEGATIVE is better"), "{printed}");
+
+        // An arm that priced a different number of windows is misaligned window for window,
+        // and must be refused rather than reported as having no economic effect.
+        let mut short_prefix = scores("cand", "ff", -0.25);
+        short_prefix.traded_blocks = short_prefix.traded_blocks.map(|mut blocks| {
+            blocks.truncate(32);
+            blocks
+        });
+        let err = paired_comparison(&baseline, &short_prefix)
+            .expect_err("two traded prefixes must not be paired")
+            .to_string();
+        assert!(err.contains("different prefixes"), "{err}");
+
+        // Absence must print, not vanish: a stale artifact that silently skipped the row
+        // would read as an arm with no economic effect.
+        let mut unrecorded = paired.clone();
+        unrecorded.edge_difference = None;
+        unrecorded.model_growth_difference = None;
+        let printed = unrecorded.to_string();
+        assert_eq!(
+            printed
+                .matches(&format!(
+                    "NOT COMPARABLE (pre-v{WINDOW_SCORES_FORMAT_VERSION} artifact"
+                ))
+                .count(),
+            2,
+            "{printed}"
+        );
     }
 
     /// Month blocking must collapse the 64 windows onto the 8 calendar months they occupy,
@@ -1557,6 +2242,32 @@ mod tests {
         assert_eq!(loaded.corpus_fingerprint, scored.corpus_fingerprint);
         assert_eq!(loaded.split_bounds, scored.split_bounds);
         assert_eq!(loaded.eval_window_seed, scored.eval_window_seed);
+        assert_eq!(loaded.supports_sha256, scored.supports_sha256);
+        assert_eq!(loaded.traded_blocks, scored.traded_blocks);
+        assert_eq!(loaded.sizing_rule, scored.sizing_rule);
+        // Identity fields are exact; the bps vectors are held to the same tolerance as the
+        // nats above, because serde_json's default parser does not promise the last bit and a
+        // pico-bp is ~13 orders of magnitude below anything selection acts on.
+        let close = |a: &Option<Vec<f64>>, b: &Option<Vec<f64>>| {
+            let (a, b) = (a.as_ref().expect("recorded"), b.as_ref().expect("recorded"));
+            assert_eq!(a.len(), b.len());
+            assert!(a.iter().zip(b).all(|(a, b)| (a - b).abs() < 1e-12));
+        };
+        close(&loaded.selection_edge_bps, &scored.selection_edge_bps);
+        close(&loaded.model_growth_bps, &scored.model_growth_bps);
+        let (got, want) = (
+            loaded.calibration.expect("recorded"),
+            scored.calibration.expect("recorded"),
+        );
+        assert!((got.mean_beta.0 - want.mean_beta.0).abs() < 1e-12);
+        assert!((got.mean_beta_se.0 - want.mean_beta_se.0).abs() < 1e-12);
+        assert!((got.variance_beta.0 - want.variance_beta.0).abs() < 1e-12);
+        // A v2 artifact must fail at LOAD rather than pair as though it recorded economics.
+        let mut stale = scored.clone();
+        stale.format_version = WINDOW_SCORES_FORMAT_VERSION - 1;
+        let stale_path = dir.join("stale.windows.json");
+        stale.save(&stale_path).expect("save");
+        assert!(WindowScores::load(&stale_path).is_err());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

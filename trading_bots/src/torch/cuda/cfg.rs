@@ -1,4 +1,4 @@
-use std::sync::Once;
+use std::{marker::PhantomData, rc::Rc, sync::Once};
 
 use tch::Cuda;
 
@@ -45,4 +45,41 @@ pub fn configure_cuda() {
 
         println!("CUDA configured: autocast bf16, SDPA flash only");
     });
+}
+
+/// Keep single-GPU pretraining backward scheduling on the caller thread.
+///
+/// PyTorch's indexed device-ready queues can reject valid CUDA device metadata after an
+/// ordinary CUDA backward has initialized the engine. Fresh and resumed world-model graphs
+/// have both reached that invalid ordinal path. Single-GPU pretraining does not need
+/// cross-device autograd workers; the caller's ready queue preserves the CUDA kernels.
+#[must_use]
+pub(crate) struct AutogradMultithreadingGuard {
+    was_enabled: bool,
+    _thread_bound: PhantomData<Rc<()>>,
+}
+
+impl Drop for AutogradMultithreadingGuard {
+    fn drop(&mut self) {
+        let restored = unsafe {
+            torch_sys::at_autograd_set_multithreading_enabled(i32::from(self.was_enabled))
+        };
+        assert!(
+            restored >= 0 || std::thread::panicking(),
+            "failed to restore PyTorch autograd multithreading"
+        );
+    }
+}
+
+pub(crate) fn disable_autograd_multithreading() -> AutogradMultithreadingGuard {
+    let was_enabled = unsafe { torch_sys::at_autograd_set_multithreading_enabled(0) };
+    assert!(
+        was_enabled >= 0,
+        "failed to disable PyTorch autograd multithreading"
+    );
+    println!("PyTorch autograd multithreading disabled for single-GPU pretraining");
+    AutogradMultithreadingGuard {
+        was_enabled: was_enabled != 0,
+        _thread_bound: PhantomData,
+    }
 }

@@ -283,6 +283,16 @@ enum Commands {
         #[arg(long, default_value_t = 1)]
         dyn_horizon: usize,
 
+        /// Base weight on direct complete-bar t+2 Hard categorical NLL. The fixed 0.5
+        /// multiplier remains active through every context stage. Zero is the control default.
+        #[arg(long, default_value_t = 0.0)]
+        direct_t2_weight: f64,
+
+        /// Base weight on direct complete-bar t+3 Hard categorical NLL. The fixed 0.25
+        /// multiplier remains active through every context stage. Zero is the control default.
+        #[arg(long, default_value_t = 0.0)]
+        direct_t3_weight: f64,
+
         /// Weight on the NextLat hidden-state term, i.e. the reference's `lambda_mse`.
         ///
         /// `1.0` paired with a mean reduction over every element of `[B, T, BAR_MODEL_DIM]`
@@ -336,11 +346,42 @@ enum Commands {
         #[arg(long, default_value_t = 1000)]
         validate_every: usize,
 
+        /// Use the historical global second-order surrogate `f = E[R]/E[R^2]` instead of
+        /// the default second-cumulant expected-log rule.
+        ///
+        /// This opt-out exists for exact reproduction of pre-A1 decision artifacts. It changes
+        /// no gradient or weight, only the reduction of the predictive law that decides the
+        /// position. The active rule and its same-bars comparison are recorded in
+        /// `pretrain_sizing_rule.report.bin`.
+        #[arg(long, default_value_t = false)]
+        quadratic_kelly: bool,
+
+        /// Size the traded book on the out-of-sample recalibrated conditional mean instead of
+        /// the raw one.
+        ///
+        /// Default off, for the same reason. The Mincer-Zarnowitz recalibration is refitted at
+        /// every validation on 256 validation windows sharing no `(symbol, calendar month)`
+        /// block with the prefix the bench trades, so the slope is never fitted and spent on
+        /// the same data; a degenerate regression is a hard error rather than a silent fall
+        /// back to the identity.
+        ///
+        /// Its effect is a function of how far the run annealed. The slope measured
+        /// `0.6653 +/- 0.0286` fully annealed on a full-length one-epoch run, `1.0058 +/-
+        /// 0.0355` at peak learning rate, and `0.9734` on a 3000-step screen budget — so a
+        /// short screening run will show this arm doing almost nothing, which is a fact about
+        /// the budget and not about the rule. Judge it at full length. The applied slope and
+        /// the independently measured one are both drawn in
+        /// `pretrain_sizing_rule.report.bin`, so an inert arm is distinguishable from a
+        /// mis-wired one.
+        #[arg(long, default_value_t = false)]
+        mean_shrink: bool,
+
         /// Write a step-tagged crash-recovery checkpoint every N optimizer steps (0 disables).
         ///
-        /// Promotion is gated on the deployed context and the batch ramp is memory-gated, so a
-        /// run can go two epochs without producing a promoted checkpoint. This bounds what a
-        /// crash destroys; the newest few are kept and older ones are pruned.
+        /// The 2048-step production default is about 7.6 minutes at the observed 4.5 step/s,
+        /// inside the 5–10 minute recovery target. Each event serializes one canonical bundle;
+        /// `pretrain_last` payloads are atomically replaced hardlink aliases, with metadata
+        /// committed last. Three periodic tagged bundles plus an off-grid final are retained.
         #[arg(long, default_value_t = trading_bot_0::torch::train::pretrain::DEFAULT_CHECKPOINT_EVERY)]
         checkpoint_every: usize,
 
@@ -382,6 +423,19 @@ enum Commands {
         #[arg(long, default_value_t = 0.0)]
         min_dollar_volume: f64,
 
+        /// Fit the bin supports on, and train the head against, VOLATILITY-STANDARDIZED
+        /// targets: `z_r = r / sigma_t` and `z_s = s / (1.665 * sigma_t)` for a causal
+        /// Garman-Klass HAR sigma measured from bars <= t only.
+        ///
+        /// CHANGES THE BIN GEOMETRY. `supports_sha256` differs from the control's, the default
+        /// supports cache is a different file (`bar_supports.volstd.<res>.json`), and no NLL,
+        /// CRPS, PIT or bin-occupancy figure is comparable against a raw-target run: pair the
+        /// arms with `pretrain-compare --allow-geometry-change`, under which only
+        /// `model_growth_difference` survives. The realized-return economics remain comparable
+        /// because they are arithmetic on prices, not on bins.
+        #[arg(long, default_value_t = false)]
+        vol_standardize_targets: bool,
+
         /// Refuse to start if measured capacity would REDUCE --batch-size, instead of
         /// clamping to what fits.
         ///
@@ -391,6 +445,16 @@ enum Commands {
         /// run and wrong for a controlled comparison; only the caller knows which this is.
         #[arg(long, default_value_t = false)]
         exact_batch: bool,
+
+        /// Complete training, validation, promotion, and checkpoint publication without
+        /// constructing or scoring the protected test split.
+        ///
+        /// Intended for campaign recovery and model selection before the one authorized
+        /// terminal Test read. The canonical report set is still finalized, with
+        /// `pretrain_test` explicitly marked deferred/unmeasured. This does not alter the
+        /// objective, schedule, optimizer, deterministic cursor, or recovery lineage.
+        #[arg(long, default_value_t = false)]
+        defer_test: bool,
     },
     /// Candle pictures of an EXISTING pretrain checkpoint against the realized bars.
     ///
@@ -494,6 +558,32 @@ enum Commands {
         #[arg(long, default_value_t = 8)]
         batch_size: usize,
 
+        /// Use the historical global second-order surrogate `f = E[R]/E[R^2]` instead of
+        /// the default second-cumulant expected-log rule.
+        ///
+        /// This is the explicit pre-A1 compatibility path. The active rule is priced against
+        /// its same-bars alternative across the whole cap grid in
+        /// `pretrain_sizing_rule.report.bin`.
+        #[arg(long, default_value_t = false)]
+        quadratic_kelly: bool,
+
+        /// Size on the OUT-OF-SAMPLE recalibrated conditional mean.
+        ///
+        /// Default off. Costs a second evaluation pass, over `--fit-windows` of this draw's
+        /// block-disjoint surplus, because the Mincer-Zarnowitz slope has to be fitted on
+        /// windows the bench never trades — an in-sample recalibration is worse than none. The
+        /// applied slope and the position it produced are both reported in
+        /// `pretrain_sizing_rule.report.bin`, so an arm whose slope came back at ~1.0 is
+        /// distinguishable from one that was mis-wired.
+        #[arg(long, default_value_t = false)]
+        mean_shrink: bool,
+
+        /// Windows of the block-disjoint remainder to fit `--mean-shrink` on. Truncated to
+        /// what the remainder holds, so asking for more than exists is safe. Ignored without
+        /// that flag.
+        #[arg(long, default_value_t = 256)]
+        fit_windows: usize,
+
         #[arg(long, default_value_t = trading_bot_0::data::ingest::bars_dir().to_string_lossy().into_owned())]
         data_dir: String,
 
@@ -543,6 +633,11 @@ enum Commands {
 
         #[arg(long, default_value_t = 300)]
         resolution_secs: u32,
+
+        /// Bars a symbol needs to enter the evaluation corpus. The evaluator raises smaller
+        /// values to the causal history required by panel construction and ADV calibration.
+        #[arg(long, default_value_t = trading_bot_0::torch::dataset::DEFAULT_MIN_BARS)]
+        min_bars: usize,
 
         #[arg(long, value_parser = parse_split_bounds)]
         split_bounds: Option<(i64, i64)>,
@@ -707,6 +802,45 @@ enum Commands {
         #[arg(long, default_value_t = 0.0)]
         min_dollar_volume: f64,
     },
+    /// Fit and persist a content-addressable bar-support artifact without starting training.
+    ///
+    /// This is the campaign geometry prerequisite: support fitting is CPU-only and must finish
+    /// before any seed arm is queued, so every arm names one immutable support hash rather than
+    /// racing to create a cache inside its training run. An existing matching artifact is
+    /// validated and reported; a mismatched one is refused, never overwritten.
+    FitBarSupports {
+        /// Destination support artifact. Geometry-changing arms should use a distinct path.
+        #[arg(long)]
+        output_supports: String,
+
+        #[arg(long, default_value_t = 4_000_000)]
+        samples: usize,
+
+        #[arg(long, default_value_t = 0x5EED)]
+        seed: u64,
+
+        #[arg(long, default_value_t = trading_bot_0::data::ingest::bars_dir().to_string_lossy().into_owned())]
+        data_dir: String,
+
+        #[arg(long, default_value_t = 300)]
+        resolution_secs: u32,
+
+        #[arg(long, default_value_t = trading_bot_0::torch::dataset::DEFAULT_MIN_BARS)]
+        min_bars: usize,
+
+        #[arg(long, value_parser = parse_split_bounds)]
+        split_bounds: Option<(i64, i64)>,
+
+        #[arg(long, default_value_t = false)]
+        derive_split_bounds: bool,
+
+        #[arg(long, default_value_t = 0.0)]
+        min_dollar_volume: f64,
+
+        /// Fit the authenticated standardized v8 geometry instead of raw v6 supports.
+        #[arg(long, default_value_t = false)]
+        vol_standardize_targets: bool,
+    },
     /// Measure the FITTED per-bin conditional means of an EXISTING bar support and write the
     /// v5 artifact carrying them, on UNCHANGED bin geometry.
     ///
@@ -781,6 +915,11 @@ enum Commands {
         /// Liquidity floor the run used; 0 uses every file on disk, which is what bardist_v2 did.
         #[arg(long, default_value_t = 0.0)]
         min_dollar_volume: f64,
+
+        /// The support under measurement tiles VOLATILITY-STANDARDIZED targets. Must match the
+        /// artifact named by --supports, whose own `dof_scaling` member records it.
+        #[arg(long, default_value_t = false)]
+        vol_standardize_targets: bool,
     },
     /// Can a CONTINUOUS per-DOF mixed likelihood replace the 128-way equal-mass discrete support?
     ///
@@ -1160,6 +1299,16 @@ enum Commands {
         /// Candidate run's per-window vector.
         #[arg(long)]
         candidate: String,
+        /// Compare two runs whose BIN GEOMETRIES differ, reporting the model growth leg
+        /// alone.
+        ///
+        /// Refused by default, because an NLL measured under two discretizations is two
+        /// different quantities and nothing else on the artifact records the binning. Give
+        /// this only for an arm whose treatment IS the discretization: every figure decoded
+        /// through the bins — the nats rows, the per-DOF rows and the selection edge, whose
+        /// null leg is support-derived — is then withheld rather than corrected.
+        #[arg(long)]
+        allow_geometry_change: bool,
     },
     TrainPlanner {
         #[arg(long, default_value = "weights/pretrain_best.ot")]
@@ -1395,10 +1544,32 @@ fn enforce_cli_eval_budget(cli: &Cli) -> anyhow::Result<()> {
             250_000,
             allow,
         ),
+        // The recalibration arm runs a SECOND pass, over the block-disjoint fit slice, so the
+        // guard has to price both or it understates a `--mean-shrink` bench by up to 2x.
         Some(Commands::PretrainTrade {
-            windows, context, ..
-        })
-        | Some(Commands::PretrainSkill {
+            windows,
+            context,
+            mean_shrink,
+            fit_windows,
+            ..
+        }) => torch::train::eval_budget::enforce(
+            "pretrain held-out window evaluation",
+            "scored bar-tokens",
+            eval_work_product([
+                (*windows).min(torch::train::trade_bench::TRADE_WINDOWS)
+                    + if *mean_shrink {
+                        (*fit_windows).min(windows.saturating_sub(
+                            (*windows).min(torch::train::trade_bench::TRADE_WINDOWS),
+                        ))
+                    } else {
+                        0
+                    },
+                (*context).max(0) as usize,
+            ]),
+            500_000,
+            allow,
+        ),
+        Some(Commands::PretrainSkill {
             windows, context, ..
         }) => torch::train::eval_budget::enforce(
             "pretrain held-out window evaluation",
@@ -1558,6 +1729,8 @@ async fn run() {
             auxiliary_resolutions,
             support_samples,
             dyn_horizon,
+            direct_t2_weight,
+            direct_t3_weight,
             lambda_dyn,
             lambda_kl,
             validation_windows,
@@ -1565,6 +1738,8 @@ async fn run() {
             snapshot_windows,
             snapshot_samples,
             validate_every,
+            quadratic_kelly,
+            mean_shrink,
             checkpoint_every,
             log_every,
             split_bounds,
@@ -1572,7 +1747,9 @@ async fn run() {
             supports,
             freeze_supports,
             min_dollar_volume,
+            vol_standardize_targets,
             exact_batch,
+            defer_test,
             lr_plateau_fraction,
             sdlr,
             optimizer_ablation,
@@ -1593,6 +1770,8 @@ async fn run() {
                 auxiliary_resolutions: auxiliary_resolutions.clone(),
                 support_samples: *support_samples,
                 dyn_horizon: *dyn_horizon,
+                direct_t2_weight: *direct_t2_weight,
+                direct_t3_weight: *direct_t3_weight,
                 lambda_dyn: *lambda_dyn,
                 lambda_kl: *lambda_kl,
                 validation_windows: *validation_windows,
@@ -1602,12 +1781,16 @@ async fn run() {
                 validate_every: *validate_every,
                 checkpoint_every: *checkpoint_every,
                 log_every: *log_every,
+                quadratic_kelly: *quadratic_kelly,
+                mean_shrink: *mean_shrink,
                 split_bounds: *split_bounds,
                 derive_split_bounds: *derive_split_bounds,
                 supports: supports.clone(),
                 freeze_supports: *freeze_supports,
                 min_dollar_volume: *min_dollar_volume,
+                vol_standardize_targets: *vol_standardize_targets,
                 exact_batch: *exact_batch,
+                defer_test: *defer_test,
                 lr_plateau_fraction: *lr_plateau_fraction,
                 sdlr: *sdlr,
                 optimizer_ablation: *optimizer_ablation,
@@ -1647,6 +1830,7 @@ async fn run() {
                     split_bounds: *split_bounds,
                     derive_split_bounds: *derive_split_bounds,
                     min_dollar_volume: *min_dollar_volume,
+                    dof_scaling: torch::bar_dist::DofScaling::Raw,
                 },
             };
             tokio::task::spawn_blocking(move || torch::train::pretrain_candles(args))
@@ -1661,6 +1845,9 @@ async fn run() {
             windows,
             context,
             batch_size,
+            quadratic_kelly,
+            mean_shrink,
+            fit_windows,
             data_dir,
             resolution_secs,
             min_bars,
@@ -1675,6 +1862,9 @@ async fn run() {
                 windows: *windows,
                 context: *context,
                 batch_size: *batch_size,
+                quadratic_kelly: *quadratic_kelly,
+                mean_shrink: *mean_shrink,
+                fit_windows: *fit_windows,
                 corpus: torch::train::CorpusFlags {
                     data_dir: data_dir.clone(),
                     resolution_secs: *resolution_secs,
@@ -1682,6 +1872,7 @@ async fn run() {
                     split_bounds: *split_bounds,
                     derive_split_bounds: *derive_split_bounds,
                     min_dollar_volume: *min_dollar_volume,
+                    dof_scaling: torch::bar_dist::DofScaling::Raw,
                 },
             };
             tokio::task::spawn_blocking(move || torch::train::pretrain_trade(args))
@@ -1717,6 +1908,7 @@ async fn run() {
                     split_bounds: *split_bounds,
                     derive_split_bounds: *derive_split_bounds,
                     min_dollar_volume: *min_dollar_volume,
+                    dof_scaling: torch::bar_dist::DofScaling::Raw,
                 },
             };
             tokio::task::spawn_blocking(move || torch::train::skill::pretrain_skill(args))
@@ -1731,6 +1923,7 @@ async fn run() {
             allow_test,
             data_dir,
             resolution_secs,
+            min_bars,
             split_bounds,
             max_symbols,
             max_instants,
@@ -1767,6 +1960,7 @@ async fn run() {
                 checkpoint: std::path::PathBuf::from(weights),
                 gens_dir: std::path::PathBuf::from(output),
                 res_secs: *resolution_secs,
+                min_bars: *min_bars,
                 device: if *cpu {
                     tch::Device::Cpu
                 } else {
@@ -1830,6 +2024,9 @@ async fn run() {
                     split_bounds: *split_bounds,
                     derive_split_bounds: *derive_split_bounds,
                     min_dollar_volume: *min_dollar_volume,
+                    // Dry runs never score a target. Non-dry calibration replaces this with the
+                    // first authenticated checkpoint's deployment geometry before corpus load.
+                    dof_scaling: torch::bar_dist::DofScaling::Raw,
                 },
                 restrict_symbols: restrict_symbols.clone(),
             };
@@ -1837,6 +2034,41 @@ async fn run() {
                 .await
                 .expect("calibration task panicked")
                 .expect("mean calibration failed");
+        }
+        Some(Commands::FitBarSupports {
+            output_supports,
+            samples,
+            seed,
+            data_dir,
+            resolution_secs,
+            min_bars,
+            split_bounds,
+            derive_split_bounds,
+            min_dollar_volume,
+            vol_standardize_targets,
+        }) => {
+            let args = torch::train::pretrain::FitSupportsArgs {
+                output_supports: output_supports.clone(),
+                samples: *samples,
+                seed: *seed,
+                corpus: torch::train::CorpusFlags {
+                    data_dir: data_dir.clone(),
+                    resolution_secs: *resolution_secs,
+                    min_bars: *min_bars,
+                    split_bounds: *split_bounds,
+                    derive_split_bounds: *derive_split_bounds,
+                    min_dollar_volume: *min_dollar_volume,
+                    dof_scaling: if *vol_standardize_targets {
+                        torch::bar_dist::DofScaling::VolStandardized
+                    } else {
+                        torch::bar_dist::DofScaling::Raw
+                    },
+                },
+            };
+            tokio::task::spawn_blocking(move || torch::train::pretrain::fit_bar_supports(args))
+                .await
+                .expect("support fit task panicked")
+                .expect("support fit failed");
         }
         Some(Commands::BarSupportsMoments {
             supports,
@@ -1851,6 +2083,7 @@ async fn run() {
             split_bounds,
             derive_split_bounds,
             min_dollar_volume,
+            vol_standardize_targets,
         }) => {
             let args = torch::train::support_moments::SupportMomentsArgs {
                 supports: supports.clone(),
@@ -1866,6 +2099,11 @@ async fn run() {
                     split_bounds: *split_bounds,
                     derive_split_bounds: *derive_split_bounds,
                     min_dollar_volume: *min_dollar_volume,
+                    dof_scaling: if *vol_standardize_targets {
+                        torch::bar_dist::DofScaling::VolStandardized
+                    } else {
+                        torch::bar_dist::DofScaling::Raw
+                    },
                 },
             };
             tokio::task::spawn_blocking(move || {
@@ -1905,6 +2143,7 @@ async fn run() {
                     split_bounds: *split_bounds,
                     derive_split_bounds: *derive_split_bounds,
                     min_dollar_volume: *min_dollar_volume,
+                    dof_scaling: torch::bar_dist::DofScaling::Raw,
                 },
             };
             tokio::task::spawn_blocking(move || torch::train::bar_family::fit_bar_families(args))
@@ -1938,6 +2177,7 @@ async fn run() {
                     split_bounds: *split_bounds,
                     derive_split_bounds: *derive_split_bounds,
                     min_dollar_volume: *min_dollar_volume,
+                    dof_scaling: torch::bar_dist::DofScaling::Raw,
                 },
             };
             tokio::task::spawn_blocking(move || torch::train::split_seams::audit_split_seams(args))
@@ -1976,6 +2216,7 @@ async fn run() {
                     split_bounds: *split_bounds,
                     derive_split_bounds: *derive_split_bounds,
                     min_dollar_volume: *min_dollar_volume,
+                    dof_scaling: torch::bar_dist::DofScaling::Raw,
                 },
             };
             tokio::task::spawn_blocking(move || {
@@ -2019,6 +2260,7 @@ async fn run() {
                     split_bounds: *split_bounds,
                     derive_split_bounds: *derive_split_bounds,
                     min_dollar_volume: *min_dollar_volume,
+                    dof_scaling: torch::bar_dist::DofScaling::Raw,
                 },
             };
             tokio::task::spawn_blocking(move || torch::train::mem_probe::mem_probe(args))
@@ -2029,10 +2271,17 @@ async fn run() {
         Some(Commands::PretrainCompare {
             baseline,
             candidate,
+            allow_geometry_change,
         }) => {
-            let comparison = torch::train::pretrain_stats::compare_runs(
+            let geometry = if *allow_geometry_change {
+                torch::train::pretrain_stats::GeometryPolicy::ModelGrowthOnly
+            } else {
+                torch::train::pretrain_stats::GeometryPolicy::Require
+            };
+            let comparison = torch::train::pretrain_stats::compare_runs_with(
                 std::path::Path::new(baseline),
                 std::path::Path::new(candidate),
+                geometry,
             )
             .expect("paired comparison failed");
             print!("{comparison}");
@@ -2249,16 +2498,22 @@ mod tests {
                 seed,
                 resolution_secs,
                 dyn_horizon,
+                direct_t2_weight,
+                direct_t3_weight,
                 lambda_dyn,
                 lambda_kl,
                 validation_windows,
                 diagnostic_context,
+                checkpoint_every,
                 data_dir,
                 lr_plateau_fraction,
                 sdlr,
                 optimizer_ablation,
                 ablation_lr,
                 smd_meta_lr,
+                defer_test,
+                quadratic_kelly,
+                mean_shrink,
                 ..
             }) = pretrain.command
             else {
@@ -2289,10 +2544,16 @@ mod tests {
             assert_eq!(optimizer_ablation, None);
             assert_eq!(ablation_lr, 1e-3);
             assert_eq!(smd_meta_lr, 0.05);
+            assert!(
+                !defer_test,
+                "Test scoring must remain the compatible default"
+            );
             assert_eq!(resolution_secs, 300);
             // NextLat learns one transition at a time; long-horizon recursive diagnostics
             // remain controlled independently by their fixed rollout horizon grid.
             assert_eq!(dyn_horizon, 1);
+            assert_eq!(direct_t2_weight, 0.0);
+            assert_eq!(direct_t3_weight, 0.0);
             // 1.0 is the NextLat reference's `lambda_mse` (arXiv 2511.05963,
             // `defaults.yaml`), and under `next_lat_loss`'s `Reduction::Mean` over
             // `[B, T, BAR_MODEL_DIM]` it is width-independent, so it stays 1.0 if
@@ -2306,12 +2567,21 @@ mod tests {
             // the default at 1/512 of the reference under a mean reduction.
             assert_eq!(lambda_dyn, 1.0);
             assert_eq!(lambda_kl, 1.0);
+            assert_eq!(
+                checkpoint_every,
+                trading_bot_0::torch::train::pretrain::DEFAULT_CHECKPOINT_EVERY
+            );
+            assert_eq!(checkpoint_every, 2048);
             assert_eq!(validation_windows, 4096);
             assert_eq!(
                 diagnostic_context,
                 trading_bot_0::torch::train::pretrain::BAR_CONTEXT_RAMP_START
             );
             assert!(data_dir.ends_with("bars"), "{data_dir}");
+            // A1's frozen-checkpoint evidence promoted the second-cumulant expected-log rule;
+            // the old quadratic rule remains an explicit reproducibility opt-out.
+            assert!(!quadratic_kelly, "--quadratic-kelly must default OFF");
+            assert!(!mean_shrink, "--mean-shrink must default OFF");
             assert_eq!(
                 trading_bot_0::torch::bar_dist::BarScoring::default(),
                 trading_bot_0::torch::bar_dist::BarScoring::Hard
@@ -2325,6 +2595,22 @@ mod tests {
     }
 
     #[test]
+    fn pretrain_checkpoint_cadence_can_be_overridden() {
+        with_large_cli_stack(|| {
+            let cli =
+                Cli::try_parse_from(["trading_bot", "pretrain", "--checkpoint-every", "4096"])
+                    .expect("explicit recovery cadence should parse");
+            assert!(matches!(
+                cli.command,
+                Some(Commands::Pretrain {
+                    checkpoint_every: 4096,
+                    ..
+                })
+            ));
+        });
+    }
+
+    #[test]
     fn pretrain_sdlr_is_explicitly_reachable() {
         with_large_cli_stack(|| {
             let cli = Cli::try_parse_from(["trading_bot", "pretrain", "--sdlr"])
@@ -2332,6 +2618,21 @@ mod tests {
             assert!(matches!(
                 cli.command,
                 Some(Commands::Pretrain { sdlr: true, .. })
+            ));
+        });
+    }
+
+    #[test]
+    fn pretrain_can_explicitly_defer_the_protected_test_split() {
+        with_large_cli_stack(|| {
+            let cli = Cli::try_parse_from(["trading_bot", "pretrain", "--defer-test"])
+                .expect("the Test deferral policy should parse");
+            assert!(matches!(
+                cli.command,
+                Some(Commands::Pretrain {
+                    defer_test: true,
+                    ..
+                })
             ));
         });
     }
@@ -2717,85 +3018,7 @@ mod tests {
     }
     #[test]
     fn receding_kelly_defaults_to_validation_and_test_requires_unlock() {
-        let cli = Cli::try_parse_from([
-            "trading_bot",
-            "pretrain-kelly",
-            "--weights",
-            "checkpoint.ot",
-            "--output",
-            "gens/0",
-        ])
-        .expect("production Kelly CLI should parse");
-        let Some(Commands::PretrainKelly {
-            split,
-            allow_test,
-            mean_sign_hysteresis_bps,
-            forecast_horizon,
-            ..
-        }) = cli.command
-        else {
-            panic!("pretrain-kelly should parse as PretrainKelly");
-        };
-        assert_eq!(split, PlannerDataSplit::Validation);
-        assert!(!allow_test);
-        assert_eq!(mean_sign_hysteresis_bps, None);
-        assert_eq!(
-            forecast_horizon,
-            trading_bot_0::torch::train::horizon::DEFAULT_FORECAST_HORIZON
-        );
-        assert!(
-            trading_bot_0::torch::train::horizon::validate_receding_split(
-                PlannerDataSplit::Test.split(),
-                false,
-            )
-            .is_err(),
-            "naming test alone must not unlock the locked split"
-        );
-        assert!(
-            trading_bot_0::torch::train::horizon::validate_receding_split(
-                PlannerDataSplit::Test.split(),
-                true,
-            )
-            .is_ok(),
-            "the explicit unlock must make the final test score addressable"
-        );
-    }
-    #[test]
-    fn receding_kelly_accepts_one_explicit_hysteresis_margin() {
-        let cli = Cli::try_parse_from([
-            "trading_bot",
-            "pretrain-kelly",
-            "--weights",
-            "checkpoint.ot",
-            "--output",
-            "gens/0",
-            "--split",
-            "test",
-            "--allow-test",
-            "--forecast-horizon",
-            "1",
-            "--mean-sign-hysteresis-bps",
-            "8",
-        ])
-        .expect("the preselected hysteresis margin should parse");
-        let Some(Commands::PretrainKelly {
-            mean_sign_hysteresis_bps,
-            split,
-            allow_test,
-            forecast_horizon,
-            ..
-        }) = cli.command
-        else {
-            panic!("pretrain-kelly should parse as PretrainKelly");
-        };
-        assert_eq!(mean_sign_hysteresis_bps, Some(8.0));
-        assert_eq!(split, PlannerDataSplit::Test);
-        assert!(allow_test);
-        assert_eq!(forecast_horizon, 1);
-    }
-    #[test]
-    fn receding_kelly_cli_accepts_only_exact_evaluated_forecast_horizons() {
-        for (value, expected) in [("1", 1usize), ("100", 100usize)] {
+        with_large_cli_stack(|| {
             let cli = Cli::try_parse_from([
                 "trading_bot",
                 "pretrain-kelly",
@@ -2803,32 +3026,142 @@ mod tests {
                 "checkpoint.ot",
                 "--output",
                 "gens/0",
-                "--forecast-horizon",
-                value,
             ])
-            .expect("an exact production-grid horizon should parse");
+            .expect("production Kelly CLI should parse");
             let Some(Commands::PretrainKelly {
-                forecast_horizon, ..
+                split,
+                allow_test,
+                min_bars,
+                mean_sign_hysteresis_bps,
+                forecast_horizon,
+                ..
             }) = cli.command
             else {
                 panic!("pretrain-kelly should parse as PretrainKelly");
             };
-            assert_eq!(forecast_horizon, expected);
-        }
-
-        assert!(
-            Cli::try_parse_from([
+            assert_eq!(split, PlannerDataSplit::Validation);
+            assert!(!allow_test);
+            assert_eq!(mean_sign_hysteresis_bps, None);
+            assert_eq!(
+                min_bars,
+                trading_bot_0::torch::dataset::DEFAULT_MIN_BARS
+            );
+            assert_eq!(
+                forecast_horizon,
+                trading_bot_0::torch::train::horizon::DEFAULT_FORECAST_HORIZON
+            );
+            assert!(
+                trading_bot_0::torch::train::horizon::validate_receding_split(
+                    PlannerDataSplit::Test.split(),
+                    false,
+                )
+                .is_err(),
+                "naming test alone must not unlock the locked split"
+            );
+            assert!(
+                trading_bot_0::torch::train::horizon::validate_receding_split(
+                    PlannerDataSplit::Test.split(),
+                    true,
+                )
+                .is_ok(),
+                "the explicit unlock must make the final test score addressable"
+            );
+        });
+    }
+    #[test]
+    fn receding_kelly_accepts_one_explicit_hysteresis_margin() {
+        with_large_cli_stack(|| {
+            let cli = Cli::try_parse_from([
                 "trading_bot",
                 "pretrain-kelly",
                 "--weights",
                 "checkpoint.ot",
                 "--output",
                 "gens/0",
+                "--split",
+                "test",
+                "--allow-test",
                 "--forecast-horizon",
-                "2",
+                "1",
+                "--mean-sign-hysteresis-bps",
+                "8",
             ])
-            .is_err(),
-            "a horizon without an exact evaluated prefix must fail at CLI parsing"
-        );
+            .expect("the preselected hysteresis margin should parse");
+            let Some(Commands::PretrainKelly {
+                mean_sign_hysteresis_bps,
+                split,
+                allow_test,
+                forecast_horizon,
+                ..
+            }) = cli.command
+            else {
+                panic!("pretrain-kelly should parse as PretrainKelly");
+            };
+            assert_eq!(mean_sign_hysteresis_bps, Some(8.0));
+            assert_eq!(split, PlannerDataSplit::Test);
+            assert!(allow_test);
+            assert_eq!(forecast_horizon, 1);
+        });
+    }
+
+    #[test]
+    fn receding_kelly_accepts_an_explicit_corpus_minimum() {
+        with_large_cli_stack(|| {
+            let cli = Cli::try_parse_from([
+                "trading_bot",
+                "pretrain-kelly",
+                "--weights",
+                "checkpoint.ot",
+                "--output",
+                "gens/0",
+                "--min-bars",
+                "4096",
+            ])
+            .expect("an explicit Kelly corpus minimum should parse");
+            let Some(Commands::PretrainKelly { min_bars, .. }) = cli.command else {
+                panic!("pretrain-kelly should parse as PretrainKelly");
+            };
+            assert_eq!(min_bars, 4096);
+        });
+    }
+    #[test]
+    fn receding_kelly_cli_accepts_only_exact_evaluated_forecast_horizons() {
+        with_large_cli_stack(|| {
+            for (value, expected) in [("1", 1usize), ("100", 100usize)] {
+                let cli = Cli::try_parse_from([
+                    "trading_bot",
+                    "pretrain-kelly",
+                    "--weights",
+                    "checkpoint.ot",
+                    "--output",
+                    "gens/0",
+                    "--forecast-horizon",
+                    value,
+                ])
+                .expect("an exact production-grid horizon should parse");
+                let Some(Commands::PretrainKelly {
+                    forecast_horizon, ..
+                }) = cli.command
+                else {
+                    panic!("pretrain-kelly should parse as PretrainKelly");
+                };
+                assert_eq!(forecast_horizon, expected);
+            }
+
+            assert!(
+                Cli::try_parse_from([
+                    "trading_bot",
+                    "pretrain-kelly",
+                    "--weights",
+                    "checkpoint.ot",
+                    "--output",
+                    "gens/0",
+                    "--forecast-horizon",
+                    "2",
+                ])
+                .is_err(),
+                "a horizon without an exact evaluated prefix must fail at CLI parsing"
+            );
+        });
     }
 }

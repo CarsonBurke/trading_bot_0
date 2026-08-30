@@ -5,9 +5,10 @@
 //! Bases live in `shared::report::PRETRAIN_REPORT_BASES`, which the TUI consumes directly.
 //!
 //! All scalar curves share one x-axis, the *record tick*. [`PretrainReporter::record_step`]
-//! mean-aggregates [`STEP_DECIMATION`] optimizer steps into one tick, and
-//! [`PretrainReporter::record_epoch`] commits a tick of its own carrying the
-//! validation numbers. Series that only exist on one of the two paths are
+//! aggregates [`STEP_DECIMATION`] optimizer steps into one tick; `nats/bar` series are weighted
+//! by exact scored target bars while other step diagnostics retain their ordinary finite mean.
+//! [`PretrainReporter::record_epoch`] commits a tick of its own carrying the validation numbers.
+//! Series that only exist on one of the two paths are
 //! NaN-padded on the other, which the report renderer already filters. The
 //! practical effect is a dense training curve with validation markers
 //! interleaved, instead of a chart with one point per epoch.
@@ -48,18 +49,20 @@ use super::support_moments::SupportDecode;
 use super::trade_bench::{
     BandShrinkOverlap, BandSweep, EdgeAttribution, HysteresisComposition, HysteresisOos,
     HysteresisSweep, MeanCalibration, OuterDecomposition, PolicyStats, ShrunkBench, SignalDecay,
-    TradeBench, ATTRIBUTION_ARMS, ATTRIBUTION_DECILES, ATTRIBUTION_NAMES, BARS_PER_YEAR, CAP_GRID,
-    CELL_LABELS, COMPOSITION_NAMES, COST_GRID_BPS, DECAY_HORIZONS, DEFAULT_COST_SLOT,
-    FREE_KELLY_EDGES, HYSTERESIS_MARGINS, HYSTERESIS_NET_COSTS, HYSTERESIS_SELECTION_COST,
-    LEVERAGE_CAP, MAX_BREAK_EVEN_BPS, MAX_LEVERAGE, PANEL_LABELS, POLICY_COUNT,
-    POLICY_KELLY_MULTIPLE, POLICY_MARGINAL, POLICY_MODEL, POLICY_NAMES, POLICY_ORACLE,
-    SIZING_KNOBS, SIZING_SHAPES, TAIL_LEVELS, TAIL_RATIO_WARN,
+    SizingPoint, TradeBench, ATTRIBUTION_ARMS, ATTRIBUTION_DECILES, ATTRIBUTION_NAMES,
+    BARS_PER_YEAR, CAP_GRID, CELL_LABELS, COMPOSITION_NAMES, COST_GRID_BPS, DECAY_HORIZONS,
+    DEFAULT_COST_SLOT, FREE_KELLY_EDGES, HYSTERESIS_MARGINS, HYSTERESIS_NET_COSTS,
+    HYSTERESIS_SELECTION_COST, LEVERAGE_CAP, MAX_BREAK_EVEN_BPS, MAX_LEVERAGE, PANEL_LABELS,
+    POLICY_COUNT, POLICY_KELLY_MULTIPLE, POLICY_MARGINAL, POLICY_MODEL, POLICY_NAMES,
+    POLICY_ORACLE, POLICY_VOL_TARGET, SIZING_KNOBS, SIZING_SHAPES, TAIL_LEVELS, TAIL_RATIO_WARN,
+    VOL_FORECASTS, VOL_FORECAST_NAMES, VOL_HAR, VOL_MODEL, VOL_WARMUP_BARS,
 };
 use crate::torch::bar_dist::{
-    decode_dof, BarDof, BarScoring, BarSupports, BAR_DOF, BAR_DOF_NAMES, DOF_R, DOF_S, DOF_U,
-    DOF_V, NUM_BAR_BINS,
+    decode_dof, BarDof, BarScoring, BarSupports, BAR_DOF, BAR_DOF_NAMES, BAR_SIGMA_RELATIVE_FLOOR,
+    BAR_SIGMA_WARMUP_BARS, BAR_VOL_SLOW_ANCHOR_SPAN, BAR_Z_LIMIT, DOF_R, DOF_S, DOF_U, DOF_V,
+    NUM_BAR_BINS,
 };
-use crate::torch::dataset::{mix64, Split, MULTIPLICITY_BUCKETS};
+use crate::torch::dataset::{mix64, Split, TargetGeometry, MULTIPLICITY_BUCKETS, TARGET_QUANTILES};
 
 /// Resolution of the per-DOF PIT histogram.
 pub const PIT_HIST_BINS: usize = 16;
@@ -166,15 +169,29 @@ pub fn uniform_categorical_nll_bar() -> f64 {
 
 /// Per-optimizer-step training metrics. Build with [`StepMetrics::nan`] and set
 /// what is available; non-finite fields are skipped rather than plotted.
+///
+/// The NLL fields carry NUMERATORS plus the exact number of scored target bars. Keeping the
+/// count integral until the final division makes a `nats/bar` aggregate independent of how
+/// targets were partitioned across contexts, full minibatches, and short stage tails.
 #[derive(Clone, Copy, Debug)]
 pub struct StepMetrics {
     pub epoch: usize,
     pub step: usize,
-    pub nll_bar: f64,
-    pub nll_dof: [f64; BAR_DOF],
+    pub nll_bar_numerator: f64,
+    pub nll_dof_numerators: [f64; BAR_DOF],
+    pub nll_target_count: u64,
     pub dyn_loss: f64,
     pub kl_loss: f64,
     pub total_loss: f64,
+    pub direct_nll: [f64; 2],
+    pub direct_nll_dof: [[f64; BAR_DOF]; 2],
+    pub direct_target_count: [u64; 2],
+    pub direct_weights: [f64; 2],
+    pub direct_objective_share: f64,
+    pub shared_grad_alignment: f64,
+    pub shared_grad_conflict: f64,
+    pub forward_wall_secs: f64,
+    pub step_wall_secs: f64,
     /// Mean raw-payoff growth loss in nats per bar under the deployed leverage cap, where
     /// `f_hat = E[R]/E[R²]` is the moment-correct quadratic Kelly fraction of
     /// `p(r|past)`. Exact `-log1p(f_hat R)` applies at wealth `>= 1e-4`; a finite
@@ -272,11 +289,21 @@ impl StepMetrics {
         Self {
             epoch: 0,
             step: 0,
-            nll_bar: f64::NAN,
-            nll_dof: [f64::NAN; BAR_DOF],
+            nll_bar_numerator: f64::NAN,
+            nll_dof_numerators: [f64::NAN; BAR_DOF],
+            nll_target_count: 0,
             dyn_loss: f64::NAN,
             kl_loss: f64::NAN,
             total_loss: f64::NAN,
+            direct_nll: [f64::NAN; 2],
+            direct_nll_dof: [[f64::NAN; BAR_DOF]; 2],
+            direct_target_count: [0; 2],
+            direct_weights: [f64::NAN; 2],
+            direct_objective_share: f64::NAN,
+            shared_grad_alignment: f64::NAN,
+            shared_grad_conflict: f64::NAN,
+            forward_wall_secs: f64::NAN,
+            step_wall_secs: f64::NAN,
             nll_share: f64::NAN,
             dyn_share: f64::NAN,
             kl_share: f64::NAN,
@@ -337,6 +364,13 @@ pub struct EpochMetrics {
     /// Path the promoted checkpoint was written to, or `None` if this validation
     /// did not promote. The reporter fingerprints the artifact here so the
     /// end-of-run test battery can prove it scored that exact file.
+    pub direct_nll: [f64; 2],
+    pub direct_nll_dof: [[f64; BAR_DOF]; 2],
+    pub direct_crps_dof: [[f64; BAR_DOF]; 2],
+    pub direct_dir_acc: [f64; 2],
+    pub direct_valid_fraction: [f64; 2],
+    /// Direct Hard-NLL minus the exact teacher-forced belief-advance score at the same horizon.
+    pub direct_vs_exact_delta: [f64; 2],
     pub promoted_checkpoint: Option<PathBuf>,
     /// Across-run diagnostic at the fixed [`DIAGNOSTIC_CONTEXT`].
     pub val_nll_bar_diag: f64,
@@ -468,6 +502,12 @@ impl EpochMetrics {
             val_nll_bar: f64::NAN,
             best_val_nll_bar: f64::NAN,
             promoted_checkpoint: None,
+            direct_nll: [f64::NAN; 2],
+            direct_nll_dof: [[f64::NAN; BAR_DOF]; 2],
+            direct_crps_dof: [[f64::NAN; BAR_DOF]; 2],
+            direct_dir_acc: [f64::NAN; 2],
+            direct_valid_fraction: [f64::NAN; 2],
+            direct_vs_exact_delta: [f64::NAN; 2],
             val_nll_bar_diag: f64::NAN,
             train_nll_dof: [f64::NAN; BAR_DOF],
             val_nll_dof: [f64::NAN; BAR_DOF],
@@ -703,6 +743,12 @@ pub struct TestBattery {
     /// numbers came from an artifact read back off disk rather than from the
     /// in-memory training model.
     pub model_lineage: String,
+    pub direct_nll: [f64; 2],
+    pub direct_nll_dof: [[f64; BAR_DOF]; 2],
+    pub direct_crps_dof: [[f64; BAR_DOF]; 2],
+    pub direct_dir_acc: [f64; 2],
+    pub direct_valid_fraction: [f64; 2],
+    pub direct_vs_exact_delta: [f64; 2],
     pub nll_bar: f64,
     pub nll_dof: [f64; BAR_DOF],
     pub crps_dof: [f64; BAR_DOF],
@@ -793,6 +839,12 @@ impl TestBattery {
             crps_dof: [f64::NAN; BAR_DOF],
             rollout_nll_exact: [f64::NAN; ROLLOUT_HORIZONS.len()],
             rollout_nll_dynamics: [f64::NAN; ROLLOUT_HORIZONS.len()],
+            direct_nll: [f64::NAN; 2],
+            direct_nll_dof: [[f64::NAN; BAR_DOF]; 2],
+            direct_crps_dof: [[f64::NAN; BAR_DOF]; 2],
+            direct_dir_acc: [f64::NAN; 2],
+            direct_valid_fraction: [f64::NAN; 2],
+            direct_vs_exact_delta: [f64::NAN; 2],
             pit: PitHistogram::default(),
             dir_acc: f64::NAN,
             corpus_fingerprint: String::new(),
@@ -1396,6 +1448,70 @@ impl Series {
     }
 }
 
+/// Target-weighted NLL reduction shared by step-chart and epoch aggregation.
+///
+/// Every component uses the SAME integral target count. A contribution is accepted only when
+/// the total and every per-DOF numerator are finite, preventing a partially measured step from
+/// giving identically labeled `nats/bar` series different denominators.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct NllAccumulator {
+    numerator: f64,
+    dof_numerators: [f64; BAR_DOF],
+    target_count: u64,
+}
+
+impl Default for NllAccumulator {
+    fn default() -> Self {
+        Self {
+            numerator: 0.0,
+            dof_numerators: [0.0; BAR_DOF],
+            target_count: 0,
+        }
+    }
+}
+
+impl NllAccumulator {
+    pub(super) fn push(
+        &mut self,
+        numerator: f64,
+        dof_numerators: [f64; BAR_DOF],
+        target_count: u64,
+    ) {
+        if target_count == 0
+            || !numerator.is_finite()
+            || dof_numerators.iter().any(|value| !value.is_finite())
+        {
+            return;
+        }
+        self.numerator += numerator;
+        for (sum, value) in self.dof_numerators.iter_mut().zip(dof_numerators) {
+            *sum += value;
+        }
+        self.target_count = self
+            .target_count
+            .checked_add(target_count)
+            .expect("scored target-bar count overflowed u64");
+    }
+
+    pub(super) fn means(self) -> (f64, [f64; BAR_DOF]) {
+        if self.target_count == 0 {
+            (f64::NAN, [f64::NAN; BAR_DOF])
+        } else {
+            let denominator = self.target_count as f64;
+            (
+                self.numerator / denominator,
+                self.dof_numerators.map(|value| value / denominator),
+            )
+        }
+    }
+
+    pub(super) fn write_epoch(self, metrics: &mut EpochMetrics) {
+        let (nll_bar, nll_dof) = self.means();
+        metrics.train_nll_bar = nll_bar;
+        metrics.train_nll_dof = nll_dof;
+    }
+}
+
 /// Running mean that ignores non-finite contributions.
 #[derive(Clone, Copy, Debug, Default)]
 struct Mean {
@@ -1423,11 +1539,19 @@ impl Mean {
 #[derive(Clone, Copy, Debug, Default)]
 struct StepAccumulator {
     steps: usize,
-    nll_bar: Mean,
-    nll_dof: [Mean; BAR_DOF],
+    nll: NllAccumulator,
     dyn_loss: Mean,
     kl_loss: Mean,
     total_loss: Mean,
+    direct_nll: [NllAccumulator; 2],
+    direct_valid_rows: [u64; 2],
+    direct_possible_rows: [u64; 2],
+    direct_weights: [Mean; 2],
+    direct_objective_share: Mean,
+    shared_grad_alignment: Mean,
+    shared_grad_conflict: Mean,
+    forward_wall_secs: Mean,
+    step_wall_secs: Mean,
     nll_share: Mean,
     dyn_share: Mean,
     kl_share: Mean,
@@ -1477,13 +1601,38 @@ struct StepAccumulator {
 impl StepAccumulator {
     fn push(&mut self, step: &StepMetrics) {
         self.steps += 1;
-        self.nll_bar.push(step.nll_bar);
-        for (slot, &value) in self.nll_dof.iter_mut().zip(step.nll_dof.iter()) {
-            slot.push(value);
-        }
+        self.nll.push(
+            step.nll_bar_numerator,
+            step.nll_dof_numerators,
+            step.nll_target_count,
+        );
         self.dyn_loss.push(step.dyn_loss);
         self.kl_loss.push(step.kl_loss);
         self.total_loss.push(step.total_loss);
+        for horizon in 0..2 {
+            let count = step.direct_target_count[horizon];
+            if count > 0 {
+                let denominator = count as f64;
+                self.direct_nll[horizon].push(
+                    step.direct_nll[horizon] * denominator,
+                    step.direct_nll_dof[horizon].map(|value| value * denominator),
+                    count,
+                );
+            }
+            self.direct_valid_rows[horizon] = self.direct_valid_rows[horizon]
+                .checked_add(count)
+                .expect("direct target count overflowed u64");
+            self.direct_possible_rows[horizon] = self.direct_possible_rows[horizon]
+                .checked_add(step.nll_target_count)
+                .expect("direct potential-row count overflowed u64");
+            self.direct_weights[horizon].push(step.direct_weights[horizon]);
+        }
+        self.direct_objective_share
+            .push(step.direct_objective_share);
+        self.shared_grad_alignment.push(step.shared_grad_alignment);
+        self.shared_grad_conflict.push(step.shared_grad_conflict);
+        self.forward_wall_secs.push(step.forward_wall_secs);
+        self.step_wall_secs.push(step.step_wall_secs);
         self.nll_share.push(step.nll_share);
         self.dyn_share.push(step.dyn_share);
         self.kl_share.push(step.kl_share);
@@ -1573,6 +1722,15 @@ pub struct PretrainReporter {
     dyn_share: Series,
     kl_share: Series,
     growth_loss: Series,
+    direct_nll: [Series; 2],
+    direct_nll_dof: [[Series; BAR_DOF]; 2],
+    direct_weights: [Series; 2],
+    direct_valid_fraction: [Series; 2],
+    direct_objective_share: Series,
+    shared_grad_alignment: Series,
+    shared_grad_conflict: Series,
+    forward_wall_secs: Series,
+    step_wall_secs: Series,
     growth_share: Series,
     growth_abs_f: Series,
     growth_clamp_bind: Series,
@@ -1591,6 +1749,11 @@ pub struct PretrainReporter {
     sdlr_alpha_bound_fraction: Series,
     sdlr_evidence_mean: Series,
     sdlr_evidence_std: Series,
+    direct_nll_val: [Series; 2],
+    direct_nll_dof_val: [[Series; BAR_DOF]; 2],
+    direct_crps_dof_val: [[Series; BAR_DOF]; 2],
+    direct_dir_acc_val: [Series; 2],
+    direct_vs_exact_delta: [Series; 2],
     sdlr_objective: Series,
     sdlr_update_magnitude: Series,
     smd_gain_mean: Series,
@@ -1737,6 +1900,40 @@ pub struct PretrainReporter {
     trade_abs_position: Series,
     trade_drawdown_mean: Series,
     trade_drawdown_max: Series,
+    /// The vol-targeted baseline's edge over the marginal null, in bps/bar. It rides in the
+    /// `vs baselines` chart rather than in the growth chart because the question it answers
+    /// is comparative: how much of the model's edge is available from causal volatility
+    /// timing alone, with no return forecast anywhere.
+    trade_vol_target_edge: Series,
+    /// [`qlike`](super::trade_bench::qlike) per volatility forecast, and each row's measured
+    /// level bias beside it. Dimensionless.
+    vol_qlike: [Series; VOL_FORECASTS],
+    vol_level_ratio: [Series; VOL_FORECASTS],
+    /// `qlike - qlike(har-rv)`, paired per window. Negative is the forecast beating HAR, and
+    /// the interval is carried for the scale-corrected model row because that is the one the
+    /// campaign's verdict is read off.
+    vol_versus_har: [Series; VOL_FORECASTS],
+    vol_versus_har_low: Series,
+    vol_versus_har_high: Series,
+    /// The HAR baseline's QLIKE DECOMPOSITION: `E[z]` and `E[ln z]` separately, at
+    /// `z = realized / predicted`.
+    ///
+    /// Charted because the composite hid a straw-man baseline. Pooled QLIKE is identically
+    /// `E[z] - E[ln z] - 1`, so a baseline whose loss is carried by `E[z]` while its level
+    /// ratio sits at one has a handful of catastrophically small predictions rather than a
+    /// uniformly poor fit, and no composite figure separates those two.
+    vol_har_mean_ratio: Series,
+    vol_har_log_bias: Series,
+    /// Baseline HEALTH per evaluation: the share of scored bars whose HAR forecast was a fit
+    /// rejected by the magnitude floor, the share where no fit was usable at all, and one on
+    /// the ticks where the verdict was WITHHELD because the baseline is degenerate.
+    ///
+    /// These live on the verdict panel rather than the level panel because they qualify the
+    /// verdict: a baseline rescued on most of its bars cannot be beaten in any meaningful
+    /// sense, and the paired difference alone never says so.
+    vol_har_floor_rate: Series,
+    vol_har_refusal_rate: Series,
+    vol_verdict_withheld: Series,
     /// Latest validation cost curve and, once the run ends, the test-split one. Both live
     /// on the COST axis rather than the record-tick axis, so they are held whole rather
     /// than appended per tick.
@@ -1746,6 +1943,10 @@ pub struct PretrainReporter {
     /// the record tick: a handful of rows per run, and every series drawn from them has to
     /// stay index-aligned with the others, which independent `Series` could not guarantee.
     epoch_rows: Vec<EpochBoundary>,
+    /// The target parametrization measured on the evaluation split, once, before step zero.
+    /// Constant for the whole run and held whole rather than ticked, so its three panels are
+    /// rewritten into every generation directory beside the curves they explain.
+    target_geometry: Option<TargetGeometry>,
     /// Metrics already announced as unmeasured, so the warning fires once per metric per run
     /// instead of on every validation.
     warned_unmeasured: BTreeSet<String>,
@@ -1793,6 +1994,15 @@ impl PretrainReporter {
             dyn_share: Series::default(),
             kl_share: Series::default(),
             growth_loss: Series::default(),
+            direct_nll: array::from_fn(|_| Series::default()),
+            direct_nll_dof: array::from_fn(|_| array::from_fn(|_| Series::default())),
+            direct_weights: array::from_fn(|_| Series::default()),
+            direct_valid_fraction: array::from_fn(|_| Series::default()),
+            direct_objective_share: Series::default(),
+            shared_grad_alignment: Series::default(),
+            shared_grad_conflict: Series::default(),
+            forward_wall_secs: Series::default(),
+            step_wall_secs: Series::default(),
             growth_share: Series::default(),
             growth_abs_f: Series::default(),
             growth_clamp_bind: Series::default(),
@@ -1818,6 +2028,11 @@ impl PretrainReporter {
             smd_gain_min: Series::default(),
             smd_gain_max: Series::default(),
             smd_gain_bound_fraction: Series::default(),
+            direct_nll_val: array::from_fn(|_| Series::default()),
+            direct_nll_dof_val: array::from_fn(|_| array::from_fn(|_| Series::default())),
+            direct_crps_dof_val: array::from_fn(|_| array::from_fn(|_| Series::default())),
+            direct_dir_acc_val: array::from_fn(|_| Series::default()),
+            direct_vs_exact_delta: array::from_fn(|_| Series::default()),
             smd_credit_mean: Series::default(),
             smd_credit_std: Series::default(),
             smd_beta_update_abs_mean: Series::default(),
@@ -1910,9 +2125,21 @@ impl PretrainReporter {
             trade_abs_position: Series::default(),
             trade_drawdown_mean: Series::default(),
             trade_drawdown_max: Series::default(),
+            trade_vol_target_edge: Series::default(),
+            vol_qlike: array::from_fn(|_| Series::default()),
+            vol_level_ratio: array::from_fn(|_| Series::default()),
+            vol_versus_har: array::from_fn(|_| Series::default()),
+            vol_versus_har_low: Series::default(),
+            vol_versus_har_high: Series::default(),
+            vol_har_mean_ratio: Series::default(),
+            vol_har_log_bias: Series::default(),
+            vol_har_floor_rate: Series::default(),
+            vol_har_refusal_rate: Series::default(),
+            vol_verdict_withheld: Series::default(),
             trade_val: None,
             trade_test: None,
             epoch_rows: Vec::new(),
+            target_geometry: None,
             warned_unmeasured: BTreeSet::new(),
         }
     }
@@ -1921,6 +2148,16 @@ impl PretrainReporter {
     /// set are known. Call once, before the first [`Self::record_epoch`].
     pub fn set_held_out_baselines(&mut self, baselines: HeldOutBaselines) {
         self.baselines = baselines;
+    }
+
+    /// Supply the target-geometry audit of the evaluation split. Call once, before the first
+    /// [`Self::record_step`], so the three panels exist in every generation directory.
+    ///
+    /// Never gated on `--vol-standardize-targets`: the control's numbers ARE the baseline the
+    /// standardized arm's are read against, and the two panels are only comparable because both
+    /// arms write them.
+    pub fn set_target_geometry(&mut self, geometry: TargetGeometry) {
+        self.target_geometry = Some(geometry);
     }
 
     /// Fold one optimizer step in. Every [`STEP_DECIMATION`] steps this commits a
@@ -2063,6 +2300,17 @@ impl PretrainReporter {
         self.dir_acc.set(tick, metrics.val_dir_acc);
         self.unique_bar_reuse.set(tick, metrics.unique_bar_reuse);
         self.effective_rank.set(tick, metrics.effective_rank);
+        for horizon in 0..2 {
+            self.direct_nll_val[horizon].set(tick, metrics.direct_nll[horizon]);
+            self.direct_dir_acc_val[horizon].set(tick, metrics.direct_dir_acc[horizon]);
+            self.direct_vs_exact_delta[horizon].set(tick, metrics.direct_vs_exact_delta[horizon]);
+            for dof in 0..BAR_DOF {
+                self.direct_nll_dof_val[horizon][dof]
+                    .set(tick, metrics.direct_nll_dof[horizon][dof]);
+                self.direct_crps_dof_val[horizon][dof]
+                    .set(tick, metrics.direct_crps_dof[horizon][dof]);
+            }
+        }
         self.record_trade(tick, &metrics.trade);
         if let Some(checkpoint) = &metrics.promoted_checkpoint {
             // A promotion whose artifact is not on disk means the end-of-run test
@@ -2177,6 +2425,26 @@ impl PretrainReporter {
             (trade.policies[POLICY_ORACLE].net_growth - trade.policies[POLICY_MARGINAL].net_growth)
                 * 1e4,
         );
+        self.trade_vol_target_edge
+            .set(tick, trade.edge[POLICY_VOL_TARGET].mean * 1e4);
+        for forecast in 0..VOL_FORECASTS {
+            let score = &trade.vol.scores[forecast];
+            self.vol_qlike[forecast].set(tick, score.qlike.mean);
+            self.vol_level_ratio[forecast].set(tick, score.level_ratio);
+            self.vol_versus_har[forecast].set(tick, trade.vol.versus_har[forecast].mean);
+        }
+        let paired = trade.vol.model_versus_har();
+        self.vol_versus_har_low.set(tick, paired.ci_low);
+        self.vol_versus_har_high.set(tick, paired.ci_high);
+        let har = &trade.vol.scores[VOL_HAR];
+        self.vol_har_mean_ratio.set(tick, har.mean_ratio);
+        self.vol_har_log_bias.set(tick, har.log_bias);
+        self.vol_har_floor_rate
+            .set(tick, trade.vol.har_floor_rate());
+        self.vol_har_refusal_rate
+            .set(tick, trade.vol.har_refusal_rate());
+        self.vol_verdict_withheld
+            .set(tick, f64::from(trade.vol.har_degenerate));
         // An infinite break-even is a real outcome (cost never removes the edge) but it is
         // not a chartable number, so the series omits it and the chart title states it.
         self.trade_break_even.set(tick, trade.model_break_even());
@@ -2359,6 +2627,11 @@ impl PretrainReporter {
     ///    time, so scoring the in-memory model, a stale `*_best.ot`, or a file
     ///    rewritten since promotion all fail loudly. `model_lineage` must be
     ///    non-empty, which only a real `BarWorldModel::load` can supply.
+    ///
+    /// Campaigns that have not authorized their one Test read use
+    /// [`Self::finish_deferred_test`] instead. It consumes the reporter under the same
+    /// terminal ownership rule and authenticates the promoted artifact, but records an
+    /// explicit unmeasured state without accepting a [`TestBattery`].
     pub fn finish(mut self, battery: &TestBattery) -> Result<()> {
         let (promoted, promoted_digest) = self.promoted_checkpoint.clone().context(
             "no promotion was ever reported, so there is no checkpoint the held-out battery could \
@@ -2401,6 +2674,10 @@ impl PretrainReporter {
         let uniform = self.baselines.uniform_nll_bar;
         let score_contract = self.baselines.scoring.report_contract();
         let mut series = vec![
+            point_series(
+                "test evaluation status (0 = deferred/unmeasured, 1 = measured)",
+                1.0,
+            ),
             point_series(&format!("{score_contract} nats/bar"), battery.nll_bar),
             point_series(
                 &format!("{score_contract} vs uniform"),
@@ -2425,6 +2702,35 @@ impl PretrainReporter {
                 },
             ),
         ];
+        for horizon in 0..2 {
+            let h = horizon + 2;
+            series.push(point_series(
+                &format!("direct h{h} complete-bar hard NLL"),
+                battery.direct_nll[horizon],
+            ));
+            series.push(point_series(
+                &format!("direct h{h} return direction accuracy"),
+                battery.direct_dir_acc[horizon],
+            ));
+            series.push(point_series(
+                &format!("direct h{h} ordinary-row coverage"),
+                battery.direct_valid_fraction[horizon],
+            ));
+            series.push(point_series(
+                &format!("direct h{h} minus exact-rollout NLL"),
+                battery.direct_vs_exact_delta[horizon],
+            ));
+            for (dof, name) in BAR_DOF_NAMES.iter().enumerate() {
+                series.push(point_series(
+                    &format!("direct h{h} NLL {name}"),
+                    battery.direct_nll_dof[horizon][dof],
+                ));
+                series.push(point_series(
+                    &format!("direct h{h} CRPS {name}"),
+                    battery.direct_crps_dof[horizon][dof],
+                ));
+            }
+        }
         let pit_tv = battery.pit.total_variation();
         for (dof, name) in BAR_DOF_NAMES.iter().enumerate() {
             series.push(point_series(&format!("nll {name}"), battery.nll_dof[dof]));
@@ -2599,15 +2905,67 @@ impl PretrainReporter {
         )
     }
 
+    /// Finalize every canonical report while leaving the protected Test split unmeasured.
+    ///
+    /// This is a terminal state, not a partial flush: taking `self` prevents any later
+    /// promotion, the selected artifact is re-authenticated against the digest captured at
+    /// promotion, and `pretrain_test` receives a finite machine-readable status point. No
+    /// Test-derived value or placeholder battery is accepted by this path.
+    pub fn finish_deferred_test(mut self) -> Result<()> {
+        let (promoted, promoted_digest) = self.promoted_checkpoint.clone().context(
+            "no promotion was ever reported, so there is no checkpoint to publish while Test is \
+             deferred; report the promotion through EpochMetrics::promoted_checkpoint first",
+        )?;
+        if file_digest(&promoted)? != promoted_digest {
+            anyhow::bail!(
+                "{} changed on disk after it was promoted; the deferred terminal report cannot \
+                 authenticate the selected weights",
+                promoted.display()
+            );
+        }
+
+        self.flush()?;
+        let dir = self.gens_dir.join(self.epoch.to_string());
+        fs::create_dir_all(&dir).with_context(|| format!("failed to create {}", dir.display()))?;
+        let name = promoted
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| promoted.display().to_string());
+        let artifact_sha256: String = promoted_digest
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        write_chart(
+            &dir,
+            "pretrain_test",
+            format!(
+                "Pretrain Held-out Test Battery - DEFERRED / UNMEASURED - {name} - artifact \
+                 sha256 {} - step {}",
+                &artifact_sha256[..12],
+                self.global_step,
+            ),
+            "single terminal state",
+            "protected Test split not constructed or scored",
+            ScaleKind::Linear,
+            vec![
+                point_series(
+                    "test evaluation status (0 = deferred/unmeasured, 1 = measured)",
+                    0.0,
+                ),
+                point_series("test windows scored", 0.0),
+            ],
+        )
+    }
+
     fn commit_steps(&mut self) {
         let tick = self.tick;
         let acc = self.accumulator;
-        let nll = acc.nll_bar.value();
+        let (nll, nll_dof) = acc.nll.means();
         self.nll_bar_train.set(tick, nll);
         self.vs_uniform_train
             .set(tick, self.baselines.uniform_nll_bar - nll);
-        for dof in 0..BAR_DOF {
-            self.nll_dof_train[dof].set(tick, acc.nll_dof[dof].value());
+        for (series, value) in self.nll_dof_train.iter_mut().zip(nll_dof) {
+            series.set(tick, value);
         }
         self.dyn_loss.set(tick, acc.dyn_loss.value());
         self.kl_loss.set(tick, acc.kl_loss.value());
@@ -2615,6 +2973,31 @@ impl PretrainReporter {
         self.nll_share.set(tick, acc.nll_share.value());
         self.dyn_share.set(tick, acc.dyn_share.value());
         self.kl_share.set(tick, acc.kl_share.value());
+        for horizon in 0..2 {
+            let (nll, nll_dof) = acc.direct_nll[horizon].means();
+            self.direct_nll[horizon].set(tick, nll);
+            self.direct_weights[horizon].set(tick, acc.direct_weights[horizon].value());
+            for (series, value) in self.direct_nll_dof[horizon].iter_mut().zip(nll_dof) {
+                series.set(tick, value);
+            }
+            self.direct_valid_fraction[horizon].set(
+                tick,
+                if acc.direct_possible_rows[horizon] > 0 {
+                    acc.direct_valid_rows[horizon] as f64 / acc.direct_possible_rows[horizon] as f64
+                } else {
+                    f64::NAN
+                },
+            );
+        }
+        self.direct_objective_share
+            .set(tick, acc.direct_objective_share.value());
+        self.shared_grad_alignment
+            .set(tick, acc.shared_grad_alignment.value());
+        self.shared_grad_conflict
+            .set(tick, acc.shared_grad_conflict.value());
+        self.forward_wall_secs
+            .set(tick, acc.forward_wall_secs.value());
+        self.step_wall_secs.set(tick, acc.step_wall_secs.value());
         self.growth_loss.set(tick, acc.growth_loss.value());
         self.growth_share.set(tick, acc.growth_share.value());
         self.growth_abs_f.set(tick, acc.growth_abs_f.value());
@@ -3150,8 +3533,94 @@ impl PretrainReporter {
                 self.nll_share.labeled("nll", len),
                 self.dyn_share.labeled("dyn", len),
                 self.kl_share.labeled("kl", len),
+                self.direct_objective_share.labeled("direct h2+h3", len),
                 self.growth_share.labeled("growth (detached)", len),
                 constant_series("aux warning threshold", AUX_SHARE_WARN, len),
+            ],
+        )?;
+
+        let mut direct_nll = Vec::with_capacity(2 * (2 * BAR_DOF + 4));
+        for horizon in 0..2 {
+            let label = horizon + 2;
+            direct_nll.push(
+                self.direct_nll[horizon].labeled(&format!("direct h{label} train total"), len),
+            );
+            direct_nll.push(
+                self.direct_nll_val[horizon].labeled(&format!("direct h{label} val total"), len),
+            );
+            direct_nll.push(
+                self.direct_dir_acc_val[horizon]
+                    .labeled(&format!("direct h{label} return direction accuracy"), len),
+            );
+            direct_nll.push(
+                self.direct_vs_exact_delta[horizon]
+                    .labeled(&format!("direct h{label} minus exact-rollout NLL"), len),
+            );
+            for (dof, name) in BAR_DOF_NAMES.iter().enumerate() {
+                direct_nll.push(
+                    self.direct_nll_dof[horizon][dof]
+                        .labeled(&format!("direct h{label} train {name}"), len),
+                );
+                direct_nll.push(
+                    self.direct_nll_dof_val[horizon][dof]
+                        .labeled(&format!("direct h{label} val {name}"), len),
+                );
+                direct_nll.push(
+                    self.direct_crps_dof_val[horizon][dof]
+                        .labeled(&format!("direct h{label} val CRPS {name}"), len),
+                );
+            }
+        }
+        write_chart(
+            &dir,
+            "pretrain_direct_horizon_nll",
+            format!("Direct Complete-Bar Hard NLL - {suffix}"),
+            "record",
+            "hard categorical nats/bar; h[t] predicts ordinary bar[t+k]",
+            ScaleKind::Linear,
+            direct_nll,
+        )?;
+        write_chart(
+            &dir,
+            "pretrain_direct_objective",
+            format!("Direct Horizon Objective Schedule - {suffix}"),
+            "record",
+            "scheduled weight or attached objective magnitude share",
+            ScaleKind::Linear,
+            vec![
+                self.direct_weights[0].labeled("scheduled h2 weight", len),
+                self.direct_weights[1].labeled("scheduled h3 weight", len),
+                self.direct_valid_fraction[0].labeled("ordinary-row coverage h2", len),
+                self.direct_valid_fraction[1].labeled("ordinary-row coverage h3", len),
+                self.direct_objective_share
+                    .labeled("direct objective share", len),
+            ],
+        )?;
+        write_chart(
+            &dir,
+            "pretrain_direct_gradients",
+            format!("Primary vs Direct Shared Gradients - {suffix}"),
+            "record",
+            "cosine alignment and coordinate sign-conflict fraction at validation cadence",
+            ScaleKind::Linear,
+            vec![
+                self.shared_grad_alignment.labeled("cosine alignment", len),
+                self.shared_grad_conflict
+                    .labeled("sign conflict fraction", len),
+                constant_series("orthogonal", 0.0, len),
+            ],
+        )?;
+        write_chart(
+            &dir,
+            "pretrain_direct_timing",
+            format!("Direct-Supervision Step Cost - {suffix}"),
+            "record",
+            "measured wall seconds; forward includes primary, direct, dynamics and diagnostics",
+            ScaleKind::Linear,
+            vec![
+                self.forward_wall_secs.labeled("forward wall seconds", len),
+                self.step_wall_secs
+                    .labeled("full optimizer-step wall seconds", len),
             ],
         )?;
 
@@ -3818,6 +4287,9 @@ impl PretrainReporter {
 
         self.write_trade_charts(&dir, &suffix, len)?;
         self.write_epoch_charts(&dir, &suffix)?;
+        if let Some(geometry) = self.target_geometry.as_ref() {
+            write_target_geometry_charts(&dir, &suffix, geometry)?;
+        }
 
         Ok(())
     }
@@ -3882,6 +4354,11 @@ impl PretrainReporter {
                 self.trade_oracle_edge
                     .labeled("perfect-foresight ceiling", len),
                 self.trade_capture.labeled("share of ceiling captured", len),
+                // The model-free volatility-timing baseline on the same axis, so the model's
+                // edge is read against what causal vol targeting alone earns rather than only
+                // against a constant-stake market.
+                self.trade_vol_target_edge
+                    .labeled("vol-targeted b&h edge", len),
                 constant_series("no edge", 0.0, len),
             ],
         )?;
@@ -3956,7 +4433,100 @@ impl PretrainReporter {
                 constant_series("coin flip", 0.5, len),
             ],
         )?;
+        self.write_vol_charts(dir, suffix, len)?;
         self.write_cap_and_tail_charts(dir, suffix)?;
+        Ok(())
+    }
+
+    /// The VOLATILITY panel: two charts, and the second one is the verdict.
+    ///
+    /// Split by object rather than crammed together. The first is the LEVEL of each
+    /// forecaster's QLIKE with its measured level bias beside it — necessary because QLIKE is
+    /// not scale-invariant, so a row's loss mixes the quality of its conditional variation
+    /// with the accuracy of its units, and the bias column is what separates them. The second
+    /// is the PAIRED difference against the HAR baseline with the interval that decides it,
+    /// which is not recoverable from four independently-intervalled levels: two forecasts
+    /// scored on the same bars share almost all of their sampling variance and differencing
+    /// two separate intervals throws that common component away.
+    ///
+    /// Written unconditionally, gaps and all: [`Series::set`] drops non-finite values, so a
+    /// validation whose windows carried no realized bar geometry leaves a gap rather than
+    /// charting a zero QLIKE, which would read as a perfect variance forecast.
+    fn write_vol_charts(&self, dir: &Path, suffix: &str, len: usize) -> Result<()> {
+        let mut levels: Vec<ReportSeries> = VOL_FORECAST_NAMES
+            .iter()
+            .enumerate()
+            .map(|(forecast, name)| self.vol_qlike[forecast].labeled(name, len))
+            .collect();
+        levels.extend(
+            VOL_FORECAST_NAMES
+                .iter()
+                .enumerate()
+                .map(|(forecast, name)| {
+                    self.vol_level_ratio[forecast].labeled(&format!("{name} E[rv]/E[p]"), len)
+                }),
+        );
+        levels.push(
+            self.vol_har_mean_ratio
+                .labeled(&format!("{} E[z]", VOL_FORECAST_NAMES[VOL_HAR]), len),
+        );
+        levels.push(
+            self.vol_har_log_bias
+                .labeled(&format!("{} log bias", VOL_FORECAST_NAMES[VOL_HAR]), len),
+        );
+        levels.push(constant_series("level unbiased", 1.0, len));
+        write_chart(
+            dir,
+            "pretrain_vol_qlike",
+            format!(
+                "Pretrain Volatility QLIKE on a Garman-Klass Proxy (warmup {VOL_WARMUP_BARS} \
+                 bars) - {suffix}"
+            ),
+            "record",
+            "qlike, nats (lower is better) / level ratio (1.0 is unbiased) / E[z], log bias",
+            ScaleKind::Symlog,
+            levels,
+        )?;
+
+        let mut paired: Vec<ReportSeries> = VOL_FORECAST_NAMES
+            .iter()
+            .enumerate()
+            .filter(|(forecast, _)| *forecast != VOL_HAR)
+            .map(|(forecast, name)| self.vol_versus_har[forecast].labeled(name, len))
+            .collect();
+        paired.push(
+            self.vol_versus_har_low
+                .labeled(&format!("{} ci95 low", VOL_FORECAST_NAMES[VOL_MODEL]), len),
+        );
+        paired.push(
+            self.vol_versus_har_high
+                .labeled(&format!("{} ci95 high", VOL_FORECAST_NAMES[VOL_MODEL]), len),
+        );
+        // The baseline's own health, beside the verdict it qualifies: a floored or refused
+        // fit is a bar where HAR was rescued rather than forecasting, and the withheld
+        // indicator is one on exactly the ticks where no win could be claimed.
+        paired.push(self.vol_har_floor_rate.labeled("har-rv floor rate", len));
+        paired.push(
+            self.vol_har_refusal_rate
+                .labeled("har-rv refusal rate", len),
+        );
+        paired.push(
+            self.vol_verdict_withheld
+                .labeled("verdict withheld (baseline degenerate)", len),
+        );
+        paired.push(constant_series("har-rv parity", 0.0, len));
+        write_chart(
+            dir,
+            "pretrain_vol_vs_har",
+            format!(
+                "Pretrain Volatility QLIKE minus the CAUSAL HAR-RV Baseline, Paired per Window \
+                 (below zero is the model winning) - {suffix}"
+            ),
+            "record",
+            "qlike minus har-rv, nats / share of scored bars",
+            ScaleKind::Symlog,
+            paired,
+        )?;
         Ok(())
     }
 
@@ -4358,8 +4928,460 @@ fn write_cap_and_tail_charts(
             constant_series("warn", TAIL_RATIO_WARN, TAIL_LEVELS.len()),
         ],
     )?;
+    write_sizing_rule_chart(dir, suffix, val)?;
     Ok(())
 }
+
+/// Report base of the sizing-rule comparison. Registered in
+/// [`shared::report::PRETRAIN_REPORT_BASES`], and absent from any run that sized on
+/// [`trade_bench::SizingRule::CONTROL`] — which is every default run.
+pub const SIZING_RULE_BASE: &str = "pretrain_sizing_rule";
+
+/// What the pass's sizing rule was worth against the rule it replaced, across the cap grid.
+///
+/// The cap axis is the whole point rather than a courtesy. The second-order surrogate's error
+/// is third-order in `f`, so it is the same order as the ENTIRE measured selection edge at
+/// the 4x headline and `~2.5e-4` bps/bar at the 0.25x selection cap; a mean recalibration by
+/// contrast rescales `f` and therefore bites hardest exactly where the cap is NOT binding. A
+/// single number at one cap could not tell those two mechanisms apart, and both arms are read
+/// off this one picture.
+///
+/// The two calibration slopes are drawn as reference lines because they are different objects
+/// and confusing them is the trap: the APPLIED slope was fitted on a block-disjoint slice and
+/// is what sized the book, while the MEASURED slope is this slice's own miscalibration and is
+/// what says whether the applied one was the right correction. A run where the applied slope
+/// is far from the measured one is a run whose recalibration is stale, not one whose sizing is
+/// wrong, and only having both on the axis makes that readable.
+fn write_sizing_rule_chart(dir: &Path, suffix: &str, val: &TradeBench) -> Result<()> {
+    let Some(sizing) = val.sizing.as_ref() else {
+        return Ok(());
+    };
+    let axis = CAP_GRID.len();
+    let point = |label: &str, project: &dyn Fn(&SizingPoint) -> f64| ReportSeries {
+        label: label.to_owned(),
+        values: sizing
+            .curve
+            .iter()
+            .map(|point| project(point) as f32)
+            .collect(),
+    };
+    let headline = sizing.headline();
+    write_chart(
+        dir,
+        SIZING_RULE_BASE,
+        format!(
+            "Pretrain Sizing Rule vs Control — {} (applied MZ slope {:.4}, measured {:.4}; at \
+             the {:.1}x headline PAIRED {:+.4} bps/bar{}, saturation {:.0}% -> {:.0}%, {} \
+             control bars outside the ruin domain) - {suffix}",
+            sizing.rule.label(),
+            sizing.shrink.beta,
+            val.calibration.mean.beta,
+            headline.cap,
+            headline.paired.mean * 1e4,
+            if headline.resolvable() {
+                ""
+            } else {
+                " NOT RESOLVABLE"
+            },
+            100.0 * sizing.free_kelly_control.saturated,
+            100.0 * sizing.free_kelly_active.saturated,
+            sizing.ruin_breach_bars,
+        ),
+        "cap grid index (see the `cap (x)` series)",
+        "bps/bar for growth, units of wealth for |f|, fraction for shares, count for ruined \
+         bars — see the series labels",
+        ScaleKind::Symlog,
+        vec![
+            ReportSeries {
+                label: "cap (x)".to_owned(),
+                values: CAP_GRID.iter().map(|cap| *cap as f32).collect(),
+            },
+            // THE verdict. Everything below is context for this line and its interval.
+            point("PAIRED active - control, bps/bar", &|p| p.paired.mean * 1e4),
+            point("paired ci95 low", &|p| p.paired.ci_low * 1e4),
+            point("paired ci95 high", &|p| p.paired.ci_high * 1e4),
+            point("active net growth, bps/bar", &|p| p.active.net_growth * 1e4),
+            point("control net growth, bps/bar", &|p| {
+                p.control.net_growth * 1e4
+            }),
+            // How much the rule actually moved the bet. A paired growth difference on a
+            // vanishing position gap is noise by construction, and this is the series that
+            // says so.
+            point("mean |f_active - f_control|", &|p| p.mean_abs_gap),
+            point("mean |f| active", &|p| p.active.mean_abs_position),
+            point("mean |f| control", &|p| p.control.mean_abs_position),
+            // ALLOCATION rather than level. With the cap pinned on most bars the level is the
+            // ceiling under either rule, and all a sizing change can still do is redistribute
+            // exposure across bars. A level shift with no dispersion shift cannot pay at the
+            // headline cap however large it is.
+            point("CROSS-BAR sd of f, active", &|p| p.sd_active),
+            point("cross-bar sd of f, control", &|p| p.sd_control),
+            point("signed mean |f_active| - |f_control|", &|p| {
+                p.mean_signed_gap
+            }),
+            // The pathology under test: the share of bars whose size was chosen by the cap
+            // rather than by the distribution, under each rule.
+            point("SHARE AT THE CAP, active", &|p| p.active.clamped_fraction),
+            point("share at the cap, control", &|p| p.control.clamped_fraction),
+            point("turnover/bar, active", &|p| p.active.turnover),
+            point("turnover/bar, control", &|p| p.control.turnover),
+            point("max drawdown, active", &|p| p.active.max_drawdown),
+            point("max drawdown, control", &|p| p.control.max_drawdown),
+            // Counts, never smoothed: one ruined bar is one window whose wealth went to the
+            // floor, and de-levering is supposed to remove them.
+            point("RUINED bars, active", &|p| p.active.ruin_bars as f64),
+            point("RUINED bars, control", &|p| p.control.ruin_bars as f64),
+            constant_series("no gain", 0.0, axis),
+            constant_series("APPLIED MZ slope", sizing.shrink.beta, axis),
+            constant_series("measured MZ slope", val.calibration.mean.beta, axis),
+            constant_series("perfect calibration", 1.0, axis),
+            constant_series(
+                "control bars outside the ruin domain (share)",
+                sizing.ruin_breach_share,
+                axis,
+            ),
+            constant_series(
+                "uncapped mean signed |f*| gap, active - control",
+                sizing.free_mean_signed_gap,
+                axis,
+            ),
+            constant_series(
+                "uncapped mean |f*| gap magnitude",
+                sizing.free_mean_abs_gap,
+                axis,
+            ),
+            constant_series(
+                "uncapped cross-bar sd of f*, active",
+                sizing.free_sd_active,
+                axis,
+            ),
+            constant_series(
+                "uncapped cross-bar sd of f*, control",
+                sizing.free_sd_control,
+                axis,
+            ),
+        ],
+    )?;
+    Ok(())
+}
+
+/// Report bases of the target-geometry audit, registered in
+/// [`shared::report::PRETRAIN_REPORT_BASES`].
+pub const SIGMA_DIST_BASE: &str = "pretrain_sigma_dist";
+pub const TARGET_SCALE_BASE: &str = "pretrain_target_scale";
+pub const BIN_OCCUPANCY_BASE: &str = "pretrain_bin_occupancy";
+
+/// The three panels of [`crate::torch::dataset::BarCorpus::audit_target_geometry`]: the causal
+/// divisor, the quotient the fitter received, and the grid occupancy the quotient produces.
+///
+/// Written on EVERY run, control and standardized arm alike, and rewritten unchanged into every
+/// generation directory. None of the three is a function of an optimizer step — they are
+/// properties of the corpus under a parametrization, measured once before step zero — so they
+/// carry no tick axis and are held whole rather than decimated.
+pub(super) fn write_target_geometry_charts(
+    dir: &Path,
+    suffix: &str,
+    geometry: &TargetGeometry,
+) -> Result<()> {
+    write_sigma_dist_chart(dir, suffix, geometry)?;
+    write_target_scale_chart(dir, suffix, geometry)?;
+    write_bin_occupancy_chart(dir, suffix, geometry)?;
+    Ok(())
+}
+
+/// The causal volatility estimator's OWN behaviour on the evaluation bars.
+///
+/// Measured under [`DofScaling::VolStandardized`] on both arms, so the control's panel answers
+/// "what would the standardized arm have divided by" instead of reporting the constant one that
+/// its own encode actually applied. A reader comparing two runs is therefore comparing the same
+/// object, and a divisor that misbehaves is visible on the arm that does not use it.
+///
+/// The shares are correctness and stability evidence, drawn beside the distribution they
+/// qualify. `relative-floored` is the explicit scale-free intervention rate. Numerical fallback,
+/// either z-clamp, or under-warm evaluation bars are tripwires: each names a distinct failure
+/// mode and none is silently combined with the policy floor.
+fn write_sigma_dist_chart(dir: &Path, suffix: &str, geometry: &TargetGeometry) -> Result<()> {
+    let axis = TARGET_QUANTILES.len();
+    let median = geometry.sigma_quantiles[axis / 2];
+    let (low, high) = (
+        geometry.sigma_quantiles[0],
+        geometry.sigma_quantiles[axis - 1],
+    );
+    write_chart(
+        dir,
+        SIGMA_DIST_BASE,
+        format!(
+            "Pretrain Causal sigma_t (GKYZ HAR-EWMA, {:?} split, {} bars) — p50 {:.2} bps/bar, \
+             p99/p1 {:.1}x, relative-floor {:.6}%, numerical-fallback {:.6}%, r/s clamp \
+             {:.6}%/{:.6}%, under-warmed {:.6}% - {suffix}",
+            geometry.split,
+            geometry.bars,
+            1e4 * median,
+            high / low,
+            100.0 * geometry.sigma_relative_floored_share(),
+            100.0 * geometry.sigma_numerical_fallback_share(),
+            100.0 * geometry.r_z_clamped_share(),
+            100.0 * geometry.s_z_clamped_share(),
+            100.0 * geometry.sigma_unwarmed_share(),
+        ),
+        "quantile index (see the `probability` series)",
+        "bps/bar for sigma_t; shares for floor, fallback, clamp, and warm-up diagnostics",
+        ScaleKind::Symlog,
+        vec![
+            ReportSeries {
+                label: "probability (the x axis of this panel)".to_owned(),
+                values: TARGET_QUANTILES.iter().map(|q| *q as f32).collect(),
+            },
+            ReportSeries {
+                label: "sigma_t, bps/bar — ALWAYS the standardized encode's divisor, on both \
+                        arms, so the control and the arm report the same object"
+                    .to_owned(),
+                values: geometry
+                    .sigma_quantiles
+                    .iter()
+                    .map(|q| (1e4 * q) as f32)
+                    .collect(),
+            },
+            constant_series(
+                "name-scale-relative floor share",
+                geometry.sigma_relative_floored_share(),
+                axis,
+            ),
+            constant_series(
+                "NUMERICAL-FALLBACK share (must be zero on evaluable history)",
+                geometry.sigma_numerical_fallback_share(),
+                axis,
+            ),
+            constant_series(
+                "r z-clamp share (must be zero or explicitly investigated)",
+                geometry.r_z_clamped_share(),
+                axis,
+            ),
+            constant_series(
+                "s z-clamp share (must be zero or explicitly investigated)",
+                geometry.s_z_clamped_share(),
+                axis,
+            ),
+            constant_series(
+                "UNDER-WARMED share (must be zero on held-out splits)",
+                geometry.sigma_unwarmed_share(),
+                axis,
+            ),
+            constant_series(
+                "relative floor fraction of name-specific slow sigma",
+                BAR_SIGMA_RELATIVE_FLOOR,
+                axis,
+            ),
+            constant_series(
+                "slow floor-anchor span, bars",
+                BAR_VOL_SLOW_ANCHOR_SPAN,
+                axis,
+            ),
+            constant_series("z clamp magnitude", BAR_Z_LIMIT, axis),
+            constant_series(
+                "warm-up length, bars (BAR_SIGMA_WARMUP_BARS)",
+                BAR_SIGMA_WARMUP_BARS as f64,
+                axis,
+            ),
+            constant_series("bars measured", geometry.bars as f64, axis),
+        ],
+    )
+}
+
+/// Did standardization actually happen, and did it take the tail with it.
+///
+/// This is the direct check on the arm and on the control at once, one run each: under
+/// [`DofScaling::VolStandardized`] the `r` row should read `sd ~ 1` and the `s` row `mean ~ 1`
+/// (`s` is divided by `BAR_RANGE_TO_SIGMA * sigma`, the ratio form rather than a log, because
+/// `s == 0` is a mandated atom and `ln(0)` would delete it), while under [`DofScaling::Raw`] both
+/// rows are in raw log-return units three orders smaller. Two runs' panels laid side by side are
+/// the whole measurement.
+///
+/// EXCESS KURTOSIS is the series that can refute the change rather than confirm it, and it is the
+/// reason this panel carries a shape statistic at all. Standardization is supposed to remove the
+/// cross-sectional and cross-regime SCALE mixture and leave the conditional shape alone, so the
+/// fat tail must survive: a standardized kurtosis collapsing toward zero means the divisor is
+/// tracking each bar's own move closely enough to absorb it, which is a leak of precisely the
+/// quantity the emission head exists to predict. Some fall is expected and correct — part of the
+/// raw figure IS the scale mixture — but a fall to Gaussian is a defect, not a success.
+fn write_target_scale_chart(dir: &Path, suffix: &str, geometry: &TargetGeometry) -> Result<()> {
+    let axis = TARGET_QUANTILES.len();
+    let mut series = vec![ReportSeries {
+        label: "probability (the x axis of this panel)".to_owned(),
+        values: TARGET_QUANTILES.iter().map(|q| *q as f32).collect(),
+    }];
+    for dof in &geometry.dof {
+        series.push(ReportSeries {
+            label: format!("{} quantile, as the supports fitter received it", dof.name),
+            values: dof.quantiles.iter().map(|q| *q as f32).collect(),
+        });
+        series.push(constant_series(&format!("{} sd", dof.name), dof.sd, axis));
+        series.push(constant_series(
+            &format!("{} mean", dof.name),
+            dof.mean,
+            axis,
+        ));
+        series.push(constant_series(
+            &format!(
+                "{} EXCESS KURTOSIS - must stay LARGE. A collapse toward zero means the divisor \
+                 absorbed the tail, i.e. it is predicting the bar instead of scaling it",
+                dof.name
+            ),
+            dof.excess_kurtosis,
+            axis,
+        ));
+    }
+    // `sd(z_r) ~ 1` and `mean(z_s) ~ 1` are what "standardized" means here, and `0` is where a
+    // Gaussian's excess kurtosis would sit. Both are on the axis so neither reading needs a
+    // second chart.
+    series.push(constant_series("unit scale", 1.0, axis));
+    series.push(constant_series("gaussian excess kurtosis", 0.0, axis));
+    write_chart(
+        dir,
+        TARGET_SCALE_BASE,
+        format!(
+            "Pretrain Encoded Target Scale under {} ({:?} split, {} bars) — sd({}) {:.4}, \
+             mean({}) {:.4}, excess kurtosis {:.1} / {:.1} - {suffix}",
+            geometry.scaling,
+            geometry.split,
+            geometry.bars,
+            geometry.dof[0].name,
+            geometry.dof[0].sd,
+            geometry.dof[1].name,
+            geometry.dof[1].mean,
+            geometry.dof[0].excess_kurtosis,
+            geometry.dof[1].excess_kurtosis,
+        ),
+        "quantile index (see the `probability` series)",
+        "units of sigma_t under the standardized parametrization, raw log-return units under \
+         the raw one; dimensionless for the kurtosis lines",
+        ScaleKind::Symlog,
+        series,
+    )
+}
+
+/// The defect T1.1 exists to fix, measured directly on the grid the emission head predicts on.
+///
+/// Indexed by SYMBOL, worst-resolved first, because the per-symbol decomposition is the only
+/// thing that can see the defect. A pooled equal-mass histogram is balanced by construction on
+/// either parametrization — its entropy is `ln(NUM_BAR_BINS)` on both, which is why the pooled
+/// fraction is a reference line here rather than the headline — while the audit's defect 1 is
+/// that a quiet name concentrates in a handful of central bins and a volatile one spreads over
+/// the whole grid, so effective resolution varies by an order of magnitude ACROSS the panel.
+///
+/// The headline is therefore the SPREAD, `best / worst` effective bins, and standardization is
+/// supposed to raise the worst symbol and drive the spread toward one. Both are reference lines
+/// on this panel and both are read across two runs.
+///
+/// This is the one bin-occupancy quantity that IS comparable between a raw run and a standardized
+/// one, despite the geometry change `--allow-geometry-change` warns about. Each side is measured
+/// against its own 128 equal-mass bins over its own pooled train draw, so the pooled entropy is
+/// pinned at `ln(128)` on both and the per-symbol dispersion around it is scale-free. An NLL
+/// level across those two grids is not comparable; this dispersion is.
+///
+/// `bars measured` rides on the same axis because it BOUNDS the statistic: a symbol with ninety
+/// evaluation bars cannot exceed `ln(90)` however well the grid fits it, and reading such a row
+/// as poor resolution instead of as a short series would be a measurement artifact.
+fn write_bin_occupancy_chart(dir: &Path, suffix: &str, geometry: &TargetGeometry) -> Result<()> {
+    let axis = geometry.per_symbol.len();
+    if axis == 0 {
+        return Ok(());
+    }
+    let uniform = (NUM_BAR_BINS as f64).ln();
+    let worst = geometry
+        .per_symbol
+        .iter()
+        .take(WORST_OCCUPANCY_LISTED)
+        .map(|s| format!("{} {:.1}", s.symbol, s.effective_bins))
+        .collect::<Vec<_>>()
+        .join(", ");
+    write_chart(
+        dir,
+        BIN_OCCUPANCY_BASE,
+        format!(
+            "Pretrain r-Grid Occupancy by Symbol under {} ({:?} split, {} symbols) — effective \
+             bins worst {:.1} / median {:.1} / best {:.1} of {NUM_BAR_BINS}, SPREAD {:.2}x, \
+             pooled entropy {:.4} of ln({NUM_BAR_BINS}) | worst: {worst} - {suffix}",
+            geometry.scaling,
+            geometry.split,
+            axis,
+            geometry.worst_effective_bins(),
+            geometry.median_effective_bins(),
+            geometry.best_effective_bins(),
+            geometry.effective_bin_spread(),
+            geometry.entropy_fraction(),
+        ),
+        "symbol rank (WORST effective resolution first)",
+        "bins for the effective-resolution series, fraction of ln(128) for the entropy series, \
+         bars for the sample-size series",
+        ScaleKind::Symlog,
+        vec![
+            // THE series. Everything else on this panel is context for its level and its slope.
+            ReportSeries {
+                label: "per-symbol EFFECTIVE r-bins, exp(H) — reads directly as how many of the \
+                        128 bins this symbol actually has"
+                    .to_owned(),
+                values: geometry
+                    .per_symbol
+                    .iter()
+                    .map(|s| s.effective_bins as f32)
+                    .collect(),
+            },
+            ReportSeries {
+                label: "per-symbol occupancy entropy as a fraction of ln(128)".to_owned(),
+                values: geometry
+                    .per_symbol
+                    .iter()
+                    .map(|s| (s.entropy / uniform) as f32)
+                    .collect(),
+            },
+            // The artifact guard: entropy is bounded by ln(bars), so a short series reads as a
+            // quiet one unless its sample size is on the same picture.
+            ReportSeries {
+                label: "bars measured for this symbol — BOUNDS the entropy at ln(bars)".to_owned(),
+                values: geometry.per_symbol.iter().map(|s| s.bars as f32).collect(),
+            },
+            constant_series(
+                "SPREAD, best/worst effective bins - the headline. An order of magnitude is the \
+                 defect; standardization must drive this toward 1",
+                geometry.effective_bin_spread(),
+                axis,
+            ),
+            constant_series(
+                "worst per-symbol effective bins",
+                geometry.worst_effective_bins(),
+                axis,
+            ),
+            constant_series(
+                "median per-symbol effective bins",
+                geometry.median_effective_bins(),
+                axis,
+            ),
+            constant_series(
+                "best per-symbol effective bins",
+                geometry.best_effective_bins(),
+                axis,
+            ),
+            // Pinned at 1.0 by the equal-mass fit on BOTH parametrizations, which is exactly why
+            // it cannot be the headline: it is drawn so that a reader who checks it sees it move
+            // nowhere and looks at the per-symbol curve instead.
+            constant_series(
+                "POOLED occupancy entropy as a fraction of ln(128) - equal-mass by construction \
+                 on either parametrization, so it says nothing about the defect",
+                geometry.entropy_fraction(),
+                axis,
+            ),
+            constant_series("uniform maximum (fraction)", 1.0, axis),
+            constant_series("grid size, bins (NUM_BAR_BINS)", NUM_BAR_BINS as f64, axis),
+            constant_series("no spread at all", 1.0, axis),
+        ],
+    )
+}
+
+/// Worst-resolved symbols named in the [`BIN_OCCUPANCY_BASE`] title. The schema carries no
+/// per-point labels, so the only place a symbol name is readable is the title — the same
+/// convention [`crate::torch::dataset::CorpusAnomalies`] uses for the same reason.
+const WORST_OCCUPANCY_LISTED: usize = 12;
 
 /// Write the trading-bench panel for ONE measured bench, outside a training run.
 ///
@@ -4588,6 +5610,15 @@ pub fn write_mean_calibration(dir: &Path, label: &str, points: &[CalibrationPoin
     let arm = |point: &CalibrationPoint, pick: &dyn Fn(&OuterDecomposition) -> f64| -> f64 {
         point.eval.outer.as_ref().map_or(f64::NAN, pick)
     };
+    // A cell whose realized spread is not measured has no ratio; `NaN` is the absent state and
+    // `write_chart` drops an all-NaN series rather than drawing a floor of zeros.
+    let spread_ratio = |cell: &super::trade_bench::VolatilityCell| -> f64 {
+        if cell.realized_sd > 0.0 && cell.realized_sd.is_finite() {
+            cell.predicted_sd / cell.realized_sd
+        } else {
+            f64::NAN
+        }
+    };
 
     // The trend. `beta` and its blocked interval are the headline; the fit slice's slope sits
     // beside them because a correction fitted on one set of blocks and applied to another is
@@ -4649,6 +5680,74 @@ pub fn write_mean_calibration(dir: &Path, label: &str, points: &[CalibrationPoin
         series_of(
             "signed net catch-all mass, % per bar",
             over(&|p| arm(p, &|outer| 100.0 * outer.signed)),
+        ),
+        // THE VOLATILITY GRADIENT, CHARTED. These were log lines only, which made the single
+        // cleanest test of an absolute misplacement of mass unavailable to a cross-arm
+        // comparison. Two things belong on this axis and nothing else does.
+        //
+        // First, the four per-quartile `predicted / realized` spread ratios. The LEVEL is the
+        // less interesting half; the SPREAD ACROSS the four is the signature. A bulk error
+        // moves all four together, whereas mass placed on one global absolute grid over a panel
+        // whose names differ by an order of magnitude in volatility over-states the spread of
+        // the quiet names and under-states the loud ones, so the four separate monotonically.
+        // Four ratios converging on 1.0 AND on each other is what a fix looks like.
+        //
+        // Second, the pooled slope gradient per decade of realized sd, with its own standard
+        // error beside it so the reader can tell a moved gradient from a noisy one. It is one
+        // scalar per checkpoint and it is the quantity a volatility-standardization arm is
+        // supposed to drive to zero.
+        series_of(
+            "var slope gradient per decade (fitted full law)",
+            over(&|p| p.eval.gradient.var_gradient),
+        ),
+        series_of(
+            "var slope gradient SE (fitted full law)",
+            over(&|p| p.eval.gradient.var_gradient_se),
+        ),
+        series_of(
+            "mean slope gradient per decade (fitted full law)",
+            over(&|p| p.eval.gradient.mean_gradient),
+        ),
+        series_of(
+            "var slope gradient per decade (fitted interior-only law)",
+            over(&|p| arm(p, &|outer| outer.gradient.var_gradient)),
+        ),
+        series_of(
+            "var slope gradient SE (fitted interior-only law)",
+            over(&|p| arm(p, &|outer| outer.gradient.var_gradient_se)),
+        ),
+        series_of("no volatility gradient", vec![0.0; points.len()]),
+        series_of(
+            "predicted/realized sd, vol quartile 0 (full law)",
+            over(&|p| spread_ratio(&p.eval.gradient.cells[0])),
+        ),
+        series_of(
+            "predicted/realized sd, vol quartile 1 (full law)",
+            over(&|p| spread_ratio(&p.eval.gradient.cells[1])),
+        ),
+        series_of(
+            "predicted/realized sd, vol quartile 2 (full law)",
+            over(&|p| spread_ratio(&p.eval.gradient.cells[2])),
+        ),
+        series_of(
+            "predicted/realized sd, vol quartile 3 (full law)",
+            over(&|p| spread_ratio(&p.eval.gradient.cells[3])),
+        ),
+        series_of(
+            "predicted/realized sd, vol quartile 0 (interior-only)",
+            over(&|p| arm(p, &|outer| spread_ratio(&outer.gradient.cells[0]))),
+        ),
+        series_of(
+            "predicted/realized sd, vol quartile 3 (interior-only)",
+            over(&|p| arm(p, &|outer| spread_ratio(&outer.gradient.cells[3]))),
+        ),
+        series_of(
+            "realized sd, vol quartile 0 (bps/bar)",
+            over(&|p| 1e4 * p.eval.gradient.cells[0].realized_sd),
+        ),
+        series_of(
+            "realized sd, vol quartile 3 (bps/bar)",
+            over(&|p| 1e4 * p.eval.gradient.cells[3].realized_sd),
         ),
     ];
     write_chart(
@@ -4750,7 +5849,8 @@ pub fn write_mean_calibration(dir: &Path, label: &str, points: &[CalibrationPoin
     write_edge_confidence(dir, &suffix, points)?;
     write_edge_hysteresis(dir, &suffix, points)?;
     write_edge_composition(dir, &suffix, points)?;
-    write_signal_decay(dir, &suffix, points)
+    write_signal_decay(dir, &suffix, points)?;
+    write_rank_ic(dir, &suffix, points)
 }
 
 /// The COST-AWARE sizing axis: every shape swept, with the gain over the incumbent paired.
@@ -5396,6 +6496,88 @@ fn write_signal_decay(dir: &Path, suffix: &str, points: &[CalibrationPoint]) -> 
         ),
         "holding horizon in bars",
         "hit rate / bps per bar / correlation",
+        ScaleKind::Symlog,
+        series,
+    )
+}
+
+/// The signal's INFORMATION COEFFICIENT per horizon, ranked and Pearson, both with bands.
+///
+/// Separate from [`write_signal_decay`] rather than six more series on its base, because the
+/// axis is shared but the object is not: that base carries a hit rate and a bps edge, which
+/// are properties of a POLICY that stakes the sign, while this one carries a correlation,
+/// which is a property of the signal alone. Reading a rank IC on a chart whose y-label is
+/// "bps per bar" is how a dimensionless statistic gets quoted as money.
+///
+/// Both statistics are charted, and the GAP between them is the reason. Spearman bounds every
+/// bar's influence and is invariant to a monotone change of either axis; Pearson is neither.
+/// A rank IC materially smaller than the Pearson IC says the linear correlation was carried
+/// by a handful of extreme bars, which is exactly the failure a fat-tailed regressand invites
+/// and exactly what a single pooled `corr` column cannot show.
+fn write_rank_ic(dir: &Path, suffix: &str, points: &[CalibrationPoint]) -> Result<()> {
+    if points.iter().all(|point| !point.decay.measured()) {
+        return Ok(());
+    }
+    let horizons = DECAY_HORIZONS.len();
+    let mut series = vec![ReportSeries {
+        label: "horizon (bars)".to_owned(),
+        values: DECAY_HORIZONS.iter().map(|k| *k as f32).collect(),
+    }];
+    for point in points {
+        if !point.decay.measured() {
+            continue;
+        }
+        let tag = &point.label;
+        let row = |extract: &dyn Fn(&super::trade_bench::DecayPoint) -> f64| -> Vec<f32> {
+            point
+                .decay
+                .points
+                .iter()
+                .map(|p| extract(p) as f32)
+                .collect()
+        };
+        series.push(ReportSeries {
+            label: format!("{tag} rank IC"),
+            values: row(&|p| p.rank_ic.mean),
+        });
+        series.push(ReportSeries {
+            label: format!("{tag} rank IC ci95 low"),
+            values: row(&|p| p.rank_ic.ci_low),
+        });
+        series.push(ReportSeries {
+            label: format!("{tag} rank IC ci95 high"),
+            values: row(&|p| p.rank_ic.ci_high),
+        });
+        series.push(ReportSeries {
+            label: format!("{tag} pearson IC"),
+            values: row(&|p| p.pearson_ic.mean),
+        });
+        series.push(ReportSeries {
+            label: format!("{tag} pearson IC ci95 low"),
+            values: row(&|p| p.pearson_ic.ci_low),
+        });
+        series.push(ReportSeries {
+            label: format!("{tag} pearson IC ci95 high"),
+            values: row(&|p| p.pearson_ic.ci_high),
+        });
+        series.push(ReportSeries {
+            label: format!("{tag} pooled pearson (no interval)"),
+            values: row(&|p| p.correlation),
+        });
+    }
+    series.push(ReportSeries {
+        label: "no information".to_owned(),
+        values: vec![0.0; horizons],
+    });
+    write_chart(
+        dir,
+        "pretrain_rank_ic",
+        format!(
+            "Pretrain Rank IC: Spearman Correlation of the Predicted Mean against the k-Bar \
+             Forward Return, Block-Bootstrapped - {suffix}"
+        ),
+        "holding horizon in bars",
+        "correlation (dimensionless)",
         ScaleKind::Symlog,
         series,
     )
@@ -7693,9 +8875,90 @@ mod tests {
         POLICY_QUARTER,
     };
     use super::*;
-    use crate::torch::test_rng;
+    use crate::torch::{
+        bar_dist::DofScaling,
+        dataset::{DofScale, SymbolBinOccupancy},
+        test_rng,
+    };
     use shared::report::read_report;
     use std::sync::atomic::{AtomicU64, Ordering};
+
+    fn set_step_nll(
+        metrics: &mut StepMetrics,
+        nll_bar: f64,
+        nll_dof: [f64; BAR_DOF],
+        target_count: u64,
+    ) {
+        metrics.nll_bar_numerator = nll_bar * target_count as f64;
+        metrics.nll_dof_numerators = nll_dof.map(|value| value * target_count as f64);
+        metrics.nll_target_count = target_count;
+    }
+
+    #[test]
+    fn train_nll_uses_exact_target_bars_for_step_and_epoch_aggregates() {
+        // A low-context full batch, a high-context full batch, then the retained short tail.
+        // Their means deliberately differ, so an unweighted mean cannot pass by coincidence.
+        let batches = [4usize, 4, 1];
+        let contexts = [2i64, 6, 6];
+        let nll_bar = [1.0, 3.0, 9.0];
+        let nll_dof = [
+            [0.10, 0.15, 0.20, 0.25, 0.30],
+            [0.30, 0.45, 0.60, 0.75, 0.90],
+            [0.90, 1.35, 1.80, 2.25, 2.70],
+        ];
+
+        let mut steps = StepAccumulator::default();
+        let mut epoch = NllAccumulator::default();
+        let mut total_targets = 0u64;
+        let mut total_numerator = 0.0;
+        let mut dof_numerators = [0.0; BAR_DOF];
+        for index in 0..batches.len() {
+            let target_count = batches[index] as u64 * contexts[index] as u64;
+            let mut metrics = StepMetrics::nan();
+            metrics.batch_size = batches[index];
+            metrics.context = contexts[index];
+            set_step_nll(&mut metrics, nll_bar[index], nll_dof[index], target_count);
+            steps.push(&metrics);
+            epoch.push(
+                metrics.nll_bar_numerator,
+                metrics.nll_dof_numerators,
+                metrics.nll_target_count,
+            );
+            total_targets += target_count;
+            total_numerator += metrics.nll_bar_numerator;
+            for (sum, value) in dof_numerators.iter_mut().zip(metrics.nll_dof_numerators) {
+                *sum += value;
+            }
+        }
+
+        assert_eq!(total_targets, 38);
+        let expected_bar = total_numerator / total_targets as f64;
+        let expected_dof = dof_numerators.map(|value| value / total_targets as f64);
+        let unweighted = nll_bar.iter().sum::<f64>() / nll_bar.len() as f64;
+        assert!((expected_bar - unweighted).abs() > 0.5);
+        for dof in 0..BAR_DOF {
+            let unweighted_dof =
+                nll_dof.iter().map(|step| step[dof]).sum::<f64>() / nll_dof.len() as f64;
+            assert!((expected_dof[dof] - unweighted_dof).abs() > 0.01);
+        }
+        assert!((expected_dof.iter().sum::<f64>() - expected_bar).abs() < 1e-12);
+
+        let root = scratch_dir("target_weighted_step_nll");
+        let mut reporter = PretrainReporter::new(&root, MARGINAL_DOF);
+        reporter.accumulator = steps;
+        reporter.commit_steps();
+        assert!((reporter.nll_bar_train.0[0] as f64 - expected_bar).abs() < 1e-6);
+        for (series, expected) in reporter.nll_dof_train.iter().zip(expected_dof) {
+            assert!((series.0[0] as f64 - expected).abs() < 1e-6);
+        }
+
+        let mut epoch_metrics = EpochMetrics::nan();
+        epoch.write_epoch(&mut epoch_metrics);
+        assert!((epoch_metrics.train_nll_bar - expected_bar).abs() < 1e-12);
+        for (actual, expected) in epoch_metrics.train_nll_dof.into_iter().zip(expected_dof) {
+            assert!((actual - expected).abs() < 1e-12);
+        }
+    }
 
     #[test]
     fn randomized_pit_spreads_an_atom_instead_of_pinching_it_to_midpoint() {
@@ -7881,36 +9144,49 @@ mod tests {
         // horizon - so they are exempt for the same reason and executed by the same test.
         "pretrain_edge_hysteresis",
         "pretrain_signal_decay",
+        // The per-horizon rank IC rides the same re-scored pass on the same horizon axis, so
+        // it is exempt for the same reason and executed by the same test.
+        "pretrain_rank_ic",
         // The shrink x hysteresis 2x2 needs the recalibrated fraction from a disjoint fit slice
         // AND the frontier's constant-stake reconstruction on the same windows, so it is exempt
         // for the same reason and executed by the same test.
         "pretrain_edge_composition",
+        // The sizing-rule comparison is written by `write_sizing_rule_chart` off
+        // `TradeBench::sizing`, which is `None` unless the pass sized on a non-control
+        // `SizingRule` — and the default configuration this fixture drives is the control.
+        // Executed by `the_sizing_rule_chart_lands_for_a_non_control_arm`.
+        "pretrain_sizing_rule",
         // Written by `horizon::write_horizon_frontier`. One point per holding horizon, each
         // needing a whole held-out panel, a loaded checkpoint and a sampled multi-bar rollout,
         // so an in-run cycle over one step's metrics cannot produce it. Executed by
         // `horizon::tests::the_horizon_frontier_base_is_written_and_read_back`.
         "pretrain_horizon_frontier",
         // Written by `horizon::write_receding_reports`,
-        // `horizon::write_receding_attribution`, `horizon::write_receding_policy_frontier`, and
-        // optional `horizon::write_receding_hysteresis` after a whole held-out panel, one common
-        // max-H ancestral rollout and every-bar economic solves. The selected production
-        // horizon is highlighted inside the existing grid reports and held fixed across the
-        // attribution ladder. Validation alone reuses it as the zero-width fixed-frontier
-        // incumbent; locked test never writes that selection grid. The optional hysteresis
-        // base instead carries exactly one predeclared margin paired against the selected-H Raw
-        // incumbent on common cached rows, and is absent unless named on the CLI. None is an
-        // optimizer-step metric. The grid writers are exercised by
+        // `horizon::write_receding_attribution`, `horizon::write_receding_policy_frontier`,
+        // `horizon::write_receding_persistence`, and optional
+        // `horizon::write_receding_hysteresis` after a whole held-out panel, one common max-H
+        // ancestral rollout and every-bar economic solves. The selected production horizon is
+        // highlighted inside the existing grid reports and held fixed across the attribution
+        // ladder. Validation alone reuses it as the zero-width fixed-frontier incumbent and as
+        // the raw row of the fixed causal forecast-moment EMA frontier; locked test never writes
+        // either selection grid. The optional hysteresis base instead carries exactly one
+        // predeclared margin paired against the selected-H Raw incumbent on common cached rows,
+        // and is absent unless named on the CLI. None is an optimizer-step metric. The grid
+        // writers are exercised by
         // `horizon::tests::receding_reports_persist_the_selected_run_and_keep_the_full_grid`;
         // the attribution writer and schema by
         // `horizon::tests::receding_attribution_writes_the_registered_five_stage_schema`; the
-        // frontier writer by
-        // `horizon::tests::receding_policy_frontier_round_trips_the_fixed_registered_grid`; and
+        // action frontier by
+        // `horizon::tests::receding_policy_frontier_round_trips_the_fixed_registered_grid`; the
+        // persistence frontier by
+        // `horizon::tests::receding_persistence_round_trips_fixed_order_and_gate_series`; and
         // hysteresis by
         // `horizon::tests::receding_hysteresis_round_trips_two_exact_paired_rows`.
         "pretrain_receding_kelly",
         "pretrain_receding_covariance",
         "pretrain_receding_attribution",
         "pretrain_receding_policy_frontier",
+        "pretrain_receding_persistence",
         "pretrain_receding_hysteresis",
         // Written by `skill::write_skill_profile`. Indexed by DECILE of the model's own
         // confidence rather than by step, and produced from a whole held-out panel scored with
@@ -8762,12 +10038,14 @@ mod tests {
         metrics
     }
 
-    /// A MEASURED bench, produced by running the real accounting over hand-made position
-    /// paths. The fixture supplies positions, not distributions, because what these tests
-    /// exercise is the report path; the solver has its own suite next door.
-    fn populated_trade() -> TradeBench {
-        let cap = 4.0;
-        let windows: Vec<WindowPaths> = (0..6usize)
+    /// Leverage cap of the hand-made bench fixtures.
+    const FIXTURE_CAP: f64 = 4.0;
+
+    /// The hand-made position paths [`populated_trade`] and [`sized_trade`] both bench, so the
+    /// two differ ONLY in the sizing rule attached to them rather than in the data.
+    fn fixture_windows() -> Vec<WindowPaths> {
+        let cap = FIXTURE_CAP;
+        (0..6usize)
             .map(|window| {
                 let bars = 48usize;
                 let realized: Vec<f64> = (0..bars)
@@ -8817,10 +10095,21 @@ mod tests {
                         vec![0.5; bars],
                         vec![1.0; bars],
                         oracle,
+                        // The vol-targeted row at a constant stake: this fixture carries no
+                        // realized bar geometry, so there is no trailing sigma to size on and
+                        // the writer only needs a full-length path to account.
+                        vec![0.7; bars],
                     ],
                 )
             })
-            .collect();
+            .collect()
+    }
+
+    /// A MEASURED bench, produced by running the real accounting over hand-made position
+    /// paths. The fixture supplies positions, not distributions, because what these tests
+    /// exercise is the report path; the solver has its own suite next door.
+    fn populated_trade() -> TradeBench {
+        let windows = fixture_windows();
         // Two windows per block: the bootstrap needs more than one block to have an interval.
         let blocks: Vec<u64> = (0..windows.len() as u64).map(|window| window / 2).collect();
         // Hand-made tail exceedances, on the same windows. The loosest level fires a few
@@ -8840,8 +10129,211 @@ mod tests {
             &windows,
             &blocks,
             &tail,
+            BenchConfig::new(DEFAULT_COST_BPS, FIXTURE_CAP, 0.5),
+        )
+    }
+
+    /// The same bench, on windows long enough to clear [`VOL_WARMUP_BARS`] and carrying the
+    /// realized bar geometry and conditional moments the volatility panel needs.
+    ///
+    /// Separate from [`populated_trade`] rather than an extension of it: that fixture's 48-bar
+    /// windows are load-bearing for the tail-count panel, and a volatility forecast cannot be
+    /// scored at all until the trailing baselines have warmed up, so the two objects genuinely
+    /// need different window lengths.
+    fn vol_measured_trade() -> TradeBench {
+        let cap = 4.0;
+        let bars = VOL_WARMUP_BARS + 96;
+        let windows: Vec<WindowPaths> = (0..6usize)
+            .map(|window| {
+                let truth: Vec<f64> = (0..bars)
+                    .map(|bar| {
+                        // Persistent on HAR's own timescale, for the reason
+                        // `trade_bench::tests::vol_fixture` states.
+                        let phase = (window * bars + bar) as f64 / 800.0 * std::f64::consts::TAU;
+                        3.0e-6 * (0.9 * phase.sin()).exp()
+                    })
+                    .collect();
+                let draw = |salt: u64, bar: usize| -> f64 {
+                    (mix64(salt, (window * bars + bar) as u64) >> 11) as f64 / (1u64 << 53) as f64
+                };
+                let proxy: Vec<f64> = truth
+                    .iter()
+                    .enumerate()
+                    .map(|(bar, variance)| variance * -draw(0x501D, bar).max(1e-12).ln())
+                    .collect();
+                let realized: Vec<f64> = truth
+                    .iter()
+                    .enumerate()
+                    .map(|(bar, variance)| variance.sqrt() * (2.0 * draw(0x501E, bar) - 1.0))
+                    .collect();
+                let free: Vec<f64> = realized.iter().map(|r| 0.9 * cap * r.signum()).collect();
+                let clamped = |multiple: f64| -> Vec<f64> {
+                    free.iter()
+                        .map(|position| (multiple * position).clamp(-cap, cap))
+                        .collect()
+                };
+                let mut paths = WindowPaths::unmeasured(
+                    realized.clone(),
+                    free.clone(),
+                    [
+                        clamped(1.0),
+                        clamped(POLICY_KELLY_MULTIPLE[POLICY_HALF]),
+                        clamped(POLICY_KELLY_MULTIPLE[POLICY_QUARTER]),
+                        vec![0.5; bars],
+                        vec![1.0; bars],
+                        realized.iter().map(|r| cap * r.signum()).collect(),
+                        vec![0.7; bars],
+                    ],
+                );
+                paths.predicted_mean = vec![0.0; bars];
+                paths.predicted_var = truth;
+                paths.realized_variance = proxy;
+                paths
+            })
+            .collect();
+        let blocks: Vec<u64> = (0..windows.len() as u64).map(|window| window / 2).collect();
+        let mut tail = TailCounts::empty();
+        tail.bars = vec![bars as f64; windows.len()];
+        for level in 0..TAIL_LEVELS.len() {
+            tail.lower[level] = vec![0.0; windows.len()];
+            tail.upper[level] = vec![0.0; windows.len()];
+        }
+        super::super::trade_bench::bench(
+            &windows,
+            &blocks,
+            &tail,
             BenchConfig::new(DEFAULT_COST_BPS, cap, 0.5),
         )
+    }
+
+    /// The volatility panel carries REAL numbers, not just its reference lines.
+    ///
+    /// The cycle walk only proves each base holds one finite value, and a chart consisting of
+    /// nothing but its own `level unbiased` and `har-rv parity` constants would satisfy that
+    /// while telling a reader nothing. This asserts the measured rows landed: every
+    /// forecaster's QLIKE, its level ratio, and the paired difference against HAR with the
+    /// interval the verdict is read off.
+    #[test]
+    fn the_volatility_panel_carries_a_measured_qlike_for_every_forecaster() {
+        let trade = vol_measured_trade();
+        assert!(
+            trade.vol.measured(),
+            "the fixture's windows must clear the warmup and carry the proxy"
+        );
+        let root = scratch_dir("vol_panel");
+        let mut reporter = PretrainReporter::new(&root, MARGINAL_DOF);
+        let mut metrics = populated_epoch(0, 10, None);
+        metrics.trade = trade;
+        reporter.record_epoch(&metrics).unwrap();
+
+        let dir = root.join("0");
+        let levels = read_report(&dir.join("pretrain_vol_qlike.report.bin")).expect("qlike reads");
+        let ReportKind::MultiLine { series } = levels.kind else {
+            panic!("the qlike panel is not a multi-line chart");
+        };
+        for name in VOL_FORECAST_NAMES {
+            let row = series
+                .iter()
+                .find(|s| s.label == name)
+                .unwrap_or_else(|| panic!("{name} has no qlike series"));
+            assert!(
+                row.values.iter().any(|v| v.is_finite() && *v > 0.0),
+                "{name} charted no positive qlike, so its row is a gap"
+            );
+            let ratio = series
+                .iter()
+                .find(|s| s.label == format!("{name} E[rv]/E[p]"))
+                .unwrap_or_else(|| panic!("{name} has no level-ratio series"));
+            assert!(
+                ratio.values.iter().any(|v| v.is_finite() && *v > 0.0),
+                "{name} charted no level ratio, so a level bias would be unreadable"
+            );
+        }
+        // The DECOMPOSITION of the baseline's loss, which is what exposed an unfloored HAR
+        // being reported as beaten: pooled qlike is `E[z] - E[ln z] - 1`, so both terms have
+        // to be readable separately or a few catastrophic bars look like a poor fit.
+        for label in [
+            format!("{} E[z]", VOL_FORECAST_NAMES[VOL_HAR]),
+            format!("{} log bias", VOL_FORECAST_NAMES[VOL_HAR]),
+        ] {
+            let row = series
+                .iter()
+                .find(|s| s.label == label)
+                .unwrap_or_else(|| panic!("{label} is missing from the qlike panel"));
+            assert!(
+                row.values.iter().any(|v| v.is_finite()),
+                "{label} charted nothing, so the baseline's loss cannot be decomposed"
+            );
+        }
+
+        let paired =
+            read_report(&dir.join("pretrain_vol_vs_har.report.bin")).expect("vs-har reads");
+        let ReportKind::MultiLine { series } = paired.kind else {
+            panic!("the vs-har panel is not a multi-line chart");
+        };
+        assert!(
+            series
+                .iter()
+                .all(|s| s.label != VOL_FORECAST_NAMES[VOL_HAR]),
+            "the baseline must not be charted against itself: the row is identically zero"
+        );
+        for label in [
+            VOL_FORECAST_NAMES[VOL_MODEL].to_owned(),
+            format!("{} ci95 low", VOL_FORECAST_NAMES[VOL_MODEL]),
+            format!("{} ci95 high", VOL_FORECAST_NAMES[VOL_MODEL]),
+        ] {
+            let row = series
+                .iter()
+                .find(|s| s.label == label)
+                .unwrap_or_else(|| panic!("{label} is missing from the vs-har panel"));
+            assert!(
+                row.values.iter().any(|v| v.is_finite()),
+                "{label} charted nothing, so the verdict has no interval"
+            );
+        }
+        // Baseline health, on the verdict panel because it qualifies the verdict.
+        for label in [
+            "har-rv floor rate",
+            "har-rv refusal rate",
+            "verdict withheld (baseline degenerate)",
+        ] {
+            let row = series
+                .iter()
+                .find(|s| s.label == label)
+                .unwrap_or_else(|| panic!("{label} is missing from the vs-har panel"));
+            assert!(
+                row.values.iter().any(|v| v.is_finite()),
+                "{label} charted nothing, so a rescued baseline would be invisible"
+            );
+        }
+    }
+
+    /// The vol-targeted baseline is charted on the SAME axis as the model's edge, in the same
+    /// units, so a reader can see how much of the model's edge causal vol timing alone gets.
+    #[test]
+    fn the_vol_targeted_baseline_rides_the_same_edge_axis_as_the_model() {
+        let root = scratch_dir("vol_target_row");
+        let mut reporter = PretrainReporter::new(&root, MARGINAL_DOF);
+        reporter
+            .record_epoch(&populated_epoch(0, 10, None))
+            .unwrap();
+        let report = read_report(&root.join("0/pretrain_trade_vs_baselines.report.bin"))
+            .expect("the baselines panel reads");
+        let ReportKind::MultiLine { series } = report.kind else {
+            panic!("the baselines panel is not a multi-line chart");
+        };
+        let row = series
+            .iter()
+            .find(|s| s.label == "vol-targeted b&h edge")
+            .expect("the vol-targeted baseline is not on the edge axis");
+        assert!(
+            row.values.iter().any(|v| v.is_finite()),
+            "the vol-targeted row charted nothing"
+        );
+        assert!(
+            series.iter().any(|s| s.label == "edge vs marginal"),
+            "the model's own edge left the panel, so the comparison lost its subject"
+        );
     }
 
     /// Two checkpoints' worth of calibration measurement, built through the REAL bench so the
@@ -8894,6 +10386,7 @@ mod tests {
                                 vec![0.5; bars],
                                 vec![1.0; bars],
                                 oracle,
+                                vec![0.7; bars],
                             ],
                         );
                         // A conditional mean that varies per bar, so the regression the writer
@@ -8978,7 +10471,7 @@ mod tests {
             .collect()
     }
 
-    /// All NINE calibration bases land on disk with finite values, which is the coverage their
+    /// All TEN calibration bases land on disk with finite values, which is the coverage their
     /// [`CYCLE_EXEMPT`] entries name. An exemption whose writer no test executes is how a
     /// permanently blank panel ships.
     #[test]
@@ -9009,6 +10502,7 @@ mod tests {
             "pretrain_edge_confidence",
             "pretrain_edge_hysteresis",
             "pretrain_signal_decay",
+            "pretrain_rank_ic",
             "pretrain_edge_composition",
         ] {
             assert!(
@@ -9042,6 +10536,7 @@ mod tests {
                 "pretrain_edge_confidence" => ATTRIBUTION_DECILES,
                 "pretrain_edge_hysteresis" => HYSTERESIS_MARGINS.len(),
                 "pretrain_signal_decay" => DECAY_HORIZONS.len(),
+                "pretrain_rank_ic" => DECAY_HORIZONS.len(),
                 "pretrain_edge_composition" => COMPOSITION_NAMES.len(),
                 _ => CAP_GRID.len(),
             };
@@ -9115,6 +10610,126 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 
+    /// [`populated_trade`], re-benched under a NON-control sizing rule.
+    ///
+    /// The control fixture is reused verbatim and only the sizing evidence is attached, so the
+    /// difference the chart reports is the rule and nothing else — exactly the property the
+    /// in-run comparison claims.
+    fn sized_trade() -> TradeBench {
+        let mut windows = fixture_windows();
+        for (index, window) in windows.iter_mut().enumerate() {
+            let bars = window.bars();
+            // The active rule de-levers by a tenth on even windows and levers up on odd ones,
+            // so neither the signed gap nor the cross-bar dispersion can pass by being zero.
+            let scale = if index % 2 == 0 { 0.9 } else { 1.15 };
+            let free_control = window.free.clone();
+            window.free = free_control.iter().map(|f| f * scale).collect();
+            window.positions[POLICY_MODEL] = window
+                .free
+                .iter()
+                .map(|f| f.clamp(-FIXTURE_CAP, FIXTURE_CAP))
+                .collect();
+            let mut ruin_breach = vec![0.0; bars];
+            if bars > 0 {
+                ruin_breach[index % bars] = 1.0;
+            }
+            window.sizing = Some(super::super::trade_bench::SizingEvidence {
+                rule: super::super::trade_bench::SizingRule::CUMULANT_LOG,
+                shrink: super::super::trade_bench::MeanShrink::identity(),
+                free_control,
+                ruin_breach,
+            });
+        }
+        let blocks: Vec<u64> = (0..windows.len() as u64).map(|window| window / 2).collect();
+        super::super::trade_bench::bench(
+            &windows,
+            &blocks,
+            &TailCounts::empty(),
+            BenchConfig::new(DEFAULT_COST_BPS, FIXTURE_CAP, 0.5),
+        )
+    }
+
+    /// The sizing-rule base lands, is registered, is exempt from the in-run cycle walk, and
+    /// carries the two calibration slopes a reader needs to tell a stale recalibration from a
+    /// wrong one. This is the test its [`CYCLE_EXEMPT`] entry names.
+    #[test]
+    fn the_sizing_rule_chart_lands_for_a_non_control_arm() {
+        let root = scratch_dir("sizing_rule");
+        let control = populated_trade();
+        write_trade_bench(&root, "control", &control).expect("the control bench writes");
+        assert!(
+            control.sizing.is_none(),
+            "the control fixture must carry no sizing comparison"
+        );
+        assert!(
+            !root.join(format!("{SIZING_RULE_BASE}.report.bin")).exists(),
+            "a control pass must leave no sizing-rule chart at all, or the campaign's control \
+             is not bit-identical"
+        );
+
+        let sized = sized_trade();
+        let sizing = sized
+            .sizing
+            .as_ref()
+            .expect("a non-control bench carries its comparison");
+        assert!(
+            sizing.free_mean_abs_gap > 0.0 && sizing.ruin_breach_bars > 0,
+            "the fixture must move the position and record a ruin breach, or the chart proves \
+             nothing"
+        );
+        write_trade_bench(&root, "arm", &sized).expect("the arm bench writes");
+
+        assert!(
+            EXPECTED_BASES.contains(&SIZING_RULE_BASE),
+            "{SIZING_RULE_BASE} is written but not registered, so the TUI never scans for it"
+        );
+        assert!(
+            CYCLE_EXEMPT.contains(&SIZING_RULE_BASE),
+            "{SIZING_RULE_BASE} cannot be produced by a control in-run cycle, so it must be \
+             exempt WITH this test named in its entry"
+        );
+        let path = root.join(format!("{SIZING_RULE_BASE}.report.bin"));
+        assert!(path.exists(), "{SIZING_RULE_BASE} was never written");
+        let report = read_report(&path).expect("report reads back");
+        let ReportKind::MultiLine { series } = report.kind else {
+            panic!("{SIZING_RULE_BASE} must be a multi-line chart");
+        };
+        for line in &series {
+            assert_eq!(
+                line.values.len(),
+                CAP_GRID.len(),
+                "series `{}` has {} points against the {}-point cap grid",
+                line.label,
+                line.values.len(),
+                CAP_GRID.len(),
+            );
+        }
+        // The five series the arm is actually judged on. Named individually rather than counted,
+        // because a chart that silently loses the paired verdict still renders.
+        for label in [
+            "PAIRED active - control, bps/bar",
+            "mean |f_active - f_control|",
+            "CROSS-BAR sd of f, active",
+            "cross-bar sd of f, control",
+            "APPLIED MZ slope",
+        ] {
+            let line = series
+                .iter()
+                .find(|s| s.label == label)
+                .unwrap_or_else(|| panic!("`{label}` is not charted"));
+            assert!(
+                line.values.iter().all(|v| v.is_finite()),
+                "`{label}` holds a non-finite value: {:?}",
+                line.values
+            );
+        }
+        // Both slopes, so a run whose applied recalibration has gone stale is distinguishable
+        // from one whose sizing is wrong.
+        assert!(series.iter().any(|s| s.label == "measured MZ slope"));
+        assert!(series.iter().any(|s| s.label == "perfect calibration"));
+        let _ = fs::remove_dir_all(&root);
+    }
+
     /// The cost panel is the chart the economic verdict is read off, and it has to carry the
     /// fraction being quoted rather than only the clamp's own opinion. The values must be the
     /// bench's own per-policy curves in basis points, not a re-derivation.
@@ -9184,21 +10799,90 @@ mod tests {
         }
     }
 
+    /// A target-geometry audit shaped like a CONTROL measurement: `r` and `s` in raw
+    /// log-return units, a fat tail, and a per-symbol effective resolution that varies by an
+    /// order of magnitude. That last property is the defect the panel exists to show, so a
+    /// fixture without it could not tell a working writer from one that plots a constant.
+    fn populated_geometry() -> TargetGeometry {
+        let symbols = ["QUIET", "SLOW", "MID", "FAST", "WILD"];
+        let effective = [9.1f64, 21.4, 47.8, 71.2, 96.5];
+        TargetGeometry {
+            res_secs: 300,
+            scaling: DofScaling::Raw,
+            split: Split::Val,
+            bars: 4_182_004,
+            sigma_quantiles: [
+                4.1e-4, 7.3e-4, 9.6e-4, 1.6e-3, 2.8e-3, 5.1e-3, 9.4e-3, 1.4e-2, 3.2e-2,
+            ],
+            sigma_relative_floored: 0,
+            sigma_numerical_fallback: 0,
+            r_z_clamped: 0,
+            s_z_clamped: 0,
+            sigma_unwarmed: 0,
+            dof: [
+                DofScale {
+                    name: "r",
+                    mean: -1.2e-6,
+                    sd: 3.4e-3,
+                    quantiles: [
+                        -1.4e-2, -6.1e-3, -4.2e-3, -1.6e-3, 0.0, 1.6e-3, 4.2e-3, 6.1e-3, 1.4e-2,
+                    ],
+                    excess_kurtosis: 41.7,
+                },
+                DofScale {
+                    name: "s",
+                    mean: 4.6e-3,
+                    sd: 3.1e-3,
+                    quantiles: [
+                        0.0, 8.0e-4, 1.2e-3, 2.4e-3, 3.9e-3, 5.9e-3, 9.1e-3, 1.2e-2, 2.1e-2,
+                    ],
+                    excess_kurtosis: 63.2,
+                },
+            ],
+            // Equal-mass by construction, which is exactly the point the panel makes about the
+            // pooled statistic: it cannot see the defect the per-symbol rows carry.
+            r_occupancy: vec![1.0 / NUM_BAR_BINS as f64; NUM_BAR_BINS as usize],
+            per_symbol: symbols
+                .iter()
+                .zip(effective)
+                .enumerate()
+                .map(|(rank, (symbol, bins))| SymbolBinOccupancy {
+                    symbol: (*symbol).to_owned(),
+                    bars: 700_000 + rank as u64 * 130_000,
+                    entropy: bins.ln(),
+                    effective_bins: bins,
+                })
+                .collect(),
+        }
+    }
+
     #[test]
     fn a_full_cycle_writes_every_registered_base() {
         let _torch_rng_guard = test_rng::shared();
         let root = scratch_dir("full_cycle");
         let mut reporter = PretrainReporter::new(&root, MARGINAL_DOF);
+        // Set exactly where a real run sets it — once, before the first step — so the three
+        // target-geometry bases are part of the cycle rather than an exemption.
+        reporter.set_target_geometry(populated_geometry());
 
         for step in 0..STEP_DECIMATION {
             let mut metrics = StepMetrics::nan();
             metrics.epoch = 0;
             metrics.step = step;
-            metrics.nll_bar = 24.0 - step as f64 * 0.01;
-            metrics.nll_dof = [4.8; BAR_DOF];
+            let nll_bar = 24.0 - step as f64 * 0.01;
+            set_step_nll(&mut metrics, nll_bar, [4.8; BAR_DOF], (16 * 896) as u64);
             metrics.dyn_loss = 0.5;
             metrics.kl_loss = 0.25;
             metrics.total_loss = 24.75;
+            metrics.direct_nll = [23.5, 23.9];
+            metrics.direct_nll_dof = [[4.7; BAR_DOF], [4.78; BAR_DOF]];
+            metrics.direct_target_count = [14_200, 14_100];
+            metrics.direct_weights = [0.5, 0.25];
+            metrics.direct_objective_share = 0.31;
+            metrics.shared_grad_alignment = 0.18;
+            metrics.shared_grad_conflict = 0.41;
+            metrics.forward_wall_secs = 0.08;
+            metrics.step_wall_secs = 0.21;
             // Set because a real step always sets them: the growth term is computed and
             // charted on BOTH ablation arms, so a fixture that left them NaN would make the
             // registry walk pass only because `write_chart` skips an all-NaN panel.
@@ -9481,8 +11165,8 @@ mod tests {
                 let mut metrics = StepMetrics::nan();
                 metrics.epoch = epoch;
                 metrics.step = epoch * ticks_per_epoch * STEP_DECIMATION + tick;
-                metrics.nll_bar = 24.0 - metrics.step as f64 * 0.001;
-                metrics.nll_dof = [4.8; BAR_DOF];
+                let nll_bar = 24.0 - metrics.step as f64 * 0.001;
+                set_step_nll(&mut metrics, nll_bar, [4.8; BAR_DOF], (16 * 896) as u64);
                 metrics.total_loss = 24.0;
                 metrics.context = 896;
                 metrics.batch_size = 16;
@@ -9737,7 +11421,9 @@ mod tests {
         for step in 0..STEP_DECIMATION * 3 {
             let mut metrics = StepMetrics::nan();
             metrics.step = step;
-            metrics.nll_bar = 24.0;
+            metrics.context = 1;
+            metrics.batch_size = 1;
+            set_step_nll(&mut metrics, 24.0, [4.8; BAR_DOF], 1);
             reporter.record_step(&metrics).unwrap();
         }
         reporter
@@ -9891,6 +11577,12 @@ mod tests {
         battery.crps_dof = [0.003, 0.002, 0.19, 0.21, 0.44];
         battery.rollout_nll_exact = [21.4, 22.1, 22.9, 23.8, 24.4];
         battery.rollout_nll_dynamics = [21.5, 22.4, 23.6, 25.1, 26.2];
+        battery.direct_nll = [22.3, 22.8];
+        battery.direct_nll_dof = [[4.46; BAR_DOF], [4.56; BAR_DOF]];
+        battery.direct_crps_dof = [[0.12; BAR_DOF], [0.14; BAR_DOF]];
+        battery.direct_dir_acc = [0.508, 0.505];
+        battery.direct_valid_fraction = [0.993, 0.989];
+        battery.direct_vs_exact_delta = [0.2, 0.35];
         battery.dir_acc = 0.514;
         battery.pit.accumulate(
             &(Tensor::arange(1024, (Kind::Float, Device::Cpu)) / 1024.0)
@@ -9960,6 +11652,7 @@ mod tests {
         };
         let labels: Vec<&str> = series.iter().map(|s| s.label.as_str()).collect();
         for expected in [
+            "test evaluation status (0 = deferred/unmeasured, 1 = measured)",
             "smoothed-target cross entropy (diagnostic) nats/bar",
             "smoothed-target cross entropy (diagnostic) vs uniform",
             "smoothed-target cross entropy (diagnostic) vs marginal",
@@ -9970,6 +11663,10 @@ mod tests {
             "pit tv u",
             "TEACHER-FORCED score h64 exact belief advance",
             "TEACHER-FORCED score h64 dynamics advance",
+            "direct h2 complete-bar hard NLL",
+            "direct h3 minus exact-rollout NLL",
+            "direct h2 CRPS r",
+            "direct h2 ordinary-row coverage",
             "dir acc",
             "nll_bar se",
             "nll_bar ci95 low",
@@ -9997,6 +11694,42 @@ mod tests {
             .unwrap()
             .values[0] as f64;
         assert!((gain - (marginal_total - 21.4)).abs() < 1.0e-4);
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn deferred_test_finalizes_reports_with_an_explicit_unmeasured_state() {
+        let root = scratch_dir("battery_deferred");
+        let weights = checkpoint(&root, "best.ot", b"promoted");
+        let reporter = promoted_reporter(&root, &weights);
+        reporter.finish_deferred_test().unwrap();
+
+        let report = read_report(&root.join("0").join("pretrain_test.report.bin")).unwrap();
+        assert!(
+            report.title.contains("DEFERRED / UNMEASURED") && report.title.contains("best.ot"),
+            "the terminal state must name both policy and artifact: {}",
+            report.title
+        );
+        let ReportKind::MultiLine { series } = report.kind else {
+            panic!("expected MultiLine");
+        };
+        let status = series
+            .iter()
+            .find(|series| {
+                series.label == "test evaluation status (0 = deferred/unmeasured, 1 = measured)"
+            })
+            .expect("deferred status series");
+        assert_eq!(status.values, vec![0.0]);
+        let scored = series
+            .iter()
+            .find(|series| series.label == "test windows scored")
+            .expect("scored-window count");
+        assert_eq!(scored.values, vec![0.0]);
+        assert!(
+            root.join("0").join("pretrain_nll_bar.report.bin").is_file(),
+            "the canonical Train/Val report cycle must also be finalized"
+        );
 
         fs::remove_dir_all(&root).ok();
     }

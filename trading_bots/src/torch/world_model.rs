@@ -31,8 +31,8 @@ use tch::{autocast, nn, nn::Init, Device, Kind, Tensor};
 
 use crate::torch::{
     bar_dist::{
-        BarEmissionHead, BarSupports, BAR_CHAIN, BAR_DOF, BAR_DOF_NAMES, BAR_LABEL_SIGMA_RATIO,
-        BAR_PREFIX_EMBED_DIM, BAR_VOLUME_EMA_SPAN, NUM_BAR_BINS,
+        BarEmissionHead, BarSupports, DofScaling, BAR_CHAIN, BAR_DOF, BAR_DOF_NAMES,
+        BAR_LABEL_SIGMA_RATIO, BAR_PREFIX_EMBED_DIM, BAR_VOLUME_EMA_SPAN, NUM_BAR_BINS,
     },
     dataset::{
         resolution_class, time_ids_without_market, BAR_TIME_CARDINALITY, BAR_TIME_CONDITIONING,
@@ -62,6 +62,26 @@ pub const BAR_HEADS: i64 = 8;
 pub const BAR_HEAD_DIM: i64 = 64;
 pub const BAR_FF_DIM: i64 = 2048;
 pub const BAR_MAX_CONTEXT: i64 = 2048;
+pub const BAR_DIRECT_STAGE_COUNT: usize = 3;
+pub const BAR_DIRECT_T2_STAGE_MULTIPLIER: [f64; BAR_DIRECT_STAGE_COUNT] =
+    [0.5; BAR_DIRECT_STAGE_COUNT];
+pub const BAR_DIRECT_T3_STAGE_MULTIPLIER: [f64; BAR_DIRECT_STAGE_COUNT] =
+    [0.25; BAR_DIRECT_STAGE_COUNT];
+
+fn direct_schedule_canonical() -> String {
+    let encode = |values: &[f64]| {
+        values
+            .iter()
+            .map(|value| format!("{:016x}", value.to_bits()))
+            .collect::<Vec<_>>()
+            .join(",")
+    };
+    format!(
+        "h2:{}|h3:{}",
+        encode(&BAR_DIRECT_T2_STAGE_MULTIPLIER),
+        encode(&BAR_DIRECT_T3_STAGE_MULTIPLIER)
+    )
+}
 /// Lineage: `v2` -> `v3` replaces the rank-1 affine chain-prefix conditioning in
 /// [`BarEmissionHead`] with per-slot bin embeddings (`binprefix`) and RMS-normalizes
 /// the [`BarDynamics`] output onto the trunk belief shell (`dynrms`). `v3` -> `v4`
@@ -70,15 +90,19 @@ pub const BAR_MAX_CONTEXT: i64 = 2048;
 /// token forecast-safe by masking its same-instant market ids, gives the emission
 /// readout an explicit target-clock/current-market conditioning vector, and makes
 /// dynamics consume the trunk's exact shared token embedding rather than private
-/// DOF and clock encoders. Each transition changes VarStore shapes or semantics,
-/// so checkpoints cannot be cross-loaded.
+/// DOF and clock encoders. `v6` -> `v7` adds direct-horizon complete-bar supervision.
+/// `v7` -> `v8` gives h1, h2 and h3 private emission parameter banks while retaining the
+/// shared live trunk. Each transition changes VarStore shapes or semantics, so checkpoints
+/// cannot be cross-loaded.
 pub const BAR_ARCHITECTURE: &str =
-    "bardist-causal-ar-pope64-fa4-time9market-binprefix-dynrms-x0shortcut-forecastcond-sharedtoken-v6";
+    "bardist-causal-ar-pope64-fa4-time9market-binprefix-dynrms-x0shortcut-forecastcond-sharedtoken-directh23-privateheads-v8";
 
 /// KV-cache layout contract. Any change to the cache geometry, the position
 /// bookkeeping or the eviction rule must bump this, because it feeds the lineage
 /// hash and therefore invalidates every checkpoint that claims the old one.
 pub const BAR_CACHE_CONTRACT: &str = "bar-circular-pope-absolute-bshd-k128-v64-fa4-v1";
+pub const BAR_DIRECT_FLOW_CONTRACT: &str =
+    "h1-head-private|h2-head-private|h3-head-private|trunk-shared";
 
 /// RMSNorm epsilon. The norm carries no learnable gain anywhere in this model.
 pub const BAR_NORM_EPS: f64 = 1e-6;
@@ -91,12 +115,10 @@ pub const BAR_POST_LAMBDA_INIT: f64 = 1.0;
 pub const BAR_DYNAMICS_HIDDEN: i64 = 1664;
 
 /// Metadata schema version. v5 and below are LeJEPA-era and unreadable here. v7 adds
-/// [`BarTrainingProvenance`], so a checkpoint states which corpus and which selection rule
-/// produced it instead of leaving both to a run log nobody kept. v8 adds the three CONTEXT
-/// lengths of that selection: a checkpoint promoted at the ramp's starting context because
-/// the run never reached the deployed one is a legitimate artifact but not the same artifact,
-/// and the difference has to be readable off the file rather than inferred from a log.
-pub const BAR_METADATA_VERSION: u32 = 8;
+/// [`BarTrainingProvenance`], v8 adds the selection contexts, v9 authenticates direct
+/// objective weights, v10 authenticates their stage schedule, v11 authenticates the
+/// private-head/shared-trunk gradient-flow contract, and v12 authenticates economic sizing.
+pub const BAR_METADATA_VERSION: u32 = 12;
 
 /// ET minutes at which the session channel changes value, re-exported from the
 /// producer. Folded into the lineage because the cardinality alone does not pin
@@ -283,6 +305,18 @@ pub struct BarTrainingProvenance {
     /// reason: a checkpoint cannot be relabelled with a mode it was not trained under, and
     /// `pretrain-compare` refuses to pair two runs that disagree.
     pub scoring: String,
+    /// Reduction of the predictive return law that sized every economic selection metric.
+    ///
+    /// Required on newly written artifacts and folded into lineage. Empty only on metadata
+    /// predating this field.
+    #[serde(default)]
+    pub sizing_rule: String,
+    /// Base weights of the direct complete-bar t+2 and t+3 Hard-NLL objectives. Their
+    /// persistent stage multipliers are training contract `[.5,.5,.5]` and `[.25,.25,.25]`.
+    #[serde(default)]
+    pub direct_t2_weight: f64,
+    #[serde(default)]
+    pub direct_t3_weight: f64,
     /// Context length, in bars, of the held-out set the promotion decision was actually
     /// taken on.
     ///
@@ -364,6 +398,18 @@ pub struct BarTrainingProvenance {
     /// written before optimizer provenance was recorded.
     #[serde(default)]
     pub optimizer: Option<BarOptimizerProvenance>,
+    /// Target parametrization the head was trained against.
+    ///
+    /// Load-bearing for the lineage exactly as `scoring` is, and for a stronger reason: two
+    /// runs scored under different [`crate::torch::bar_dist::BarScoring`] modes differ by an
+    /// additive constant, whereas two runs under different [`DofScaling`] modes are modelling
+    /// DIFFERENT RANDOM VARIABLES. `dof_scaling` on the supports artifact says what the bins
+    /// tile; this says what the weights were fitted to predict, and the two must agree.
+    ///
+    /// [`DofScaling::Raw`] on every checkpoint written before this existed, which is what those
+    /// runs did, so the default is a fact rather than a placeholder.
+    #[serde(default)]
+    pub dof_scaling: DofScaling,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -398,8 +444,13 @@ pub struct BarOptimizerAblationProvenance {
     pub beta_update_clip: Option<f64>,
 }
 
+/// Exact-continuation sidecar contract. Version 5 additionally authenticates the sizing rule
+/// that drives checkpoint promotion, so a resumed run cannot change its economic objective.
+pub const BAR_PRETRAIN_RECOVERY_VERSION: u32 = 5;
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct BarPretrainRecovery {
+    pub format_version: u32,
     pub total_steps: usize,
     pub stage_steps: Vec<usize>,
     /// Startup-planned batch multipliers used to partition the pass and size each stage.
@@ -409,14 +460,27 @@ pub struct BarPretrainRecovery {
     pub base_batch: usize,
     pub requested_batch: usize,
     pub exact_batch: bool,
+    pub quadratic_kelly: bool,
+    pub mean_shrink: bool,
     pub epochs: usize,
     #[serde(default)]
     pub steps_override: Option<usize>,
     pub dyn_horizon: usize,
     pub lambda_dyn: f64,
     pub lambda_kl: f64,
+    pub direct_t2_weight: f64,
+    pub direct_t3_weight: f64,
     #[serde(default)]
     pub auxiliary_resolutions: Vec<u32>,
+    /// Whether the optimizer sidecar carries AdamW gradients retained between cadence updates.
+    /// Required rather than defaulted so artifacts written before exact accumulation recovery
+    /// are rejected instead of being mistaken for post-update checkpoints.
+    pub adamw_accumulation_pending: bool,
+    /// Last measured activation footprint in device bytes per bar-token. Zero means unmeasured.
+    pub activation_bytes_per_token: f64,
+    /// Stable device identity (NVML UUID and name) under which the footprint was measured.
+    /// Empty only when the footprint is unmeasured.
+    pub activation_device: String,
     pub checkpoint_every: usize,
     pub validate_every: usize,
     pub ablation_lr: f64,
@@ -593,6 +657,44 @@ impl BarWorldModelMetadata {
         Ok(())
     }
 
+    /// Require the supports a caller will actually use to carry exactly the bin geometry the
+    /// authenticated checkpoint was trained against. The checkpoint-adjacent files are hash
+    /// checked before they are loaded, so copied or tampered support sidecars cannot certify a
+    /// different output space.
+    pub fn validate_support_geometry(
+        &self,
+        checkpoint: impl AsRef<Path>,
+        actual: &BarSupportSet,
+    ) -> Result<()> {
+        let checkpoint = checkpoint.as_ref();
+        self.validate_supports(checkpoint)?;
+        ensure!(
+            actual.resolutions() == self.resolutions(),
+            "world-model support resolutions mismatch: checkpoint={:?}, current={:?}",
+            self.resolutions(),
+            actual.resolutions()
+        );
+        for resolution in self.resolutions() {
+            let expected = BarSupports::load(&world_model_supports_path(checkpoint, resolution))
+                .with_context(|| {
+                    format!("failed loading authenticated {resolution}s checkpoint supports")
+                })?;
+            let current = actual
+                .get(resolution)
+                .with_context(|| format!("current run has no {resolution}s supports"))?;
+            let same = (0..BAR_DOF).all(|dof| {
+                expected.lower_bounds(dof) == current.lower_bounds(dof)
+                    && expected.widths(dof) == current.widths(dof)
+            });
+            ensure!(
+                same,
+                "world-model {resolution}s support geometry differs from the authenticated \
+                 checkpoint; refusing to reinterpret its output bins"
+            );
+        }
+        Ok(())
+    }
+
     pub fn validate_schema(&self) -> Result<()> {
         if self.format_version != BAR_METADATA_VERSION {
             bail!(
@@ -622,7 +724,28 @@ impl BarWorldModelMetadata {
         if self.res_secs == 0 {
             bail!("world-model bar resolution must be positive");
         }
+        if let Some(training) = &self.training {
+            ensure!(
+                training.direct_t2_weight.is_finite()
+                    && training.direct_t2_weight >= 0.0
+                    && training.direct_t3_weight.is_finite()
+                    && training.direct_t3_weight >= 0.0,
+                "direct horizon weights must be finite and non-negative"
+            );
+        }
         if let Some(recovery) = &self.pretrain_recovery {
+            ensure!(
+                recovery.format_version == BAR_PRETRAIN_RECOVERY_VERSION,
+                "unsupported pretrain recovery version {}, expected {BAR_PRETRAIN_RECOVERY_VERSION}",
+                recovery.format_version
+            );
+            ensure!(
+                recovery.direct_t2_weight.is_finite()
+                    && recovery.direct_t2_weight >= 0.0
+                    && recovery.direct_t3_weight.is_finite()
+                    && recovery.direct_t3_weight >= 0.0,
+                "pretrain recovery direct horizon weights must be finite and non-negative"
+            );
             ensure!(
                 self.optimizer_checkpoint_sha256
                     .as_ref()
@@ -653,6 +776,17 @@ impl BarWorldModelMetadata {
                             .all(|multiple| *multiple > 0)),
                 "pretrain recovery metadata carries an invalid planned batch ramp {:?}",
                 recovery.derived_batch_ramp
+            );
+            ensure!(
+                recovery.activation_bytes_per_token == 0.0
+                    || recovery.activation_bytes_per_token.is_finite()
+                        && recovery.activation_bytes_per_token > 0.0,
+                "pretrain recovery activation footprint must be zero or finite and positive"
+            );
+            ensure!(
+                (recovery.activation_bytes_per_token == 0.0)
+                    == recovery.activation_device.is_empty(),
+                "pretrain recovery activation footprint and device provenance must be present together"
             );
         } else {
             ensure!(
@@ -737,7 +871,7 @@ impl BarWorldModelMetadata {
             "corpus={};bounds={}:{};pinned={};eval_seed={:016x};train_seed={:016x};\
              metric={};weights={};guard={}@{:016x};min_dollar_volume_bits={:016x};symbols={};\
              supports_frozen={};supports_corpus={};universe={};universe_train_end={};\
-             scoring={};context={}@{}/{};batch_ramp={}{}{}",
+             scoring={};sizing_rule={};direct_weights={:016x}:{:016x};direct_schedule={};direct_flow={};context={}@{}/{};batch_ramp={}{}{}{}",
             training.corpus_fingerprint,
             training.split_bounds.0,
             training.split_bounds.1,
@@ -766,6 +900,11 @@ impl BarWorldModelMetadata {
                 .map(|ms| ms.to_string())
                 .unwrap_or_else(|| "none".to_owned()),
             training.scoring,
+            training.sizing_rule,
+            training.direct_t2_weight.to_bits(),
+            training.direct_t3_weight.to_bits(),
+            direct_schedule_canonical(),
+            BAR_DIRECT_FLOW_CONTRACT,
             training.selection_context,
             training.reached_context,
             training.deployed_context,
@@ -790,6 +929,14 @@ impl BarWorldModelMetadata {
                 )
             },
             optimizer_suffix,
+            // Same discipline: [`DofScaling::Raw`] renders NOTHING, so every checkpoint
+            // written before the parametrization was recorded — all of which trained on raw
+            // targets — keeps validating against its own stored hash, while a standardized arm
+            // can never collide with a raw run's lineage.
+            match training.dof_scaling {
+                DofScaling::Raw => String::new(),
+                scaling => format!(";dof_scaling={scaling}"),
+            },
         )
     }
 
@@ -811,9 +958,10 @@ impl BarWorldModelMetadata {
             )
         };
         format!(
-            ";optimizer_checkpoint_sha256={};optimizer_initialized_adamw={};recovery=total_steps={},stage_steps={}{},base_batch={},requested_batch={},exact_batch={},epochs={},steps_override={},dyn_horizon={},lambda_dyn={:016x},lambda_kl={:016x},auxiliary_resolutions={},checkpoint_every={},validate_every={},ablation_lr={:016x},smd_meta_lr={:016x}",
+            ";optimizer_checkpoint_sha256={};optimizer_initialized_adamw={};recovery=format_version={},total_steps={},stage_steps={}{},base_batch={},requested_batch={},exact_batch={},quadratic_kelly={},mean_shrink={},epochs={},steps_override={},dyn_horizon={},lambda_dyn={:016x},lambda_kl={:016x},direct_t2_weight={:016x},direct_t3_weight={:016x},direct_schedule={},direct_flow={},auxiliary_resolutions={},adamw_accumulation_pending={},activation_bytes_per_token={:016x},activation_device={},checkpoint_every={},validate_every={},ablation_lr={:016x},smd_meta_lr={:016x}",
             self.optimizer_checkpoint_sha256.as_deref().unwrap_or("none"),
             self.optimizer_initialized_adamw.join(","),
+            recovery.format_version,
             recovery.total_steps,
             recovery
                 .stage_steps
@@ -825,6 +973,8 @@ impl BarWorldModelMetadata {
             recovery.base_batch,
             recovery.requested_batch,
             recovery.exact_batch,
+            recovery.quadratic_kelly,
+            recovery.mean_shrink,
             recovery.epochs,
             recovery
                 .steps_override
@@ -832,12 +982,19 @@ impl BarWorldModelMetadata {
             recovery.dyn_horizon,
             recovery.lambda_dyn.to_bits(),
             recovery.lambda_kl.to_bits(),
+            recovery.direct_t2_weight.to_bits(),
+            recovery.direct_t3_weight.to_bits(),
+            direct_schedule_canonical(),
+            BAR_DIRECT_FLOW_CONTRACT,
             recovery
                 .auxiliary_resolutions
                 .iter()
                 .map(u32::to_string)
                 .collect::<Vec<_>>()
                 .join(","),
+            recovery.adamw_accumulation_pending,
+            recovery.activation_bytes_per_token.to_bits(),
+            recovery.activation_device,
             recovery.checkpoint_every,
             recovery.validate_every,
             recovery.ablation_lr.to_bits(),
@@ -864,7 +1021,7 @@ impl BarWorldModelMetadata {
              weights_sha256={};norm=rmsnorm-no-gain;norm_eps_bits={:016x};qk_norm=head-dim-rmsnorm;\
              mlp=relu-squared;resid_lambda_init_bits={:016x};post_lambda_init_bits={:016x};\
              weight_scalars=qkv-and-out;zero_init=attn-out,ff-out,dyn-fc3,x0-lambda;\
-             shortcut=embedding-x0-per-layer-attn-residual;dynamics_hidden={};\
+             direct_head_init=copy-h1-without-rng;shortcut=embedding-x0-per-layer-attn-residual;dynamics_hidden={};\
              dynamics_act=gelu-none;dynamics_layers=3;pope_dim={};pope_qk_dim={};\
              pope_frequency_base_bits={:016x};pope_attention_scale_bits={:016x};\
              pope_theta_init=two-pi-block-aware;pope_layout=real-then-imag;\
@@ -2345,6 +2502,20 @@ impl BarWorldModel {
             ));
         }
         let supports = BarSupportSet::new(loaded)?;
+        if let Some(training) = metadata.training.as_ref() {
+            for resolution in metadata.resolutions() {
+                let support = supports
+                    .get(resolution)
+                    .expect("the support set was built from every metadata resolution");
+                ensure!(
+                    support.dof_scaling() == training.dof_scaling,
+                    "checkpoint training provenance records {} targets but its authenticated \
+                     {resolution}s supports tile {} targets",
+                    training.dof_scaling,
+                    support.dof_scaling(),
+                );
+            }
+        }
 
         let mut var_store = nn::VarStore::new(device);
         let modules = BarModules::new(&var_store.root());
@@ -2919,7 +3090,11 @@ mod tests {
     }
 
     fn synthetic_supports() -> BarSupports {
-        let mut rng = Lcg(0x5eed_1234);
+        synthetic_supports_with_seed(0x5eed_1234)
+    }
+
+    fn synthetic_supports_with_seed(seed: u64) -> BarSupports {
+        let mut rng = Lcg(seed);
         let samples: Vec<BarDof> = (0..8192)
             .map(|index| {
                 // Real bars pile mass on flat ranges and mid-range closes, which
@@ -3186,6 +3361,37 @@ mod tests {
         fs::remove_dir_all(&dir).ok();
     }
 
+    #[test]
+    fn metadata_rejects_tampered_weights_and_mismatched_support_geometry() {
+        let _torch_rng_guard = test_rng::exclusive();
+        let dir = temp_dir("warm-start-authentication");
+        let checkpoint_supports = synthetic_supports();
+        let (weights, metadata_path, _vs) = write_fixture(&dir, &checkpoint_supports);
+        let metadata = BarWorldModelMetadata::load(&metadata_path).expect("metadata");
+
+        let matching =
+            BarSupportSet::new(vec![(300, synthetic_supports())]).expect("matching supports");
+        metadata
+            .validate_support_geometry(&weights, &matching)
+            .expect("identical geometry is valid");
+
+        let mismatched = BarSupportSet::new(vec![(300, synthetic_supports_with_seed(0xdead_beef))])
+            .expect("mismatched supports");
+        let mismatch = metadata
+            .validate_support_geometry(&weights, &mismatched)
+            .expect_err("different bin geometry must be rejected")
+            .to_string();
+        assert!(mismatch.contains("support geometry differs"));
+
+        fs::write(&weights, b"tampered weights").expect("tamper weights");
+        let tamper = metadata
+            .validate_checkpoint(&weights)
+            .expect_err("metadata must authenticate weights before loading")
+            .to_string();
+        assert!(tamper.contains("checkpoint hash mismatch"));
+        fs::remove_dir_all(&dir).ok();
+    }
+
     fn training_fixture(scoring: BarScoring) -> BarTrainingProvenance {
         BarTrainingProvenance {
             corpus_fingerprint: "c0ffee".to_owned(),
@@ -3203,7 +3409,10 @@ mod tests {
             supports_corpus_fingerprint: None,
             universe_fingerprint: None,
             universe_train_end_ms: None,
+            direct_t2_weight: 0.0,
+            direct_t3_weight: 0.0,
             scoring: scoring.to_string(),
+            sizing_rule: "global_quadratic_raw_mean".to_owned(),
             selection_context: BAR_MAX_CONTEXT,
             deployed_context: BAR_MAX_CONTEXT,
             reached_context: BAR_MAX_CONTEXT,
@@ -3215,6 +3424,7 @@ mod tests {
             batch_ramp: vec![1, 2, 3],
             lr_plateau_fraction: 0.40,
             optimizer: None,
+            dof_scaling: DofScaling::Raw,
         }
     }
 
@@ -3235,18 +3445,26 @@ mod tests {
             "1".repeat(64),
             Vec::new(),
             BarPretrainRecovery {
+                format_version: BAR_PRETRAIN_RECOVERY_VERSION,
+                direct_t2_weight: 0.0,
+                direct_t3_weight: 0.0,
                 total_steps: 90,
                 stage_steps: vec![10, 20, 60],
                 derived_batch_ramp: vec![1, 2, 3],
                 base_batch: 8,
                 requested_batch: 8,
                 exact_batch: true,
+                quadratic_kelly: true,
+                mean_shrink: false,
                 epochs: 1,
                 steps_override: None,
                 dyn_horizon: 1,
                 lambda_dyn: 1.0,
                 lambda_kl: 1.0,
                 auxiliary_resolutions: Vec::new(),
+                adamw_accumulation_pending: false,
+                activation_bytes_per_token: 480_000.0,
+                activation_device: "GPU-test:test-device".to_owned(),
                 checkpoint_every: 32,
                 validate_every: 64,
                 ablation_lr: 1e-3,
@@ -3264,6 +3482,29 @@ mod tests {
         assert!(
             tampered.validate_schema().is_err(),
             "the planned pass partition must be lineage-bound"
+        );
+
+        let mut direct_tampered = metadata.clone();
+        direct_tampered
+            .pretrain_recovery
+            .as_mut()
+            .expect("recovery")
+            .direct_t2_weight = 0.5;
+        assert!(
+            direct_tampered.validate_schema().is_err(),
+            "direct objective weights must be lineage-authenticated"
+        );
+
+        let mut obsolete_recipe = metadata.clone();
+        obsolete_recipe
+            .pretrain_recovery
+            .as_mut()
+            .expect("recovery")
+            .format_version = BAR_PRETRAIN_RECOVERY_VERSION - 1;
+        obsolete_recipe.lineage_sha256 = obsolete_recipe.compute_lineage_sha256();
+        assert!(
+            obsolete_recipe.validate_schema().is_err(),
+            "an obsolete direct-objective schedule must fail even with recomputed lineage"
         );
 
         let mut legacy = metadata;
@@ -3461,6 +3702,7 @@ mod tests {
     #[test]
     fn untrained_trunk_emits_finite_beliefs() {
         let _torch_rng_guard = test_rng::exclusive();
+        let _ = tch::manual_seed(0xabc);
         let supports = synthetic_supports();
         let vs = nn::VarStore::new(Device::Cpu);
         let modules = BarModules::new(&vs.root());
@@ -3469,15 +3711,13 @@ mod tests {
         assert_eq!(beliefs.size(), vec![2, 32, BAR_MODEL_DIM]);
         assert!(bool::try_from(beliefs.isfinite().all()).expect("finite check"));
 
-        // At zero-init every sublayer output is annihilated before it reaches the
-        // residual, so this covers the EMBEDDING path and the starting point of
-        // training, not attention — the attention coverage lives in
-        // `cached_forward_matches_full_forward` and
-        // `sliding_window_bounds_the_receptive_field`, which wake the projections
-        // first. What it does pin is that the two zero-init contracts hold: the
-        // trunk is the identity on its normalized embedding, so every belief row
-        // is exactly unit-RMS, and the emission head starts at exactly uniform
-        // categoricals.
+        // Every trunk sublayer output is annihilated before it reaches the residual at
+        // initialization, so this covers the EMBEDDING path and the starting point of training,
+        // not attention. The attention coverage lives in `cached_forward_matches_full_forward`
+        // and `sliding_window_bounds_the_receptive_field`, which wake the projections first.
+        // The trunk is therefore the identity on its normalized embedding. The emission head,
+        // however, deliberately has small fan-in-scaled random weights so categorical NLL has
+        // a gradient into the belief on step zero; uniform logits are not its contract.
         let rms = beliefs
             .pow_tensor_scalar(2.0)
             .mean_dim([-1i64].as_slice(), false, Kind::Float)
@@ -3486,14 +3726,36 @@ mod tests {
         assert!(deviation < 1e-3, "belief RMS deviated by {deviation}");
 
         let conditioning = modules.trunk.forecast_conditioning(&time_ids, &time_ids);
+        let bins = supports.bin_ids(&dof);
+        let logits = modules.head.logits(&beliefs, &conditioning, &bins);
+        assert!(bool::try_from(logits.isfinite().all()).expect("finite logits"));
+        let log_probs = logits.log_softmax(-1, Kind::Float);
+        let probabilities = log_probs.exp();
+        let max_probability =
+            f64::try_from(probabilities.max()).expect("maximum initial probability");
+        assert!(
+            max_probability < 0.10,
+            "an untrained categorical collapsed onto one bin with probability {max_probability}"
+        );
+        let entropy =
+            -(&probabilities * &log_probs).sum_dim_intlist([-1i64].as_slice(), false, Kind::Float);
+        let min_entropy = f64::try_from(entropy.min()).expect("minimum initial entropy");
+        let uniform_entropy = (NUM_BAR_BINS as f64).ln();
+        assert!(
+            min_entropy > uniform_entropy - 0.5,
+            "an untrained categorical lost too much entropy: minimum {min_entropy}, uniform \
+             {uniform_entropy}"
+        );
+
         let (nll, _) = modules
             .head
             .nll(&beliefs, &conditioning, &dof, &supports, BarScoring::Hard);
         let nll = f64::try_from(nll).expect("nll");
-        let uniform = BAR_DOF as f64 * (NUM_BAR_BINS as f64).ln();
+        let uniform_nll = BAR_DOF as f64 * uniform_entropy;
+        let sane_margin = 0.25 * BAR_DOF as f64;
         assert!(
-            (nll - uniform).abs() < 1e-3,
-            "untrained nll {nll} != uniform {uniform}"
+            nll.is_finite() && (nll - uniform_nll).abs() < sane_margin,
+            "untrained nll {nll} is not sane relative to uniform {uniform_nll}"
         );
 
         // Once the projections carry mass the beliefs must stay finite and must
@@ -3557,6 +3819,7 @@ mod tests {
             .forecast_conditioning(&shifted_clock, &current);
         let base_logits = modules.head.logits(&h, &base_conditioning, &bins);
         let no_target_logits = modules.head.logits(&h, &no_target_market, &bins);
+
         assert_eq!(
             f64::try_from((&base_logits - no_target_logits).abs().max()).expect("logit gap"),
             0.0,
@@ -3576,6 +3839,94 @@ mod tests {
         assert!(
             f64::try_from((market_logits - base_logits).abs().max()).expect("market gap") > 1e-5,
             "the current observed market did not reach the emission logits after wake-up"
+        );
+    }
+    #[test]
+    fn private_direct_heads_copy_h1_initialization_without_aliasing() {
+        let _torch_rng_guard = test_rng::exclusive();
+        let vs = nn::VarStore::new(Device::Cpu);
+        let modules = BarModules::new(&vs.root());
+        let h = Tensor::randn([2, 3, BAR_MODEL_DIM], (Kind::Float, Device::Cpu));
+        let conditioning = Tensor::randn([2, 3, BAR_MODEL_DIM], (Kind::Float, Device::Cpu));
+        let bins = Tensor::zeros([2, 3, BAR_DOF as i64], (Kind::Int64, Device::Cpu));
+        let h1 = modules.head.logits(&h, &conditioning, &bins);
+        for horizon in [2usize, 3] {
+            let direct = modules
+                .head
+                .direct_logits(&h, &conditioning, &bins, horizon);
+            assert_eq!(
+                (&h1 - direct).abs().max().double_value(&[]),
+                0.0,
+                "private h{horizon} bank did not copy the h1 initialization"
+            );
+        }
+
+        let mut h2_r = vs
+            .variables()
+            .remove("bar_dof_head_direct_h2_r.weight")
+            .expect("private h2 r weight");
+        tch::no_grad(|| {
+            let _ = h2_r.zero_();
+        });
+        let h1_after = modules.head.logits(&h, &conditioning, &bins);
+        let h2_after = modules.head.direct_logits(&h, &conditioning, &bins, 2);
+        assert_eq!((&h1 - h1_after).abs().max().double_value(&[]), 0.0);
+        assert!(
+            (&h1 - h2_after).abs().max().double_value(&[]) > 0.0,
+            "mutating the private h2 bank changed no direct logits"
+        );
+    }
+
+    #[test]
+    fn direct_and_h1_emission_gradients_use_disjoint_banks_with_live_beliefs() {
+        let _torch_rng_guard = test_rng::exclusive();
+        let vs = nn::VarStore::new(Device::Cpu);
+        let modules = BarModules::new(&vs.root());
+        let h = Tensor::randn([2, 3, BAR_MODEL_DIM], (Kind::Float, Device::Cpu))
+            .set_requires_grad(true);
+        let conditioning = Tensor::randn([2, 3, BAR_MODEL_DIM], (Kind::Float, Device::Cpu));
+        let bins = Tensor::zeros([2, 3, BAR_DOF as i64], (Kind::Int64, Device::Cpu));
+
+        modules
+            .head
+            .direct_logits(&h, &conditioning, &bins, 2)
+            .square()
+            .mean(Kind::Float)
+            .backward();
+        let variables = vs.variables();
+        let main = &variables["bar_dof_head_r.weight"];
+        let h2 = &variables["bar_dof_head_direct_h2_r.weight"];
+        let h3 = &variables["bar_dof_head_direct_h3_r.weight"];
+        assert!(!main.grad().defined(), "direct loss reached the h1 head");
+        assert!(h2.grad().defined() && h2.grad().abs().max().double_value(&[]) > 0.0);
+        assert!(!h3.grad().defined(), "h2 loss reached the h3 head");
+        assert!(
+            h.grad().defined() && h.grad().abs().max().double_value(&[]) > 0.0,
+            "private direct loss stopped at its readout instead of reaching the shared trunk"
+        );
+
+        for tensor in variables.values() {
+            let mut grad = tensor.grad();
+            if grad.defined() {
+                let _ = grad.zero_();
+            }
+        }
+        let mut h_grad = h.grad();
+        let _ = h_grad.zero_();
+        modules
+            .head
+            .logits(&h, &conditioning, &bins)
+            .square()
+            .mean(Kind::Float)
+            .backward();
+        assert!(main.grad().defined() && main.grad().abs().max().double_value(&[]) > 0.0);
+        assert!(
+            !h2.grad().defined() || h2.grad().abs().max().double_value(&[]) == 0.0,
+            "h1 loss reached the private h2 head"
+        );
+        assert!(
+            !h3.grad().defined() || h3.grad().abs().max().double_value(&[]) == 0.0,
+            "h1 loss reached the private h3 head"
         );
     }
 
