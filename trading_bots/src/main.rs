@@ -456,6 +456,56 @@ enum Commands {
         #[arg(long, default_value_t = false)]
         defer_test: bool,
     },
+    /// Train the isolated c277 MSE-JEPA/LeJEPA causal latent model on mmap bars.
+    PretrainMseJepa {
+        /// Authenticated `mse_jepa*.ot` bundle or historical `pretrain_heads*.ot` artifact.
+        /// A historical `pretrain_model*.ot` path resolves only to its sibling heads artifact.
+        #[arg(short, long)]
+        weights: Option<String>,
+
+        #[arg(long)]
+        run: Option<String>,
+
+        #[arg(long, default_value_t = 1)]
+        epochs: usize,
+
+        #[arg(long)]
+        steps: Option<usize>,
+
+        #[arg(long, default_value_t = trading_bot_0::torch::train::mse_jepa::DEFAULT_BATCH_SIZE)]
+        batch_size: usize,
+
+        #[arg(long, default_value_t = 0x5EED)]
+        seed: u64,
+
+        #[arg(long, default_value_t = trading_bot_0::data::ingest::bars_dir().to_string_lossy().into_owned())]
+        data_dir: String,
+
+        #[arg(long, default_value_t = 300)]
+        resolution_secs: u32,
+
+        #[arg(long, default_value_t = trading_bot_0::torch::lejepa::dataset::DEFAULT_MIN_BARS)]
+        min_bars: usize,
+
+        #[arg(long, default_value_t = trading_bot_0::torch::train::mse_jepa::DEFAULT_VALIDATION_WINDOWS)]
+        validation_windows: usize,
+
+        #[arg(long, default_value_t = 1000)]
+        validate_every: usize,
+
+        #[arg(long, default_value_t = trading_bot_0::torch::train::mse_jepa::DEFAULT_CHECKPOINT_EVERY)]
+        checkpoint_every: usize,
+
+        /// LeWM future-latent SIGReg weight.
+        #[arg(long, default_value_t = trading_bot_0::torch::lejepa::sigreg::DEFAULT_SIGREG_LAMBDA)]
+        lambda_sigreg: f64,
+
+        #[arg(long, value_parser = parse_split_bounds)]
+        split_bounds: Option<(i64, i64)>,
+
+        #[arg(long, default_value_t = false, conflicts_with = "split_bounds")]
+        derive_split_bounds: bool,
+    },
     /// Candle pictures of an EXISTING pretrain checkpoint against the realized bars.
     ///
     /// A run only writes candle snapshots after its first promotion, which cannot happen
@@ -1802,6 +1852,45 @@ async fn run() {
                 .expect("pretraining task panicked")
                 .expect("pretraining failed");
         }
+        Some(Commands::PretrainMseJepa {
+            weights,
+            run,
+            epochs,
+            steps,
+            batch_size,
+            seed,
+            data_dir,
+            resolution_secs,
+            min_bars,
+            validation_windows,
+            validate_every,
+            checkpoint_every,
+            lambda_sigreg,
+            split_bounds,
+            derive_split_bounds,
+        }) => {
+            let args = torch::train::MseJepaArgs {
+                weights: weights.clone(),
+                run: run.clone(),
+                epochs: *epochs,
+                steps: *steps,
+                batch_size: *batch_size,
+                seed: *seed,
+                data_dir: data_dir.clone(),
+                resolution_secs: *resolution_secs,
+                min_bars: *min_bars,
+                validation_windows: *validation_windows,
+                validate_every: *validate_every,
+                checkpoint_every: *checkpoint_every,
+                lambda_sigreg: *lambda_sigreg,
+                split_bounds: *split_bounds,
+                derive_split_bounds: *derive_split_bounds,
+            };
+            tokio::task::spawn_blocking(move || torch::train::pretrain_mse_jepa(args))
+                .await
+                .expect("MSE-JEPA pretraining task panicked")
+                .expect("MSE-JEPA pretraining failed");
+        }
         Some(Commands::PretrainCandles {
             weights,
             output,
@@ -2591,6 +2680,58 @@ mod tests {
                 "pretraining has one Hard categorical contract; Density is a diagnostic API, not \
              a training/selection CLI objective"
             );
+        });
+    }
+
+    #[test]
+    fn mse_jepa_cli_defaults_are_family_isolated() {
+        with_large_cli_stack(|| {
+            let cli = Cli::try_parse_from(["trading_bot", "pretrain-mse-jepa"])
+                .expect("pretrain-mse-jepa should parse");
+            let Some(Commands::PretrainMseJepa {
+                weights,
+                epochs,
+                steps,
+                batch_size,
+                seed,
+                resolution_secs,
+                min_bars,
+                validation_windows,
+                validate_every,
+                checkpoint_every,
+                lambda_sigreg,
+                split_bounds,
+                derive_split_bounds,
+                ..
+            }) = cli.command
+            else {
+                panic!("expected pretrain-mse-jepa command");
+            };
+            assert_eq!(weights, None);
+            assert_eq!(epochs, 1);
+            assert_eq!(steps, None);
+            assert_eq!(
+                batch_size,
+                trading_bot_0::torch::train::mse_jepa::DEFAULT_BATCH_SIZE
+            );
+            assert_eq!(seed, 0x5EED);
+            assert_eq!(resolution_secs, 300);
+            assert_eq!(
+                min_bars,
+                trading_bot_0::torch::lejepa::dataset::DEFAULT_MIN_BARS
+            );
+            assert_eq!(
+                validation_windows,
+                trading_bot_0::torch::train::mse_jepa::DEFAULT_VALIDATION_WINDOWS
+            );
+            assert_eq!(validate_every, 1_000);
+            assert_eq!(
+                checkpoint_every,
+                trading_bot_0::torch::train::mse_jepa::DEFAULT_CHECKPOINT_EVERY
+            );
+            assert_eq!(lambda_sigreg, 0.09);
+            assert_eq!(split_bounds, None);
+            assert!(!derive_split_bounds);
         });
     }
 

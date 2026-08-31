@@ -21,6 +21,23 @@ then run ML builds through the validating launcher:
 ./torch-env.sh ldd target/release/trading_bot_0
 ```
 
+The categorical world-model pretrainer remains the `pretrain` command. The maintained
+c277 MSE-JEPA/LeJEPA model is an isolated path with its own checkpoints and report family:
+
+```bash
+./trading_bots/run-release-cuda.sh pretrain
+./trading_bots/run-release-cuda.sh pretrain-mse-jepa --run mse_jepa_v1
+./trading_bots/run-release-cuda.sh pretrain-mse-jepa \
+  --weights training/runs/mse_jepa_v1/weights/mse_jepa_best.ot \
+  --run mse_jepa_v1_warmstart
+```
+
+`pretrain-mse-jepa` uses the mmap bar corpus, a fixed 6,000-bar context, and the
+LeWM future-latent SIGReg default `--lambda-sigreg 0.09`. It accepts authenticated
+`mse_jepa*.ot` bundles and authenticated historical c277 `pretrain_heads*.ot` artifacts;
+a historical `pretrain_model*.ot` argument resolves only to its sibling heads artifact.
+Categorical and other LeJEPA checkpoint families are rejected.
+
 The launcher rejects mismatched PyTorch/CUDA builds before Cargo starts. ML binaries
 embed the matching wheel's library directory so normal execution does not depend on
 `LD_LIBRARY_PATH`; the `ldd` check deliberately clears that variable while validating

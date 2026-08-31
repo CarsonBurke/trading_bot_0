@@ -190,6 +190,11 @@ pub struct StepMetrics {
     pub direct_objective_share: f64,
     pub shared_grad_alignment: f64,
     pub shared_grad_conflict: f64,
+    /// Wall seconds the training thread spent obtaining the batch: the window draw, the host
+    /// staging that the prefetch worker did not already have ready, and the host-to-device
+    /// transfer. `forward_wall_secs` and `step_wall_secs` both start after this, so without
+    /// this series the data path is invisible and a regression in it looks like free time.
+    pub data_wall_secs: f64,
     pub forward_wall_secs: f64,
     pub step_wall_secs: f64,
     /// Mean raw-payoff growth loss in nats per bar under the deployed leverage cap, where
@@ -302,6 +307,7 @@ impl StepMetrics {
             direct_objective_share: f64::NAN,
             shared_grad_alignment: f64::NAN,
             shared_grad_conflict: f64::NAN,
+            data_wall_secs: f64::NAN,
             forward_wall_secs: f64::NAN,
             step_wall_secs: f64::NAN,
             nll_share: f64::NAN,
@@ -1550,6 +1556,7 @@ struct StepAccumulator {
     direct_objective_share: Mean,
     shared_grad_alignment: Mean,
     shared_grad_conflict: Mean,
+    data_wall_secs: Mean,
     forward_wall_secs: Mean,
     step_wall_secs: Mean,
     nll_share: Mean,
@@ -1631,6 +1638,7 @@ impl StepAccumulator {
             .push(step.direct_objective_share);
         self.shared_grad_alignment.push(step.shared_grad_alignment);
         self.shared_grad_conflict.push(step.shared_grad_conflict);
+        self.data_wall_secs.push(step.data_wall_secs);
         self.forward_wall_secs.push(step.forward_wall_secs);
         self.step_wall_secs.push(step.step_wall_secs);
         self.nll_share.push(step.nll_share);
@@ -1729,6 +1737,7 @@ pub struct PretrainReporter {
     direct_objective_share: Series,
     shared_grad_alignment: Series,
     shared_grad_conflict: Series,
+    data_wall_secs: Series,
     forward_wall_secs: Series,
     step_wall_secs: Series,
     growth_share: Series,
@@ -2001,6 +2010,7 @@ impl PretrainReporter {
             direct_objective_share: Series::default(),
             shared_grad_alignment: Series::default(),
             shared_grad_conflict: Series::default(),
+            data_wall_secs: Series::default(),
             forward_wall_secs: Series::default(),
             step_wall_secs: Series::default(),
             growth_share: Series::default(),
@@ -2995,6 +3005,7 @@ impl PretrainReporter {
             .set(tick, acc.shared_grad_alignment.value());
         self.shared_grad_conflict
             .set(tick, acc.shared_grad_conflict.value());
+        self.data_wall_secs.set(tick, acc.data_wall_secs.value());
         self.forward_wall_secs
             .set(tick, acc.forward_wall_secs.value());
         self.step_wall_secs.set(tick, acc.step_wall_secs.value());
@@ -3613,11 +3624,13 @@ impl PretrainReporter {
         write_chart(
             &dir,
             "pretrain_direct_timing",
-            format!("Direct-Supervision Step Cost - {suffix}"),
+            format!("Step Cost - {suffix}"),
             "record",
-            "measured wall seconds; forward includes primary, direct, dynamics and diagnostics",
+            "measured wall seconds; batch is draw + host staging + H2D, forward includes \
+             primary, direct, dynamics and diagnostics, step is the whole optimizer step",
             ScaleKind::Linear,
             vec![
+                self.data_wall_secs.labeled("batch wall seconds", len),
                 self.forward_wall_secs.labeled("forward wall seconds", len),
                 self.step_wall_secs
                     .labeled("full optimizer-step wall seconds", len),
@@ -9092,6 +9105,13 @@ mod tests {
     /// Every name here is also asserted to BE in the registry, so a rename turns into a failure
     /// rather than into an exemption that silently covers for nothing.
     const CYCLE_EXEMPT: &[&str] = &[
+        // Written by the isolated MSE-JEPA reporter rather than this categorical reporter.
+        // Executed and checked bidirectionally by
+        // `mse_jepa::reports::tests::writer_and_shared_registry_are_bidirectionally_complete`.
+        "mse_jepa_loss",
+        "mse_jepa_objective",
+        "mse_jepa_representation",
+        "mse_jepa_optimization",
         // `finish` writes it and consumes the reporter, so it belongs to the end of a run.
         // Executed by `the_held_out_battery_is_written_once_with_every_scalar`.
         "pretrain_test",
@@ -10882,6 +10902,7 @@ mod tests {
             metrics.shared_grad_alignment = 0.18;
             metrics.shared_grad_conflict = 0.41;
             metrics.forward_wall_secs = 0.08;
+            metrics.data_wall_secs = 0.01;
             metrics.step_wall_secs = 0.21;
             // Set because a real step always sets them: the growth term is computed and
             // charted on BOTH ablation arms, so a fixture that left them NaN would make the

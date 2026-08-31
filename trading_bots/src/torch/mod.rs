@@ -1,4 +1,5 @@
 pub mod action_space;
+pub mod backward_probe;
 pub mod bar_dist;
 pub mod constants;
 pub mod cuda;
@@ -8,6 +9,7 @@ pub mod fa4;
 pub(crate) mod hashing;
 pub mod infer;
 pub mod load;
+pub mod lejepa;
 pub mod model;
 pub mod optim;
 pub mod planner;

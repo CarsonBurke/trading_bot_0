@@ -482,7 +482,10 @@ fn cargo_selects_trading_bot(args: &[String]) -> bool {
 }
 
 fn is_training_subcommand(arg: &str) -> bool {
-    matches!(arg, "train" | "train-planner" | "genetic" | "pretrain")
+    matches!(
+        arg,
+        "train" | "train-planner" | "genetic" | "pretrain" | "pretrain-mse-jepa"
+    )
 }
 
 fn run_dir_from_name(name: &str) -> Option<RunDir> {
@@ -727,6 +730,13 @@ mod tests {
             bots,
             Path::new("/repo/target/release/trading_bot_0"),
             &strings(&["/repo/target/release/trading_bot_0", "pretrain"]),
+            workspace,
+            bots,
+        ));
+        assert!(is_training_invocation(
+            bots,
+            Path::new("/repo/target/release/trading_bot_0"),
+            &strings(&["/repo/target/release/trading_bot_0", "pretrain-mse-jepa",]),
             workspace,
             bots,
         ));

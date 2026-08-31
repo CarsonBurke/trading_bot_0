@@ -1153,8 +1153,8 @@ mod planner_inference_discovery_tests {
         fs::remove_dir_all(root).unwrap();
     }
 
-    /// The registry side of the two-sided contract. The writer's suite proves a full
-    /// pretraining cycle produces every name in `PRETRAIN_REPORT_BASES`; this proves the
+    /// The registry side of the two-sided contract. The pretraining writers' suites prove
+    /// they produce every name in `PRETRAIN_REPORT_BASES`; this proves the
     /// TUI actually looks for each of them, so neither half can drift into a chart that
     /// is written and never displayed or displayed and never written.
     #[test]
@@ -1204,6 +1204,17 @@ mod planner_inference_discovery_tests {
         }
         assert!(bases.contains(&"pretrain_recirculation_sweep"));
         assert!(bases.contains(&"pretrain_receding_persistence"));
+        for mse_jepa in [
+            "mse_jepa_loss",
+            "mse_jepa_objective",
+            "mse_jepa_representation",
+            "mse_jepa_optimization",
+        ] {
+            assert!(
+                bases.contains(&mse_jepa),
+                "{mse_jepa} must be scanned as an isolated MSE-JEPA report"
+            );
+        }
         for sdlr in ["pretrain_sdlr_alpha", "pretrain_sdlr_evidence"] {
             assert!(
                 bases.contains(&sdlr),

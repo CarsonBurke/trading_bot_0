@@ -29,9 +29,9 @@ pub const RL_META_REPORT_BASES: &[&str] = &[
     "hl_gauss_return_range",
 ];
 
-/// Every chart base the DISTRIBUTIONAL PRETRAINER writes, and the single source of truth
-/// for it. The writer's own test asserts a full cycle produces each of these, and the TUI
-/// builds its meta-chart list by extending from this slice.
+/// Every chart base written by either first-class pretrainer, and their shared source of
+/// truth. Each writer's own test proves its portion, and the TUI builds its meta-chart list
+/// by extending from this slice.
 ///
 /// It lives here rather than in either consumer because the two failure modes are silent
 /// in opposite directions and both shipped: a base registered with no writer renders as a
@@ -363,6 +363,12 @@ pub const PRETRAIN_REPORT_BASES: &[&str] = &[
     // serialized-alpha0 control, Stage-A screen, disjoint Stage-B confirmation, and the
     // gated test result in one discoverable artifact.
     "pretrain_recirculation_sweep",
+    // Isolated c277 MSE-JEPA/LeJEPA pretrainer. These names deliberately do not share the
+    // categorical pretrainer's `pretrain_*` family, so cross-family runs cannot render as one.
+    "mse_jepa_loss",
+    "mse_jepa_objective",
+    "mse_jepa_representation",
+    "mse_jepa_optimization",
 ];
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

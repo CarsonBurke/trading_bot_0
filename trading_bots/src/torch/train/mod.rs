@@ -10,12 +10,14 @@ mod log;
 mod loop_;
 pub mod lr_disentangle;
 pub mod mem_probe;
+pub mod mse_jepa;
 pub(crate) mod numeric_debug;
 pub(crate) mod optimizer_glue;
 pub mod portfolio;
 pub mod portfolio_cost;
 pub mod pretrain;
 pub mod pretrain_aux;
+pub mod pretrain_profile;
 pub mod pretrain_reports;
 pub mod pretrain_stats;
 pub mod recirculate;
@@ -35,6 +37,7 @@ pub use horizon::{
     FORECAST_HORIZONS,
 };
 pub use loop_::train;
+pub use mse_jepa::{pretrain_mse_jepa, MseJepaArgs};
 pub use pretrain::{
     pretrain, pretrain_calibration, pretrain_candles, pretrain_trade, CalibrationArgs, CandleArgs,
     CorpusFlags, PretrainArgs, TradeArgs,

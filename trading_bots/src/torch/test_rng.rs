@@ -286,6 +286,7 @@ mod tests {
         ("torch/train/trainer.rs", "new"),
         ("torch/train/rollout.rs", "collect_rollout"), // per-update reseed
         ("torch/train/pretrain.rs", "build_trainer"),  // incl. `manual_seed_all`
+        ("torch/train/mse_jepa/mod.rs", "pretrain_mse_jepa"), // run seed, as `build_trainer`
         ("torch/planner/runner.rs", "train_planner"),  // per-update reseed
         ("torch/train/horizon.rs", "run_horizon_sweep"), // per-replicate reseed
         ("torch/train/horizon.rs", "run_receding_evaluation"), // common rollout seed
