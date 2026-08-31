@@ -1,15 +1,23 @@
 use anyhow::{anyhow, bail, Context, Result};
 use pyo3::prelude::*;
 use pyo3::sync::PyOnceLock;
-use pyo3::types::PyDict;
+use pyo3::types::{PyCFunction, PyDict, PyTuple};
 use std::ffi::CString;
 use std::sync::Mutex;
+use std::time::Instant;
 use tch::{Kind, Tensor};
 
 use super::pope::{PolarQk, POPE_ATTENTION_SCALE, POPE_DIM, POPE_QK_DIM};
+use super::train::pretrain_profile as profile;
 
 static FA4_CALL_LOCK: Mutex<()> = Mutex::new(());
 static FA4_SERIALIZED_CALL: PyOnceLock<Py<PyAny>> = PyOnceLock::new();
+/// `flash_attn.cute.flash_attn_func` and the two immutable kwarg dictionaries, resolved once.
+/// The trunk issues one call per layer per forward, and re-resolving `sys.modules`, the module
+/// attribute and a fresh `PyDict` on every one of them is pure per-call Python overhead on the
+/// critical path.
+static FA4_FUNCTION: PyOnceLock<Py<PyAny>> = PyOnceLock::new();
+static FA4_KWARGS: PyOnceLock<(Py<PyDict>, Py<PyDict>)> = PyOnceLock::new();
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum AttentionMode {
@@ -48,29 +56,32 @@ pub fn pope_flash_attention_decode_q1(
 
 fn call_fa4(query: &Tensor, key: &Tensor, value: &Tensor, mode: AttentionMode) -> Result<Tensor> {
     validate(query, key, value, mode)?;
+    let probing = profile::fine().then(Instant::now);
     // CuTe DSL compilation and its AST-preprocessor session are process-global
     // and not thread-safe even across separately GIL-protected callers.
     let _call_guard = FA4_CALL_LOCK
         .lock()
         .map_err(|_| anyhow!("FA4 process-global call lock was poisoned"))?;
+    let entered = probing.map(|started| {
+        let entered = Instant::now();
+        profile::record(profile::FA4_FORWARD_LOCK, (entered - started).as_secs_f64());
+        entered
+    });
     let output = Python::attach(|py| -> Result<Tensor> {
-        py.import("torch")
-            .map_err(|error| anyhow!("failed to initialize Python torch: {error:?}"))?;
-        let module = py
-            .import("flash_attn.cute")
-            .map_err(|error| anyhow!("failed to import flash_attn.cute: {error:?}"))?;
-        let function = module
-            .getattr("flash_attn_func")
-            .map_err(|error| anyhow!("flash_attn_func is unavailable: {error:?}"))?;
+        if let Some(entered) = entered {
+            profile::record(profile::FA4_FORWARD_GIL, entered.elapsed().as_secs_f64());
+        }
+        let function = flash_attn_func(py)?;
         let serialized_function = serialized_python_call(py)?;
+        let (causal_kwargs, plain_kwargs) = attention_kwargs(py)?;
+        let kwargs = match mode {
+            AttentionMode::CausalPrefill => causal_kwargs,
+            AttentionMode::DecodeQ1 => plain_kwargs,
+        };
 
         let query_object = tensor_object(py, query).context("wrapping FA4 query")?;
         let key_object = tensor_object(py, key).context("wrapping FA4 key")?;
         let value_object = tensor_object(py, value).context("wrapping FA4 value")?;
-        let kwargs = PyDict::new(py);
-        kwargs.set_item("softmax_scale", POPE_ATTENTION_SCALE)?;
-        kwargs.set_item("causal", mode == AttentionMode::CausalPrefill)?;
-        kwargs.set_item("pack_gqa", true)?;
 
         let result = serialized_function
             .call(
@@ -85,6 +96,9 @@ fn call_fa4(query: &Tensor, key: &Tensor, value: &Tensor, mode: AttentionMode) -
             .context("unwrapping FA4 output")?
             .ok_or_else(|| anyhow!("FA4 output is not a torch Tensor"))
     })?;
+    if let Some(entered) = entered {
+        profile::record(profile::FA4_FORWARD_PY, entered.elapsed().as_secs_f64());
+    }
     let expected = [query.size()[0], query.size()[1], query.size()[2], POPE_DIM];
     if output.size() != expected {
         bail!(
@@ -95,16 +109,55 @@ fn call_fa4(query: &Tensor, key: &Tensor, value: &Tensor, mode: AttentionMode) -
     Ok(output)
 }
 
+/// `flash_attn.cute.flash_attn_func`, resolved once. `PyOnceLock` rather than `LazyLock`
+/// because initialization needs a GIL token.
+fn flash_attn_func<'py>(py: Python<'py>) -> Result<Bound<'py, PyAny>> {
+    let function = FA4_FUNCTION.get_or_try_init(py, || -> Result<Py<PyAny>> {
+        py.import("torch")
+            .map_err(|error| anyhow!("failed to initialize Python torch: {error:?}"))?;
+        Ok(py
+            .import("flash_attn.cute")
+            .map_err(|error| anyhow!("failed to import flash_attn.cute: {error:?}"))?
+            .getattr("flash_attn_func")
+            .map_err(|error| anyhow!("flash_attn_func is unavailable: {error:?}"))?
+            .unbind())
+    })?;
+    Ok(function.bind(py).clone())
+}
+
+/// The causal and non-causal kwarg dictionaries. Safe to share: `**kwargs` copies into a fresh
+/// dictionary on the callee side, so neither `flash_attn_func` nor the serializing helper can
+/// observe or mutate these.
+fn attention_kwargs<'py>(py: Python<'py>) -> Result<(Bound<'py, PyDict>, Bound<'py, PyDict>)> {
+    let (causal, plain) =
+        FA4_KWARGS.get_or_try_init(py, || -> Result<(Py<PyDict>, Py<PyDict>)> {
+            let build = |causal: bool| -> Result<Py<PyDict>> {
+                let kwargs = PyDict::new(py);
+                kwargs.set_item("softmax_scale", POPE_ATTENTION_SCALE)?;
+                kwargs.set_item("causal", causal)?;
+                kwargs.set_item("pack_gqa", true)?;
+                Ok(kwargs.unbind())
+            };
+            Ok((build(true)?, build(false)?))
+        })?;
+    Ok((causal.bind(py).clone(), plain.bind(py).clone()))
+}
+
 fn serialized_python_call<'py>(py: Python<'py>) -> Result<Bound<'py, PyAny>> {
     // The CuTe AST-preprocessor session releases the GIL and is not thread-safe.
     // This Python lock spans each forward and, through node hooks, its eventual
     // FlashAttnFunc backward as well.
+    //
+    // `_rust_fa4_probe` is absent unless the profiler installed it, so a production backward
+    // pays one cached global lookup per node hook and nothing else.
     let helper = FA4_SERIALIZED_CALL.get_or_try_init(py, || -> Result<Py<PyAny>> {
         let source = CString::new(
             r#"
 import threading as _rust_fa4_threading
 if "_RUST_FA4_LOCK" not in globals():
     _RUST_FA4_LOCK = _rust_fa4_threading.Lock()
+if "_rust_fa4_probe" not in globals():
+    _rust_fa4_probe = None
 if "_rust_fa4_serialized_call" not in globals():
     def _rust_fa4_serialized_call(fn, q, k, v, **kwargs):
         with _RUST_FA4_LOCK:
@@ -114,13 +167,19 @@ if "_rust_fa4_serialized_call" not in globals():
         if node is not None:
             state = [False]
             def acquire(grad_outputs):
+                if _rust_fa4_probe is not None:
+                    _rust_fa4_probe(0)
                 _RUST_FA4_LOCK.acquire()
                 state[0] = True
+                if _rust_fa4_probe is not None:
+                    _rust_fa4_probe(1)
                 return grad_outputs
             def release(grad_inputs, grad_outputs):
                 if state[0]:
                     state[0] = False
                     _RUST_FA4_LOCK.release()
+                if _rust_fa4_probe is not None:
+                    _rust_fa4_probe(2)
                 return grad_inputs
             node.register_prehook(acquire)
             node.register_hook(release)
@@ -129,6 +188,9 @@ if "_rust_fa4_serialized_call" not in globals():
         )?;
         py.run(source.as_c_str(), None, None)
             .map_err(|error| anyhow!("installing serialized FA4 helper failed: {error:?}"))?;
+        if profile::fine() {
+            install_backward_probe(py)?;
+        }
         Ok(py
             .import("__main__")?
             .getattr("_rust_fa4_serialized_call")?
@@ -137,7 +199,45 @@ if "_rust_fa4_serialized_call" not in globals():
     Ok(helper.bind(py).clone())
 }
 
-fn tensor_object<'py>(py: Python<'py>, tensor: &Tensor) -> Result<Bound<'py, PyAny>> {
+/// Charge the `FlashAttnFunc` autograd node's host time to the profiler from the node's own
+/// pre- and post-hooks.
+///
+/// The three phases are the node's entry, the moment it owns the serializing Python lock, and
+/// its exit, so `FA4_BACKWARD_LOCK` is time the backward wave spent blocked on that lock and
+/// `FA4_BACKWARD_NODE` is host time inside FA4's Python backward. Neither drains the device:
+/// the question these answer is what re-entering Python costs, not what the kernels cost. The
+/// autograd engine runs one node at a time, so a single cursor is enough.
+fn install_backward_probe(py: Python<'_>) -> Result<()> {
+    static ENTERED: Mutex<Option<Instant>> = Mutex::new(None);
+    let probe = PyCFunction::new_closure(
+        py,
+        Some(c"fa4_backward_probe"),
+        None,
+        |arguments: &Bound<'_, PyTuple>, _keywords: Option<&Bound<'_, PyDict>>| -> PyResult<()> {
+            let phase = arguments.get_item(0)?.extract::<u8>()?;
+            let now = Instant::now();
+            let mut entered = ENTERED.lock().expect("the FA4 probe cursor is not poisoned");
+            match (phase, entered.replace(now)) {
+                (1, Some(previous)) => {
+                    profile::record(profile::FA4_BACKWARD_LOCK, (now - previous).as_secs_f64());
+                }
+                (2, Some(previous)) => {
+                    *entered = None;
+                    profile::record(profile::FA4_BACKWARD_NODE, (now - previous).as_secs_f64());
+                }
+                _ => {}
+            }
+            Ok(())
+        },
+    )
+    .map_err(|error| anyhow!("building the FA4 backward probe failed: {error:?}"))?;
+    py.import("__main__")
+        .and_then(|main| main.setattr("_rust_fa4_probe", probe))
+        .map_err(|error| anyhow!("installing the FA4 backward probe failed: {error:?}"))?;
+    Ok(())
+}
+
+pub(super) fn tensor_object<'py>(py: Python<'py>, tensor: &Tensor) -> Result<Bound<'py, PyAny>> {
     let pointer = tensor.pyobject_wrap()?;
     Ok(unsafe { Bound::from_owned_ptr(py, pointer.cast()) })
 }

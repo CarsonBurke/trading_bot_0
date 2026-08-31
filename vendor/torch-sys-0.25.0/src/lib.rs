@@ -93,6 +93,8 @@ extern "C" {
     pub fn at_sdp_set_use_cudnn(b: c_int);
     pub fn at_sdp_use_cudnn() -> c_int;
     pub fn at_cuda_graph_new() -> *mut C_cuda_graph;
+    pub fn at_cuda_graph_pool_handle(id: *mut u64);
+    pub fn at_cuda_graph_new_in_pool(pool_first: u64, pool_second: u64) -> *mut C_cuda_graph;
     pub fn at_cuda_graph_is_available() -> bool;
     pub fn at_cuda_graph_free(graph: *mut C_cuda_graph);
     pub fn at_cuda_graph_stream_begin(graph: *mut C_cuda_graph, device_index: i64);

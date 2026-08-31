@@ -6,7 +6,9 @@
 #include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDAStream.h>
 #endif
+#include <map>
 #include <memory>
+#include <mutex>
 #include <stdexcept>
 #include <torch/csrc/autograd/engine.h>
 #include <torch/csrc/jit/codegen/cuda/interface.h>
@@ -35,6 +37,10 @@ thread_local char *torch_last_err = nullptr;
 struct TchCudaGraph {
   at::cuda::CUDAGraph graph;
   c10::DeviceIndex device_index = -1;
+  // Private mempool this graph's capture allocates into. {0, 0} is libtorch's
+  // default: capture_begin mints a pool of the graph's own. A shared id, from
+  // at_cuda_graph_pool_handle, makes several graphs reuse one pool's blocks.
+  c10::MempoolId_t mempool_id{0, 0};
   // The side stream that warmup, capture, and every replay run on. Created once
   // (lazily, off the pool) and retained for the graph's lifetime so all three
   // phases are serialized on a single non-default stream. cudaStreamBeginCapture
@@ -62,6 +68,26 @@ static void stream_wait_stream(const c10::cuda::CUDAStream &waiter,
   at::cuda::CUDAEvent event;
   event.record(waited_on);
   event.block(waiter);
+}
+
+// The capture stream shared by every graph in one private mempool. The caching
+// allocator keys free blocks by stream (BlockComparatorSize orders on stream
+// before size, and get_free_block rejects a block from another stream), so
+// graphs sharing a pool only reuse each other's blocks when they also capture on
+// the same stream. torch.cuda.graph shares one process-wide capture stream for
+// the same reason, which is why the stream belongs to the pool and not to the
+// graph.
+static c10::cuda::CUDAStream shared_capture_stream(c10::MempoolId_t pool,
+                                                   c10::DeviceIndex device_index) {
+  static std::mutex mutex;
+  static std::map<std::pair<c10::MempoolId_t, c10::DeviceIndex>, c10::cuda::CUDAStream> streams;
+  std::lock_guard<std::mutex> guard(mutex);
+  auto key = std::make_pair(pool, device_index);
+  auto found = streams.find(key);
+  if (found == streams.end()) {
+    found = streams.emplace(key, c10::cuda::getStreamFromPool(false, device_index)).first;
+  }
+  return found->second;
 }
 
 static void reset_cuda_graph_after_failed_capture(TchCudaGraph *g) {
@@ -391,6 +417,37 @@ cuda_graph at_cuda_graph_new() {
   return nullptr;
 }
 
+// Mint a sharable private-mempool id. Graphs built by at_cuda_graph_new_in_pool
+// from the same id capture into one pool instead of each retaining its own copy
+// of the transient working set for the life of the process.
+void at_cuda_graph_pool_handle(uint64_t *id) {
+#ifdef TCH_CUDA_GRAPHS
+  PROTECT(
+    c10::MempoolId_t pool = at::cuda::graph_pool_handle();
+    id[0] = pool.first;
+    id[1] = pool.second;
+  )
+#else
+  (void)id;
+  PROTECT(throw std::runtime_error("CUDA graph support is unavailable in this torch-sys build");)
+#endif
+}
+
+cuda_graph at_cuda_graph_new_in_pool(uint64_t pool_first, uint64_t pool_second) {
+#ifdef TCH_CUDA_GRAPHS
+  PROTECT(
+    auto *g = new TchCudaGraph();
+    g->mempool_id = c10::MempoolId_t(pool_first, pool_second);
+    return g;
+  )
+#else
+  (void)pool_first;
+  (void)pool_second;
+  PROTECT(throw std::runtime_error("CUDA graph support is unavailable in this torch-sys build");)
+#endif
+  return nullptr;
+}
+
 bool at_cuda_graph_is_available() {
 #ifdef TCH_CUDA_GRAPHS
   return true;
@@ -422,8 +479,12 @@ void at_cuda_graph_stream_begin(cuda_graph graph, int64_t device_index) {
     g->device_index = static_cast<c10::DeviceIndex>(device_index);
     c10::cuda::CUDAGuard device_guard(c10::Device(c10::DeviceType::CUDA, g->device_index));
     if (!g->capture_stream) {
+      // A graph with its own pool can take any pool stream; graphs sharing a
+      // pool must all capture on that pool's stream to reuse its blocks.
       g->capture_stream = std::make_unique<c10::cuda::CUDAStream>(
-          c10::cuda::getStreamFromPool(false, g->device_index));
+          g->mempool_id == c10::MempoolId_t{0, 0}
+              ? c10::cuda::getStreamFromPool(false, g->device_index)
+              : shared_capture_stream(g->mempool_id, g->device_index));
     }
     g->outer_stream = std::make_unique<c10::cuda::CUDAStream>(
         c10::cuda::getCurrentCUDAStream(g->device_index));
@@ -485,7 +546,7 @@ void at_cuda_graph_capture_begin(cuda_graph graph, int64_t device_index) {
     }
     // The scope guard already makes capture_stream the current stream, so
     // capture_begin records on it (a non-default stream, as required).
-    g->graph.capture_begin();
+    g->graph.capture_begin(g->mempool_id);
   } catch (const exception& e) {
     reset_cuda_graph_after_failed_capture(reinterpret_cast<TchCudaGraph*>(graph));
     torch_last_err = strdup(e.what());

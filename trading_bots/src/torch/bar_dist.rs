@@ -4011,15 +4011,19 @@ fn widest_key_gap(edges: &[f32]) -> (usize, u64) {
 /// randomized statistic is bit-reproducible for a fixed seed without touching the
 /// global torch generator.
 fn counter_uniforms(seed: u64, count: usize) -> Vec<f32> {
-    (0..count as u64)
-        .map(|i| {
-            let mut z = seed.wrapping_add(0x9E37_79B9_7F4A_7C15u64.wrapping_mul(i.wrapping_add(1)));
-            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-            z ^= z >> 31;
-            (z >> 40) as f32 / (1u64 << 24) as f32
-        })
-        .collect()
+    counter_uniforms_iter(seed, count).collect()
+}
+
+/// [`counter_uniforms`] as an iterator, so a caller that needs several streams laid end to end
+/// can fill one buffer instead of allocating a `Vec` per stream.
+fn counter_uniforms_iter(seed: u64, count: usize) -> impl Iterator<Item = f32> {
+    (0..count as u64).map(move |i| {
+        let mut z = seed.wrapping_add(0x9E37_79B9_7F4A_7C15u64.wrapping_mul(i.wrapping_add(1)));
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^= z >> 31;
+        (z >> 40) as f32 / (1u64 << 24) as f32
+    })
 }
 
 fn leading_dims(t: &Tensor, last: i64, what: &str) -> Vec<i64> {
@@ -4063,8 +4067,10 @@ fn with_tail(lead: &[i64], tail: &[i64]) -> Vec<i64> {
 /// Each horizon bank owns one `Linear(2 * latent_dim + BAR_PREFIX_SLOTS *
 /// BAR_PREFIX_EMBED_DIM -> NUM_BAR_BINS)` per DOF and one combined prefix table.
 /// The deployed h1 bank is isolated from private h2/h3 direct-supervision banks.
-/// A constant `[BAR_DOF, BAR_PREFIX_SLOTS, 1]` mask zeroes the embeddings of the
-/// slots a head may not see, which lets all five factors be evaluated in one pass.
+/// A constant mask zeroes the prefix weight COLUMNS of the slots a head may not see,
+/// which lets all five factors be evaluated in one pass. Masking the weights instead of
+/// the embeddings is exact for a 0/1 mask and keeps a `[rows, BAR_DOF,
+/// BAR_PREFIX_WIDTH]` copy of the prefix out of every forward.
 ///
 /// The chain conditions on the prefix DOF's BIN, never on its raw value. An affine
 /// map of the value (`x * w + b`) is exactly rank one in `x`, so the whole head
@@ -4095,8 +4101,11 @@ pub struct BarEmissionHead {
     direct_heads: [Vec<nn::Linear>; 2],
     direct_prefix_embed: [Tensor; 2],
     latent_dim: i64,
-    /// `[BAR_DOF, BAR_PREFIX_SLOTS, 1]`, constant, not a VarStore variable.
-    prefix_mask: Tensor,
+    /// `[BAR_DOF, 1, 2 * latent_dim + BAR_PREFIX_WIDTH]`, constant, not a VarStore
+    /// variable: ones over the two readout blocks, and over the prefix block a one
+    /// exactly where the slot precedes that DOF in [`BAR_CHAIN`]. Folded into a bank's
+    /// packed weights once per forward pass by [`BarEmissionHead::pack`].
+    input_mask: Tensor,
     /// `[1, BAR_PREFIX_SLOTS]` constant `slot * NUM_BAR_BINS`, the row base of
     /// each slot's table inside an emission bank's prefix table.
     prefix_row_base: Tensor,
@@ -4104,16 +4113,50 @@ pub struct BarEmissionHead {
     prefix_slot_dof: Tensor,
 }
 
-/// Inverse-CDF draw of one bin per row from `[rows, NUM_BAR_BINS]` probabilities, using
-/// [`counter_uniforms`] rather than the global torch RNG.
+/// One forward pass's packing of an emission bank: the five per-DOF [`nn::Linear`]
+/// weights and biases stacked into single `[BAR_DOF, ..]` tensors with the chain mask
+/// already folded into the prefix weight columns, plus the bank's prefix table.
+///
+/// The packing is invariant across every head evaluation inside one forward pass and a
+/// pretrain step evaluates the head six times, so building it once turns eighteen
+/// `Tensor::stack`s per step into three. With gradients live, one shared stack node is
+/// exactly equivalent to a stack per consumer: its gradient accumulates over the
+/// consumers into the sum the separate nodes produced.
+///
+/// A bank MUST NOT outlive the forward pass that built it — the weights move on every
+/// optimizer step. [`BarEmissionHead::logits_with`] has no `detach` argument on purpose:
+/// the flavour is fixed when the bank is built, so a frozen evaluation cannot silently
+/// borrow a bank that still carries parameter gradients, nor the reverse.
+#[derive(Debug)]
+pub struct HeadBank {
+    /// `[BAR_DOF, NUM_BAR_BINS, 2 * latent_dim + BAR_PREFIX_WIDTH]`, with the prefix
+    /// columns of the slots each DOF may not see already zeroed.
+    weights: Tensor,
+    /// `[BAR_DOF, NUM_BAR_BINS]`.
+    biases: Tensor,
+    /// `[BAR_PREFIX_SLOTS * NUM_BAR_BINS, BAR_PREFIX_EMBED_DIM]`.
+    prefix_embed: Tensor,
+}
+
+/// Inverse-CDF draw of one bin per row from `[seeds.len() * rows, NUM_BAR_BINS]` probabilities,
+/// using [`counter_uniforms`] rather than the global torch RNG.
 ///
 /// The evaluation path needs draws that are reproducible from a seed alone: `multinomial`
 /// advances a process-wide generator, so two runs of the same checkpoint would disagree and
 /// a marginalized held-out number would not be a fixed quantity. `counter_uniforms` is keyed
-/// by (seed, element), so row `i` of every call draws its own stream.
-fn sample_bin_by_cdf(probs: &Tensor, seed: u64) -> Tensor {
-    let rows = probs.size()[0];
-    let uniforms = Tensor::from_slice(&counter_uniforms(seed, rows as usize))
+/// by (seed, element), so row `i` of every stream draws its own uniform.
+///
+/// Draw `d` occupies rows `d * rows .. (d + 1) * rows` and `seeds[d]` is the stream that draw
+/// would have used on its own, so the vector built here is literally the concatenation of the
+/// per-draw calls. That is what makes batching the draw dimension bit-identical to sampling the
+/// draws one at a time, and it is the whole reason the batching is safe rather than merely
+/// faster.
+fn sample_bins_by_cdf(probs: &Tensor, rows: usize, seeds: &[u64]) -> Tensor {
+    let mut uniforms = Vec::with_capacity(seeds.len() * rows);
+    for &seed in seeds {
+        uniforms.extend(counter_uniforms_iter(seed, rows));
+    }
+    let uniforms = Tensor::from_slice(&uniforms)
         .to_device(probs.device())
         .unsqueeze(-1);
     // `cdf[.., NUM_BAR_BINS - 1]` is 1.0 only up to f32 rounding, so a uniform above it
@@ -4210,17 +4253,18 @@ impl BarEmissionHead {
             }
         });
 
-        let mut mask = vec![0f32; BAR_DOF * BAR_PREFIX_SLOTS];
+        let width = in_features as usize;
+        let mut mask = vec![1f32; BAR_DOF * width];
         for dof in 0..BAR_DOF {
-            for slot in 0..BAR_PREFIX_SLOTS {
-                if slot < CHAIN_POS[dof] {
-                    mask[dof * BAR_PREFIX_SLOTS + slot] = 1.0;
-                }
+            for slot in CHAIN_POS[dof]..BAR_PREFIX_SLOTS {
+                let base =
+                    dof * width + (2 * latent_dim + slot as i64 * BAR_PREFIX_EMBED_DIM) as usize;
+                mask[base..base + BAR_PREFIX_EMBED_DIM as usize].fill(0.0);
             }
         }
         let device = vs.device();
-        let prefix_mask = Tensor::from_slice(&mask)
-            .view([BAR_DOF as i64, BAR_PREFIX_SLOTS as i64, 1])
+        let input_mask = Tensor::from_slice(&mask)
+            .view([BAR_DOF as i64, 1, in_features])
             .to_device(device);
         let row_base: Vec<i64> = (0..BAR_PREFIX_SLOTS as i64)
             .map(|slot| slot * NUM_BAR_BINS)
@@ -4236,7 +4280,7 @@ impl BarEmissionHead {
             direct_heads,
             direct_prefix_embed,
             latent_dim,
-            prefix_mask,
+            input_mask,
             prefix_row_base,
             prefix_slot_dof,
         }
@@ -4246,43 +4290,33 @@ impl BarEmissionHead {
         self.latent_dim
     }
 
-    fn readout_weights(&self, heads: &[nn::Linear], detach: bool) -> Tensor {
-        stack_maybe_detached(
-            heads.iter().map(|h| h.ws.narrow(1, 0, 2 * self.latent_dim)),
-            detach,
-        )
-    }
-
-    fn prefix_weights(&self, heads: &[nn::Linear], detach: bool) -> Tensor {
-        stack_maybe_detached(
-            heads
-                .iter()
-                .map(|h| h.ws.narrow(1, 2 * self.latent_dim, BAR_PREFIX_WIDTH)),
-            detach,
-        )
-    }
-
-    fn biases(&self, heads: &[nn::Linear], detach: bool) -> Tensor {
-        stack_maybe_detached(
-            heads
-                .iter()
-                .map(|h| h.bs.as_ref().expect("head bias").shallow_clone()),
-            detach,
-        )
+    /// The five per-DOF weights and biases of one emission bank, packed for the whole of
+    /// one forward pass. See [`HeadBank`].
+    fn pack(&self, heads: &[nn::Linear], prefix_embed: &Tensor, detach: bool) -> HeadBank {
+        HeadBank {
+            weights: stack_maybe_detached(heads.iter().map(|h| h.ws.shallow_clone()), detach)
+                * &self.input_mask,
+            biases: stack_maybe_detached(
+                heads
+                    .iter()
+                    .map(|h| h.bs.as_ref().expect("head bias").shallow_clone()),
+                detach,
+            ),
+            prefix_embed: if detach {
+                prefix_embed.detach()
+            } else {
+                prefix_embed.shallow_clone()
+            },
+        }
     }
 
     /// `[rows, BAR_PREFIX_SLOTS, BAR_PREFIX_EMBED_DIM]` slot embeddings for
     /// `[rows, BAR_PREFIX_SLOTS]` prefix bin ids. One gather over the four tables
     /// laid end to end: no GEMM, and the result is bounded by the table itself.
-    fn prefix_lookup(&self, prefix_bins: &Tensor, prefix_embed: &Tensor, detach: bool) -> Tensor {
+    fn prefix_lookup(&self, prefix_bins: &Tensor, prefix_embed: &Tensor) -> Tensor {
         let device = prefix_bins.device();
-        let table = if detach {
-            prefix_embed.detach()
-        } else {
-            prefix_embed.shallow_clone()
-        };
         let flat = (prefix_bins + self.prefix_row_base.to_device(device)).reshape([-1]);
-        Tensor::embedding(&table, &flat, -1, false, false).view([
+        Tensor::embedding(prefix_embed, &flat, -1, false, false).view([
             -1,
             BAR_PREFIX_SLOTS as i64,
             BAR_PREFIX_EMBED_DIM,
@@ -4298,7 +4332,7 @@ impl BarEmissionHead {
     /// mixed): that is what pins the prefix onto the fitted support and what makes
     /// an exact atom land on its own zero-width bin rather than a neighbour.
     pub fn logits(&self, h: &Tensor, conditioning: &Tensor, target_bins: &Tensor) -> Tensor {
-        self.forward_logits(h, conditioning, target_bins, false)
+        self.logits_with(&self.bank(false), h, conditioning, target_bins)
     }
 
     /// Teacher-forced logits for a complete bar at direct horizon `2` or `3`.
@@ -4313,18 +4347,11 @@ impl BarEmissionHead {
         target_bins: &Tensor,
         horizon: usize,
     ) -> Tensor {
-        assert!(
-            (2..=3).contains(&horizon),
-            "direct horizon must be 2 or 3, got {horizon}"
-        );
-        let slot = horizon - 2;
-        self.forward_logits_with_bank(
+        self.logits_with(
+            &self.direct_bank(horizon, false),
             h,
             conditioning,
             target_bins,
-            &self.direct_heads[slot],
-            &self.direct_prefix_embed[slot],
-            false,
         )
     }
 
@@ -4332,45 +4359,127 @@ impl BarEmissionHead {
     /// only `h` and `conditioning`. This is the predicted-latent branch of the
     /// dynamics KL term.
     pub fn logits_frozen(&self, h: &Tensor, conditioning: &Tensor, target_bins: &Tensor) -> Tensor {
-        self.forward_logits(h, conditioning, target_bins, true)
+        self.logits_with(&self.bank(true), h, conditioning, target_bins)
     }
 
-    fn forward_logits(
-        &self,
-        h: &Tensor,
-        conditioning: &Tensor,
-        target_bins: &Tensor,
-        detach: bool,
-    ) -> Tensor {
-        self.forward_logits_with_bank(
-            h,
-            conditioning,
-            target_bins,
-            &self.heads,
-            &self.prefix_embed,
+    /// The h1 emission bank packed for ONE forward pass. See [`HeadBank`].
+    pub fn bank(&self, detach: bool) -> HeadBank {
+        self.pack(&self.heads, &self.prefix_embed, detach)
+    }
+
+    /// The private direct-supervision bank for horizon `2` or `3`, packed for ONE forward
+    /// pass. See [`HeadBank`].
+    pub fn direct_bank(&self, horizon: usize, detach: bool) -> HeadBank {
+        assert!(
+            (2..=3).contains(&horizon),
+            "direct horizon must be 2 or 3, got {horizon}"
+        );
+        let slot = horizon - 2;
+        self.pack(
+            &self.direct_heads[slot],
+            &self.direct_prefix_embed[slot],
             detach,
         )
     }
 
-    fn forward_logits_with_bank(
+    /// [`Self::logits`] against a bank packed once for the whole forward pass, with the
+    /// same contract on `target_bins` and the same result.
+    ///
+    /// The readout and the prefix contract as one `[rows, 2 * latent_dim +
+    /// BAR_PREFIX_WIDTH]` GEMM rather than two summed: one fewer `[rows, BAR_DOF,
+    /// NUM_BAR_BINS]` intermediate, and the contraction is rounded out of the fp32
+    /// accumulator once instead of twice.
+    pub fn logits_with(
+        &self,
+        bank: &HeadBank,
+        h: &Tensor,
+        conditioning: &Tensor,
+        target_bins: &Tensor,
+    ) -> Tensor {
+        let lead = self.readout_lead(h, conditioning, target_bins);
+        let rows = lead.iter().product::<i64>();
+        let kind = readout_kind(h);
+        let inputs = Tensor::cat(
+            &[
+                h.reshape([-1, self.latent_dim]).to_kind(kind),
+                conditioning.reshape([-1, self.latent_dim]).to_kind(kind),
+                self.prefix_features(bank, target_bins, rows).to_kind(kind),
+            ],
+            -1,
+        );
+        (Tensor::einsum(
+            "nj,koj->nko",
+            &[&inputs, &bank.weights.to_kind(kind)],
+            None::<&[i64]>,
+        ) + bank.biases.unsqueeze(0))
+            .reshape(with_tail(&lead, &[BAR_DOF as i64, NUM_BAR_BINS]))
+    }
+
+    /// [`Self::logits_with`] for ONE chain factor, returning `[..., NUM_BAR_BINS]` with no
+    /// DOF axis. Both the contraction and the output are `1 / BAR_DOF` of the full readout.
+    ///
+    /// The weight columns, the bias, its dtype and the fp32/bf16 policy are exactly the ones
+    /// `logits_with(..).select(-2, dof)` would have used, over an accumulation of the same
+    /// values and the same length. What differs is that cuBLAS is handed `N = NUM_BAR_BINS`
+    /// rather than `N = BAR_DOF * NUM_BAR_BINS`, and how it blocks the `in_features`
+    /// reduction is its own choice, so the two agree to a reassociation of that reduction
+    /// and not necessarily bit for bit.
+    ///
+    /// [`BAR_CHAIN`]`[0]` takes no same-bar prefix, so the head's input mask zeroed its whole
+    /// prefix block. Contracting against it is an exact zero, so that factor drops the block
+    /// AND the embedding gather feeding it instead of multiplying them out. `target_bins`
+    /// stays required — it carries the leading-dimension and [`BarSupports::bin_ids`]
+    /// provenance contract the other four factors need — but nothing reads it.
+    pub fn logits_dof_with(
+        &self,
+        bank: &HeadBank,
+        h: &Tensor,
+        conditioning: &Tensor,
+        target_bins: &Tensor,
+        dof: usize,
+    ) -> Tensor {
+        assert!(dof < BAR_DOF, "bar DOF {dof} is outside the five slots");
+        let lead = self.readout_lead(h, conditioning, target_bins);
+        let rows = lead.iter().product::<i64>();
+        let kind = readout_kind(h);
+        let mut inputs = Vec::with_capacity(3);
+        inputs.push(h.reshape([-1, self.latent_dim]).to_kind(kind));
+        inputs.push(conditioning.reshape([-1, self.latent_dim]).to_kind(kind));
+        let weights = bank.weights.select(0, dof as i64);
+        let weights = if CHAIN_POS[dof] == 0 {
+            weights.narrow(1, 0, 2 * self.latent_dim)
+        } else {
+            inputs.push(self.prefix_features(bank, target_bins, rows).to_kind(kind));
+            weights
+        };
+        (Tensor::cat(&inputs, -1).linear(&weights.to_kind(kind), None::<Tensor>)
+            + bank.biases.select(0, dof as i64).unsqueeze(0))
+            .reshape(with_tail(&lead, &[NUM_BAR_BINS]))
+    }
+
+    /// [`Self::logits`] for ONE chain factor. See [`Self::logits_dof_with`].
+    pub fn logits_dof(
         &self,
         h: &Tensor,
         conditioning: &Tensor,
         target_bins: &Tensor,
-        heads: &[nn::Linear],
-        prefix_embed: &Tensor,
-        detach: bool,
+        dof: usize,
     ) -> Tensor {
+        self.logits_dof_with(&self.bank(false), h, conditioning, target_bins, dof)
+    }
+
+    /// The leading dimensions every teacher-forced readout shares, with the
+    /// [`BarSupports::bin_ids`] provenance of `target_bins` checked.
+    fn readout_lead(&self, h: &Tensor, conditioning: &Tensor, target_bins: &Tensor) -> Vec<i64> {
         let lead = leading_dims(h, self.latent_dim, "latent");
-        let conditioning_lead =
-            leading_dims(conditioning, self.latent_dim, "forecast conditioning");
-        let bin_lead = leading_dims(target_bins, BAR_DOF as i64, "target bins");
         assert_eq!(
-            lead, conditioning_lead,
+            lead,
+            leading_dims(conditioning, self.latent_dim, "forecast conditioning"),
             "latent and forecast conditioning must share leading dimensions"
         );
         assert_eq!(
-            lead, bin_lead,
+            lead,
+            leading_dims(target_bins, BAR_DOF as i64, "target bins"),
             "latent and target bins must share leading dimensions"
         );
         assert_eq!(
@@ -4378,41 +4487,17 @@ impl BarEmissionHead {
             Kind::Int64,
             "target bins must be the i64 output of BarSupports::bin_ids, not raw DOF values"
         );
-        let device = h.device();
-        let rows = lead.iter().product::<i64>();
-        let readout = Tensor::cat(
-            &[
-                h.to_kind(Kind::Float).reshape([-1, self.latent_dim]),
-                conditioning
-                    .to_device(device)
-                    .to_kind(Kind::Float)
-                    .reshape([-1, self.latent_dim]),
-            ],
-            -1,
-        );
+        lead
+    }
+
+    /// `[rows, BAR_PREFIX_WIDTH]` teacher-forced prefix features, flattened (slot, dim).
+    fn prefix_features(&self, bank: &HeadBank, target_bins: &Tensor, rows: i64) -> Tensor {
+        let device = target_bins.device();
         let prefix_bins = target_bins
             .reshape([-1, BAR_DOF as i64])
             .index_select(1, &self.prefix_slot_dof.to_device(device));
-
-        let embedded = self.prefix_lookup(&prefix_bins, prefix_embed, detach);
-        let masked = (embedded.unsqueeze(1) * self.prefix_mask.to_device(device)).reshape([
-            rows,
-            BAR_DOF as i64,
-            BAR_PREFIX_WIDTH,
-        ]);
-
-        let latent_part = Tensor::einsum(
-            "nl,kol->nko",
-            &[&readout, &self.readout_weights(heads, detach)],
-            None::<&[i64]>,
-        );
-        let prefix_part = Tensor::einsum(
-            "nkp,kop->nko",
-            &[&masked, &self.prefix_weights(heads, detach)],
-            None::<&[i64]>,
-        );
-        (latent_part + prefix_part + self.biases(heads, detach).unsqueeze(0))
-            .reshape(with_tail(&lead, &[BAR_DOF as i64, NUM_BAR_BINS]))
+        self.prefix_lookup(&prefix_bins, &bank.prefix_embed)
+            .reshape([rows, BAR_PREFIX_WIDTH])
     }
 
     /// Ancestral sample of a bar's DOF from beliefs and forecast conditioning
@@ -4454,26 +4539,30 @@ impl BarEmissionHead {
             );
             let device = h.device();
             let rows = lead.iter().product::<i64>();
+            let bank = self.bank(false);
+            let kind = readout_kind(h);
             let readout = Tensor::cat(
                 &[
-                    h.to_kind(Kind::Float).reshape([-1, self.latent_dim]),
-                    conditioning
-                        .to_device(device)
-                        .to_kind(Kind::Float)
-                        .reshape([-1, self.latent_dim]),
+                    h.reshape([-1, self.latent_dim]).to_kind(kind),
+                    conditioning.reshape([-1, self.latent_dim]).to_kind(kind),
                 ],
                 -1,
             );
 
             let base = Tensor::einsum(
                 "nl,kol->nko",
-                &[&readout, &self.readout_weights(&self.heads, false)],
+                &[
+                    &readout,
+                    &bank.weights.narrow(2, 0, 2 * self.latent_dim).to_kind(kind),
+                ],
                 None::<&[i64]>,
-            ) + self.biases(&self.heads, false).unsqueeze(0);
-            let prefix_w_all = self.prefix_weights(&self.heads, false);
-            let mask = self.prefix_mask.to_device(device);
+            ) + bank.biases.unsqueeze(0);
+            let prefix_w_all = bank
+                .weights
+                .narrow(2, 2 * self.latent_dim, BAR_PREFIX_WIDTH)
+                .to_kind(kind);
 
-            // Unvisited slots hold bin 0; the mask zeroes their embedding, so the
+            // Unvisited slots hold bin 0; the pack zeroes their weight columns, so the
             // seed value cannot reach any logit.
             let mut slot_bins: Vec<Tensor> = (0..BAR_PREFIX_SLOTS)
                 .map(|_| Tensor::zeros([rows], (Kind::Int64, device)))
@@ -4483,11 +4572,12 @@ impl BarEmissionHead {
 
             for (position, &dof) in BAR_CHAIN.iter().enumerate() {
                 let prefix_bins = Tensor::stack(&slot_bins, 1);
-                let embedded = self.prefix_lookup(&prefix_bins, &self.prefix_embed, false);
-                let masked =
-                    (embedded * mask.select(0, dof as i64)).reshape([rows, BAR_PREFIX_WIDTH]);
+                let embedded = self
+                    .prefix_lookup(&prefix_bins, &bank.prefix_embed)
+                    .reshape([rows, BAR_PREFIX_WIDTH])
+                    .to_kind(kind);
                 let logits = base.select(1, dof as i64)
-                    + masked.linear(&prefix_w_all.select(0, dof as i64), None::<Tensor>);
+                    + embedded.linear(&prefix_w_all.select(0, dof as i64), None::<Tensor>);
                 let (value, bin) = supports.sample_dof_binned(dof, &logits, temperature);
                 if position < BAR_PREFIX_SLOTS {
                     slot_bins[position] = bin.shallow_clone();
@@ -4535,8 +4625,12 @@ impl BarEmissionHead {
     /// rather than pretending it is exact. Factor `BAR_CHAIN[0]` has no prefix, so its row is
     /// bit-identical to its teacher-forced row and its marginal is exact by construction.
     ///
-    /// The belief/conditioning GEMM is hoisted out of the draw loop: only the prefix
-    /// embedding lookup and its `[BAR_PREFIX_WIDTH, NUM_BAR_BINS]` projection repeat.
+    /// The belief/conditioning GEMM is hoisted out of the draw loop, and the draws themselves
+    /// are batched into the row dimension: one prefix gather, one
+    /// `[BAR_PREFIX_WIDTH, NUM_BAR_BINS]` projection, one softmax and one inverse-CDF draw per
+    /// chain position, whatever `draws` is. The `BAR_CHAIN` positions stay a loop because each
+    /// factor conditions on the sampled prefix of the ones ahead of it, but nothing else here
+    /// scales with `draws` in kernel count.
     pub fn forecast_log_probs(
         &self,
         h: &Tensor,
@@ -4554,59 +4648,70 @@ impl BarEmissionHead {
             );
             let device = h.device();
             let rows = lead.iter().product::<i64>();
+            let bank = self.bank(false);
+            let kind = readout_kind(h);
             let readout = Tensor::cat(
                 &[
-                    h.to_kind(Kind::Float).reshape([-1, self.latent_dim]),
-                    conditioning
-                        .to_device(device)
-                        .to_kind(Kind::Float)
-                        .reshape([-1, self.latent_dim]),
+                    h.reshape([-1, self.latent_dim]).to_kind(kind),
+                    conditioning.reshape([-1, self.latent_dim]).to_kind(kind),
                 ],
                 -1,
             );
             let base = Tensor::einsum(
                 "nl,kol->nko",
-                &[&readout, &self.readout_weights(&self.heads, false)],
+                &[
+                    &readout,
+                    &bank.weights.narrow(2, 0, 2 * self.latent_dim).to_kind(kind),
+                ],
                 None::<&[i64]>,
-            ) + self.biases(&self.heads, false).unsqueeze(0);
-            let prefix_w_all = self.prefix_weights(&self.heads, false);
-            let mask = self.prefix_mask.to_device(device);
+            ) + bank.biases.unsqueeze(0);
+            let prefix_w_all = bank
+                .weights
+                .narrow(2, 2 * self.latent_dim, BAR_PREFIX_WIDTH)
+                .to_kind(kind);
 
-            let mut total: Option<Tensor> = None;
-            for draw in 0..draws {
-                // Unvisited slots hold bin 0; the mask zeroes their embedding, so the seed
-                // value cannot reach any logit.
-                let mut slot_bins: Vec<Tensor> = (0..BAR_PREFIX_SLOTS)
-                    .map(|_| Tensor::zeros([rows], (Kind::Int64, device)))
-                    .collect();
-                let mut per_dof: Vec<Option<Tensor>> = (0..BAR_DOF).map(|_| None).collect();
-                for (position, &dof) in BAR_CHAIN.iter().enumerate() {
-                    let prefix_bins = Tensor::stack(&slot_bins, 1);
-                    let embedded = self.prefix_lookup(&prefix_bins, &self.prefix_embed, false);
-                    let masked =
-                        (embedded * mask.select(0, dof as i64)).reshape([rows, BAR_PREFIX_WIDTH]);
-                    let logits = base.select(1, dof as i64)
-                        + masked.linear(&prefix_w_all.select(0, dof as i64), None::<Tensor>);
-                    let probs = logits.softmax(-1, Kind::Float);
-                    if position < BAR_PREFIX_SLOTS {
-                        slot_bins[position] =
-                            sample_bin_by_cdf(&probs, prefix_stream_seed(seed, draw, position));
-                    }
-                    per_dof[dof] = Some(probs);
+            // Draw `d`'s rows live at offset `d * rows`, which is what lets the per-draw
+            // uniform streams concatenate and keeps every sampled bin bit-identical to
+            // sampling the draws one at a time.
+            let stacked_rows = draws as i64 * rows;
+            // Unvisited slots hold bin 0; the pack zeroes their weight columns, so the
+            // seed value cannot reach any logit.
+            let mut slot_bins: Vec<Tensor> = (0..BAR_PREFIX_SLOTS)
+                .map(|_| Tensor::zeros([stacked_rows], (Kind::Int64, device)))
+                .collect();
+            let mut per_dof: Vec<Option<Tensor>> = (0..BAR_DOF).map(|_| None).collect();
+            for (position, &dof) in BAR_CHAIN.iter().enumerate() {
+                let prefix_bins = Tensor::stack(&slot_bins, 1);
+                let embedded = self
+                    .prefix_lookup(&prefix_bins, &bank.prefix_embed)
+                    .reshape([stacked_rows, BAR_PREFIX_WIDTH])
+                    .to_kind(kind);
+                let logits = base.select(1, dof as i64).unsqueeze(0)
+                    + embedded
+                        .linear(&prefix_w_all.select(0, dof as i64), None::<Tensor>)
+                        .view([draws as i64, rows, NUM_BAR_BINS]);
+                let probs = logits.softmax(-1, Kind::Float);
+                if position < BAR_PREFIX_SLOTS {
+                    let seeds: Vec<u64> = (0..draws)
+                        .map(|draw| prefix_stream_seed(seed, draw, position))
+                        .collect();
+                    slot_bins[position] = sample_bins_by_cdf(
+                        &probs.view([stacked_rows, NUM_BAR_BINS]),
+                        rows as usize,
+                        &seeds,
+                    );
                 }
-                let stacked = Tensor::stack(
-                    &per_dof
-                        .into_iter()
-                        .map(|p| p.expect("every DOF has a predictive row"))
-                        .collect::<Vec<_>>(),
-                    1,
-                );
-                total = Some(match total {
-                    Some(acc) => acc + stacked,
-                    None => stacked,
-                });
+                // Reduced here rather than after the chain so that only one factor's draws are
+                // resident at a time; holding all five would be `draws` times the old peak.
+                per_dof[dof] = Some(probs.sum_dim_intlist([0].as_slice(), false, Kind::Float));
             }
-            let mixture = total.expect("at least one draw") / draws as f64;
+            let mixture = Tensor::stack(
+                &per_dof
+                    .into_iter()
+                    .map(|p| p.expect("every DOF has a predictive row"))
+                    .collect::<Vec<_>>(),
+                1,
+            ) / draws as f64;
             // Softmax output is strictly positive, so the mixture is too; the floor only
             // guards f32 underflow on a factor the head has driven to a point mass.
             mixture
@@ -4675,6 +4780,30 @@ fn stack_maybe_detached(parts: impl Iterator<Item = Tensor>, detach: bool) -> Te
         parts.collect()
     };
     Tensor::stack(&collected, 0)
+}
+
+/// The dtype the readout contraction will actually run in.
+///
+/// Under the bf16 CUDA autocast [`crate::torch::cuda::cfg::configure_cuda`] pins, every
+/// matmul casts its operands to bf16 whatever it was handed, so widening the belief to
+/// fp32 first only doubles a `[B * T, 2 * latent_dim + BAR_PREFIX_WIDTH]` copy that
+/// autocast immediately undoes, in both directions. Building the input in bf16 directly
+/// is bit-identical: the cast autocast applies to the concatenation is the same cast
+/// applied to its parts.
+///
+/// Every other regime keeps the fp32 widening, which is what the growth and horizon
+/// diagnostics rely on: they disable autocast precisely because their cancelling sums need
+/// fp32.
+fn readout_kind(h: &Tensor) -> Kind {
+    let reduced = h.device().is_cuda()
+        && unsafe {
+            torch_sys::at_autocast_is_enabled() != 0 && torch_sys::at_autocast_is_bfloat16() != 0
+        };
+    if reduced {
+        Kind::BFloat16
+    } else {
+        Kind::Float
+    }
 }
 
 /// The scoring rule of [`BarScoring`], materialized against one batch of observations.
@@ -7273,15 +7402,15 @@ mod tests {
         );
     }
 
-    /// `forward_logits` and `sample` build the prefix through two separate code paths:
-    /// the batched one masks `[rows, 1, SLOTS, DIM]` against `[BAR_DOF, SLOTS, 1]` and
-    /// contracts with `einsum`, the sequential one masks `[rows, SLOTS, DIM]` against
-    /// one DOF's mask row and contracts with `linear`. Both then flatten (slot, dim)
-    /// into the `BAR_PREFIX_WIDTH` block after the two readout-width blocks. A
-    /// transposition or a slot swap in either one would leave the teacher-forced
-    /// training loss exactly correct while every ancestral draw — direction accuracy,
-    /// `BarWorldModel::imagine`, the planner's whole forecast — came from the wrong
-    /// conditional, with no failing test and no loss regression.
+    /// [`BarEmissionHead::logits_with`] and `sample` build the prefix through two separate
+    /// code paths: the batched one contracts every DOF at once with `einsum`, the
+    /// sequential one contracts one DOF's prefix weight columns with `linear`. Both flatten
+    /// (slot, dim) into the `BAR_PREFIX_WIDTH` block after the two readout-width blocks,
+    /// and both read that block out of the same masked `[BAR_DOF, NUM_BAR_BINS, 2 *
+    /// latent_dim + BAR_PREFIX_WIDTH]` pack. A transposition or a slot swap in either one
+    /// would leave the teacher-forced training loss exactly correct while every ancestral
+    /// draw — direction accuracy, `BarWorldModel::imagine`, the planner's whole forecast —
+    /// came from the wrong conditional, with no failing test and no loss regression.
     ///
     /// At temperature zero the chain is a deterministic argmax and each step decodes to
     /// its bin's center, so re-binning the draw recovers exactly the prefix the chain
@@ -8319,6 +8448,172 @@ mod tests {
             "teacher-forcing inflation on the synthetic fixture: {dependent_inflation:.4} \
              nats/bar dependent, {independent_inflation:.2e} independent"
         );
+    }
+
+    /// The pre-batching `forecast_log_probs`: one prefix gather, projection, softmax and
+    /// inverse-CDF draw per (draw, chain position). Kept here as the oracle so the batched
+    /// implementation is checked against the algorithm it replaced and not against itself.
+    fn forecast_log_probs_per_draw(
+        head: &BarEmissionHead,
+        h: &Tensor,
+        conditioning: &Tensor,
+        draws: usize,
+        seed: u64,
+    ) -> Tensor {
+        tch::no_grad(|| {
+            let lead = leading_dims(h, head.latent_dim, "latent");
+            let device = h.device();
+            let rows = lead.iter().product::<i64>();
+            let bank = head.bank(false);
+            let kind = readout_kind(h);
+            let readout = Tensor::cat(
+                &[
+                    h.reshape([-1, head.latent_dim]).to_kind(kind),
+                    conditioning.reshape([-1, head.latent_dim]).to_kind(kind),
+                ],
+                -1,
+            );
+            let base = Tensor::einsum(
+                "nl,kol->nko",
+                &[
+                    &readout,
+                    &bank.weights.narrow(2, 0, 2 * head.latent_dim).to_kind(kind),
+                ],
+                None::<&[i64]>,
+            ) + bank.biases.unsqueeze(0);
+            let prefix_w_all = bank
+                .weights
+                .narrow(2, 2 * head.latent_dim, BAR_PREFIX_WIDTH)
+                .to_kind(kind);
+            let mut total: Option<Tensor> = None;
+            for draw in 0..draws {
+                let mut slot_bins: Vec<Tensor> = (0..BAR_PREFIX_SLOTS)
+                    .map(|_| Tensor::zeros([rows], (Kind::Int64, device)))
+                    .collect();
+                let mut per_dof: Vec<Option<Tensor>> = (0..BAR_DOF).map(|_| None).collect();
+                for (position, &dof) in BAR_CHAIN.iter().enumerate() {
+                    let prefix_bins = Tensor::stack(&slot_bins, 1);
+                    let embedded = head
+                        .prefix_lookup(&prefix_bins, &bank.prefix_embed)
+                        .reshape([rows, BAR_PREFIX_WIDTH])
+                        .to_kind(kind);
+                    let logits = base.select(1, dof as i64)
+                        + embedded.linear(&prefix_w_all.select(0, dof as i64), None::<Tensor>);
+                    let probs = logits.softmax(-1, Kind::Float);
+                    if position < BAR_PREFIX_SLOTS {
+                        slot_bins[position] = sample_bins_by_cdf(
+                            &probs,
+                            rows as usize,
+                            &[prefix_stream_seed(seed, draw, position)],
+                        );
+                    }
+                    per_dof[dof] = Some(probs);
+                }
+                let stacked = Tensor::stack(
+                    &per_dof
+                        .into_iter()
+                        .map(|p| p.expect("every DOF has a predictive row"))
+                        .collect::<Vec<_>>(),
+                    1,
+                );
+                total = Some(match total {
+                    Some(acc) => acc + stacked,
+                    None => stacked,
+                });
+            }
+            (total.expect("at least one draw") / draws as f64)
+                .clamp_min(f32::MIN_POSITIVE as f64)
+                .log()
+                .reshape(with_tail(&lead, &[BAR_DOF as i64, NUM_BAR_BINS]))
+        })
+    }
+
+    /// Batching the draw dimension must not move the RNG stream by one element.
+    ///
+    /// This is the invariant the whole optimization rests on, asserted where it lives rather
+    /// than inferred from a downstream score: a stacked draw dimension samples the same bins as
+    /// the per-draw calls it replaced, because `counter_uniforms` is keyed by (seed, index) and
+    /// the stacked uniform vector is the concatenation of the per-draw streams.
+    #[test]
+    fn stacking_draws_preserves_every_sampled_bin() {
+        let _torch_rng_guard = test_rng::exclusive();
+        let _ = tch::manual_seed(0x5EED_1234);
+        for (rows, draws, seed) in [
+            (1usize, 1usize, 0u64),
+            (1, 16, 0xDEAD_BEEF),
+            (7, 3, 1),
+            (64, 16, 0xE7A1_5E7D),
+            (129, 5, u64::MAX),
+        ] {
+            let probs = Tensor::randn(
+                [(draws * rows) as i64, NUM_BAR_BINS],
+                (Kind::Float, Device::Cpu),
+            )
+            .softmax(-1, Kind::Float);
+            for position in 0..BAR_PREFIX_SLOTS {
+                let seeds: Vec<u64> = (0..draws)
+                    .map(|draw| prefix_stream_seed(seed, draw, position))
+                    .collect();
+                let stacked = sample_bins_by_cdf(&probs, rows, &seeds);
+                let per_draw = Tensor::cat(
+                    &(0..draws)
+                        .map(|draw| {
+                            sample_bins_by_cdf(
+                                &probs.narrow(0, (draw * rows) as i64, rows as i64),
+                                rows,
+                                &seeds[draw..=draw],
+                            )
+                        })
+                        .collect::<Vec<_>>(),
+                    0,
+                );
+                assert!(
+                    stacked.equal(&per_draw),
+                    "stacked sampling diverged at rows={rows} draws={draws} seed={seed} \
+                     position={position}: {stacked:?} vs {per_draw:?}"
+                );
+            }
+        }
+    }
+
+    /// End to end: the batched `forecast_log_probs` reproduces the per-draw algorithm.
+    ///
+    /// Bit-identity is the bar, and it is reachable because every kernel involved is either
+    /// elementwise, a gather, a softmax over an unchanged 128-wide axis, or a reduction over
+    /// the draw axis; only the `[rows, BAR_PREFIX_WIDTH] x [BAR_PREFIX_WIDTH, NUM_BAR_BINS]`
+    /// projection sees a longer row dimension. A failure here means a real numerical change and
+    /// must be reported with its magnitude, never relaxed into a tolerance.
+    #[test]
+    fn batched_draws_reproduce_the_per_draw_forecast_mixture() {
+        let _torch_rng_guard = test_rng::exclusive();
+        let _ = tch::manual_seed(0x0FEC_2);
+        let latent = 12i64;
+        let vs = nn::VarStore::new(Device::Cpu);
+        let head = BarEmissionHead::new(&vs.root(), latent);
+        tch::no_grad(|| {
+            for variable in vs.trainable_variables() {
+                let mut variable = variable;
+                let _ = variable.normal_(0.0, 0.4);
+            }
+        });
+        for (rows, draws, seed) in [
+            (1i64, 1usize, 0u64),
+            (5, 4, 0xE7A1_5E7D),
+            (37, 16, 0xDEAD_BEEF),
+            (128, 7, 12345),
+        ] {
+            let h = Tensor::randn([rows, latent], (Kind::Float, Device::Cpu));
+            let conditioning = Tensor::randn([rows, latent], (Kind::Float, Device::Cpu));
+            let batched = head.forecast_log_probs(&h, &conditioning, draws, seed);
+            let oracle = forecast_log_probs_per_draw(&head, &h, &conditioning, draws, seed);
+            assert_eq!(batched.size(), oracle.size());
+            let gap = (&batched - &oracle).abs().max().double_value(&[]);
+            assert!(
+                batched.equal(&oracle),
+                "batching the draw dimension changed the forecast mixture at rows={rows} \
+                 draws={draws} seed={seed}: max |delta| {gap:.3e} nats"
+            );
+        }
     }
 
     // -----------------------------------------------------------------------

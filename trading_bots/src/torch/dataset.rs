@@ -293,6 +293,88 @@ pub struct BarBatch {
     pub market_missing: usize,
 }
 
+/// Host staging buffers for one batch, owned by the caller and reused across steps.
+///
+/// A stage-2 batch stages ~6.3 MiB of DOF, id, sigma and validity rows. Allocating that per
+/// step faults in fresh zeroed pages the fill then overwrites in full, so the buffers live
+/// here and are only ever `resize`d. Every region IS fully overwritten — [`fill_batch_row`]
+/// writes all `len` slots of its row and the direct builder writes both horizons of all
+/// `context` decisions — so the resize filler is never read.
+#[derive(Debug, Default)]
+pub struct BatchScratch {
+    dof: Vec<f32>,
+    time: Vec<i32>,
+    sigma: Vec<f32>,
+    raw_dof: Vec<f32>,
+    direct_time: Vec<i32>,
+    direct_valid: Vec<u8>,
+}
+
+/// Every calendar id is bounded by [`BAR_TIME_CARDINALITY`], so the host wire format can be
+/// half the width of the int64 tensor the embeddings ultimately index with.
+const _: () = {
+    let mut feature = 0;
+    while feature < BAR_TIME_FEATURES {
+        assert!(BAR_TIME_CARDINALITY[feature] <= i32::MAX as i64);
+        feature += 1;
+    }
+};
+
+/// The CPU half of a [`BarBatch`]: every tensor built, nothing transferred.
+///
+/// Split out so a producer thread can encode a batch while the GPU is still on the previous
+/// step, leaving the training thread only the copies. `Tensor::to_device` is a synchronous
+/// copy on the default stream, so a producer that also transferred would serialize against
+/// the training kernels instead of overlapping with them.
+#[derive(Debug)]
+pub struct HostSample {
+    dof: Tensor,
+    /// `[N, L, BAR_TIME_FEATURES]` i32, widened by [`Self::to_device`].
+    time_ids: Tensor,
+    sigma: Tensor,
+    raw_dof: Option<Tensor>,
+    /// `[direct_time_ids, direct_valid]` as i32 and u8, widened by [`Self::to_device`].
+    direct: Option<(Tensor, Tensor)>,
+    /// [`BarBatch::market_missing`], already counted on the host.
+    pub market_missing: usize,
+}
+
+impl HostSample {
+    /// Transfer to `device` and widen the staged ids to the dtypes [`BarBatch`] declares.
+    ///
+    /// The only part of a batch build that touches CUDA, so it is the only part that must run
+    /// on the thread owning the training stream.
+    pub fn to_device(self, device: Device) -> BarBatch {
+        let (direct_time_ids, direct_valid) = match self.direct {
+            Some((ids, valid)) => (
+                Some(ids.to_device(device).to_kind(Kind::Int64)),
+                Some(valid.to_device(device).to_kind(Kind::Bool)),
+            ),
+            None => (None, None),
+        };
+        BarBatch {
+            dof: self.dof.to_device(device),
+            time_ids: self.time_ids.to_device(device).to_kind(Kind::Int64),
+            sigma: self.sigma.to_device(device),
+            raw_dof: self.raw_dof.map(|raw| raw.to_device(device)),
+            direct_time_ids,
+            direct_valid,
+            market_missing: self.market_missing,
+        }
+    }
+}
+
+/// The pretrainer builds a batch on a producer thread holding `&BarSampler` and moves the
+/// finished [`HostSample`] to the training thread, so these are load-bearing rather than
+/// incidental. `HostSample` is only `Send`: `tch::Tensor` is not `Sync`.
+const _: fn() = || {
+    fn shared<T: Send + Sync>() {}
+    fn moved<T: Send>() {}
+    shared::<BarSampler>();
+    shared::<BatchScratch>();
+    moved::<HostSample>();
+};
+
 pub fn resolution_class(res_secs: u32) -> i64 {
     RESOLUTION_CLASS_SECS
         .iter()
@@ -322,6 +404,18 @@ pub fn bar_time_ids(
     res_secs: u32,
     market: Option<&MarketChannel>,
 ) -> [i64; BAR_TIME_FEATURES] {
+    bar_time_ids_from(ts_ms, prev_ts_ms, res_secs, market, 0).0
+}
+
+/// [`bar_time_ids`] for a non-decreasing scan, carrying [`MarketChannel::ids_at_from`]'s
+/// cursor forward across the bars of one window.
+pub fn bar_time_ids_from(
+    ts_ms: i64,
+    prev_ts_ms: Option<i64>,
+    res_secs: u32,
+    market: Option<&MarketChannel>,
+    cursor: usize,
+) -> ([i64; BAR_TIME_FEATURES], usize) {
     let utc = ts_ms.div_euclid(1000);
     let local = utc + et_offset_secs(utc) as i64;
     let day = local.div_euclid(SECS_PER_DAY);
@@ -338,8 +432,10 @@ pub fn bar_time_ids(
     } else {
         3
     };
-    let [market_r, market_s, market_w] =
-        market.map_or([MARKET_MISSING; MARKET_FEATURES], |m| m.ids_at(ts_ms));
+    let ([market_r, market_s, market_w], cursor) = match market {
+        Some(channel) => channel.ids_at_from(ts_ms, cursor),
+        None => ([MARKET_MISSING; MARKET_FEATURES], cursor),
+    };
     let ids = [
         minute,
         weekday,
@@ -357,7 +453,7 @@ pub fn bar_time_ids(
             .all(|(&id, cardinality)| (0..cardinality).contains(&id)),
         "conditioning ids {ids:?} escaped {BAR_TIME_CARDINALITY:?} for ts_ms {ts_ms}"
     );
-    ids
+    (ids, cursor)
 }
 
 /// Conditioning ids of a bar that has NOT happened yet.
@@ -383,6 +479,52 @@ pub fn future_conditioning_ids(
 /// core session does not close the whole extended-hours venue, and a fixed full-day grid is
 /// preferable to letting future print availability decide whether a forecast step exists.
 pub fn is_us_equity_trading_date(date: NaiveDate) -> bool {
+    let table = &*TRADING_DATES;
+    match usize::try_from(date.num_days_from_ce() - table.base_ce) {
+        Ok(index) if index < table.days => {
+            let (word, bit) = (index / 64, index % 64);
+            table.bits[word] & (1 << bit) != 0
+        }
+        _ => computed_us_equity_trading_date(date),
+    }
+}
+
+/// One bit per date over the [`ET_TRANSITIONS`] span, set for a full-day trading date.
+///
+/// [`computed_us_equity_trading_date`] rebuilds ten `NaiveDate`s and an Easter computus on
+/// every call, and [`direct_forecast_schedule_ids`] asks about ~150k dates per batch. Every
+/// bit here is produced BY that function, so the table cannot disagree with it, and a date
+/// outside the span still falls through to it.
+struct TradingDates {
+    base_ce: i32,
+    days: usize,
+    bits: Vec<u64>,
+}
+
+static TRADING_DATES: std::sync::LazyLock<TradingDates> =
+    std::sync::LazyLock::new(build_trading_dates);
+
+fn build_trading_dates() -> TradingDates {
+    let first = NaiveDate::from_ymd_opt(1990, 1, 1).expect("the offset table start is a date");
+    let last = NaiveDate::from_ymd_opt(2100, 1, 1).expect("the offset table end is a date");
+    let days = (last - first).num_days() as usize;
+    let mut bits = vec![0u64; days.div_ceil(64)];
+    let mut date = first;
+    for index in 0..days {
+        if computed_us_equity_trading_date(date) {
+            let (word, bit) = (index / 64, index % 64);
+            bits[word] |= 1 << bit;
+        }
+        date = date.succ_opt().expect("the table span stays representable");
+    }
+    TradingDates {
+        base_ce: first.num_days_from_ce(),
+        days,
+        bits,
+    }
+}
+
+fn computed_us_equity_trading_date(date: NaiveDate) -> bool {
     if matches!(date.weekday(), Weekday::Sat | Weekday::Sun) {
         return false;
     }
@@ -471,11 +613,7 @@ fn forecast_schedule_local(decision_ts_ms: i64, res_secs: u32) -> NaiveDateTime 
         res_secs > 0,
         "a forecast schedule needs a positive resolution"
     );
-    New_York
-        .timestamp_millis_opt(decision_ts_ms)
-        .single()
-        .expect("a timestamp has one New York representation")
-        .naive_local()
+    et_naive_local(decision_ts_ms)
 }
 
 fn advance_forecast_schedule(local: &mut NaiveDateTime, res_secs: u32) -> i64 {
@@ -492,10 +630,11 @@ fn advance_forecast_schedule(local: &mut NaiveDateTime, res_secs: u32) -> i64 {
             let date = local.date();
             let seconds = i64::from(local.time().num_seconds_from_midnight());
             let in_session = (4 * 3600..20 * 3600).contains(&seconds);
-            if is_us_equity_trading_date(date) && in_session {
+            let trading = is_us_equity_trading_date(date);
+            if trading && in_session {
                 break;
             }
-            let next_date = if is_us_equity_trading_date(date) && seconds < 4 * 3600 {
+            let next_date = if trading && seconds < 4 * 3600 {
                 date
             } else {
                 date + Duration::days(1)
@@ -564,11 +703,7 @@ pub fn forecast_schedule_previous(ts_ms: i64, res_secs: u32) -> i64 {
         res_secs <= 16 * 3600 || res_secs >= 86_400,
         "intraday resolutions must fit inside the 16-hour extended session"
     );
-    let current = New_York
-        .timestamp_millis_opt(ts_ms)
-        .single()
-        .expect("a timestamp has one New York representation");
-    let mut local = current.naive_local();
+    let mut local = et_naive_local(ts_ms);
     loop {
         if res_secs >= 86_400 {
             local -= Duration::days(1);
@@ -796,10 +931,47 @@ impl MarketChannel {
     /// a function of the proxy bar covering the SAME half-open interval and of nothing later.
     #[inline]
     pub fn ids_at(&self, ts_ms: i64) -> [i64; MARKET_FEATURES] {
-        match self.ts_ms.binary_search(&ts_ms) {
-            Ok(index) => self.ids[index].map(i64::from),
-            Err(_) => [MARKET_MISSING; MARKET_FEATURES],
-        }
+        self.ids_at_from(ts_ms, 0).0
+    }
+
+    /// [`Self::ids_at`] for a non-decreasing scan, returning the cursor to pass to the next
+    /// bar of the same window.
+    ///
+    /// A window's ~2000 bars otherwise pay ~2000 independent 21-probe bisections over the
+    /// whole proxy vector, every probe a cache miss. Adjacent bars land one slot apart, so a
+    /// bounded forward scan resolves the join outright; a corpus hole falls back to a
+    /// bisection over the suffix rather than walking it. `cursor` must never exceed the
+    /// index this returned for an earlier, no-later timestamp.
+    #[inline]
+    pub fn ids_at_from(&self, ts_ms: i64, cursor: usize) -> ([i64; MARKET_FEATURES], usize) {
+        const SCAN: usize = 16;
+        // The scan only moves forward, so a cursor resolved for a LATER timestamp cannot be
+        // walked back: the join would report the reserved row for a bar the proxy covers, and
+        // a wrong conditioning id is invisible to every shape check and every loss. Necessary
+        // condition of the precondition, and free in release.
+        debug_assert!(
+            cursor == 0
+                || self
+                    .ts_ms
+                    .get(cursor - 1)
+                    .is_some_and(|&previous| previous < ts_ms),
+            "market cursor {cursor} was resolved for a timestamp later than {ts_ms}"
+        );
+        let base = cursor.min(self.ts_ms.len());
+        let rest = &self.ts_ms[base..];
+        let near = rest.len().min(SCAN);
+        let offset = match rest[..near].iter().position(|&ts| ts >= ts_ms) {
+            Some(offset) => offset,
+            None if near < SCAN => near,
+            None => near + rest[near..].partition_point(|&ts| ts < ts_ms),
+        };
+        let index = base + offset;
+        let ids = if self.ts_ms.get(index) == Some(&ts_ms) {
+            self.ids[index].map(i64::from)
+        } else {
+            [MARKET_MISSING; MARKET_FEATURES]
+        };
+        (ids, index)
     }
 }
 
@@ -1154,6 +1326,28 @@ fn load_or_fit_market_supports(
 pub fn et_local_day(ts_ms: i64) -> i64 {
     let utc = ts_ms.div_euclid(1000);
     (utc + et_offset_secs(utc) as i64).div_euclid(SECS_PER_DAY)
+}
+
+/// America/New_York wall clock at `ts_ms`, from the same table [`et_local_day`] reads.
+///
+/// Identical to `New_York.timestamp_millis_opt(ts_ms).single().naive_local()` by construction:
+/// [`ET_TRANSITIONS`] is built from chrono-tz's own offsets, and the local wall clock IS the
+/// UTC instant shifted by that offset. Outside the table's span the tz query is kept, so a
+/// timestamp the table cannot answer for is answered exactly rather than clamped.
+fn et_naive_local(ts_ms: i64) -> NaiveDateTime {
+    let utc = ts_ms.div_euclid(1000);
+    if (ET_TABLE_FROM..ET_TABLE_TO).contains(&utc) {
+        return chrono::DateTime::from_timestamp_millis(
+            ts_ms + i64::from(et_offset_secs(utc)) * 1000,
+        )
+        .expect("an in-table instant shifted by its offset is representable")
+        .naive_utc();
+    }
+    New_York
+        .timestamp_millis_opt(ts_ms)
+        .single()
+        .expect("a timestamp has one New York representation")
+        .naive_local()
 }
 
 const SECS_PER_DAY: i64 = 86_400;
@@ -2360,35 +2554,55 @@ impl BarSampler {
         refs.par_iter().for_each(|r| readahead(self.slab(r, len)));
     }
 
+    /// Empty host staging for this sampler, grown on first use and kept alive across steps.
+    pub fn scratch(&self) -> BatchScratch {
+        BatchScratch::default()
+    }
+
     /// `[refs.len(), context + future_bars, ..]` DOF and calendar ids on `device`.
     pub fn batch_of(&self, refs: &[WindowRef], device: Device) -> BarBatch {
+        self.batch_of_into(refs, device, &mut self.scratch())
+    }
+
+    /// [`Self::batch_of`] reusing caller-owned host staging.
+    pub fn batch_of_into(
+        &self,
+        refs: &[WindowRef],
+        device: Device,
+        scratch: &mut BatchScratch,
+    ) -> BarBatch {
+        self.host_batch_of_into(refs, scratch).to_device(device)
+    }
+
+    /// Every host-side part of a batch: the encode, the calendar ids and the staged CPU
+    /// tensors. Touches no device, so it can run a step ahead on a producer thread while the
+    /// GPU is still consuming the previous batch.
+    pub fn host_batch_of_into(&self, refs: &[WindowRef], scratch: &mut BatchScratch) -> HostSample {
         assert!(!refs.is_empty(), "cannot build an empty batch");
         let len = (self.context + self.future_bars) as usize;
         let rows: Vec<(usize, usize)> = refs
             .iter()
             .map(|r| (r.symbol as usize, r.bar_index as usize))
             .collect();
-        let mut batch = build_batch(
+        let mut sample = build_host_batch(
             &self.corpus.files,
             &rows,
             len,
             self.corpus.res_secs,
             self.corpus.market.as_ref(),
             self.corpus.dof_scaling,
-            device,
+            scratch,
         );
         if self.future_bars >= 3 {
-            let (time_ids, valid) = build_direct_forecast_time_ids(
+            sample.direct = Some(build_host_direct_forecast_time_ids(
                 &self.corpus.files,
                 &rows,
                 self.context as usize,
                 self.corpus.res_secs,
-                device,
-            );
-            batch.direct_time_ids = Some(time_ids);
-            batch.direct_valid = Some(valid);
+                scratch,
+            ));
         }
-        batch
+        sample
     }
 
     /// One forecast-safe next-bar clock for every consecutive decision row in each window.
@@ -3644,20 +3858,25 @@ fn build_one_step_forecast_time_ids(
         .to_device(device)
 }
 
-fn build_direct_forecast_time_ids(
+fn build_host_direct_forecast_time_ids(
     files: &[BarFile],
     rows: &[(usize, usize)],
     context: usize,
     res_secs: u32,
-    device: Device,
+    scratch: &mut BatchScratch,
 ) -> (Tensor, Tensor) {
     let time_row = context * 2 * BAR_TIME_FEATURES;
     let valid_row = context * 2;
-    let mut flat_time = vec![0i64; rows.len() * time_row];
-    let mut flat_valid = vec![0u8; rows.len() * valid_row];
-    flat_time
+    scratch.direct_time.resize(rows.len() * time_row, 0);
+    scratch.direct_valid.resize(rows.len() * valid_row, 0);
+    let BatchScratch {
+        direct_time,
+        direct_valid,
+        ..
+    } = scratch;
+    direct_time
         .par_chunks_mut(time_row)
-        .zip(flat_valid.par_chunks_mut(valid_row))
+        .zip(direct_valid.par_chunks_mut(valid_row))
         .zip(rows.par_iter())
         .for_each(|((time_output, valid_output), &(series, start))| {
             let bars = files[series].bars();
@@ -3665,9 +3884,9 @@ fn build_direct_forecast_time_ids(
                 let horizons = direct_forecast_schedule_ids(bars[start + decision].ts(), res_secs);
                 let time_offset = decision * 2 * BAR_TIME_FEATURES;
                 time_output[time_offset..time_offset + BAR_TIME_FEATURES]
-                    .copy_from_slice(&horizons[1].1);
+                    .copy_from_slice(&horizons[1].1.map(|id| id as i32));
                 time_output[time_offset + BAR_TIME_FEATURES..time_offset + 2 * BAR_TIME_FEATURES]
-                    .copy_from_slice(&horizons[2].1);
+                    .copy_from_slice(&horizons[2].1.map(|id| id as i32));
                 let mut ordinary = true;
                 for step in 0..3 {
                     ordinary &= bars[start + decision + step + 1].ts() == horizons[step].0;
@@ -3677,44 +3896,47 @@ fn build_direct_forecast_time_ids(
                 }
             }
         });
-    let time_ids = Tensor::from_slice(&flat_time)
-        .view([
-            rows.len() as i64,
-            context as i64,
-            2,
-            BAR_TIME_FEATURES as i64,
-        ])
-        .to_device(device);
-    let valid = Tensor::from_slice(&flat_valid)
-        .view([rows.len() as i64, context as i64, 2])
-        .to_device(device)
-        .to_kind(Kind::Bool);
+    let n = rows.len() as i64;
+    let context = context as i64;
+    let time_ids =
+        Tensor::from_slice(direct_time.as_slice()).view([n, context, 2, BAR_TIME_FEATURES as i64]);
+    let valid = Tensor::from_slice(direct_valid.as_slice()).view([n, context, 2]);
     (time_ids, valid)
 }
 
-fn build_batch(
+fn build_host_batch(
     files: &[BarFile],
     rows: &[(usize, usize)],
     len: usize,
     res_secs: u32,
     market: Option<&MarketChannel>,
     scaling: DofScaling,
-    device: Device,
-) -> BarBatch {
+    scratch: &mut BatchScratch,
+) -> HostSample {
     let dof_row = len * BAR_DOF;
     let time_row = len * BAR_TIME_FEATURES;
-    let mut dof = vec![0f32; rows.len() * dof_row];
-    let mut time = vec![0i64; rows.len() * time_row];
-    let mut sigma = vec![0f32; rows.len() * len];
-    let mut raw_dof = scaling
-        .is_standardized()
-        .then(|| vec![0f32; rows.len() * dof_row]);
-    let market_missing: usize = match raw_dof.as_mut() {
-        Some(raw) => dof
-            .par_chunks_mut(dof_row)
+    let standardized = scaling.is_standardized();
+    let raw_len = if standardized {
+        rows.len() * dof_row
+    } else {
+        0
+    };
+    scratch.dof.resize(rows.len() * dof_row, 0.0);
+    scratch.time.resize(rows.len() * time_row, 0);
+    scratch.sigma.resize(rows.len() * len, 0.0);
+    scratch.raw_dof.resize(raw_len, 0.0);
+    let BatchScratch {
+        dof,
+        time,
+        sigma,
+        raw_dof,
+        ..
+    } = scratch;
+    let market_missing: usize = if standardized {
+        dof.par_chunks_mut(dof_row)
             .zip(time.par_chunks_mut(time_row))
             .zip(sigma.par_chunks_mut(len))
-            .zip(raw.par_chunks_mut(dof_row))
+            .zip(raw_dof.par_chunks_mut(dof_row))
             .zip(rows.par_iter())
             .map(
                 |((((dof_out, time_out), sigma_out), raw_out), &(series, start))| {
@@ -3733,9 +3955,9 @@ fn build_batch(
                     )
                 },
             )
-            .sum(),
-        None => dof
-            .par_chunks_mut(dof_row)
+            .sum()
+    } else {
+        dof.par_chunks_mut(dof_row)
             .zip(time.par_chunks_mut(time_row))
             .zip(sigma.par_chunks_mut(len))
             .zip(rows.par_iter())
@@ -3745,27 +3967,40 @@ fn build_batch(
                     sigma_out, None,
                 )
             })
-            .sum(),
+            .sum()
     };
     let n = rows.len() as i64;
     let len = len as i64;
-    BarBatch {
-        dof: Tensor::from_slice(&dof)
-            .view([n, len, BAR_DOF as i64])
-            .to_device(device),
-        time_ids: Tensor::from_slice(&time)
-            .view([n, len, BAR_TIME_FEATURES as i64])
-            .to_device(device),
-        sigma: Tensor::from_slice(&sigma).view([n, len]).to_device(device),
-        raw_dof: raw_dof.map(|raw| {
-            Tensor::from_slice(&raw)
-                .view([n, len, BAR_DOF as i64])
-                .to_device(device)
-        }),
-        direct_time_ids: None,
-        direct_valid: None,
+    HostSample {
+        dof: Tensor::from_slice(dof.as_slice()).view([n, len, BAR_DOF as i64]),
+        time_ids: Tensor::from_slice(time.as_slice()).view([n, len, BAR_TIME_FEATURES as i64]),
+        sigma: Tensor::from_slice(sigma.as_slice()).view([n, len]),
+        raw_dof: standardized
+            .then(|| Tensor::from_slice(raw_dof.as_slice()).view([n, len, BAR_DOF as i64])),
+        direct: None,
         market_missing,
     }
+}
+
+fn build_batch(
+    files: &[BarFile],
+    rows: &[(usize, usize)],
+    len: usize,
+    res_secs: u32,
+    market: Option<&MarketChannel>,
+    scaling: DofScaling,
+    device: Device,
+) -> BarBatch {
+    build_host_batch(
+        files,
+        rows,
+        len,
+        res_secs,
+        market,
+        scaling,
+        &mut BatchScratch::default(),
+    )
+    .to_device(device)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3778,7 +4013,7 @@ fn fill_batch_row(
     market: Option<&MarketChannel>,
     scaling: DofScaling,
     dof_out: &mut [f32],
-    time_out: &mut [i64],
+    time_out: &mut [i32],
     sigma_out: &mut [f32],
     mut raw_out: Option<&mut [f32]>,
 ) -> usize {
@@ -3786,6 +4021,9 @@ fn fill_batch_row(
     readahead(&bars[start.saturating_sub(scaling.warmup_bars() + 1)..start + len]);
     let mut slot = 0usize;
     let mut missing = 0usize;
+    // The window's bars are strictly time-ordered, so the market join advances forward rather
+    // than bisecting the whole proxy vector once per bar.
+    let mut cursor = 0usize;
     for_each_window_dof_detailed(bars, start, len, scaling, |bar, raw, encoded| {
         dof_out[slot * BAR_DOF..(slot + 1) * BAR_DOF].copy_from_slice(&encoded.row.dof.to_array());
         sigma_out[slot] = encoded.row.sigma;
@@ -3794,14 +4032,17 @@ fn fill_batch_row(
         }
         // `start >= 1` for every window — bar 0 carries no DOF — so the predecessor is always
         // addressable. The market channel is joined at the row bar's own timestamp.
-        let ids = bar_time_ids(
+        let (ids, next) = bar_time_ids_from(
             bar.ts(),
             Some(bars[start + slot - 1].ts()),
             res_secs,
             market,
+            cursor,
         );
+        cursor = next;
         missing += usize::from(ids[TIME_MARKET_R] == MARKET_MISSING);
-        time_out[slot * BAR_TIME_FEATURES..(slot + 1) * BAR_TIME_FEATURES].copy_from_slice(&ids);
+        time_out[slot * BAR_TIME_FEATURES..(slot + 1) * BAR_TIME_FEATURES]
+            .copy_from_slice(&ids.map(|id| id as i32));
         slot += 1;
     });
     debug_assert_eq!(slot, len);
@@ -7402,5 +7643,350 @@ mod tests {
         assert_eq!(geometry.sigma_numerical_fallback_share(), 7.0 / 40.0);
         assert_eq!(geometry.r_z_clamped_share(), 10.0 / 40.0);
         assert_eq!(geometry.s_z_clamped_share(), 12.0 / 40.0);
+    }
+
+    /// The bitset is a CACHE for [`computed_us_equity_trading_date`], generated by it, so the
+    /// only thing that can be wrong is the index arithmetic. A sweep of a year either side of
+    /// the table's span checks the interior bit for bit AND that a date the table cannot
+    /// answer for is not aliased into it: an `index <= days` bound reads an unset bit past the
+    /// last covered date and closes the exchange on an ordinary Monday.
+    #[test]
+    fn the_trading_date_bitset_agrees_with_the_computation_it_caches() {
+        let end = NaiveDate::from_ymd_opt(2101, 1, 1).expect("sweep end");
+        let mut date = NaiveDate::from_ymd_opt(1989, 1, 1).expect("sweep start");
+        let mut open = 0usize;
+        while date < end {
+            let computed = computed_us_equity_trading_date(date);
+            assert_eq!(
+                is_us_equity_trading_date(date),
+                computed,
+                "the bitset disagrees with its own generator at {date}"
+            );
+            open += usize::from(computed);
+            date = date.succ_opt().expect("the sweep stays representable");
+        }
+        assert!(
+            open > 27_000,
+            "only {open} trading dates swept, so the sweep is broken rather than the table"
+        );
+
+        // The four dates the index arithmetic decides between, named rather than left to a
+        // loop that could skip them.
+        let table = &*TRADING_DATES;
+        let first = NaiveDate::from_ymd_opt(1990, 1, 1).expect("span start");
+        let last = first + Duration::days(table.days as i64 - 1);
+        assert_eq!(last, NaiveDate::from_ymd_opt(2099, 12, 31).expect("span end"));
+        for date in [
+            first - Duration::days(1),
+            first,
+            last,
+            last + Duration::days(1),
+        ] {
+            assert_eq!(
+                is_us_equity_trading_date(date),
+                computed_us_equity_trading_date(date),
+                "the span edge {date} must be answered exactly, not clamped"
+            );
+        }
+        // The first ordinary weekday past the span: nothing about it is closed, so only the
+        // fallthrough can produce the right answer.
+        let monday = NaiveDate::from_ymd_opt(2100, 1, 4).expect("past the span");
+        assert_eq!(monday.weekday(), Weekday::Mon);
+        assert!(
+            is_us_equity_trading_date(monday),
+            "a date past the table aliased onto an unset bit"
+        );
+
+        // And the arithmetic itself, because a one-day overrun of the span aliases only
+        // 2100-01-01 — permanently New Year's Day, permanently closed, permanently the same
+        // answer as the unset bit it would read — so no behavioural assertion can see it.
+        let index = |date: NaiveDate| usize::try_from(date.num_days_from_ce() - table.base_ce);
+        assert!(index(first - Duration::days(1)).is_err());
+        assert_eq!(index(first), Ok(0));
+        assert_eq!(index(last), Ok(table.days - 1));
+        assert_eq!(index(last + Duration::days(1)), Ok(table.days));
+    }
+
+    /// [`et_naive_local`] claims a bisected offset table reproduces chrono-tz exactly, and the
+    /// only instants a table can be wrong about are its own transitions. Every one is probed on
+    /// both sides at second and millisecond distance, in both directions.
+    ///
+    /// The comparison is `single()` because that is the call the production fallback makes, and
+    /// it is total here: a UTC instant has exactly one New York wall clock. Ambiguity belongs
+    /// to the local-to-UTC direction, which neither this function nor its callers take.
+    #[test]
+    fn the_et_offset_table_reproduces_chrono_tz_at_every_transition() {
+        let (starts, offsets) = &*ET_TRANSITIONS;
+        assert_eq!(starts.len(), offsets.len());
+        assert!(
+            starts.len() > 200,
+            "only {} transitions tabulated over 110 years",
+            starts.len()
+        );
+        let mut spring_forward = 0usize;
+        let mut fall_back = 0usize;
+        for (index, &start) in starts.iter().enumerate() {
+            for delta_ms in [-1_000i64, -1, 0, 1, 1_000] {
+                let ts_ms = start * 1_000 + delta_ms;
+                let want = New_York
+                    .timestamp_millis_opt(ts_ms)
+                    .single()
+                    .expect("a UTC instant has one New York wall clock")
+                    .naive_local();
+                assert_eq!(
+                    et_naive_local(ts_ms),
+                    want,
+                    "transition {index} at {} is wrong {delta_ms} ms in",
+                    iso_ms(start * 1_000)
+                );
+            }
+            if index == 0 {
+                continue;
+            }
+            // Non-vacuity: the wall clock really jumps an hour here, so the equality above is
+            // comparing two answers that a table off by one entry would get different.
+            let jump = (et_naive_local(start * 1_000)
+                - et_naive_local((start - 1) * 1_000))
+            .num_seconds();
+            assert_eq!(
+                (jump - 1).abs(),
+                3_600,
+                "transition {index} at {} moved the wall clock by {jump} s",
+                iso_ms(start * 1_000)
+            );
+            if jump > 0 {
+                spring_forward += 1;
+            } else {
+                fall_back += 1;
+            }
+        }
+        assert!(
+            spring_forward > 100 && fall_back > 100,
+            "{spring_forward} gaps and {fall_back} ambiguous windows probed; one direction is \
+             missing from the table"
+        );
+    }
+
+    /// `Tensor::equal` rather than a tolerance: reuse is claimed to change NOTHING, and a leak
+    /// from a previous, longer draw is not a small numeric difference. It is false for NaN even
+    /// against the same tensor, so callers assert finiteness first.
+    fn assert_batch_eq(got: &BarBatch, want: &BarBatch, what: &str) {
+        let optional = |got: &Option<Tensor>, want: &Option<Tensor>| match (got, want) {
+            (Some(got), Some(want)) => got.equal(want),
+            (None, None) => true,
+            _ => false,
+        };
+        assert!(got.dof.equal(&want.dof), "{what}: dof");
+        assert!(got.time_ids.equal(&want.time_ids), "{what}: time_ids");
+        assert!(got.sigma.equal(&want.sigma), "{what}: sigma");
+        assert!(optional(&got.raw_dof, &want.raw_dof), "{what}: raw_dof");
+        assert!(
+            optional(&got.direct_time_ids, &want.direct_time_ids),
+            "{what}: direct_time_ids"
+        );
+        assert!(
+            optional(&got.direct_valid, &want.direct_valid),
+            "{what}: direct_valid"
+        );
+        assert_eq!(
+            got.market_missing, want.market_missing,
+            "{what}: market_missing"
+        );
+    }
+
+    /// A corpus whose windows straddle the proxy's coverage hole, standardized so `raw_dof` is
+    /// staged, and carrying three future bars so the direct-forecast buffers are staged too.
+    /// Every [`BatchScratch`] field is therefore live.
+    fn scratch_fixture(label: &str) -> (Fixture, BarCorpus) {
+        let (fixture, corpus, _) = market_fixture(label);
+        (fixture, corpus.with_dof_scaling(DofScaling::VolStandardized))
+    }
+
+    /// A long draw and a SHORT one that is not a prefix of it, both straddling the proxy hole
+    /// so `market_missing` is nonzero and the staged market ids carry the reserved row.
+    fn scratch_windows(corpus: &BarCorpus) -> (Vec<WindowRef>, Vec<WindowRef>) {
+        let symbol = series_of(corpus, "AAA") as u32;
+        let refs = |bars: &[u32]| -> Vec<WindowRef> {
+            bars.iter()
+                .map(|&bar_index| WindowRef { symbol, bar_index })
+                .collect()
+        };
+        (
+            refs(&[400, 700, 900, 1_000, 1_100, 1_150, 1_180, 1_210]),
+            refs(&[1_205, 600, 1_190]),
+        )
+    }
+
+    /// The staging buffers outlive the batch that sized them, and a stage's last draw is
+    /// deliberately SHORT. Any region a draw does not fully overwrite leaks the previous
+    /// draw's values into the tensors the trunk trains on, which no shape check and no loss can
+    /// see.
+    ///
+    /// One scratch across two CONTEXTS, because that is what `BatchPrefetcher` does: it keeps a
+    /// single [`BatchScratch`] and stages every ramp stage through it. The row stride therefore
+    /// changes between draws, so an unwritten slot inherits a different row's value rather than
+    /// the same zero every time — the difference between a leak that shows and a leak that hides
+    /// behind a fixture where every draw has the same geometry.
+    #[test]
+    fn a_reused_scratch_stages_the_same_batch_as_a_fresh_one() {
+        let (_fx, corpus) = scratch_fixture("scratch_reuse");
+        let narrow = BarSampler::new_with_future(&corpus, Split::Train, 64, 3, 7);
+        let wide = BarSampler::new_with_future(&corpus, Split::Train, 96, 3, 7);
+        let (long, short) = scratch_windows(&corpus);
+
+        let fresh: Vec<BarBatch> = [
+            (&wide, &long),
+            (&narrow, &short),
+            (&narrow, &long),
+            (&wide, &short),
+        ]
+        .iter()
+        .map(|(sampler, refs)| sampler.batch_of(refs, Device::Cpu))
+        .collect();
+        assert!(
+            bool::try_from(fresh[0].dof.isfinite().all()).expect("finite"),
+            "a NaN would make every `Tensor::equal` below fail for the wrong reason"
+        );
+        assert!(
+            fresh.iter().all(|batch| batch.market_missing > 0),
+            "every draw must contain reserved market rows"
+        );
+        assert!(fresh[0].raw_dof.is_some() && fresh[0].direct_valid.is_some());
+        assert!(
+            !fresh[1]
+                .dof
+                .equal(&fresh[0].dof.narrow(0, 0, short.len() as i64).narrow(1, 0, 65)),
+            "the draws stage the same values, so a leak between them would be invisible here"
+        );
+
+        let mut scratch = narrow.scratch();
+        for (step, (sampler, refs)) in [
+            (&wide, &long),
+            (&narrow, &short),
+            (&narrow, &long),
+            (&wide, &short),
+        ]
+        .iter()
+        .enumerate()
+        {
+            let reused = sampler.batch_of_into(refs, Device::Cpu, &mut scratch);
+            assert_batch_eq(&reused, &fresh[step], &format!("draw {step} through one scratch"));
+        }
+    }
+
+    /// The pretrainer builds the CPU half of the next draw into the SAME buffers while the
+    /// current [`HostSample`] is still in flight, and only then transfers it. That is sound
+    /// only because the staged tensors OWN their data — a sample whose tensors borrowed the
+    /// scratch would be rewritten under the training thread — and it needs nothing from the
+    /// trainer: `host_batch_of_into` followed by `to_device` IS the split.
+    #[test]
+    fn a_host_sample_survives_the_next_draw_into_its_own_scratch() {
+        let (_fx, corpus) = scratch_fixture("prefetch_split");
+        let narrow = BarSampler::new_with_future(&corpus, Split::Train, 64, 3, 11);
+        let wide = BarSampler::new_with_future(&corpus, Split::Train, 96, 3, 11);
+        let (long, short) = scratch_windows(&corpus);
+        let synchronous_wide = wide.batch_of(&long, Device::Cpu);
+        let synchronous_narrow = narrow.batch_of(&short, Device::Cpu);
+
+        let mut scratch = wide.scratch();
+        let held = wide.host_batch_of_into(&long, &mut scratch);
+        // Overwrites, shrinks AND restrides the buffers `held` was staged through, exactly as
+        // the prefetch worker does one ramp stage ahead of the transfer.
+        let following = narrow.host_batch_of_into(&short, &mut scratch);
+        assert_eq!(held.market_missing, synchronous_wide.market_missing);
+        assert_batch_eq(
+            &held.to_device(Device::Cpu),
+            &synchronous_wide,
+            "a host sample transferred after the draw that followed it",
+        );
+        assert_batch_eq(
+            &following.to_device(Device::Cpu),
+            &synchronous_narrow,
+            "the follow-on draw at another context",
+        );
+    }
+
+    /// The forward cursor is an optimization of one independent bisection per bar, so it must
+    /// agree with [`MarketChannel::ids_at`] everywhere. Threaded densely across the proxy's
+    /// coverage hole and then at a stride wider than the bounded scan, so both the scan and the
+    /// suffix bisection it falls back to are exercised, along with duplicate and off-grid
+    /// timestamps and a tail past the proxy's last bar.
+    #[test]
+    fn the_monotonic_market_cursor_matches_an_independent_lookup_per_bar() {
+        let (_fx, corpus, _) = market_fixture("cursor");
+        let channel = corpus.market_channel().expect("the fixture has a proxy");
+        let bars = corpus.bars(series_of(&corpus, "AAA"));
+        // Non-decreasing rather than strictly increasing: each bar is asked twice, then once
+        // one millisecond off the grid where no proxy bar can match.
+        let dense = bars[MARKET_HOLE_START - 40..MARKET_HOLE_END + 40]
+            .iter()
+            .flat_map(|bar| [bar.ts(), bar.ts(), bar.ts() + 1]);
+        // Wider than `SCAN`, so the bounded walk is exhausted and the suffix bisection runs.
+        let sparse = bars.iter().step_by(25).map(|bar| bar.ts());
+        let tail = [bars[bars.len() - 1].ts() + RES_MS, i64::MAX / 4];
+
+        for queries in [
+            dense.chain(tail).collect::<Vec<i64>>(),
+            sparse.chain(tail).collect(),
+        ] {
+            let mut cursor = 0usize;
+            let mut missing = 0usize;
+            let mut observed = 0usize;
+            for &ts_ms in &queries {
+                let (ids, next) = channel.ids_at_from(ts_ms, cursor);
+                assert_eq!(
+                    ids,
+                    channel.ids_at(ts_ms),
+                    "the threaded cursor disagrees with an independent join at {}",
+                    iso_ms(ts_ms)
+                );
+                assert!(next >= cursor, "the cursor moved backwards at {ts_ms}");
+                cursor = next;
+                if ids[0] == MARKET_MISSING {
+                    missing += 1;
+                } else {
+                    observed += 1;
+                }
+            }
+            assert!(
+                missing > 0 && observed > 0,
+                "{observed} observed and {missing} uncovered joins; the series does not \
+                 distinguish the two outcomes"
+            );
+        }
+    }
+
+    /// The cursor is a promise, not a hint. A cursor resolved for a LATER timestamp cannot be
+    /// walked back, so the join silently reports the reserved row for a bar the proxy covers —
+    /// a wrong conditioning id rather than a crash. Hence the `debug_assert` in
+    /// [`MarketChannel::ids_at_from`]; this pins both halves, the assert where it is compiled
+    /// in and the degradation it exists to prevent where it is not.
+    #[test]
+    fn a_market_cursor_handed_a_later_timestamp_cannot_resolve_an_earlier_bar() {
+        let (_fx, corpus, _) = market_fixture("cursor_violation");
+        let channel = corpus.market_channel().expect("the fixture has a proxy");
+        let early = channel.ts_ms[100];
+        let (correct, index) = channel.ids_at_from(early, 0);
+        assert_eq!(index, 100);
+        assert_ne!(
+            correct[0], MARKET_MISSING,
+            "proxy bar 100 is observed, so the violation below has something to lose"
+        );
+
+        #[cfg(debug_assertions)]
+        assert!(
+            std::panic::catch_unwind(|| channel.ids_at_from(early, 500)).is_err(),
+            "a backwards cursor must trip the precondition assert"
+        );
+        #[cfg(not(debug_assertions))]
+        {
+            let (ids, next) = channel.ids_at_from(early, 500);
+            assert_eq!(
+                ids,
+                [MARKET_MISSING; MARKET_FEATURES],
+                "a backwards cursor cannot recover the bar it skipped past"
+            );
+            assert_eq!(next, 500, "the scan has no way to rewind");
+        }
     }
 }

@@ -290,8 +290,9 @@ pub fn r_probs(head: &BarEmissionHead, beliefs: &Tensor, conditioning: &Tensor) 
     );
     let rows = size[0];
     let zero_prefix = Tensor::zeros([rows, BAR_DOF as i64], (Kind::Int64, beliefs.device()));
-    head.logits(beliefs, conditioning, &zero_prefix)
-        .select(1, DOF_R as i64)
+    // One DOF out of five, and `r` heads the chain so its prefix block is structurally
+    // masked to zero: 5.6x fewer FLOPs in the one fp32 GEMM of the step.
+    head.logits_dof(beliefs, conditioning, &zero_prefix, DOF_R)
         .to_kind(Kind::Float)
         .softmax(-1, Kind::Float)
 }
@@ -437,6 +438,20 @@ pub fn raw_payoff_diagnostic(
     })
 }
 
+/// The `r` row taken through the FULL five-factor readout. Both sides of the drift
+/// comparison use it so the two calls are the same kernel on the same shapes.
+fn full_r_row(
+    head: &BarEmissionHead,
+    beliefs: &Tensor,
+    conditioning: &Tensor,
+    prefix: &Tensor,
+) -> Tensor {
+    head.logits(beliefs, conditioning, prefix)
+        .select(1, DOF_R as i64)
+        .to_kind(Kind::Float)
+        .softmax(-1, Kind::Float)
+}
+
 /// Prove, on the real device and the real head, that the `r` law this diagnostic reads is the
 /// head's own PREFIX-FREE row.
 ///
@@ -468,22 +483,33 @@ pub fn verify_traded_law(
     let probe =
         Tensor::linspace(-1.0, 1.0, rows * latent, (Kind::Float, device)).view([rows, latent]);
     let conditioning = Tensor::zeros_like(&probe);
-    let (probs, drift) = tch::no_grad(|| {
+    let (probs, drift, fast_path_gap) = tch::no_grad(|| {
         let probs = r_probs(head, &probe, &conditioning);
+        // The lookahead question is about the HEAD, so both sides of it go through the same
+        // full readout: identical shapes, identical kernel, so a zero difference is a
+        // guarantee rather than a cuBLAS blocking coincidence. `r_probs` takes the narrowed
+        // single-DOF path, whose N and K differ, so it agrees only up to a reassociation of
+        // the `in_features` reduction and is checked separately below.
+        let zero_prefix = Tensor::zeros([rows, BAR_DOF as i64], (Kind::Int64, device));
+        let baseline = full_r_row(head, &probe, &conditioning, &zero_prefix);
+        let fast_path_gap = (&baseline - &probs).abs().max().double_value(&[]);
         // Every prefix slot filled with the same non-zero bin. If any of them could reach
         // the `r` row, this moves it.
         let mut drift = 0.0f64;
         for bin in [1i64, NUM_BAR_BINS / 2, NUM_BAR_BINS - 1] {
             let prefix = Tensor::full([rows, BAR_DOF as i64], bin, (Kind::Int64, device));
-            let row = head
-                .logits(&probe, &conditioning, &prefix)
-                .select(1, DOF_R as i64)
-                .to_kind(Kind::Float)
-                .softmax(-1, Kind::Float);
-            drift = drift.max((&row - &probs).abs().max().double_value(&[]));
+            let row = full_r_row(head, &probe, &conditioning, &prefix);
+            drift = drift.max((&row - &baseline).abs().max().double_value(&[]));
         }
-        (probs, drift)
+        (probs, drift, fast_path_gap)
     });
+
+    ensure!(
+        fast_path_gap < 1e-5,
+        "the single-DOF r readout disagrees with the full readout by {fast_path_gap:.3e}, \
+         which is far past the reassociation of one {latent}-wide reduction, so the narrowed \
+         weight slice is not the r block"
+    );
 
     ensure!(
         drift == 0.0,

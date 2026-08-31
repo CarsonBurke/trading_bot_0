@@ -3,10 +3,13 @@
 //! norm preservation, and AdamW for non-matrix params.
 
 use std::collections::{HashMap, HashSet};
+use std::env;
 use std::path::Path;
 
 use anyhow::{ensure, Context, Result};
 use tch::{Device, Kind, Tensor};
+
+use crate::torch::cuda::graph::{CudaGraph, CudaGraphPool};
 
 const NS_A: f64 = 3.4445;
 const NS_B: f64 = -4.7750;
@@ -159,6 +162,18 @@ pub struct MuonConfig {
     /// matrices. Disabled by default; the disabled branch allocates no controller
     /// tensors and leaves the existing optimizer arithmetic untouched.
     pub row_learned_lr: bool,
+    /// Whether this optimizer's primary step is ELIGIBLE for CUDA-graph capture. See
+    /// [`Muon::try_graph_step`]; eligibility is necessary, not sufficient — the device,
+    /// the routing and `PRETRAIN_CUDA_GRAPHS` all still get a veto.
+    ///
+    /// Default `false`, and the pretraining optimizer is the one caller that sets it.
+    /// That step is what `PRETRAIN_CUDA_GRAPHS` is named for and the only one on which
+    /// capture has been measured or validated, so eligibility is opt-in: a new caller
+    /// that says nothing gets the eager step rather than silently inheriting an
+    /// unvalidated fast path. The PPO update in particular could not take it — it runs
+    /// its own capture (`PpoUpdateCudaGraph`) and its critic-only warmup leaves the actor
+    /// without gradients for whole episodes.
+    pub capture_step_graphs: bool,
 }
 
 impl Default for MuonConfig {
@@ -190,6 +205,7 @@ impl Default for MuonConfig {
             adamw_beta_overrides: Vec::new(),
             adamw_weight_decay_multipliers: Vec::new(),
             row_learned_lr: false,
+            capture_step_graphs: false,
         }
     }
 }
@@ -222,11 +238,14 @@ enum OrthoLayout {
     ColHeads { heads: i64, head_dim: i64 },
 }
 
-/// Per-2D-param state. Each 2D param holds its own momentum.
-/// We deliberately do *not* stack same-shape params into a batched state tensor:
-/// the N× VRAM multiplier from batching NS5's intermediates dwarfs any step-time
-/// savings on realistic models. Keeping state per-param caps NS5's peak working
-/// set at a single [m, n] matrix's worth of transients.
+/// Per-2D-param state.
+///
+/// `momentum` and `second_momentum` are the tensors the rest of this file operates
+/// on: the per-parameter step, the checkpoint sidecar, the footprint accounting and
+/// the tests. When the parameter belongs to a [`Group2D`] they are `select(0, slot)`
+/// VIEWS into that group's stacked buffer instead of standalone allocations, which is
+/// what makes the batched step and the per-parameter step two ways of advancing the
+/// same state rather than two states.
 struct Entry2D {
     idx: usize,
     layout: OrthoLayout,
@@ -238,6 +257,10 @@ struct Entry2D {
     /// Kept in fp32 regardless of param dtype: an EMA at gain (1-beta2)=0.05 in
     /// bf16 silently stalls because small increments round to zero.
     second_momentum: Tensor,
+    /// `max(1, rows/cols).sqrt()` for the registered shape and layout. Precomputed so
+    /// a step can resolve every effective learning rate on the host before it issues
+    /// its first kernel.
+    aspect_scale: f64,
     /// Allocated only when `row_learned_lr` is enabled.
     row_lr: Option<RowLrState>,
 }
@@ -288,10 +311,330 @@ struct AdamWParamState {
     step_count: i64,
 }
 
+/// Static per-parameter AdamW routing, resolved once from the name-fragment tables.
+///
+/// Every step used to rescan those tables for every AdamW parameter, which for the
+/// pretrain split is over a thousand substring searches per step for an answer that
+/// cannot change after construction.
+struct AdamWSettings {
+    betas: (f64, f64),
+    /// `None` when the parameter is excluded from decoupled weight decay.
+    weight_decay_mul: Option<f64>,
+}
+
+impl AdamWSettings {
+    fn resolve(name: &str, cfg: &MuonConfig) -> Self {
+        let betas = cfg
+            .adamw_beta_overrides
+            .iter()
+            .find(|(needle, _)| name.contains(needle.as_str()))
+            .map_or(cfg.adamw_betas, |(_, betas)| *betas);
+        let excluded = cfg
+            .adamw_no_weight_decay_name_substrings
+            .iter()
+            .any(|needle| name.contains(needle));
+        let weight_decay_mul = (!excluded).then(|| {
+            cfg.adamw_weight_decay_multipliers
+                .iter()
+                .find(|(needle, _)| name.contains(needle.as_str()))
+                .map_or(1.0, |(_, mul)| *mul)
+        });
+        Self {
+            betas,
+            weight_decay_mul,
+        }
+    }
+}
+
+/// NorMuon parameters that share a shape, dtype, device and the plain `Matrix`
+/// orthogonalizer layout, stepped as one batched kernel sequence.
+///
+/// This reverses an earlier decision not to stack same-shape parameters, on two
+/// counts. The first is launch count: a 10-layer transformer holds ten identically
+/// shaped copies of every projection bank, so the ~50-kernel chain per matrix —
+/// momentum lerp, five quintic iterations of three matmuls each, the second-moment
+/// rescale, the decay and the apply — ran ten times over. The second, and larger, is
+/// that those matmuls are far too small to fill the device: one [512,512]x[512,2048]
+/// bf16 `bmm` covers 64 128x128 output tiles on 170 SMs, so most of the machine idles
+/// for the whole iteration, and the [512,512]x[512,512] one covers 16. Batching ten
+/// of them fills 640 and 160 tiles instead.
+///
+/// The cost is the stacked gradient: parameter gradients are separate autograd
+/// allocations, so each group gathers its members into one contiguous [G, m, n] tensor
+/// per step. Across all 43 NorMuon matrices of the pretrain trunk that is ~126 MB
+/// read plus ~126 MB written, roughly 180 us of bandwidth against several
+/// milliseconds of matmul and dispatch time. Momentum and the second moment are NOT
+/// gathered: the group owns them stacked and hands each member a view, so they cost
+/// nothing per step.
+///
+/// Learning rate, weight decay and the aspect scale never enter the batched region.
+/// They appear only in the per-parameter decay/apply tail, which reads `lr_scales` one
+/// parameter at a time exactly as it always has. That is why this key is purely
+/// structural: no later `set_named_lr_scale` can make a group wrong.
+struct Group2D {
+    /// Indices into `entries_2d`, in registration order.
+    entries: Vec<usize>,
+    /// `[G, m, n]`, owner of every member's momentum view.
+    momentum: Tensor,
+    /// `[G, ..]`, owner of every member's second-moment view.
+    second_momentum: Tensor,
+}
+
+/// Cap on a group's stacked parameter bytes.
+///
+/// The batched region holds the bf16 iterate, two bf16 Gram matrices and the fp32
+/// rescale transients at once, so its peak is a small multiple of the stacked bytes
+/// rather than of one matrix's; this bounds that peak. It also makes the batching
+/// self-selecting: matrices small enough to leave the device idle group deeply,
+/// matrices already large enough to saturate it group shallowly or not at all, which
+/// is exactly where each behaviour is wanted.
+///
+/// 64 MiB admits the whole of a 10-layer 512-wide transformer's largest family (ten
+/// fp32 [512, 2048] copies is 40 MiB) with room to spare, at a transient peak in the
+/// low hundreds of megabytes.
+const GROUP_STACK_BYTES_LIMIT: usize = 64 << 20;
+
+/// One host scalar the step's kernels consume, in whichever form the current path
+/// needs.
+///
+/// `Host` passes an ATen `Scalar` argument, which is bit-for-bit what this optimizer
+/// has always issued. `Device` passes a persistent 0-dim tensor, and that is the whole
+/// reason a captured CUDA graph can follow the learning-rate and momentum schedules:
+/// capture records a kernel's ARGUMENTS, so a scheduled `Scalar` would be frozen at
+/// whatever the capture step happened to hold — a silent, invisible freeze of the
+/// entire schedule. A tensor operand records an ADDRESS instead, and the host rewrites
+/// its contents before every replay.
+enum StepScalar {
+    Host(f64),
+    Device(Tensor),
+}
+
+impl StepScalar {
+    fn mul(&self, tensor: &Tensor) -> Tensor {
+        match self {
+            Self::Host(value) => tensor.g_mul_scalar(*value),
+            Self::Device(value) => tensor.g_mul(value),
+        }
+    }
+
+    fn mul_(&self, tensor: &mut Tensor) {
+        match self {
+            Self::Host(value) => {
+                let _ = tensor.g_mul_scalar_(*value);
+            }
+            Self::Device(value) => {
+                let _ = tensor.g_mul_(value);
+            }
+        }
+    }
+
+    fn lerp_(&self, tensor: &mut Tensor, end: &Tensor) {
+        match self {
+            Self::Host(value) => {
+                let _ = tensor.lerp_(end, *value);
+            }
+            Self::Device(value) => {
+                let _ = tensor.lerp_tensor_(end, value);
+            }
+        }
+    }
+
+    fn lerp(&self, start: &Tensor, end: &Tensor) -> Tensor {
+        match self {
+            Self::Host(value) => start.lerp(end, *value),
+            Self::Device(value) => start.lerp_tensor(end, value),
+        }
+    }
+}
+
+/// Every scheduled scalar one step needs, resolved once per step, for both paths, out
+/// of the same host arithmetic.
+struct StepScalars {
+    /// NorMuon first-moment lerp weight, `1 - momentum`.
+    normuon_lerp: StepScalar,
+    /// Nesterov lerp weight, `momentum`.
+    nesterov: StepScalar,
+    /// Per `entries_2d` entry: `-(lr * lr_scale * aspect_scale)`.
+    normuon_step: Vec<StepScalar>,
+    /// Per `entries_2d` entry: the decay factor in the form the configured mask needs,
+    /// `decay` when cautious and `1 - decay` otherwise. `None` omits the decay.
+    normuon_decay: Vec<Option<StepScalar>>,
+    /// Per `adamw_indices` position: `-lr * lr_scale / bias_correction1`.
+    adamw_step: Vec<StepScalar>,
+    /// Per `adamw_indices` position: `1 / sqrt(bias_correction2)`.
+    adamw_inv_bc2_sqrt: Vec<StepScalar>,
+    /// Per `adamw_indices` position, same convention as `normuon_decay`.
+    adamw_decay: Vec<Option<StepScalar>>,
+}
+
+const SLOT_NORMUON_LERP: usize = 0;
+const SLOT_NESTEROV: usize = 1;
+const SHARED_SLOT_COUNT: usize = 2;
+const NORMUON_SLOTS_PER_ENTRY: usize = 2;
+const ADAMW_SLOTS_PER_PARAM: usize = 3;
+
+/// Device-resident mirrors of every scheduled scalar, packed into one tensor.
+///
+/// One slot per (parameter, role), not one per distinct value: a refresh is a single
+/// host-to-device copy of a couple of kilobytes, so the slot count is free, and a
+/// fixed slot per role removes any possibility of two roles sharing a slot on one step
+/// and not the next, which would silently corrupt a replay.
+struct StepScalarPack {
+    /// `[slots]`, in the parameter dtype, on the parameter device.
+    values: Tensor,
+    /// One 0-dim view per slot, materialized once. Capture records these addresses, so
+    /// they have to outlive every replay.
+    slots: Vec<Tensor>,
+    /// Host staging buffer, rewritten in full every step. `f64` so the copy's
+    /// narrowing to the parameter dtype is the same rounding ATen applies to a
+    /// `Scalar` argument.
+    host: Vec<f64>,
+}
+
+impl StepScalarPack {
+    fn new(entries: usize, adamw: usize, kind: Kind, device: Device) -> Self {
+        let count =
+            SHARED_SLOT_COUNT + entries * NORMUON_SLOTS_PER_ENTRY + adamw * ADAMW_SLOTS_PER_PARAM;
+        let values = Tensor::zeros([count as i64], (kind, device));
+        let slots = (0..count as i64)
+            .map(|slot| values.select(0, slot))
+            .collect();
+        Self {
+            values,
+            slots,
+            host: vec![0.0; count],
+        }
+    }
+
+    fn set(&mut self, slot: usize, value: f64) -> StepScalar {
+        self.host[slot] = value;
+        StepScalar::Device(self.slots[slot].shallow_clone())
+    }
+
+    /// Publish this step's schedule. Issued on the default stream, which the graph's
+    /// stream scope then orders itself after, so the replay reads what was just written.
+    ///
+    /// ATen makes a copy out of pageable host memory stream-synchronizing, so this is
+    /// also a host wait on the outstanding backward. That is why the pack exists only on
+    /// the graph path: it buys the elimination of every launch in the step, and the
+    /// fallback step keeps issuing `Scalar` arguments with no host-to-device traffic at
+    /// all.
+    fn upload(&self) {
+        let mut values = self.values.shallow_clone();
+        values.copy_(&Tensor::from_slice(&self.host));
+    }
+}
+
+/// Warmup steps issued on the capture stream before capture. cuBLAS algorithm
+/// selection and the caching allocator need a few iterations to reach steady state.
+/// One optimizer step per training step is the only warmup shape available here:
+/// `PpoUpdateCudaGraph` can run its body three times inside one call because that body
+/// only computes gradients, whereas this one mutates parameters.
+const GRAPH_WARMUP_STEPS: usize = 3;
+
+/// How many times one run may capture its optimizer step before giving up on graphs.
+///
+/// Each arm mints a private mempool holding that capture's transient working set, and
+/// those blocks are retained for the process's life, so the count is a VRAM multiplier.
+/// Three admits the arming this design actually expects - the first capture, plus a
+/// re-arm after a routing setter and after a checkpoint load - and refuses a run that has
+/// started churning.
+const MAX_STEP_GRAPH_ARMS: usize = 3;
+
+#[derive(Clone, Copy)]
+enum GraphSlotState {
+    Warmup(usize),
+    ReadyToCapture,
+    Captured,
+}
+
+/// What a primary step's captured-graph attempt did to the update.
+enum GraphStepOutcome {
+    /// No graph was available. The caller runs the eager step.
+    Fallback,
+    /// The captured body ran and the update is applied.
+    Applied,
+    /// A capture or replay failed part-way through the update, so the step is neither
+    /// applied nor safe to re-run. Anything it would have consumed stays where it is.
+    Forfeited,
+}
+
+/// One captured optimizer body.
+struct StepGraph {
+    graph: CudaGraph,
+    state: GraphSlotState,
+    /// What this body was RECORDED reading, empty until it was. Checked before every
+    /// replay. See [`Muon::step_participation`].
+    participation: Vec<Option<usize>>,
+}
+
+impl StepGraph {
+    fn new(graph: CudaGraph) -> Self {
+        Self {
+            graph,
+            state: GraphSlotState::Warmup(GRAPH_WARMUP_STEPS),
+            participation: Vec::new(),
+        }
+    }
+}
+
+/// `adamw_every` gives the step exactly two shapes — NorMuon alone, and NorMuon
+/// followed by AdamW — so each gets its own graph and the host picks between them on
+/// the step counter.
+///
+/// That cadence and the stepped-parameter set are the step's only data-dependent host
+/// control flow. The cadence is a fixed function of the step counter, so each of its two
+/// values gets a body; the parameter set is not, so it is recorded per body and checked
+/// before every replay. Everything else that varies per step is a scalar, and every
+/// scalar lives in `scalars`.
+struct MuonStepGraphs {
+    normuon_only: StepGraph,
+    with_adamw: StepGraph,
+    scalars: StepScalarPack,
+}
+
+/// Boxed because it starts dormant: the graphs arm lazily, on the first primary step,
+/// once both the environment and the parameters' device are known.
+enum StepGraphState {
+    Unarmed,
+    Disabled,
+    Armed(Box<MuonStepGraphs>),
+}
+
+/// Why a step cannot be captured, and whether anything about the run could change it.
+struct StepGraphBlocker {
+    reason: String,
+    /// Set when the obstacle is a property of the build, the machine, or the model's
+    /// routing rather than a choice: with capture on by default, a run that lands on
+    /// one of those has nothing to act on and no reason to be told.
+    inherent: bool,
+}
+
+impl StepGraphBlocker {
+    fn inherent(reason: impl Into<String>) -> Self {
+        Self {
+            reason: reason.into(),
+            inherent: true,
+        }
+    }
+
+    fn actionable(reason: impl Into<String>) -> Self {
+        Self {
+            reason: reason.into(),
+            inherent: false,
+        }
+    }
+}
+
 pub struct Muon {
     cfg: MuonConfig,
     entries_2d: Vec<Entry2D>,
+    /// `entries_2d` positions batched together, in group order. Built once, at
+    /// construction, from registered shapes alone.
+    groups_2d: Vec<Group2D>,
     adamw_indices: Vec<usize>,
+    /// [`AdamWSettings`] per `adamw_indices` position.
+    adamw_settings: Vec<AdamWSettings>,
     adamw_state: HashMap<usize, AdamWParamState>,
     /// Count of PRIMARY optimization steps. Auxiliary steps deliberately do not advance
     /// it: it is both the AdamW cadence clock and the step ledger a checkpoint's metadata
@@ -317,6 +660,11 @@ pub struct Muon {
     /// observed at least one routed matrix gradient. Kept device-resident so the
     /// pretrainer can fold it into its existing single metrics transfer.
     row_lr_metrics: Option<Tensor>,
+    /// Captured optimizer bodies. Armed on the first CUDA primary step of an optimizer
+    /// whose [`MuonConfig::capture_step_graphs`] is set, unless `PRETRAIN_CUDA_GRAPHS=0`.
+    step_graphs: StepGraphState,
+    /// Arms performed, against [`MAX_STEP_GRAPH_ARMS`]. Counts the retained mempools.
+    step_graph_arms: usize,
 }
 
 /// Single-matrix quintic orthogonalization.
@@ -376,10 +724,12 @@ fn batched_quintic_orthogonalize(g: &Tensor, orth: Orthogonalizer, ns_steps: usi
     } else {
         g.to_kind(Kind::BFloat16)
     };
+    // `norm()`, which the per-parameter path uses, accumulates in fp32 and rounds once.
+    // A `square().sum(.., BFloat16)` would round the sum of squares BEFORE the sqrt, and at
+    // a sum of ~2.6e5 the bf16 spacing is 1024: 0.2% on the divisor the whole quintic is
+    // normalized by. `norm.ScalarOpt_dim` is the same fp32-accumulated reduction, per slot.
     let nrm = prescale_divisor(
-        &x3d.square()
-            .sum_dim_intlist([-2i64, -1].as_slice(), true, Kind::BFloat16)
-            .sqrt(),
+        &x3d.norm_scalaropt_dim(2, [-2i64, -1].as_slice(), true),
         orth,
     );
     let x3d = &x3d / &nrm;
@@ -628,6 +978,17 @@ fn normuon_rescale(update: &Tensor, second_momentum: &mut Tensor, beta2: f64) ->
     update * &scale
 }
 
+/// The per-matrix `max(1, rows/cols).sqrt()` learning-rate factor, derived from the
+/// registered shape and layout alone.
+fn ortho_aspect_scale(size: &[i64], layout: OrthoLayout) -> f64 {
+    let (rows, cols) = match layout {
+        OrthoLayout::Matrix => (size[0], size[1]),
+        OrthoLayout::RowHeads { head_dim, .. } => (head_dim, size[1]),
+        OrthoLayout::ColHeads { head_dim, .. } => (size[0], head_dim),
+    };
+    (1.0_f64).max(rows as f64 / cols as f64).sqrt()
+}
+
 fn normuon_transform(
     update: &Tensor,
     layout: OrthoLayout,
@@ -635,22 +996,18 @@ fn normuon_transform(
     beta2: f64,
     orth: Orthogonalizer,
     ns_steps: usize,
-) -> (Tensor, f64) {
+) -> Tensor {
     match layout {
         OrthoLayout::Matrix => {
             let update = quintic_orthogonalize(update, orth, ns_steps);
-            let update = normuon_rescale(&update, second_momentum, beta2);
-            let size = update.size();
-            let aspect_scale = (1.0_f64).max(size[0] as f64 / size[1] as f64).sqrt();
-            (update, aspect_scale)
+            normuon_rescale(&update, second_momentum, beta2)
         }
         OrthoLayout::RowHeads { heads, head_dim } => {
             let cols = update.size()[1];
             let blocks = update.reshape([heads, head_dim, cols]);
             let blocks = batched_quintic_orthogonalize(&blocks, orth, ns_steps);
             let blocks = normuon_rescale(&blocks, second_momentum, beta2);
-            let aspect_scale = (1.0_f64).max(head_dim as f64 / cols as f64).sqrt();
-            (blocks.reshape(update.size().as_slice()), aspect_scale)
+            blocks.reshape(update.size().as_slice())
         }
         OrthoLayout::ColHeads { heads, head_dim } => {
             let rows = update.size()[0];
@@ -660,14 +1017,113 @@ fn normuon_transform(
                 .contiguous();
             let blocks = batched_quintic_orthogonalize(&blocks, orth, ns_steps);
             let blocks = normuon_rescale(&blocks, second_momentum, beta2);
-            let aspect_scale = (1.0_f64).max(rows as f64 / head_dim as f64).sqrt();
-            let update = blocks
+            blocks
                 .permute([1, 0, 2])
                 .contiguous()
-                .reshape(update.size().as_slice());
-            (update, aspect_scale)
+                .reshape(update.size().as_slice())
         }
     }
+}
+
+/// Decoupled weight decay and then the update itself, both reading the pre-step
+/// parameter so the composition is `p - decay*p - lr*u`. Returns the signed
+/// gradient-only delta, which is the row-learned-rate controller's credit tensor.
+///
+/// Shared verbatim by the batched and the per-parameter path. The only difference
+/// between them is whether `update` is a slice of a group's stacked update.
+fn apply_normuon_update(
+    p: &mut Tensor,
+    update: &Tensor,
+    step: &StepScalar,
+    decay: Option<&StepScalar>,
+    cautious: bool,
+) -> Tensor {
+    if let Some(decay) = decay {
+        if cautious {
+            let keep = decay.mul(&(update * &*p).ge(0).to_kind(p.kind()));
+            let decayed = &*p * keep;
+            let _ = p.g_sub_(&decayed);
+        } else {
+            decay.mul_(p);
+        }
+    }
+    let signed_delta = step.mul(update);
+    let _ = p.g_add_(&signed_delta);
+    signed_delta
+}
+
+/// Partition the `Matrix`-layout NorMuon entries into batched groups and rewire each
+/// member's state onto a slice of its group's stacked buffers. Runs once, at
+/// construction, off nothing but registered shapes.
+///
+/// Entries carrying a row-learned-rate controller are left ungrouped: that controller
+/// normalizes its evidence over one parameter's rows and keeps a per-parameter credit
+/// tensor, so batching it would have to reproduce both per slice before it could be
+/// called equivalent.
+fn group_entries_2d(entries: &mut [Entry2D], params: &[Tensor]) -> Vec<Group2D> {
+    struct Candidate {
+        size: Vec<i64>,
+        kind: Kind,
+        device: Device,
+        members: Vec<usize>,
+    }
+    let mut candidates: Vec<Candidate> = Vec::new();
+    for (position, entry) in entries.iter().enumerate() {
+        if entry.layout != OrthoLayout::Matrix || entry.row_lr.is_some() {
+            continue;
+        }
+        let param = &params[entry.idx];
+        let (size, kind, device) = (param.size(), param.kind(), param.device());
+        match candidates
+            .iter_mut()
+            .find(|c| c.size == size && c.kind == kind && c.device == device)
+        {
+            Some(candidate) => candidate.members.push(position),
+            None => candidates.push(Candidate {
+                size,
+                kind,
+                device,
+                members: vec![position],
+            }),
+        }
+    }
+
+    let mut groups = Vec::new();
+    for candidate in candidates {
+        let elements: i64 = candidate.size.iter().product();
+        let bytes = elements as usize * candidate.kind.elt_size_in_bytes();
+        let cap = (GROUP_STACK_BYTES_LIMIT / bytes.max(1)).max(1);
+        for chunk in candidate.members.chunks(cap) {
+            if chunk.len() < 2 {
+                continue;
+            }
+            let count = chunk.len() as i64;
+            let stacked = |shape: &[i64]| {
+                let mut batched = Vec::with_capacity(shape.len() + 1);
+                batched.push(count);
+                batched.extend_from_slice(shape);
+                batched
+            };
+            let momentum = Tensor::zeros(
+                stacked(&candidate.size).as_slice(),
+                (candidate.kind, candidate.device),
+            );
+            let second_momentum = Tensor::zeros(
+                stacked(&second_momentum_shape(&candidate.size, OrthoLayout::Matrix)).as_slice(),
+                (Kind::Float, candidate.device),
+            );
+            for (slot, &position) in chunk.iter().enumerate() {
+                entries[position].momentum = momentum.select(0, slot as i64);
+                entries[position].second_momentum = second_momentum.select(0, slot as i64);
+            }
+            groups.push(Group2D {
+                entries: chunk.to_vec(),
+                momentum,
+                second_momentum,
+            });
+        }
+    }
+    groups
 }
 
 impl RowLrState {
@@ -854,12 +1310,18 @@ impl Muon {
                         second_momentum_shape(&size, layout).as_slice(),
                         (Kind::Float, device),
                     ),
+                    aspect_scale: ortho_aspect_scale(&size, layout),
                     row_lr: cfg.row_learned_lr.then(|| RowLrState::new(m, n, device)),
                 });
             } else {
                 adamw_indices.push(i);
             }
         }
+        let groups_2d = group_entries_2d(&mut entries_2d, &params);
+        let adamw_settings: Vec<AdamWSettings> = adamw_indices
+            .iter()
+            .map(|&idx| AdamWSettings::resolve(&names[idx], &cfg))
+            .collect();
 
         if !cfg.quiet {
             if cfg.use_muon_for_2d {
@@ -878,6 +1340,14 @@ impl Muon {
                         head_ortho, cfg.attention_head_dim, cfg.cross_attention_head_dim
                     );
                 }
+                let batched: usize = groups_2d.iter().map(|group| group.entries.len()).sum();
+                if batched > 0 {
+                    println!(
+                        "  batched NorMuon groups: {} params in {} group(s) of identical shape",
+                        batched,
+                        groups_2d.len()
+                    );
+                }
             } else {
                 println!(
                     "AdamW optimizer: {} params (Muon disabled for root-cause logging)",
@@ -889,7 +1359,9 @@ impl Muon {
         Self {
             cfg,
             entries_2d,
+            groups_2d,
             adamw_indices,
+            adamw_settings,
             adamw_state: HashMap::new(),
             step_count: 0,
             params,
@@ -897,6 +1369,8 @@ impl Muon {
             step_enabled: vec![true; names.len()],
             adamw_pending_grads: false,
             row_lr_metrics: None,
+            step_graphs: StepGraphState::Unarmed,
+            step_graph_arms: 0,
             names,
         }
     }
@@ -925,45 +1399,533 @@ impl Muon {
     pub fn step(&mut self, kind: StepKind) {
         tch::no_grad(|| {
             let primary = kind == StepKind::Primary;
-            let do_adamw = if primary {
-                self.step_count += 1;
-                self.step_count % (self.cfg.adamw_every.max(1) as i64) == 0
+            let do_adamw = self.begin_step(primary);
+            let applied = match if primary {
+                self.try_graph_step(do_adamw)
             } else {
-                false
+                GraphStepOutcome::Fallback
+            } {
+                GraphStepOutcome::Fallback => {
+                    let scalars = self.resolve_step_scalars(None);
+                    self.step_all_normuon(primary, &scalars);
+                    if do_adamw {
+                        self.step_all_adamw(&scalars);
+                    }
+                    true
+                }
+                GraphStepOutcome::Applied => true,
+                GraphStepOutcome::Forfeited => false,
             };
-            self.step_all_normuon(primary);
-            if do_adamw {
-                self.step_all_adamw();
-            }
-            self.adamw_pending_grads = !do_adamw;
+            // AdamW's retained gradient is released only once an update has consumed it.
+            // A forfeited step consumed nothing, so the accumulation carries into the next
+            // one rather than being thrown away: the cadence's whole point is that the
+            // gradient survives the steps that do not spend it.
+            self.adamw_pending_grads = !(do_adamw && applied);
         });
     }
 
-    fn step_all_normuon(&mut self, primary: bool) {
-        let beta1 = self.cfg.momentum;
-        let beta2 = self.cfg.beta2;
-        let nesterov = self.cfg.nesterov;
-        let wd = self.cfg.weight_decay;
-        let base_lr = self.cfg.lr;
-        let orth = self.cfg.orthogonalizer;
-        let quadratic = self.cfg.quadratic_lr_weight_decay;
-        let cautious = self.cfg.cautious_weight_decay;
-        let mut row_lr_metrics = RowLrMetricAccumulator::default();
+    /// Advance this step's host-side clocks and report whether AdamW runs.
+    ///
+    /// The AdamW moment clocks are advanced here rather than inside the update because
+    /// the bias corrections they feed are host scalars: a captured graph cannot
+    /// recompute them, and both paths must derive them from the same place.
+    fn begin_step(&mut self, primary: bool) -> bool {
+        let do_adamw = if primary {
+            self.step_count += 1;
+            self.step_count % (self.cfg.adamw_every.max(1) as i64) == 0
+        } else {
+            false
+        };
+        if do_adamw {
+            self.advance_adamw_clocks();
+        }
+        do_adamw
+    }
 
-        for entry in &mut self.entries_2d {
-            if !self.step_enabled[entry.idx] {
+    /// Advance the moment clock of, and materialize the lazy moments for, exactly the
+    /// AdamW parameters this step will update.
+    fn advance_adamw_clocks(&mut self) {
+        for position in 0..self.adamw_indices.len() {
+            let idx = self.adamw_indices[position];
+            if !self.step_enabled[idx] {
                 continue;
             }
-            let grad = self.params[entry.idx].grad();
+            let grad = self.params[idx].grad();
             if !grad.defined() {
                 continue;
             }
+            let state = self
+                .adamw_state
+                .entry(idx)
+                .or_insert_with(|| AdamWParamState {
+                    m: Tensor::zeros_like(&grad),
+                    v: Tensor::zeros_like(&grad),
+                    step_count: 0,
+                });
+            state.step_count += 1;
+        }
+    }
+
+    /// Resolve every scheduled scalar this step needs, once.
+    ///
+    /// With `pack`, each one is written into a device-resident slot and handed back as
+    /// a handle to that slot, which is what lets a captured graph follow the schedule.
+    /// Without it they stay ATen `Scalar` arguments, bit-for-bit what this optimizer
+    /// has always issued. Both forms come out of the same host arithmetic, so the
+    /// graphed and the eager step cannot drift apart.
+    fn resolve_step_scalars(&self, pack: Option<&mut StepScalarPack>) -> StepScalars {
+        let mut pack = pack;
+        let mut take = |slot: usize, value: f64| match pack.as_deref_mut() {
+            Some(pack) => pack.set(slot, value),
+            None => StepScalar::Host(value),
+        };
+        let base_lr = self.cfg.lr;
+        let wd = self.cfg.weight_decay;
+        let cautious = self.cfg.cautious_weight_decay;
+        let quadratic = self.cfg.quadratic_lr_weight_decay;
+        let normuon_lerp = take(SLOT_NORMUON_LERP, 1.0 - self.cfg.momentum);
+        let nesterov = take(SLOT_NESTEROV, self.cfg.momentum);
+        let mut normuon_step = Vec::with_capacity(self.entries_2d.len());
+        let mut normuon_decay = Vec::with_capacity(self.entries_2d.len());
+        for (position, entry) in self.entries_2d.iter().enumerate() {
+            let slot = SHARED_SLOT_COUNT + position * NORMUON_SLOTS_PER_ENTRY;
             let lr = base_lr * self.lr_scales[entry.idx];
+            let eff_lr = lr * entry.aspect_scale;
+            let decay = if quadratic {
+                wd * base_lr * eff_lr
+            } else {
+                wd * lr
+            };
+            normuon_step.push(take(slot, -eff_lr));
+            // Whether the decay runs keys off the configured `weight_decay`, never off
+            // this step's learning rate: a captured body cannot drop kernels when the
+            // schedule anneals, and it does not need to, because a zero decay leaves
+            // both `p * 1` and `p - p * 0` exact.
+            normuon_decay.push(
+                (wd > 0.0).then(|| take(slot + 1, if cautious { decay } else { 1.0 - decay })),
+            );
+        }
+        let adamw_wd = self.cfg.adamw_wd;
+        let adamw_base = self.adamw_slot_base();
+        let mut adamw_step = Vec::with_capacity(self.adamw_indices.len());
+        let mut adamw_inv_bc2_sqrt = Vec::with_capacity(self.adamw_indices.len());
+        let mut adamw_decay = Vec::with_capacity(self.adamw_indices.len());
+        for (position, &idx) in self.adamw_indices.iter().enumerate() {
+            let slot = adamw_base + position * ADAMW_SLOTS_PER_PARAM;
+            let lr = self.cfg.adamw_lr * self.lr_scales[idx];
+            let settings = &self.adamw_settings[position];
+            let (beta1, beta2) = settings.betas;
+            // The clamp only covers parameters this step does not touch, whose slots
+            // exist to keep the layout fixed and are never read.
+            let count = self
+                .adamw_state
+                .get(&idx)
+                .map_or(0, |state| state.step_count)
+                .max(1) as i32;
+            let bc1 = 1.0 - beta1.powi(count);
+            let bc2 = 1.0 - beta2.powi(count);
+            adamw_step.push(take(slot, -lr / bc1));
+            adamw_inv_bc2_sqrt.push(take(slot + 1, 1.0 / bc2.sqrt()));
+            let decay_mul = settings.weight_decay_mul.filter(|_| adamw_wd > 0.0);
+            adamw_decay.push(decay_mul.map(|wd_mul| {
+                let decay = if quadratic {
+                    lr * lr * adamw_wd * wd_mul
+                } else {
+                    lr * adamw_wd * wd_mul
+                };
+                take(slot + 2, if cautious { decay } else { 1.0 - decay })
+            }));
+        }
+        StepScalars {
+            normuon_lerp,
+            nesterov,
+            normuon_step,
+            normuon_decay,
+            adamw_step,
+            adamw_inv_bc2_sqrt,
+            adamw_decay,
+        }
+    }
+
+    /// Resolve this step's schedule into `pack`'s device slots and publish it, returning
+    /// the handles the body must read.
+    ///
+    /// The two halves belong together and in this order: the slots have to hold this
+    /// step's values before any kernel that reads them is issued, and a captured body
+    /// reads them at replay rather than at capture. Kept in one place so that the CPU
+    /// test of the device-scalar arithmetic exercises the production ordering instead of
+    /// restating it.
+    fn publish_step_scalars(&self, pack: &mut StepScalarPack) -> StepScalars {
+        let scalars = self.resolve_step_scalars(Some(pack));
+        pack.upload();
+        scalars
+    }
+
+    /// First [`StepScalarPack`] slot belonging to the AdamW branch.
+    fn adamw_slot_base(&self) -> usize {
+        SHARED_SLOT_COUNT + self.entries_2d.len() * NORMUON_SLOTS_PER_ENTRY
+    }
+
+    /// Run one primary step out of a captured CUDA graph.
+    ///
+    /// On wherever capture is possible for an eligible optimizer, matching the
+    /// `PPO_CUDA_GRAPHS` convention that the fast path is the default and `=0` opts out.
+    /// Every case capture cannot serve is detected in [`Self::step_graph_blocker`] and
+    /// degrades to the eager step. A capture or replay failure disables the graph
+    /// permanently and forfeits that one step rather than re-run a body that may have
+    /// already applied part of the update: one skipped optimizer step is invisible in a
+    /// pretraining run, a doubled one is not.
+    fn try_graph_step(&mut self, do_adamw: bool) -> GraphStepOutcome {
+        let mut graphs = match std::mem::replace(&mut self.step_graphs, StepGraphState::Disabled) {
+            StepGraphState::Unarmed => match self.arm_step_graphs() {
+                Some(graphs) => graphs,
+                None => return GraphStepOutcome::Fallback,
+            },
+            StepGraphState::Disabled => return GraphStepOutcome::Fallback,
+            StepGraphState::Armed(graphs) => graphs,
+        };
+        let scalars = self.publish_step_scalars(&mut graphs.scalars);
+        let (slot, label) = if do_adamw {
+            (&mut graphs.with_adamw, "NorMuon+AdamW")
+        } else {
+            (&mut graphs.normuon_only, "NorMuon")
+        };
+        // What the step reads is baked into the capture: which parameters it touches is
+        // host control flow, since a parameter with no gradient contributes no kernels at
+        // all, and the gradient buffers themselves are addresses in the recorded kernels.
+        // A body recorded against a different set would keep skipping — or keep stepping,
+        // out of the wrong memory — silently, for the rest of the run, and nothing
+        // downstream can detect it. So the record is checked before every replay and a
+        // change forfeits both bodies. This is the one piece of the step that neither a
+        // blocker nor a setter can rule out in advance. The print doubles as the churn
+        // signal, since [`MAX_STEP_GRAPH_ARMS`] retained mempools is where it ends.
+        if matches!(slot.state, GraphSlotState::Captured)
+            && !self.participation_matches(&slot.participation)
+        {
+            println!(
+                "pretrain CUDA graphs recapturing: what the {label} optimizer step reads \
+                 changed, so the captured body is stale"
+            );
+            self.step_graphs = StepGraphState::Unarmed;
+            return GraphStepOutcome::Fallback;
+        }
+        let state = slot.state;
+        let outcome = match state {
+            GraphSlotState::Warmup(remaining) => {
+                slot.state = if remaining <= 1 {
+                    GraphSlotState::ReadyToCapture
+                } else {
+                    GraphSlotState::Warmup(remaining - 1)
+                };
+                slot.graph
+                    .with_stream_scope(|_| self.run_step_body(&scalars, do_adamw))
+                    .map(|()| false)
+            }
+            GraphSlotState::ReadyToCapture => {
+                slot.state = GraphSlotState::Captured;
+                slot.participation = self.step_participation();
+                // Capture RECORDS without executing, so the single replay inside the
+                // same stream scope is this step's one and only update.
+                slot.graph
+                    .with_stream_scope(|graph| {
+                        graph.capture(|| self.run_step_body(&scalars, do_adamw))?;
+                        graph.replay()
+                    })
+                    .and_then(|inner| inner)
+                    .map(|()| true)
+            }
+            GraphSlotState::Captured => slot
+                .graph
+                .with_stream_scope(CudaGraph::replay)
+                .and_then(|inner| inner)
+                .map(|()| false),
+        };
+        match outcome {
+            Ok(captured) => {
+                if captured {
+                    println!("pretrain CUDA graph captured: {label} optimizer step");
+                }
+                self.step_graphs = StepGraphState::Armed(graphs);
+                GraphStepOutcome::Applied
+            }
+            Err(err) => {
+                println!(
+                    "pretrain CUDA graphs disabled: {label} optimizer step failed ({err}); \
+                     this step is forfeited and every later step runs eagerly"
+                );
+                GraphStepOutcome::Forfeited
+            }
+        }
+    }
+
+    /// Build both step graphs, or report why not. Runs on the first primary step, so
+    /// construction stays independent of the environment and of the device the parameters
+    /// ended up on, and again after anything that invalidates a capture.
+    ///
+    /// Bounded, because every arm mints a private mempool whose blocks are retained for
+    /// the process's life: a run that keeps invalidating its captures would otherwise
+    /// trade a few percent of step time for an unbounded reservation and eventually die
+    /// of a device OOM with nothing pointing here. Past the bound it gives up for good
+    /// and runs eagerly, which costs throughput and nothing else.
+    fn arm_step_graphs(&mut self) -> Option<Box<MuonStepGraphs>> {
+        if let Some(blocker) = self.step_graph_blocker() {
+            // A run that asked for graphs and cannot have them must say so. A run that
+            // took the default and merely landed somewhere capture is impossible has
+            // nothing to act on, so it degrades quietly; anything the caller could
+            // actually lift is reported either way.
+            if !blocker.inherent || self.step_graphs_requested() {
+                println!("pretrain CUDA graphs disabled: {}", blocker.reason);
+            }
+            return None;
+        }
+        if self.step_graph_arms >= MAX_STEP_GRAPH_ARMS {
+            println!(
+                "pretrain CUDA graphs disabled: {MAX_STEP_GRAPH_ARMS} captures already \
+                 retained and the step keeps changing shape; running eagerly from here"
+            );
+            return None;
+        }
+        self.step_graph_arms += 1;
+        let reference = &self.params[self.entries_2d[0].idx];
+        let (kind, device) = (reference.kind(), reference.device());
+        // The two bodies never overlap in time and never carry pool memory across a
+        // step: exactly one of them is replayed per primary step, each inside a stream
+        // scope that orders its work after the previous scope's, and every tensor a
+        // capture allocates is dropped before that capture ends. Their transients can
+        // therefore sit at the same addresses, so both capture into one private mempool
+        // rather than each retaining a copy of the working set for the process's life.
+        // `with_adamw` is a superset of `normuon_only`, so that is close to halving it.
+        let pool = match CudaGraphPool::new() {
+            Ok(pool) => pool,
+            Err(err) => {
+                println!("pretrain CUDA graphs disabled: init failed ({err})");
+                return None;
+            }
+        };
+        let graphs = match (
+            CudaGraph::new_in_pool(device, &pool),
+            CudaGraph::new_in_pool(device, &pool),
+        ) {
+            (Ok(Some(normuon_only)), Ok(Some(with_adamw))) => MuonStepGraphs {
+                normuon_only: StepGraph::new(normuon_only),
+                with_adamw: StepGraph::new(with_adamw),
+                scalars: StepScalarPack::new(
+                    self.entries_2d.len(),
+                    self.adamw_indices.len(),
+                    kind,
+                    device,
+                ),
+            },
+            (Err(err), _) | (_, Err(err)) => {
+                println!("pretrain CUDA graphs disabled: init failed ({err})");
+                return None;
+            }
+            _ => {
+                println!("pretrain CUDA graphs disabled: CUDA Graph support is unavailable");
+                return None;
+            }
+        };
+        println!(
+            "pretrain CUDA graphs armed: {} NorMuon params in {} batched group(s), {} AdamW \
+             params, two captured bodies sharing one private mempool, \
+             {GRAPH_WARMUP_STEPS} warmup steps each",
+            self.entries_2d.len(),
+            self.groups_2d.len(),
+            self.adamw_indices.len()
+        );
+        Some(Box::new(graphs))
+    }
+
+    /// What the step's kernels will read, per parameter: `None` when the parameter is not
+    /// stepped at all, otherwise the storage address of the gradient it steps out of.
+    ///
+    /// Both halves are capture inputs. Participation is host control flow —
+    /// [`Self::step_all_normuon`], [`Self::step_all_adamw`] and
+    /// [`Self::advance_adamw_clocks`] all skip anything outside the set, so a parameter
+    /// outside it contributes no kernels at all. The address is a kernel ARGUMENT, baked
+    /// in by capture. The parameters and the optimizer moments are owned here and mutated
+    /// in place, so their addresses cannot move without going through a path that already
+    /// re-arms; gradients are autograd's, not this optimizer's, which is the whole reason
+    /// they are the half that has to be checked rather than assumed.
+    fn step_participation(&self) -> Vec<Option<usize>> {
+        self.params
+            .iter()
+            .zip(&self.step_enabled)
+            .map(|(parameter, &enabled)| Self::stepped_gradient(parameter, enabled))
+            .collect()
+    }
+
+    fn stepped_gradient(parameter: &Tensor, enabled: bool) -> Option<usize> {
+        if !enabled {
+            return None;
+        }
+        let gradient = parameter.grad();
+        gradient.defined().then(|| gradient.data_ptr() as usize)
+    }
+
+    /// Whether the step still reads exactly what was `recorded` at capture.
+    /// Allocation-free and short-circuiting, because this runs before every replay.
+    fn participation_matches(&self, recorded: &[Option<usize>]) -> bool {
+        recorded.len() == self.params.len()
+            && self
+                .params
+                .iter()
+                .zip(&self.step_enabled)
+                .zip(recorded)
+                .all(|((parameter, &enabled), &was)| {
+                    Self::stepped_gradient(parameter, enabled) == was
+                })
+    }
+
+    /// Whether the run explicitly turned graphs off. An eligible optimizer captures by
+    /// default, so `PRETRAIN_CUDA_GRAPHS=0` is the opt-out and `=1` asks for nothing it
+    /// would not already get - it only makes an unavoidable blocker speak up.
+    fn step_graphs_opted_out(&self) -> bool {
+        env::var("PRETRAIN_CUDA_GRAPHS").ok().as_deref() == Some("0")
+    }
+
+    /// Whether the run explicitly ASKED for graphs, as opposed to taking the default.
+    fn step_graphs_requested(&self) -> bool {
+        env::var("PRETRAIN_CUDA_GRAPHS").ok().as_deref() == Some("1")
+    }
+
+    /// Every reason this step cannot be captured, checked once.
+    ///
+    /// Ordered so that an optimizer capture was never offered to answers first and
+    /// silently: PPO, the planner and every CPU unit test decline on eligibility before
+    /// any check that reports, so they say nothing whatever the environment holds. The
+    /// remaining order puts what nothing about this run could lift ahead of what the
+    /// caller could act on, so a CPU-only process never reaches a reporting check either.
+    fn step_graph_blocker(&self) -> Option<StepGraphBlocker> {
+        if !self.cfg.capture_step_graphs {
+            return Some(StepGraphBlocker::inherent(
+                "capture is not enabled for this optimizer",
+            ));
+        }
+        if self.step_graphs_opted_out() {
+            return Some(StepGraphBlocker::actionable(
+                "disabled by PRETRAIN_CUDA_GRAPHS=0",
+            ));
+        }
+        if !CudaGraph::is_available() {
+            return Some(StepGraphBlocker::inherent(
+                "CUDA Graph support is unavailable",
+            ));
+        }
+        let Some(first) = self.entries_2d.first() else {
+            return Some(StepGraphBlocker::inherent("no NorMuon-routed parameters"));
+        };
+        let reference = &self.params[first.idx];
+        let (kind, device) = (reference.kind(), reference.device());
+        if !device.is_cuda() {
+            return Some(StepGraphBlocker::inherent(format!(
+                "parameters live on {device:?}"
+            )));
+        }
+        // The schedule scalars are one packed tensor of one dtype, and every kernel that
+        // reads a slot has to match its operand's dtype in place.
+        if self
+            .params
+            .iter()
+            .any(|p| p.kind() != kind || p.device() != device)
+        {
+            return Some(StepGraphBlocker::actionable(
+                "parameters do not share one dtype and device",
+            ));
+        }
+        if self.cfg.row_learned_lr {
+            // The controller normalizes its evidence over one parameter's rows and
+            // accumulates a diagnostics tensor per stepped matrix; both would have to be
+            // reproduced under a fixed observation set before this body is capturable.
+            return Some(StepGraphBlocker::actionable(
+                "the row-learned learning-rate controller is enabled",
+            ));
+        }
+        None
+    }
+
+    fn run_step_body(&mut self, scalars: &StepScalars, do_adamw: bool) {
+        self.step_all_normuon(true, scalars);
+        if do_adamw {
+            self.step_all_adamw(scalars);
+        }
+    }
+
+    fn step_all_normuon(&mut self, primary: bool, scalars: &StepScalars) {
+        let beta2 = self.cfg.beta2;
+        let nesterov = self.cfg.nesterov;
+        let cautious = self.cfg.cautious_weight_decay;
+        let orth = self.cfg.orthogonalizer;
+        let ns_steps = self.cfg.ns_steps;
+        let primary_step = self.step_count;
+        let Self {
+            entries_2d,
+            groups_2d,
+            params,
+            step_enabled,
+            row_lr_metrics,
+            ..
+        } = self;
+        let mut accumulator = RowLrMetricAccumulator::default();
+        let mut batched = vec![false; entries_2d.len()];
+
+        // Batched groups first. Every member's momentum and second moment is a view into
+        // the group's stacked buffer, so a group that is not wholly steppable this step
+        // simply falls through to the per-parameter path below on exactly the same state.
+        for group in groups_2d.iter_mut() {
+            let steppable = group.entries.iter().all(|&position| {
+                let idx = entries_2d[position].idx;
+                step_enabled[idx] && params[idx].grad().defined()
+            });
+            if !steppable {
+                continue;
+            }
+            let gradients: Vec<Tensor> = group
+                .entries
+                .iter()
+                .map(|&position| params[entries_2d[position].idx].grad())
+                .collect();
+            let gradient = Tensor::stack(&gradients, 0);
+            scalars.normuon_lerp.lerp_(&mut group.momentum, &gradient);
+            let update = if nesterov {
+                scalars.nesterov.lerp(&gradient, &group.momentum)
+            } else {
+                group.momentum.shallow_clone()
+            };
+            let update = batched_quintic_orthogonalize(&update, orth, ns_steps);
+            // Same cast the per-parameter tail applies. The group's momentum carries the
+            // members' shared dtype, and `to_kind` on a matching dtype is free.
+            let update = normuon_rescale(&update, &mut group.second_momentum, beta2)
+                .to_kind(group.momentum.kind());
+            for (slot, &position) in group.entries.iter().enumerate() {
+                let entry = &entries_2d[position];
+                let mut p = params[entry.idx].shallow_clone();
+                // The signed delta is the row-learned controller's credit tensor, and
+                // grouped entries never carry that controller.
+                let _ = apply_normuon_update(
+                    &mut p,
+                    &update.select(0, slot as i64),
+                    &scalars.normuon_step[position],
+                    scalars.normuon_decay[position].as_ref(),
+                    cautious,
+                );
+                batched[position] = true;
+            }
+        }
+
+        for (position, entry) in entries_2d.iter_mut().enumerate() {
+            if batched[position] || !step_enabled[entry.idx] {
+                continue;
+            }
+            let grad = params[entry.idx].grad();
+            if !grad.defined() {
+                continue;
+            }
             let (controlled_gradient, observation) = if primary {
                 match entry.row_lr.as_mut() {
                     Some(controller) => {
                         let (gradient, observation) =
-                            controller.scale_gradient(&grad, Some(self.step_count));
+                            controller.scale_gradient(&grad, Some(primary_step));
                         (Some(gradient), observation)
                     }
                     None => (None, None),
@@ -974,74 +1936,59 @@ impl Muon {
                 (None, None)
             };
             if let Some(observation) = observation {
-                row_lr_metrics.push(observation);
+                accumulator.push(observation);
             }
             let gradient = controlled_gradient.as_ref().unwrap_or(&grad);
 
             // The learned row scale acts on the raw gradient, before either optimizer
             // momentum or orthogonalization can mix its evidence across time or rows.
-            let _ = entry.momentum.lerp_(gradient, 1.0 - beta1);
+            scalars.normuon_lerp.lerp_(&mut entry.momentum, gradient);
 
             let update = if nesterov {
-                gradient.lerp(&entry.momentum, beta1)
+                scalars.nesterov.lerp(gradient, &entry.momentum)
             } else {
                 entry.momentum.shallow_clone()
             };
 
-            let (update, aspect_scale) = normuon_transform(
+            let update = normuon_transform(
                 &update,
                 entry.layout,
                 &mut entry.second_momentum,
                 beta2,
                 orth,
-                self.cfg.ns_steps,
+                ns_steps,
             );
 
-            // Apply to param: decoupled weight decay, then the update. Both read
-            // the pre-step parameter, so the composition is `p - decay*p - lr*u`.
-            let mut p = self.params[entry.idx].shallow_clone();
+            let mut p = params[entry.idx].shallow_clone();
             let update = update.to_kind(p.kind());
-            let eff_lr = lr * aspect_scale;
-            let decay = if quadratic {
-                wd * base_lr * eff_lr
-            } else {
-                wd * lr
-            };
-            if decay > 0.0 {
-                if cautious {
-                    let keep = (&update * &p).ge(0).to_kind(p.kind()) * decay;
-                    let _ = p.g_sub_(&(&p * keep));
-                } else {
-                    let _ = p.g_mul_scalar_(1.0 - decay);
-                }
-            }
+            let signed_delta = apply_normuon_update(
+                &mut p,
+                &update,
+                &scalars.normuon_step[position],
+                scalars.normuon_decay[position].as_ref(),
+                cautious,
+            );
             if primary {
                 if let Some(controller) = entry.row_lr.as_mut() {
                     // This is theta_new - theta_old from the gradient update only. Decoupled
                     // decay above is intentionally absent from the next-step credit tensor.
-                    let signed_delta = &update * (-eff_lr);
                     controller
                         .previous_delta
                         .copy_(&signed_delta.to_kind(Kind::Float).nan_to_num(0.0, 0.0, 0.0));
-                    let _ = p.g_add_(&signed_delta);
-                    continue;
                 }
             }
-            // Exact controller-off and auxiliary arithmetic.
-            let _ = p.g_add_(&(update * (-eff_lr)));
         }
         if primary {
-            self.row_lr_metrics = row_lr_metrics.finish();
+            *row_lr_metrics = accumulator.finish();
         }
     }
 
-    fn step_all_adamw(&mut self) {
+    fn step_all_adamw(&mut self, scalars: &StepScalars) {
         let eps = self.cfg.adamw_eps;
-        let wd = self.cfg.adamw_wd;
-        let quadratic = self.cfg.quadratic_lr_weight_decay;
         let cautious = self.cfg.cautious_weight_decay;
 
-        for &idx in &self.adamw_indices {
+        for position in 0..self.adamw_indices.len() {
+            let idx = self.adamw_indices[position];
             if !self.step_enabled[idx] {
                 continue;
             }
@@ -1050,50 +1997,28 @@ impl Muon {
             if !grad.defined() {
                 continue;
             }
-            let lr = self.cfg.adamw_lr * self.lr_scales[idx];
-            let (beta1, beta2) = self.adamw_betas_for(idx);
-
+            let (beta1, beta2) = self.adamw_settings[position].betas;
             let state = self
                 .adamw_state
-                .entry(idx)
-                .or_insert_with(|| AdamWParamState {
-                    m: Tensor::zeros_like(&grad),
-                    v: Tensor::zeros_like(&grad),
-                    step_count: 0,
-                });
-            state.step_count += 1;
-            let bc1 = 1.0 - beta1.powi(state.step_count as i32);
-            let bc2 = 1.0 - beta2.powi(state.step_count as i32);
-            let step_size = -lr / bc1;
-            let inv_bc2_sqrt = 1.0 / bc2.sqrt();
-
-            let apply_weight_decay = wd > 0.0
-                && !self
-                    .cfg
-                    .adamw_no_weight_decay_name_substrings
-                    .iter()
-                    .any(|needle| self.names[idx].contains(needle));
+                .get_mut(&idx)
+                .expect("advance_adamw_clocks allocates the moments this step will update");
 
             let _ = state.m.lerp_(&grad, 1.0 - beta1);
             let _ = state.v.lerp_(&grad.square(), 1.0 - beta2);
 
-            let denom = state.v.sqrt() * inv_bc2_sqrt + eps;
+            let denom = scalars.adamw_inv_bc2_sqrt[position]
+                .mul(&state.v.sqrt())
+                .g_add_scalar(eps);
             // `step` carries the negated descent direction, i.e. `p += step`.
-            let step = &state.m / &denom * step_size;
-            if apply_weight_decay {
-                let wd_mul = self.adamw_wd_mul_for(idx);
-                let decay = if quadratic {
-                    lr * lr * wd * wd_mul
-                } else {
-                    lr * wd * wd_mul
-                };
+            let step = scalars.adamw_step[position].mul(&(&state.m / &denom));
+            if let Some(decay) = scalars.adamw_decay[position].as_ref() {
                 if cautious {
                     // The reference masks strictly on `(descent_update * p) > 0`;
                     // `step` is the negation of that update, hence `< 0`.
-                    let keep = (&step * &p).lt(0).to_kind(p.kind()) * decay;
+                    let keep = decay.mul(&(&step * &p).lt(0).to_kind(p.kind()));
                     let _ = p.g_sub_(&(&p * keep));
                 } else {
-                    let _ = p.g_mul_scalar_(1.0 - decay);
+                    decay.mul_(&mut p);
                 }
             }
             let _ = p.g_add_(&step);
@@ -1180,6 +2105,12 @@ impl Muon {
         })
     }
 
+    /// Schedule setters keep writing the host fields. Every device-resident mirror a
+    /// captured graph reads is refreshed from those fields at the top of each step, in
+    /// [`Self::resolve_step_scalars`], which is the only place that also knows the
+    /// composite scalars no setter sees (the per-matrix effective rate, the decay
+    /// factor, AdamW's bias corrections) — so one refresh covers all of them and none
+    /// can be forgotten by a new setter.
     pub fn set_lr(&mut self, lr: f64) {
         self.cfg.lr = lr;
     }
@@ -1270,6 +2201,9 @@ impl Muon {
             {
                 self.step_enabled[index] = enabled;
                 matched += 1;
+                // Which parameters a step touches is host control flow a captured body
+                // baked in, so the capture has to be redone.
+                self.step_graphs = StepGraphState::Unarmed;
             }
         }
         matched
@@ -1451,6 +2385,9 @@ impl Muon {
         })?;
         self.step_count = global_step_count;
         self.row_lr_metrics = None;
+        // Restored AdamW moments are fresh allocations at fresh addresses, and a
+        // captured graph reads addresses.
+        self.step_graphs = StepGraphState::Unarmed;
         self.adamw_pending_grads = adamw_pending_grads;
         if adamw_pending_grads {
             for &idx in &self.adamw_indices {
@@ -1767,6 +2704,15 @@ impl Muon {
     fn second_momentum_at(&self, n: usize) -> Tensor {
         self.entries_2d[n].second_momentum.shallow_clone()
     }
+
+    /// Test-only: drop the batched groups so every 2-D parameter takes the
+    /// per-parameter path. The members' momentum and second-moment views keep the
+    /// stacked storage alive, so this is the SAME state seen through the other path,
+    /// which is what makes the two paths directly comparable.
+    #[cfg(test)]
+    fn ungroup(&mut self) {
+        self.groups_2d.clear();
+    }
 }
 
 #[cfg(test)]
@@ -1776,11 +2722,13 @@ mod tests {
     use super::{
         attention_ortho_layout, batched_newtonschulz5, is_attention_output_projection_name,
         is_cross_attention_projection_name, is_self_attention_projection_name, newtonschulz5,
-        normuon_reduce_dim, normuon_rescale, normuon_transform, orthogonalize_update,
-        quintic_orthogonalize, second_momentum_shape, Muon, MuonConfig, OrthoLayout,
-        Orthogonalizer, StepKind,
+        normuon_reduce_dim, normuon_rescale, normuon_transform, ortho_aspect_scale,
+        orthogonalize_update, quintic_orthogonalize, second_momentum_shape, CudaGraph,
+        GraphSlotState, Muon, MuonConfig, OrthoLayout, Orthogonalizer, StepGraphState, StepKind,
+        StepScalar, StepScalarPack,
     };
     use crate::torch::test_rng;
+    use crate::torch::train::smd_idbd::PretrainOptimizer;
 
     const HIDDEN: i64 = 128;
     const TRAIN_STEPS: usize = 500;
@@ -2278,6 +3226,163 @@ mod tests {
         );
     }
 
+    /// The production NorMuon recipe's decay semantics, so a grouping test exercises
+    /// the whole per-parameter tail and not just the orthogonalizer.
+    fn grouping_config() -> MuonConfig {
+        MuonConfig {
+            lr: 0.02,
+            momentum: 0.9,
+            beta2: 0.9,
+            weight_decay: 1.2,
+            quadratic_lr_weight_decay: true,
+            cautious_weight_decay: true,
+            orthogonalizer: Orthogonalizer::PolarExpress5,
+            quiet: true,
+            ..MuonConfig::default()
+        }
+    }
+
+    /// Drive `steps` primary updates over freshly cloned parameters, with a fixed
+    /// per-parameter gradient, and return the final parameters.
+    fn run_grouped_or_not(
+        initial: &[Tensor],
+        gradients: &[Tensor],
+        cfg: MuonConfig,
+        lr_scale: Option<(&str, f64)>,
+        grouped: bool,
+        steps: usize,
+    ) -> Vec<Tensor> {
+        let named: Vec<(String, Tensor)> = initial
+            .iter()
+            .enumerate()
+            .map(|(index, weight)| (format!("w{index}"), weight.copy().set_requires_grad(true)))
+            .collect();
+        let mut optimizer = Muon::new_named(&named, cfg);
+        if let Some((name, scale)) = lr_scale {
+            assert_eq!(optimizer.set_named_lr_scale(&[name], scale), 1);
+        }
+        if !grouped {
+            optimizer.ungroup();
+        }
+        for _ in 0..steps {
+            optimizer.zero_grad();
+            let loss = named.iter().zip(gradients).fold(
+                Tensor::zeros([], (Kind::Float, Device::Cpu)),
+                |accumulated, ((_, weight), gradient)| {
+                    accumulated + (weight * gradient).sum(Kind::Float)
+                },
+            );
+            loss.backward();
+            optimizer.step(StepKind::Primary);
+        }
+        named
+            .iter()
+            .map(|(_, weight)| weight.detach().copy())
+            .collect()
+    }
+
+    /// The batched group path and the per-parameter path are two ways of advancing one
+    /// state, so they have to agree. This is the whole safety claim of grouping: any
+    /// member can fall out of its group on any step — a missing gradient, a disabled
+    /// name — and continue on the per-parameter path.
+    #[test]
+    fn batched_groups_agree_with_the_per_parameter_path() {
+        let _torch_rng_guard = test_rng::exclusive();
+        tch::manual_seed(4242);
+        let device = Device::Cpu;
+        let (initial, gradients) = tch::no_grad(|| {
+            let initial: Vec<Tensor> = (0..3)
+                .map(|_| Tensor::randn([6, 4], (Kind::Float, device)))
+                .collect();
+            let gradients: Vec<Tensor> = (0..3)
+                .map(|_| Tensor::randn([6, 4], (Kind::Float, device)))
+                .collect();
+            (initial, gradients)
+        });
+
+        let grouped = run_grouped_or_not(
+            &initial,
+            &gradients,
+            grouping_config(),
+            Some(("w1", 4.0)),
+            true,
+            3,
+        );
+        let separate = run_grouped_or_not(
+            &initial,
+            &gradients,
+            grouping_config(),
+            Some(("w1", 4.0)),
+            false,
+            3,
+        );
+
+        for (index, ((batched, single), start)) in
+            grouped.iter().zip(&separate).zip(&initial).enumerate()
+        {
+            let moved = (batched - start).abs().max().double_value(&[]);
+            let diff = (batched - single).abs().max().double_value(&[]);
+            assert!(
+                moved > 1e-4,
+                "w{index} barely moved ({moved:.3e}); the comparison would be vacuous"
+            );
+            // The two paths issue different kernels over the same math: bmm vs mm, and a
+            // per-slot vs whole-tensor Frobenius reduction. That is a reassociation of a
+            // bf16 iteration, so a few times bf16 epsilon of the update. It is NOT room for
+            // a different prescale divisor: a 0.2% divisor error lands at ~1e-3 here, which
+            // is what the old 3e-2 bound was wide enough to admit.
+            assert!(
+                diff < 3e-4 * moved,
+                "w{index} diverged between the batched and the per-parameter path: \
+                 diff={diff:.3e}, update={moved:.3e}"
+            );
+        }
+    }
+
+    /// A group must apply each member ITS OWN learning-rate scale. Sharing one scalar
+    /// across a group is the numerical bug batching invites, and it hides in every
+    /// aggregate: two members with identical parameters and identical gradients differ
+    /// only through the scale, so the ratio of their updates IS the scale ratio.
+    ///
+    /// The parameters start at zero and the decay is off, so `p + delta` is exact and
+    /// `4` is a power of two: the 4x member's update is bit-for-bit four times the
+    /// other's, and the assertion needs no tolerance at all.
+    #[test]
+    fn a_group_applies_each_member_its_own_learning_rate_scale() {
+        let _torch_rng_guard = test_rng::exclusive();
+        tch::manual_seed(99);
+        let device = Device::Cpu;
+        let (initial, gradients) = tch::no_grad(|| {
+            let gradient = Tensor::randn([6, 4], (Kind::Float, device));
+            (
+                vec![
+                    Tensor::zeros([6, 4], (Kind::Float, device)),
+                    Tensor::zeros([6, 4], (Kind::Float, device)),
+                ],
+                vec![gradient.copy(), gradient.copy()],
+            )
+        });
+        let cfg = MuonConfig {
+            weight_decay: 0.0,
+            ..grouping_config()
+        };
+
+        let final_weights =
+            run_grouped_or_not(&initial, &gradients, cfg, Some(("w1", 4.0)), true, 1);
+        let plain = &final_weights[0] - &initial[0];
+        let scaled = &final_weights[1] - &initial[1];
+        let moved = plain.abs().max().double_value(&[]);
+        assert!(
+            moved > 1e-4,
+            "the shared update is degenerate ({moved:.3e})"
+        );
+        let error = (&scaled - plain * 4.0).abs().max().double_value(&[]);
+        assert!(
+            error < 1e-12,
+            "the 4x member did not take 4x the step inside its group: error={error:.3e}"
+        );
+    }
+
     #[test]
     fn attention_head_ortho_preserves_original_matrix_shape() {
         let _torch_rng_guard = test_rng::exclusive();
@@ -2708,7 +3813,7 @@ mod tests {
             let momentum = &gw * (1.0 - 0.95);
             let update = gw.lerp(&momentum, 0.95);
             let mut second = Tensor::zeros([8, 1], (Kind::Float, device));
-            let (update, aspect) = normuon_transform(
+            let update = normuon_transform(
                 &update,
                 OrthoLayout::Matrix,
                 &mut second,
@@ -2716,6 +3821,7 @@ mod tests {
                 Orthogonalizer::NewtonSchulz5,
                 5,
             );
+            let aspect = ortho_aspect_scale(&[8, 4], OrthoLayout::Matrix);
             assert!((aspect - 2.0_f64.sqrt()).abs() < 1e-12);
             &w0 * (1.0 - lr * wd) + update * (-lr * aspect)
         });
@@ -2837,7 +3943,7 @@ mod tests {
         Muon::new_named(&[("w".to_owned(), wb.shallow_clone())], cfg(true)).step(StepKind::Primary);
 
         // Reproduce the update the optimizer computed, to recover its sign per coordinate.
-        let (update, _) = tch::no_grad(|| {
+        let update = tch::no_grad(|| {
             let grad = wa.grad().detach().copy();
             let momentum = &grad * (1.0 - 0.95);
             let combined = grad.lerp(&momentum, 0.95);
@@ -3288,5 +4394,631 @@ mod tests {
             error < 1e-6,
             "credit delta included decay or missed the applied update: {error}"
         );
+    }
+
+    /// Every optional term one step can carry, so every slot the pack allocates is
+    /// actually read: decoupled decay on both branches, the AdamW cadence that gives the
+    /// step its two capturable shapes, and Nesterov.
+    ///
+    /// Capture-eligible, like the pretraining optimizer and unlike the default, so that
+    /// the policy tests below reach the checks they are about instead of stopping at
+    /// eligibility.
+    fn schedule_config() -> MuonConfig {
+        MuonConfig {
+            lr: 0.02,
+            momentum: 0.9,
+            weight_decay: 0.1,
+            adamw_lr: 0.005,
+            adamw_wd: 0.2,
+            adamw_every: 2,
+            quiet: true,
+            capture_step_graphs: true,
+            ..MuonConfig::default()
+        }
+    }
+
+    /// Two same-shape matrices, which batch into one group; one odd-shaped matrix, which
+    /// takes the per-parameter tail; two vectors, which route to AdamW. Deterministic, so
+    /// two arms built from separate calls start bit-identical without touching the RNG.
+    fn schedule_params(device: Device) -> Vec<(String, Tensor)> {
+        let make = |name: &str, dims: &[i64], phase: f64| {
+            let count: i64 = dims.iter().product();
+            let values = Tensor::arange(count, (Kind::Float, device)) * 0.017 + phase;
+            (
+                name.to_owned(),
+                (values.sin() * 0.5).reshape(dims).set_requires_grad(true),
+            )
+        };
+        vec![
+            make("block.0.w", &[8, 8], 0.0),
+            make("block.1.w", &[8, 8], 1.0),
+            make("head.w", &[6, 4], 2.0),
+            make("head.bias", &[6], 3.0),
+            make("norm.gain", &[8], 4.0),
+        ]
+    }
+
+    /// A device-resident pack laid out for this optimizer, exactly as arming builds one.
+    fn schedule_pack(optimizer: &Muon) -> StepScalarPack {
+        let reference = &optimizer.params[optimizer.entries_2d[0].idx];
+        StepScalarPack::new(
+            optimizer.entries_2d.len(),
+            optimizer.adamw_indices.len(),
+            reference.kind(),
+            reference.device(),
+        )
+    }
+
+    /// Read one packed slot. Panics on a host scalar: the pack path handing one back
+    /// would be a silently frozen kernel argument, which is the failure being guarded.
+    fn slot_value(scalar: &StepScalar) -> f64 {
+        match scalar {
+            StepScalar::Device(tensor) => tensor.double_value(&[]),
+            StepScalar::Host(value) => panic!("expected a device-resident slot, got host {value}"),
+        }
+    }
+
+    /// The pack stages in `f64` and narrows to the parameter dtype, so a slot read is
+    /// fp32-exact at best.
+    fn assert_slot(actual: f64, expected: f64, what: &str) {
+        let tolerance = 1e-6 * expected.abs().max(1e-3);
+        assert!(
+            (actual - expected).abs() <= tolerance,
+            "{what}: {actual} != {expected}"
+        );
+    }
+
+    /// Every capture-policy assertion below describes the default path.
+    fn require_default_graph_policy(optimizer: &Muon) {
+        assert!(
+            !optimizer.step_graphs_opted_out(),
+            "unset PRETRAIN_CUDA_GRAPHS to run the capture-policy tests"
+        );
+    }
+
+    /// One primary step driven through the device-resident schedule mirrors instead of
+    /// `Scalar` arguments: the exact sequence [`Muon::try_graph_step`] performs, minus
+    /// the capture, which is what makes the `StepScalar::Device` arithmetic reachable on
+    /// a CPU-only runner.
+    fn packed_primary_step(optimizer: &mut Muon, pack: &mut StepScalarPack) {
+        tch::no_grad(|| {
+            let do_adamw = optimizer.begin_step(true);
+            let scalars = optimizer.publish_step_scalars(pack);
+            optimizer.run_step_body(&scalars, do_adamw);
+            optimizer.adamw_pending_grads = !do_adamw;
+        });
+    }
+
+    /// A schedule that moves every step, which is the point: a body that froze its
+    /// scalars at capture would keep applying the capture step's values.
+    fn apply_schedule(optimizer: &mut Muon, step: usize) {
+        let t = step as f64;
+        optimizer.set_lr(0.02 * 0.85f64.powf(t));
+        optimizer.set_momentum(0.8 + 0.03 * (t % 4.0));
+        optimizer.set_adamw_lr(0.005 * (1.0 + 0.2 * t));
+    }
+
+    /// Parameter-dependent gradients: identical across arms at equal parameters, and
+    /// coupled to the parameter so a divergence compounds instead of cancelling.
+    ///
+    /// A parameter matching `excluded` is left out of the loss entirely, so autograd
+    /// never defines its gradient and the step skips it. That is the only way to move the
+    /// stepped-parameter set, because `zero_grad` zeroes in place and never undefines.
+    fn backward_schedule_loss(named: &[(String, Tensor)], step: usize, excluded: Option<&str>) {
+        let device = named[0].1.device();
+        let mut loss = Tensor::zeros([], (Kind::Float, device));
+        for (position, (name, parameter)) in named.iter().enumerate() {
+            if excluded.is_some_and(|needle| name.contains(needle)) {
+                continue;
+            }
+            let weight = 0.3 + 0.1 * position as f64 + 0.05 * step as f64;
+            loss = loss + parameter.square().sum(Kind::Float) * weight;
+        }
+        loss.backward();
+    }
+
+    /// Largest relative parameter disagreement between two arms.
+    fn arm_deviation(left: &[(String, Tensor)], right: &[(String, Tensor)]) -> f64 {
+        left.iter()
+            .zip(right)
+            .map(|((_, a), (_, b))| {
+                (a - b).abs().max().double_value(&[]) / a.abs().max().double_value(&[]).max(1e-6)
+            })
+            .fold(0.0f64, f64::max)
+    }
+
+    #[test]
+    fn a_pack_refresh_moves_the_value_the_update_reads() {
+        let named = schedule_params(Device::Cpu);
+        let mut optimizer = Muon::new_named(&named, schedule_config());
+        let mut pack = schedule_pack(&optimizer);
+
+        // The handles a capture would have baked into its kernel arguments.
+        let captured = optimizer.publish_step_scalars(&mut pack);
+        assert_slot(slot_value(&captured.normuon_lerp), 1.0 - 0.9, "1 - momentum");
+        assert_slot(slot_value(&captured.nesterov), 0.9, "momentum");
+
+        optimizer.set_lr(0.05);
+        optimizer.set_momentum(0.5);
+        optimizer.set_adamw_lr(0.001);
+        assert_slot(
+            slot_value(&captured.nesterov),
+            0.9,
+            "a host setter alone must not move a device slot",
+        );
+        let _ = optimizer.resolve_step_scalars(Some(&mut pack));
+        assert_slot(
+            slot_value(&captured.nesterov),
+            0.9,
+            "resolving only stages the host buffer; upload publishes it",
+        );
+        pack.upload();
+
+        // The handles taken before the setters now read the new schedule, because they
+        // are views into the slots the refresh rewrote. That is the whole mechanism.
+        assert_slot(slot_value(&captured.nesterov), 0.5, "refreshed momentum");
+        assert_slot(
+            slot_value(&captured.normuon_lerp),
+            0.5,
+            "refreshed 1 - momentum",
+        );
+        for (position, entry) in optimizer.entries_2d.iter().enumerate() {
+            assert_slot(
+                slot_value(&captured.normuon_step[position]),
+                -(0.05 * optimizer.lr_scales[entry.idx] * entry.aspect_scale),
+                "refreshed NorMuon step",
+            );
+        }
+        for position in 0..optimizer.adamw_indices.len() {
+            // The moment clocks have not advanced, so the correction count clamps to one.
+            let (beta1, _) = optimizer.adamw_settings[position].betas;
+            assert_slot(
+                slot_value(&captured.adamw_step[position]),
+                -0.001 / (1.0 - beta1),
+                "refreshed AdamW step",
+            );
+        }
+    }
+
+    #[test]
+    fn the_pretrain_schedule_setters_all_reach_the_refreshed_slots() {
+        let named = schedule_params(Device::Cpu);
+        let optimizer = Muon::new_named(&named, schedule_config());
+        let mut pack = schedule_pack(&optimizer);
+        let captured = optimizer.publish_step_scalars(&mut pack);
+
+        // The pretrainer drives this wrapper, never the Muon setters directly.
+        let mut wrapped = PretrainOptimizer::production(optimizer);
+        wrapped.set_learning_rates(0.11, 0.013, 0.0);
+        wrapped.set_momentum(0.4);
+        let optimizer = wrapped.production_ref().expect("the production arm");
+        let _ = optimizer.publish_step_scalars(&mut pack);
+
+        assert_slot(slot_value(&captured.nesterov), 0.4, "set_momentum");
+        assert_slot(slot_value(&captured.normuon_lerp), 0.6, "set_momentum");
+        let entry = &optimizer.entries_2d[0];
+        assert_slot(
+            slot_value(&captured.normuon_step[0]),
+            -(0.11 * optimizer.lr_scales[entry.idx] * entry.aspect_scale),
+            "set_learning_rates NorMuon rate",
+        );
+        let (beta1, beta2) = optimizer.adamw_settings[0].betas;
+        assert_slot(
+            slot_value(&captured.adamw_step[0]),
+            -0.013 / (1.0 - beta1),
+            "set_learning_rates AdamW rate",
+        );
+        assert_slot(
+            slot_value(&captured.adamw_inv_bc2_sqrt[0]),
+            1.0 / (1.0 - beta2).sqrt(),
+            "AdamW second-moment bias correction",
+        );
+    }
+
+    #[test]
+    fn a_named_lr_scale_moves_only_its_own_parameters_slot() {
+        let named = schedule_params(Device::Cpu);
+        let mut optimizer = Muon::new_named(&named, schedule_config());
+        let mut pack = schedule_pack(&optimizer);
+        let captured = optimizer.publish_step_scalars(&mut pack);
+        let normuon_before: Vec<f64> = captured.normuon_step.iter().map(slot_value).collect();
+        let adamw_before: Vec<f64> = captured.adamw_step.iter().map(slot_value).collect();
+        assert!(normuon_before.len() > 1 && adamw_before.len() > 1);
+
+        assert_eq!(optimizer.set_named_lr_scale(&["block.1"], 0.25), 1);
+        assert_eq!(optimizer.set_named_lr_scale(&["head.bias"], 4.0), 1);
+        let _ = optimizer.publish_step_scalars(&mut pack);
+
+        let scaled_matrix = optimizer
+            .entries_2d
+            .iter()
+            .position(|entry| optimizer.names[entry.idx] == "block.1.w")
+            .expect("block.1.w routes to NorMuon");
+        for position in 0..normuon_before.len() {
+            let factor = if position == scaled_matrix { 0.25 } else { 1.0 };
+            assert_slot(
+                slot_value(&captured.normuon_step[position]),
+                normuon_before[position] * factor,
+                "per-parameter NorMuon scale",
+            );
+        }
+        let scaled_vector = optimizer
+            .adamw_indices
+            .iter()
+            .position(|&idx| optimizer.names[idx] == "head.bias")
+            .expect("head.bias routes to AdamW");
+        for position in 0..adamw_before.len() {
+            let factor = if position == scaled_vector { 4.0 } else { 1.0 };
+            assert_slot(
+                slot_value(&captured.adamw_step[position]),
+                adamw_before[position] * factor,
+                "per-parameter AdamW scale",
+            );
+        }
+    }
+
+    #[test]
+    fn device_resident_scalars_reproduce_the_host_scalar_step_under_a_moving_schedule() {
+        for cautious in [false, true] {
+            let config = || MuonConfig {
+                cautious_weight_decay: cautious,
+                ..schedule_config()
+            };
+            let host_named = schedule_params(Device::Cpu);
+            let packed_named = schedule_params(Device::Cpu);
+            let mut host = Muon::new_named(&host_named, config());
+            let mut packed = Muon::new_named(&packed_named, config());
+            let mut pack = schedule_pack(&packed);
+            for step in 0..12 {
+                apply_schedule(&mut host, step);
+                apply_schedule(&mut packed, step);
+                backward_schedule_loss(&host_named, step, None);
+                backward_schedule_loss(&packed_named, step, None);
+                host.step(StepKind::Primary);
+                packed_primary_step(&mut packed, &mut pack);
+                host.zero_grad();
+                packed.zero_grad();
+            }
+            // The default-on policy has to limit itself: CPU parameters cannot be
+            // captured, so the first primary step must have given up permanently.
+            assert!(
+                matches!(host.step_graphs, StepGraphState::Disabled),
+                "CPU parameters must disable capture rather than attempt it"
+            );
+            // Observed at exactly zero on CPU fp32 over both decay masks: the pack
+            // stages in `f64` and narrows on copy, which is the same rounding ATen
+            // applies to a `Scalar`. The tolerance is not tight against that
+            // observation, only against a frozen or misrouted slot, which is O(1).
+            let deviation = arm_deviation(&host_named, &packed_named);
+            println!(
+                "device-scalar vs host-scalar deviation (cautious {cautious}): {deviation:.3e}"
+            );
+            assert!(
+                deviation < 1e-5,
+                "the host-scalar and device-scalar steps diverged (cautious decay \
+                 {cautious}): {deviation}"
+            );
+        }
+    }
+
+    #[test]
+    fn capture_declines_every_case_it_cannot_serve() {
+        let cpu = Muon::new_named(&schedule_params(Device::Cpu), schedule_config());
+        require_default_graph_policy(&cpu);
+        let blocker = cpu
+            .step_graph_blocker()
+            .expect("CPU parameters cannot be captured");
+        assert!(
+            blocker.inherent,
+            "a CPU-only process has nothing to act on: {}",
+            blocker.reason
+        );
+        if CudaGraph::is_available() {
+            assert_eq!(blocker.reason, "parameters live on Cpu");
+        }
+
+        let vectors = [(
+            "a.bias".to_owned(),
+            Tensor::zeros([4], (Kind::Float, Device::Cpu)),
+        )];
+        let unrouted = Muon::new_named(&vectors, schedule_config());
+        assert!(unrouted.entries_2d.is_empty());
+        let blocker = unrouted
+            .step_graph_blocker()
+            .expect("a model with no matrices cannot be captured");
+        assert!(blocker.inherent, "routing is not an env-var decision");
+        if CudaGraph::is_available() {
+            assert_eq!(blocker.reason, "no NorMuon-routed parameters");
+        }
+
+        // Ineligibility is the default and is checked before everything else, so PPO, the
+        // planner and every caller that says nothing decline capture on any machine and
+        // without consulting the environment.
+        let opted_out = Muon::new_named(
+            &schedule_params(Device::Cpu),
+            MuonConfig {
+                capture_step_graphs: false,
+                ..schedule_config()
+            },
+        );
+        let blocker = opted_out
+            .step_graph_blocker()
+            .expect("an optimizer that opted out cannot be captured");
+        assert_eq!(blocker.reason, "capture is not enabled for this optimizer");
+        assert!(blocker.inherent, "the caller already made this choice");
+
+        let by_default = Muon::new_named(&schedule_params(Device::Cpu), MuonConfig::default());
+        assert_eq!(
+            by_default
+                .step_graph_blocker()
+                .expect("the default config is not capture-eligible")
+                .reason,
+            "capture is not enabled for this optimizer",
+            "capture must be opt-in per optimizer so a new caller cannot inherit it"
+        );
+    }
+
+    /// The one test that would catch a schedule frozen inside a replay.
+    ///
+    /// `#[ignore]`d because it needs a CUDA device and because capture tolerates no
+    /// other CUDA work in the process while it records; [`test_rng::exclusive`] is the
+    /// suite's only process-wide serialization point, so it doubles as that guard.
+    /// Returns without asserting, rather than failing, when there is no device.
+    #[test]
+    #[ignore = "captures real CUDA graphs: needs a GPU and exclusive use of the process"]
+    fn a_captured_step_tracks_a_changing_schedule_as_closely_as_the_eager_step() {
+        let _torch_rng_guard = test_rng::exclusive();
+        if !tch::Cuda::is_available() || !CudaGraph::is_available() {
+            return;
+        }
+        // `adamw_every` is 2, so the NorMuon-only body runs on odd step counts and the
+        // NorMuon+AdamW body on even ones. Each warms up for `GRAPH_WARMUP_STEPS` of its
+        // own turns, so they capture on step counts 7 and 8 and replay after that.
+        const STEPS: usize = 16;
+        const CAPTURED_AT: usize = 6;
+
+        let device = Device::Cuda(0);
+        let graphed_named = schedule_params(device);
+        let eager_named = schedule_params(device);
+        let frozen_named = schedule_params(device);
+        let mut graphed = Muon::new_named(&graphed_named, schedule_config());
+        let mut eager = Muon::new_named(&eager_named, schedule_config());
+        let mut frozen = Muon::new_named(&frozen_named, schedule_config());
+        require_default_graph_policy(&graphed);
+        // Both comparison arms take the fallback path outright, so no second capture and
+        // no environment reading enters the measurement.
+        eager.step_graphs = StepGraphState::Disabled;
+        frozen.step_graphs = StepGraphState::Disabled;
+
+        for step in 0..STEPS {
+            apply_schedule(&mut graphed, step);
+            apply_schedule(&mut eager, step);
+            // What a frozen schedule would look like: the values held at capture, kept
+            // for every later step. This arm is the test's own sensitivity yardstick.
+            apply_schedule(&mut frozen, step.min(CAPTURED_AT));
+            for named in [&graphed_named, &eager_named, &frozen_named] {
+                backward_schedule_loss(named, step, None);
+            }
+            graphed.step(StepKind::Primary);
+            eager.step(StepKind::Primary);
+            frozen.step(StepKind::Primary);
+            graphed.zero_grad();
+            eager.zero_grad();
+            frozen.zero_grad();
+        }
+
+        // A vacuous pass would be worse than a failure, so require that both bodies
+        // really were recorded and replayed.
+        match &graphed.step_graphs {
+            StepGraphState::Armed(graphs) => {
+                assert!(
+                    matches!(graphs.normuon_only.state, GraphSlotState::Captured),
+                    "the NorMuon-only body never captured"
+                );
+                assert!(
+                    matches!(graphs.with_adamw.state, GraphSlotState::Captured),
+                    "the NorMuon+AdamW body never captured"
+                );
+            }
+            _ => panic!("the graph path never armed on a CUDA device"),
+        }
+
+        let against_eager = arm_deviation(&graphed_named, &eager_named);
+        let against_frozen = arm_deviation(&graphed_named, &frozen_named);
+        println!(
+            "captured vs eager {against_eager:.3e}, captured vs frozen schedule \
+             {against_frozen:.3e}"
+        );
+        // Observed on an RTX 5090: 0.0 against eager, i.e. bit-identical, against 6.6e-1
+        // for a schedule frozen at capture. The tolerance stays loose because the graph's
+        // warmup and capture run on a side stream, where cuBLAS is free to pick a
+        // different algorithm for a large enough matrix; what the test pins is the
+        // seven-orders-of-magnitude gap between tracking the schedule and freezing it.
+        assert!(
+            against_eager < 1e-4,
+            "the captured step and the eager step disagree by {against_eager}"
+        );
+        assert!(
+            against_frozen > 100.0 * against_eager.max(1e-9),
+            "this test cannot distinguish a live schedule from a frozen one: live \
+             {against_eager}, frozen {against_frozen}"
+        );
+    }
+
+    /// The default-on path is self-limiting: a configuration capture cannot serve has to
+    /// degrade to the eager step rather than break the run.
+    #[test]
+    #[ignore = "needs a CUDA device to reach the checks a CPU device short-circuits"]
+    fn the_row_learned_lr_controller_blocks_capture_and_still_steps() {
+        let _torch_rng_guard = test_rng::exclusive();
+        if !tch::Cuda::is_available() || !CudaGraph::is_available() {
+            return;
+        }
+        let named = schedule_params(Device::Cuda(0));
+        let mut optimizer = Muon::new_named(
+            &named,
+            MuonConfig {
+                row_learned_lr: true,
+                ..schedule_config()
+            },
+        );
+        require_default_graph_policy(&optimizer);
+        assert!(!optimizer.entries_2d.is_empty());
+        let blocker = optimizer
+            .step_graph_blocker()
+            .expect("the controller blocks capture");
+        assert_eq!(
+            blocker.reason,
+            "the row-learned learning-rate controller is enabled"
+        );
+        assert!(
+            !blocker.inherent,
+            "the caller chose the controller and can unchoose it, so it gets told"
+        );
+
+        let before = named[0].1.copy();
+        backward_schedule_loss(&named, 0, None);
+        optimizer.step(StepKind::Primary);
+        assert!(matches!(optimizer.step_graphs, StepGraphState::Disabled));
+        assert!(
+            (&named[0].1 - &before).abs().max().double_value(&[]) > 0.0,
+            "the fallback step must still update the parameter"
+        );
+    }
+
+    #[test]
+    fn the_step_record_tracks_gradients_the_enable_mask_and_gradient_identity() {
+        let named = schedule_params(Device::Cpu);
+        let mut optimizer = Muon::new_named(&named, schedule_config());
+        let idle = vec![None; named.len()];
+        assert_eq!(optimizer.step_participation(), idle);
+        assert!(optimizer.participation_matches(&idle));
+
+        // One parameter in the loss: only that one has a gradient, so only it steps, and
+        // what it records is the address of the gradient it will read.
+        named[0].1.square().sum(Kind::Float).backward();
+        let recorded = optimizer.step_participation();
+        assert_eq!(
+            recorded[0],
+            Some(named[0].1.grad().data_ptr() as usize),
+            "a stepped parameter records the gradient buffer its kernels will read"
+        );
+        assert!(recorded[1..].iter().all(Option::is_none));
+        assert!(optimizer.participation_matches(&recorded));
+        assert!(
+            !optimizer.participation_matches(&idle),
+            "a gradient appearing must invalidate a set recorded without it"
+        );
+        assert!(
+            !optimizer.participation_matches(&recorded[..named.len() - 1]),
+            "a set of the wrong length must never match on a prefix"
+        );
+
+        // Accumulation and `zero_grad` both write through the existing buffer, so a
+        // capture stays valid across them. That is what makes the address worth recording
+        // rather than fatal to record.
+        named[0].1.square().sum(Kind::Float).backward();
+        optimizer.zero_grad();
+        assert!(
+            optimizer.participation_matches(&recorded),
+            "accumulating into and zeroing a gradient must not invalidate a capture"
+        );
+        assert!(
+            !optimizer.participation_matches(&[Some(1usize); 0]),
+            "an empty record must not match a live step"
+        );
+
+        // The enable mask removes a parameter that does have a gradient.
+        backward_schedule_loss(&named, 0, None);
+        assert!(optimizer.step_participation().iter().all(Option::is_some));
+        assert_eq!(optimizer.set_named_step_enabled(&["block.0"], false), 1);
+        let disabled = optimizer
+            .names
+            .iter()
+            .position(|name| name == "block.0.w")
+            .expect("block.0.w is registered");
+        assert_eq!(optimizer.step_participation()[disabled], None);
+    }
+
+    /// A parameter that acquires a gradient AFTER capture must start moving.
+    ///
+    /// This is the hazard no blocker can rule out in advance: a parameter with no
+    /// gradient contributes no kernels, so a body recorded while it was idle would keep
+    /// skipping it for the rest of the run, silently. `#[ignore]`d and serialized for the
+    /// same reasons as the agreement test above.
+    #[test]
+    #[ignore = "captures real CUDA graphs: needs a GPU and exclusive use of the process"]
+    fn a_parameter_that_gains_a_gradient_after_capture_starts_stepping() {
+        let _torch_rng_guard = test_rng::exclusive();
+        if !tch::Cuda::is_available() || !CudaGraph::is_available() {
+            return;
+        }
+        // Long enough for both bodies to capture and replay in each phase: three warmup
+        // turns plus a capture plus replays, at one turn every other step.
+        const PHASE: usize = 12;
+        const IDLE: &str = "head.w";
+
+        let graphed_named = schedule_params(Device::Cuda(0));
+        let eager_named = schedule_params(Device::Cuda(0));
+        let mut graphed = Muon::new_named(&graphed_named, schedule_config());
+        let mut eager = Muon::new_named(&eager_named, schedule_config());
+        require_default_graph_policy(&graphed);
+        eager.step_graphs = StepGraphState::Disabled;
+        let idle = graphed_named
+            .iter()
+            .position(|(name, _)| name == IDLE)
+            .expect("head.w is registered");
+        let initial = graphed_named[idle].1.copy();
+
+        for step in 0..2 * PHASE {
+            // The second phase brings the idle parameter into the loss for the first time.
+            let excluded = (step < PHASE).then_some(IDLE);
+            for (optimizer, named) in [
+                (&mut graphed, &graphed_named),
+                (&mut eager, &eager_named),
+            ] {
+                apply_schedule(optimizer, step);
+                backward_schedule_loss(named, step, excluded);
+                optimizer.step(StepKind::Primary);
+                optimizer.zero_grad();
+            }
+            if step + 1 == PHASE {
+                assert!(
+                    graphed_named[idle].1.equal(&initial),
+                    "a parameter with no gradient must not be stepped at all"
+                );
+                assert!(matches!(
+                    &graphed.step_graphs,
+                    StepGraphState::Armed(graphs)
+                        if matches!(graphs.normuon_only.state, GraphSlotState::Captured)
+                ));
+            }
+        }
+
+        // Without the participation check the replayed body would still be the one
+        // recorded while this parameter was idle, and it would never have moved.
+        let moved = (&graphed_named[idle].1 - &initial)
+            .abs()
+            .max()
+            .double_value(&[]);
+        let deviation = arm_deviation(&graphed_named, &eager_named);
+        println!("recaptured parameter moved by {moved:.3e}, arms agree to {deviation:.3e}");
+        // Observed on an RTX 5090: the parameter moved 6.0e-3 and the arms are again
+        // bit-identical, against exactly 0.0 movement if the stale body had kept replaying.
+        assert!(
+            moved > 1e-6,
+            "the captured body kept skipping a parameter that now has a gradient"
+        );
+        assert!(
+            deviation < 1e-4,
+            "the recaptured graph step and the eager step disagree by {deviation}"
+        );
+        match &graphed.step_graphs {
+            StepGraphState::Armed(graphs) => {
+                assert!(matches!(graphs.normuon_only.state, GraphSlotState::Captured));
+                assert!(matches!(graphs.with_adamw.state, GraphSlotState::Captured));
+            }
+            _ => panic!("the graph path did not recapture after the parameter set changed"),
+        }
     }
 }

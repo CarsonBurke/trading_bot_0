@@ -485,8 +485,9 @@ pub fn forecast_r_probs(head: &BarEmissionHead, beliefs: &Tensor, conditioning: 
     let rows = size[0];
     tch::no_grad(|| {
         let zero_prefix = Tensor::zeros([rows, BAR_DOF as i64], (Kind::Int64, beliefs.device()));
-        head.logits(beliefs, conditioning, &zero_prefix)
-            .select(1, DOF_R as i64)
+        // `r` heads the emission chain, so its prefix block is structurally masked to zero
+        // and the other four factors are never read: one fifth of the readout GEMM.
+        head.logits_dof(beliefs, conditioning, &zero_prefix, DOF_R)
             .softmax(-1, Kind::Float)
     })
 }
@@ -9524,6 +9525,18 @@ mod tests {
             .collect();
         Tensor::from_slice(&values).view([rows, latent])
     }
+    /// The `r` row through the FULL five-factor readout, so a prefix-drift comparison is two
+    /// calls of one kernel rather than two kernels of one function.
+    fn full_row(
+        head: &BarEmissionHead,
+        beliefs: &Tensor,
+        conditioning: &Tensor,
+        prefix: &Tensor,
+    ) -> Tensor {
+        head.logits(beliefs, conditioning, prefix)
+            .select(1, DOF_R as i64)
+            .softmax(-1, Kind::Float)
+    }
 
     fn deterministic_seconds<const N: usize>(returns: &[f64; N]) -> [f64; N] {
         std::array::from_fn(|i| returns[i] * returns[i])
@@ -10108,23 +10121,27 @@ mod tests {
                 "the traded law must integrate to 1, got {total}"
             );
         }
-
         // No prefix assignment can move it. BIT-identical, not close: a tolerance would
-        // pass a read that had picked up a teacher-forced row.
+        // pass a read that had picked up a teacher-forced row. Both sides go through the
+        // FULL readout so the two calls are the same BLAS kernel on the same shapes;
+        // `forecast_r_probs` takes the narrowed single-DOF path, whose reduction length
+        // differs, so it is held to a reassociation tolerance against the same baseline.
+        let zero_prefix = Tensor::zeros([rows, BAR_DOF as i64], (Kind::Int64, Device::Cpu));
+        let baseline = full_row(&head, &h, &conditioning, &zero_prefix);
+        assert!(
+            (&baseline - &probs).abs().max().double_value(&[]) < 1e-6,
+            "the single-DOF r readout is not the r block of the full readout"
+        );
         for bin in [0i64, 1, 37, 64, NUM_BAR_BINS - 1] {
             let prefix = Tensor::full([rows, BAR_DOF as i64], bin, (Kind::Int64, Device::Cpu));
-            let row = head
-                .logits(&h, &conditioning, &prefix)
-                .select(1, DOF_R as i64)
-                .softmax(-1, Kind::Float);
+            let row = full_row(&head, &h, &conditioning, &prefix);
             assert_eq!(
-                (&row - &probs).abs().max().double_value(&[]),
+                (&row - &baseline).abs().max().double_value(&[]),
                 0.0,
                 "the r row moved when every prefix slot was set to bin {bin}, so it is not \
                  the prefix-free row this module trades"
             );
         }
-
         // And it is the head's own forecast row, which is a separate implementation: an
         // ancestral-draw mixture over the chain, whose first factor is drawn from no prefix.
         let forecast = head

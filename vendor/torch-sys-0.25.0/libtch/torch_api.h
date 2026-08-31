@@ -68,6 +68,8 @@ void at_sdp_set_use_cudnn(bool b);
 bool at_sdp_use_cudnn();
 
 cuda_graph at_cuda_graph_new();
+void at_cuda_graph_pool_handle(uint64_t *id);
+cuda_graph at_cuda_graph_new_in_pool(uint64_t pool_first, uint64_t pool_second);
 bool at_cuda_graph_is_available();
 void at_cuda_graph_free(cuda_graph graph);
 void at_cuda_graph_stream_begin(cuda_graph graph, int64_t device_index);

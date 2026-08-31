@@ -50,9 +50,9 @@ use crate::torch::bar_dist::{
 };
 use crate::torch::cuda::cfg::{configure_cuda, disable_autograd_multithreading};
 use crate::torch::dataset::{
-    iso_ms, mix64, time_ids_without_market, BarBatch, BarCorpus, BarSampler, CorpusAnomalies,
-    CoverageAudit, PassCensus, PassLayout, PassLedger, PassPlan, Split, WindowRef,
-    BAR_TIME_CARDINALITY, BAR_TIME_CONDITIONING, BAR_TIME_FEATURES,
+    iso_ms, mix64, time_ids_without_market, BarBatch, BarCorpus, BarSampler, BatchScratch,
+    CorpusAnomalies, CoverageAudit, HostSample, PassCensus, PassLayout, PassLedger, PassPlan,
+    Split, WindowRef, BAR_TIME_CARDINALITY, BAR_TIME_CONDITIONING, BAR_TIME_FEATURES,
 };
 use crate::torch::hashing::file_sha256;
 use crate::torch::load::load_var_store_partial;
@@ -81,6 +81,7 @@ use super::optimizer_glue::named_trainable_variables;
 use super::pretrain_aux::{
     AuxiliaryConfig, AuxiliaryReport, AuxiliaryStream, AUXILIARY_HELDOUT_CONTEXT,
 };
+use super::pretrain_profile as profile;
 use super::pretrain_reports::{
     belief_effective_rank, EpochBoundary, EpochMetrics, HeldOutBaselines, NllAccumulator,
     PitHistogram, PretrainReporter, RivalSelection, SnapshotInput, StepMetrics, TestBattery,
@@ -288,6 +289,30 @@ const _: () = assert!(
 const EFFECTIVE_RANK_ROWS: i64 = 8192;
 /// Tolerance, in nats per bar, for the reloaded-checkpoint verification.
 const PROMOTION_ROUNDTRIP_TOLERANCE: f64 = 1e-4;
+/// Windows the reloaded-checkpoint verification scores, counted from the front of the
+/// promotion set.
+///
+/// The guard's only consumer is [`PROMOTION_ROUNDTRIP_TOLERANCE`]: it asks whether the
+/// serialized weights and supports reload to the SAME model, not how good that model is, and
+/// nothing it computes is reported or charted. A serialization fault is GLOBAL — a dropped
+/// tensor, a permuted load, a supports file from the wrong resolution — so it shifts every
+/// logit and shows up as a deterministic bias. There is no sampling noise for more windows to
+/// average down: both sides score the identical bars with nominally identical weights, so the
+/// drift a subset measures is the drift the full pass would measure.
+///
+/// A per-symbol floor was tried and removed: it silently resolved to the whole set, because
+/// [`BarSampler::pinned_windows`] interleaves the symbols round-robin and 1024 validation
+/// windows therefore span ~1024 distinct symbols. It was also protecting nothing. The world
+/// model has no per-symbol parameter — its tables are `bar_bin_embed`, `bar_dof_embed`,
+/// `bar_time_embed` and `bar_prefix_embed`, keyed by bin, DOF, calendar slot and chain
+/// prefix — so no window can uniquely exercise a row that another window would miss. That
+/// same interleaving is what makes a plain prefix symbol-diverse anyway. 128 windows at the
+/// deployed context is ~115k scored bars and ~574k support-bin lookups per factor, which
+/// reaches every bin carrying more than a ~1e-5 share of the held-out mass.
+///
+/// It was the WHOLE promotion set, a second full sweep costing 16% of a validation boundary
+/// to re-derive a number already known to four more decimal places than the guard reads.
+const PROMOTION_ROUNDTRIP_WINDOWS: usize = 128;
 
 /// Share of an epoch's wall clock the boundary work may take before the run says so.
 ///
@@ -1706,6 +1731,7 @@ pub fn pretrain(args: PretrainArgs) -> Result<()> {
     // Before any tensor work in the process, which is the only time torch accepts it.
     configure_threads();
     let device = Device::cuda_if_available();
+    profile::init(device);
     let _autograd_guard = device.is_cuda().then(disable_autograd_multithreading);
     build_trainer(args, RUNS_PATH, device)?.run_training()
 }
@@ -2080,6 +2106,7 @@ fn build_trainer(mut args: PretrainArgs, runs_root: &str, device: Device) -> Res
     };
 
     let (train_samplers, eval) = build_samplers(&corpus, &args)?;
+    let train_samplers = Arc::new(train_samplers);
 
     // The ramp is derived from what the card MEASURABLY holds, before anything is announced
     // or any step is taken. Everything downstream — the step count, the learning-rate
@@ -2487,6 +2514,8 @@ fn build_trainer(mut args: PretrainArgs, runs_root: &str, device: Device) -> Res
         vs,
         modules,
         optimizer,
+        fallback_scratch: train_samplers[0].scratch(),
+        prefetch: BatchPrefetcher::new(train_samplers.clone()),
         train_samplers,
         eval,
         reporter,
@@ -2679,16 +2708,14 @@ pub fn pretrain_candles(args: CandleArgs) -> Result<()> {
 
     let set = PinnedSet::pinned(&corpus, Split::Val, args.context, args.windows)?;
     let window = pinned_snapshot_window(&set, device);
-    let rollout = tch::no_grad(|| {
-        rollout_pinned_windows(
-            &world,
-            &window.history_dof,
-            &window.history_time_ids,
-            &window.future_time_ids,
-            args.samples,
-            CANDLE_ROLLOUT_MODE,
-        )
-    });
+    let rollout = rollout_pinned_windows(
+        &world,
+        &window.history_dof,
+        &window.history_time_ids,
+        &window.future_time_ids,
+        args.samples,
+        CANDLE_ROLLOUT_MODE,
+    );
 
     let output = Path::new(&args.output);
     let drawn = super::pretrain_reports::write_candle_windows(
@@ -4717,7 +4744,11 @@ enum TestEvaluationSets {
 /// skill audit, the horizon sweep — draw the SAME windows under the SAME seed through the same
 /// constructor, rather than each reimplementing the draw and quietly measuring different data.
 pub(super) struct PinnedSet {
-    pub(super) sampler: BarSampler,
+    /// Shared, because [`PinnedSet::prefix`] hands the identical sampler to a shorter window
+    /// list. The sampler owns the mmapped corpus and its anchor table; a pinned set is only a
+    /// window list over it, and duplicating the sampler to shorten that list would rebuild
+    /// the anchor table and re-derive a draw that must not move.
+    pub(super) sampler: Arc<BarSampler>,
     pub(super) windows: Vec<WindowRef>,
     pub(super) context: i64,
 }
@@ -4754,10 +4785,24 @@ impl PinnedSet {
             split.as_str()
         );
         Ok(Self {
-            sampler,
+            sampler: Arc::new(sampler),
             windows,
             context,
         })
+    }
+
+    /// The first `windows` windows of this set, over the same sampler and context.
+    ///
+    /// A PREFIX of the drawn list, never a smaller redraw: [`BarSampler::pinned_windows`]
+    /// allocates per-symbol quotas from the requested count, so `pinned(.., n)` for a smaller
+    /// `n` selects different bars entirely. Truncating the list a pass actually used is the
+    /// only way to score a subset of that pass's own windows.
+    fn prefix(&self, windows: usize) -> Self {
+        Self {
+            sampler: Arc::clone(&self.sampler),
+            windows: self.windows[..windows.min(self.windows.len())].to_vec(),
+            context: self.context,
+        }
     }
 }
 impl EvaluationSets {
@@ -4905,6 +4950,9 @@ fn build_optimizer(named: &[(String, Tensor)], row_learned_lr: bool) -> Result<M
         adamw_beta_overrides: beta_overrides,
         adamw_weight_decay_multipliers: wd_multipliers,
         row_learned_lr,
+        // The one step CUDA-graph capture has been measured on, and what
+        // `PRETRAIN_CUDA_GRAPHS` is named for. `=0` opts back out.
+        capture_step_graphs: true,
         ..MuonConfig::default()
     };
 
@@ -5144,6 +5192,112 @@ struct WindowEconomics {
     model_growth_bps: Vec<f64>,
 }
 
+/// The identity of one training draw. The prefetcher hands a batch back only against the key
+/// the loop asks for, so a mispredicted lookahead degrades to a synchronous build instead of
+/// silently feeding the step windows it did not draw.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct DrawKey {
+    epoch: usize,
+    stage: usize,
+    cursor: usize,
+    batch: usize,
+}
+
+/// One-deep host-side batch producer.
+///
+/// The measured step spends its whole host batch build with the device idle and then its whole
+/// device step with the host idle, because the previous step's packed-metric read has already
+/// drained the queue. The draw for step `n + 1` is fully determined once step `n` has advanced
+/// the stage cursor, so the encode, the calendar ids and the host staging can all run on a
+/// worker while the device executes step `n`.
+///
+/// The device transfer deliberately stays on the training thread: `to_device` is a synchronous
+/// copy on the default stream, so issuing it from the worker would serialize against the
+/// training kernels and give back the overlap it exists to win.
+struct BatchPrefetcher {
+    requests: std::sync::mpsc::SyncSender<(DrawKey, Vec<WindowRef>)>,
+    ready: std::sync::mpsc::Receiver<(DrawKey, HostSample)>,
+    outstanding: Option<DrawKey>,
+    /// Draws served off the worker, which is the only case that bought any overlap.
+    hits: u64,
+    /// Draws whose lookahead was queued for a DIFFERENT key. Doubly expensive: `take` blocks
+    /// on the worker's batch and then discards it, and the training thread rebuilds
+    /// synchronously afterwards. Counted apart from `unqueued` because the two have different
+    /// causes — a mispredicted stage cursor against no lookahead having been issued at all —
+    /// and only this one means work was thrown away.
+    misses: u64,
+    /// Draws for which no lookahead was outstanding, so nothing was discarded and the
+    /// synchronous build was the only cost. Expected once per stage boundary and at the first
+    /// step; a rising count anywhere else means `request` is being starved by a full channel.
+    unqueued: u64,
+}
+
+impl BatchPrefetcher {
+    fn new(samplers: Arc<Vec<BarSampler>>) -> Self {
+        let (requests, incoming) = std::sync::mpsc::sync_channel::<(DrawKey, Vec<WindowRef>)>(1);
+        let (outgoing, ready) = std::sync::mpsc::sync_channel::<(DrawKey, HostSample)>(1);
+        std::thread::Builder::new()
+            .name("bar-prefetch".to_string())
+            .spawn(move || {
+                // One scratch for the life of the thread: the staging buffers are sized by the
+                // widest ramp stage and then never reallocated.
+                let mut scratch = samplers[0].scratch();
+                while let Ok((key, refs)) = incoming.recv() {
+                    let host = samplers[key.stage].host_batch_of_into(&refs, &mut scratch);
+                    if outgoing.send((key, host)).is_err() {
+                        break;
+                    }
+                }
+            })
+            .expect("spawning the bar prefetch thread");
+        Self {
+            requests,
+            ready,
+            outstanding: None,
+            hits: 0,
+            misses: 0,
+            unqueued: 0,
+        }
+    }
+
+    /// Queue the next draw. A full channel means the worker has not finished the previous
+    /// request, which can only happen if the host has fallen behind the device; the request is
+    /// dropped rather than blocking the training thread.
+    fn request(&mut self, key: DrawKey, refs: Vec<WindowRef>) {
+        if self.outstanding.is_some() {
+            return;
+        }
+        if self.requests.try_send((key, refs)).is_ok() {
+            self.outstanding = Some(key);
+        }
+    }
+
+    /// The prefetched batch for `key`, or `None` when nothing was queued for it.
+    fn take(&mut self, key: DrawKey) -> Option<HostSample> {
+        let Some(outstanding) = self.outstanding.take() else {
+            self.unqueued += 1;
+            return None;
+        };
+        let (produced, host) = self.ready.recv().expect("the bar prefetch thread is alive");
+        debug_assert_eq!(produced, outstanding);
+        if produced == key {
+            self.hits += 1;
+            Some(host)
+        } else {
+            self.misses += 1;
+            None
+        }
+    }
+
+    /// Served, discarded and never-queued draw counts, in that order. Reported on the periodic
+    /// training line: the prefetcher is the whole justification for the data path's cost, and
+    /// a key-prediction regression produces identical numbers while costing roughly twice the
+    /// old data time, so it is invisible unless the counts are printed.
+    fn counts(&self) -> (u64, u64, u64) {
+        (self.hits, self.misses, self.unqueued)
+    }
+}
+
 struct Trainer {
     args: PretrainArgs,
     device: Device,
@@ -5166,7 +5320,13 @@ struct Trainer {
     vs: nn::VarStore,
     modules: BarModules,
     optimizer: PretrainOptimizer,
-    train_samplers: Vec<BarSampler>,
+    /// Shared with the prefetch worker. `BarSampler` is `Send + Sync` and immutable after
+    /// construction, so the worker reads the same mmapped corpus the training thread does.
+    train_samplers: Arc<Vec<BarSampler>>,
+    /// One-deep host batch producer, and the staging the training thread falls back to when
+    /// the lookahead could not be issued (stage boundaries, epoch boundaries, run end).
+    prefetch: BatchPrefetcher,
+    fallback_scratch: BatchScratch,
     eval: EvaluationSets,
     reporter: PretrainReporter,
     /// NLL a perfectly calibrated *marginal* head would achieve on this corpus. The
@@ -5672,28 +5832,71 @@ impl Trainer {
 
             let planned_batch = self.schedule.batch(step);
             let cursor = self.stage_cursor[stage];
-            let (refs, sample) = {
-                // The last draw of a stage is SHORT, not dropped, so the pass covers the
-                // partial tail of the stage's share instead of leaving up to `batch - 1`
-                // windows untargeted.
-                let refs = self.pass_layout.draw(stage, cursor, planned_batch).to_vec();
-                ensure!(
-                    !refs.is_empty(),
-                    "step {step} has no window left in ramp stage {stage}'s share of epoch {}: \
-                     the cursor is at {cursor} of {} assigned windows. The schedule is derived \
-                     from the partition, so this can only happen if the two disagree.",
-                    self.epoch,
-                    self.pass_layout.windows(stage).len()
-                );
-                let sample = self.train_samplers[stage].batch_of(&refs, self.device);
-                (refs, sample)
+            let step_region = profile::region(profile::STEP);
+            let data_started = Instant::now();
+            let draw_region = profile::region(profile::DATA_DRAW);
+            // The last draw of a stage is SHORT, not dropped, so the pass covers the
+            // partial tail of the stage's share instead of leaving up to `batch - 1`
+            // windows untargeted.
+            let refs = self.pass_layout.draw(stage, cursor, planned_batch).to_vec();
+            ensure!(
+                !refs.is_empty(),
+                "step {step} has no window left in ramp stage {stage}'s share of epoch {}: \
+                 the cursor is at {cursor} of {} assigned windows. The schedule is derived \
+                 from the partition, so this can only happen if the two disagree.",
+                self.epoch,
+                self.pass_layout.windows(stage).len()
+            );
+            drop(draw_region);
+            let build_region = profile::region(profile::DATA_BUILD);
+            let host = match self.prefetch.take(DrawKey {
+                epoch: self.epoch,
+                stage,
+                cursor,
+                batch: refs.len(),
+            }) {
+                Some(host) => host,
+                None => {
+                    self.train_samplers[stage].host_batch_of_into(&refs, &mut self.fallback_scratch)
+                }
             };
+            drop(build_region);
             // Marked from the DRAW, not from the cursor that produced it, so a skip or a
             // repeat shows up in the audit as a zero or a two rather than being masked by the
             // counter that caused it.
             let batch = refs.len();
             self.pass_ledger.mark(stage, cursor, batch);
             self.stage_cursor[stage] = cursor + batch;
+            // Queue step `n + 1`'s host build BEFORE this step's device work, so the encode
+            // and the calendar ids run on the worker while the device is busy. Restricted to
+            // the same stage and the same epoch: a stage boundary may hold the batch and an
+            // epoch boundary repartitions every cursor, so either would invalidate the draw.
+            // The key check makes a wrong prediction a synchronous rebuild, never a wrong batch.
+            if step + 1 < self.schedule.total_steps
+                && !self.schedule.completes_epoch(step)
+                && self.schedule.stage(step + 1) == stage
+            {
+                let next_cursor = self.stage_cursor[stage];
+                let next_refs = self
+                    .pass_layout
+                    .draw(stage, next_cursor, self.schedule.batch(step + 1))
+                    .to_vec();
+                if !next_refs.is_empty() {
+                    self.prefetch.request(
+                        DrawKey {
+                            epoch: self.epoch,
+                            stage,
+                            cursor: next_cursor,
+                            batch: next_refs.len(),
+                        },
+                        next_refs,
+                    );
+                }
+            }
+            let h2d_region = profile::region(profile::DATA_H2D);
+            let sample = host.to_device(self.device);
+            drop(h2d_region);
+            let data_wall_secs = data_started.elapsed().as_secs_f64();
 
             let lr_mult = self.schedule.lr_multiplier(step);
             self.optimizer.set_learning_rates(
@@ -5710,6 +5913,7 @@ impl Trainer {
             // index is byte-identical in ordering to a run with no auxiliary stream up to the
             // shared parameter state, which is what makes the A/B a single-variable comparison.
             self.auxiliary_steps(step)?;
+            drop(step_region);
             // The exact denominator of the scalar NLL reduction. It comes back from
             // `optimizer_step`, where `[B, T]` is flattened for the mean, rather than being
             // reconstructed from the planned batch (the final draw of a stage is short).
@@ -5757,6 +5961,7 @@ impl Trainer {
             metrics.direct_objective_share = loss.direct_objective_share;
             metrics.shared_grad_alignment = loss.shared_grad_alignment;
             metrics.shared_grad_conflict = loss.shared_grad_conflict;
+            metrics.data_wall_secs = data_wall_secs;
             metrics.forward_wall_secs = loss.forward_wall_secs;
             metrics.step_wall_secs = loss.step_wall_secs;
             metrics.growth_loss = loss.growth_diagnostic;
@@ -5848,10 +6053,12 @@ impl Trainer {
                     loss.grad_norm,
                     (step + 1) as f64 / elapsed.max(1e-9)
                 );
+                let (prefetch_hits, prefetch_misses, prefetch_unqueued) = self.prefetch.counts();
                 println!(
                     "  direct complete bars | h2 {:.4} x{:.4} | h3 {:.4} x{:.4} | objective \
                      share {:.1}% | shared-grad cosine {:.4} conflict {:.1}% | forward {:.4}s \
-                     step {:.4}s",
+                     step {:.4}s | prefetch {prefetch_hits} served / {prefetch_misses} \
+                     discarded / {prefetch_unqueued} unqueued",
                     loss.direct_nll[0],
                     loss.direct_weights[0],
                     loss.direct_nll[1],
@@ -5862,6 +6069,7 @@ impl Trainer {
                     loss.forward_wall_secs,
                     loss.step_wall_secs,
                 );
+                profile::report(&format!("step {step}"), self.args.log_every.max(1));
             }
 
             // An epoch is a PASS, and a pass is a fixed partition of the corpus, so the
@@ -6419,7 +6627,10 @@ impl Trainer {
         };
         let forward_started = Instant::now();
 
+        let zero_region = profile::region(profile::ZERO_GRAD);
         self.optimizer.zero_grad();
+        drop(zero_region);
+        let forward_region = profile::region(profile::FORWARD);
         let graph = autocast(self.device.is_cuda(), || {
             forward_losses(
                 &self.modules,
@@ -6439,6 +6650,7 @@ impl Trainer {
                 self.device,
             )
         });
+        drop(forward_region);
         let forward_wall_secs = forward_started.elapsed().as_secs_f64();
         let (shared_grad_alignment, shared_grad_conflict) = if stream.is_none()
             && self.args.validate_every > 0
@@ -6451,7 +6663,10 @@ impl Trainer {
         // Backward first so the gradient norm and optimizer diagnostics can join every loss
         // in one device-to-host transfer. Only the explicit SMD arm builds a gradient graph
         // and an exact Pearlmutter HVP; production and fixed SGD take ordinary backward.
+        let backward_region = profile::region(profile::BACKWARD);
         self.optimizer.backward(&graph.loss)?;
+        drop(backward_region);
+        let grad_norm_region = profile::region(profile::GRAD_NORM);
         let grad_norm_tensor = global_grad_norm_tensor(&self.vs, self.device);
         let row_lr_metrics = self.optimizer.row_learned_lr_metrics_tensor();
         let smd_metrics = self.optimizer.smd_metrics_tensor();
@@ -6461,7 +6676,26 @@ impl Trainer {
             row_lr_metrics.as_ref(),
             smd_metrics.as_ref(),
         );
+        drop(grad_norm_region);
+        // The update is LAUNCHED before the packet is read. NorMuon issues on the order of a
+        // thousand small kernels per step, so reading first drained the queue and then left the
+        // device idle for the entire launch storm — measured at 20% of the step. Stream order
+        // makes the packet carry pre-update values either way, because `pack_step_metrics`
+        // ends in a `cat` that is enqueued ahead of the optimizer's first kernel.
+        //
+        // `stream` is also the only thing that distinguishes a primary update from an
+        // auxiliary resolution's share of one, and AdamW's `adamw_every` cadence is defined
+        // over PRIMARY steps: keying it off a count of `step()` calls would silently halve
+        // AdamW's effective interval the moment `--auxiliary-resolutions` is non-empty.
+        let optimizer_region = profile::region(profile::OPTIMIZER);
+        self.optimizer.step(match stream {
+            None => StepKind::Primary,
+            Some(_) => StepKind::Auxiliary,
+        })?;
+        drop(optimizer_region);
+        let sync_region = profile::region(profile::METRIC_SYNC);
         let metrics = read_packed_step_metrics(&packed);
+        drop(sync_region);
         ensure_finite_step_metrics(&metrics, step)?;
         let total = metrics[STEP_METRIC_TOTAL];
         let grad_norm = metrics[STEP_METRIC_GRAD_NORM];
@@ -6474,8 +6708,8 @@ impl Trainer {
         let mut direct_nll_dof = [[f64::NAN; BAR_DOF]; 2];
         direct_nll_dof[0].copy_from_slice(&metrics[STEP_METRIC_DIRECT_T2_DOF]);
         direct_nll_dof[1].copy_from_slice(&metrics[STEP_METRIC_DIRECT_T3_DOF]);
-        let direct_target_count = std::array::from_fn(|horizon| {
-            graph.direct_target_count[horizon].double_value(&[]).round() as u64
+        let direct_target_count: [u64; 2] = std::array::from_fn(|horizon| {
+            metrics[STEP_METRIC_DIRECT_COUNT.start + horizon].round() as u64
         });
         for (horizon, count) in direct_target_count.iter().copied().enumerate() {
             ensure!(
@@ -6502,22 +6736,16 @@ impl Trainer {
         let autocorr = metrics[STEP_METRIC_AUTOCORR];
         // Raw open-tail returns may legitimately cross zero wealth. The held-out diagnostic
         // handles those through its finite bankruptcy-domain continuation; only a non-finite
-        // raw argument indicates corrupted data or arithmetic. This guard runs before
-        // optimizer mutation.
+        // raw argument indicates corrupted data or arithmetic. The update has already been
+        // launched by this point, so a trip here aborts the run on weights nobody will read
+        // rather than before the mutation; the run dies either way and the last committed
+        // checkpoint predates the poisoned step.
         ensure!(
             growth_stats.min_log_argument.is_finite(),
             "the raw-payoff growth diagnostic produced a non-finite raw log argument at step \
              {step}. The bankruptcy continuation handles every finite 1 + f_hat R, so this \
              indicates a non-finite realized return or fraction"
         );
-        // `stream` is also the only thing that distinguishes a primary update from an
-        // auxiliary resolution's share of one, and AdamW's `adamw_every` cadence is defined
-        // over PRIMARY steps: keying it off a count of `step()` calls would silently halve
-        // AdamW's effective interval the moment `--auxiliary-resolutions` is non-empty.
-        self.optimizer.step(match stream {
-            None => StepKind::Primary,
-            Some(_) => StepKind::Auxiliary,
-        })?;
         let attached = [
             nll_value,
             direct_weights.0 * direct_nll[0],
@@ -6663,8 +6891,13 @@ impl Trainer {
     /// measured are DECLARED unmeasured, so they leave a gap in their series instead of a
     /// NaN that reads exactly like a measured catastrophe.
     fn validate(&mut self, step: usize, epoch_boundary: bool, final_step: bool) -> Result<()> {
+        let validate_region = profile::region(profile::VALIDATE);
         let eval_batch = self.args.batch_size;
-        self.refit_sizing_shrink(step, eval_batch)?;
+        {
+            let _region = profile::region(profile::VALIDATE_SHRINK);
+            self.refit_sizing_shrink(step, eval_batch)?;
+        }
+        let diagnostic_region = profile::region(profile::VALIDATE_DIAG);
         let diagnostic = evaluate(
             &self.modules,
             &self.supports_dev,
@@ -6676,12 +6909,15 @@ impl Trainer {
             self.traded_sizing(),
             trade_bench::TRADE_WINDOWS,
         )?;
+        drop(diagnostic_region);
         self.print_diagnostic(step, &diagnostic);
         // Measured once and carried to the metrics: the bootstrap is the only expensive part
         // and doing it twice would buy nothing. Timed because the epoch line has to state
         // what watching the economics costs — see `EPOCH_BOUNDARY_OVERHEAD_WARN`.
         let bench_started = Instant::now();
+        let bench_region = profile::region(profile::VALIDATE_BENCH);
         let trade = self.trade(&self.eval.diagnostic, &diagnostic);
+        drop(bench_region);
         let mut bench_secs = bench_started.elapsed().as_secs_f64();
         for line in trade.report_lines() {
             println!("step {step}: {line}");
@@ -6696,6 +6932,7 @@ impl Trainer {
         let deployed_ready = self.schedule.in_final_stage(step)
             && self.reached_context >= self.eval.promotion.context;
         let promotion = if deployed_ready {
+            let _region = profile::region(profile::VALIDATE_PROMOTION);
             let stats = evaluate(
                 &self.modules,
                 &self.supports_dev,
@@ -6790,22 +7027,29 @@ impl Trainer {
         // artifact under its own name: the planner still loads `pretrain_best.ot`.
         // `trade` is the bench of THIS pass over THESE windows, so its Mincer-Zarnowitz fit is
         // the calibration of the vector being written and costs nothing extra to record.
+        let scores_region = profile::region(profile::VALIDATE_SCORES);
         let diagnostic_scores = self.window_scores(
             &self.eval.diagnostic,
             &diagnostic,
             step,
             Some(&trade.calibration),
         );
-        self.keep_context_best(step, &diagnostic, &diagnostic_scores)?;
+        drop(scores_region);
+        {
+            let _region = profile::region(profile::VALIDATE_CONTEXT_BEST);
+            self.keep_context_best(step, &diagnostic, &diagnostic_scores)?;
+        }
         // The epoch artifact and the snapshots that picture it are the two halves of one
         // record, so the artifact path is carried to the snapshot writer rather than
         // rediscovered: the pictures must depict THESE weights and no others.
         let checkpoint_started = Instant::now();
+        let checkpoint_region = profile::region(profile::VALIDATE_CHECKPOINT);
         let epoch_artifact = if epoch_boundary || final_step {
             Some(self.write_epoch_checkpoint(step, &diagnostic, &diagnostic_scores, &trade)?)
         } else {
             None
         };
+        drop(checkpoint_region);
         let checkpoint_secs = checkpoint_started.elapsed().as_secs_f64();
 
         let mut promoted_checkpoint = None;
@@ -7082,7 +7326,10 @@ impl Trainer {
                     edge_se_bps: ledger.edge_se_bps,
                     nll_conditional: selection_nll,
                 };
-                promoted_checkpoint = Some(self.promote(nll, target, eval_batch, &scores, record)?);
+                let promote_region = profile::region(profile::VALIDATE_PROMOTE);
+                promoted_checkpoint =
+                    Some(self.promote(&stats, target, eval_batch, &scores, record)?);
+                drop(promote_region);
                 self.best_val_nll_bar = nll;
                 self.best_selection_edge_bps = ledger.edge_bps;
                 self.best_selection_edge_windows = Some(candidate_edge);
@@ -7103,7 +7350,10 @@ impl Trainer {
             promotion_stats = Some(stats);
         }
 
+        let rollout_region = profile::region(profile::VALIDATE_ROLLOUT);
         let (exact, dynamics) = self.rollout_diagnostics();
+        drop(rollout_region);
+        let direct_region = profile::region(profile::VALIDATE_DIRECT);
         let direct = evaluate_direct_horizons(
             &self.modules,
             &self.supports_dev,
@@ -7111,6 +7361,7 @@ impl Trainer {
             eval_batch,
             self.device,
         );
+        drop(direct_region);
         // Pictures of the artifact written a few lines above, on the SAME pinned scene at
         // every boundary. Previously this depicted `pretrain_best.ot` and was skipped until
         // the first promotion existed, which is why a 13831-step run left exactly one
@@ -7118,9 +7369,11 @@ impl Trainer {
         // first two thirds of a run. An epoch artifact always exists at a boundary, so the
         // series has a point at every one of them and every point is that epoch's weights.
         let snapshot_started = Instant::now();
+        let snapshot_region = profile::region(profile::VALIDATE_SNAPSHOT);
         if let Some(artifact) = epoch_artifact.as_ref() {
             self.write_snapshot(step, artifact)?;
         }
+        drop(snapshot_region);
         let snapshot_secs = snapshot_started.elapsed().as_secs_f64();
 
         let mut metrics = EpochMetrics::nan();
@@ -7295,6 +7548,11 @@ impl Trainer {
             self.epoch_dyn_identity_sum = 0.0;
             self.epoch_dyn_identity_steps = 0;
         }
+        drop(validate_region);
+        // The step regions were already reported and cleared by the step-cadence log line, so
+        // this window holds the validation boundary alone. One report per boundary rather than
+        // per run: a validation is the unit whose attribution a reader can act on.
+        profile::report(&format!("validate {step}"), 1);
         Ok(())
     }
 
@@ -8746,15 +9004,21 @@ impl Trainer {
 
     /// Save a candidate, load it back through the real world-model loader, confirm
     /// the reloaded model reproduces the held-out NLL, and only then swap it in.
+    ///
+    /// `expected` is the LIVE pass over [`Self::promotion_set`], whose per-window vector is
+    /// what the guard compares against — see [`PROMOTION_ROUNDTRIP_WINDOWS`] for why the
+    /// reloaded side scores a prefix of those windows rather than all of them.
     fn promote(
         &self,
-        expected_nll: f64,
+        expected: &EvalStats,
         target: PromotionTarget,
         eval_batch: usize,
         scores: &WindowScores,
         record: SelectionRecord,
     ) -> Result<PathBuf> {
-        let artifact_context = self.promotion_set(target).context;
+        let set = self.promotion_set(target);
+        let artifact_context = set.context;
+        let expected_nll = expected.nll_bar;
         let candidate = self.run.weights.join("pretrain_promotion_candidate.ot");
         // The context the decision is being taken at, recorded in the artifact itself: a
         // checkpoint selected on the diagnostic set must not claim it was selected at the
@@ -8768,10 +9032,19 @@ impl Trainer {
                 candidate.display()
             )
         })?;
+        // A fixed prefix, with no per-symbol floor: the world model has no per-symbol
+        // parameter for a symbol-specific window to uniquely exercise. Its embeddings are
+        // `bar_bin_embed`, `bar_dof_embed`, `bar_time_embed` and `bar_prefix_embed`, all
+        // keyed by bin, DOF, calendar slot or chain prefix, and symbol identity enters only
+        // as the data selected into the window. A serialization fault is a property of the
+        // tensor file, not of which rows a window happens to read, so it shows on the first
+        // chunk. `pinned_windows` interleaves symbols so a prefix is diverse regardless.
+        let guard_set = set.prefix(PROMOTION_ROUNDTRIP_WINDOWS);
+        let roundtrip_region = profile::region(profile::VALIDATE_ROUNDTRIP);
         let reloaded = evaluate(
             world.modules(),
             world.deployment_supports(),
-            self.promotion_set(target),
+            &guard_set,
             eval_batch,
             self.device,
             false,
@@ -8779,12 +9052,34 @@ impl Trainer {
             TradedSizing::CONTROL,
             trade_bench::TRADE_WINDOWS,
         )?;
-        let drift = (reloaded.nll_bar - expected_nll).abs();
+        drop(roundtrip_region);
+        // Both sides reduce a per-window vector of the SAME windows in the SAME order, so the
+        // only thing the drift can express is a difference in the loaded weights. Comparing
+        // the prefix score against `expected_nll` would instead compare two different
+        // estimands and would fail on window heterogeneity alone.
+        let expected_prefix = mean_nats(&expected.window_nll[..guard_set.windows.len()]);
+        let reloaded_prefix = mean_nats(&reloaded.window_nll);
+        let drift = (reloaded_prefix - expected_prefix).abs();
         ensure!(
             drift < PROMOTION_ROUNDTRIP_TOLERANCE,
-            "reloaded checkpoint disagrees with the live model: {:.6} vs {expected_nll:.6} \
-             nats/bar (drift {drift:.2e})",
-            reloaded.nll_bar
+            "reloaded checkpoint disagrees with the live model over the first {} of the {} \
+             promotion windows: {reloaded_prefix:.6} vs {expected_prefix:.6} nats/bar (drift \
+             {drift:.2e}). The live full-set score was {expected_nll:.6}",
+            guard_set.windows.len(),
+            set.windows.len(),
+        );
+        // The guard was silent on success, which made the one number that says whether weight
+        // serialization is healthy invisible until the day it failed. A drift that is drifting
+        // — rising across promotions while still under tolerance — is exactly the signal worth
+        // seeing before it trips.
+        println!(
+            "step {}: reloaded-checkpoint guard OK — {} of {} promotion windows re-scored off \
+             disk, drift {drift:.3e} nats/bar against the live pass's own score for those same \
+             windows ({reloaded_prefix:.6} vs {expected_prefix:.6}, tolerance \
+             {PROMOTION_ROUNDTRIP_TOLERANCE:.0e})",
+            record.step,
+            guard_set.windows.len(),
+            set.windows.len(),
         );
 
         let best = self.run.weights.join("pretrain_best.ot");
@@ -9188,166 +9483,198 @@ fn evaluate_direct_horizons(
     let mut crps_dof = [[0.0; BAR_DOF]; 2];
     let mut dir_hits = [0.0; 2];
     let mut dir_total = [0.0; 2];
-    tch::no_grad(|| {
-        for chunk in set.windows.chunks(batch.max(1)) {
-            let sample = set.sampler.batch_of(chunk, device);
-            let direct_time_ids = sample
-                .direct_time_ids
-                .as_ref()
-                .expect("direct evaluation sampler must carry forecast-safe h2/h3 clocks");
-            let direct_valid = sample
-                .direct_valid
-                .as_ref()
-                .expect("direct evaluation sampler must carry ordinary-row masks");
-            let exact_target_time_all =
-                set.sampler
-                    .one_step_forecast_time_ids(chunk, (set.context + 2) as usize, device);
-            let context = set.context;
-            let exact_belief_context = direct_exact_belief_context(context);
-            let bins = supports.bin_ids(&sample.dof);
-            let beliefs_all = modules.trunk.forward(
-                &sample.dof.narrow(1, 0, exact_belief_context),
-                &bins.narrow(1, 0, exact_belief_context),
-                &sample.time_ids.narrow(1, 0, exact_belief_context),
-                0,
-                false,
-            );
-            let beliefs = beliefs_all.narrow(1, 0, context);
-            let current_time = sample.time_ids.narrow(1, 0, context);
-            possible_rows += (chunk.len() as i64 * context) as f64;
-            for (slot, horizon) in [2usize, 3].into_iter().enumerate() {
-                let indices = direct_valid
-                    .select(2, slot as i64)
-                    .reshape([-1])
-                    .nonzero()
-                    .squeeze_dim(1);
-                let chunk_rows = indices.size()[0] as f64;
-                if chunk_rows == 0.0 {
-                    continue;
-                }
-                rows[slot] += chunk_rows;
-                let target = sample
-                    .dof
-                    .narrow(1, horizon as i64, context)
-                    .reshape([-1, BAR_DOF as i64])
-                    .index_select(0, &indices);
-                let target_bins = bins
-                    .narrow(1, horizon as i64, context)
-                    .reshape([-1, BAR_DOF as i64])
-                    .index_select(0, &indices);
-                let target_time = direct_time_ids
-                    .select(2, slot as i64)
-                    .reshape([-1, BAR_TIME_FEATURES as i64])
-                    .index_select(0, &indices);
-                let decision_beliefs = beliefs
-                    .reshape([-1, BAR_MODEL_DIM])
-                    .index_select(0, &indices);
-                let decision_time = current_time
-                    .reshape([-1, BAR_TIME_FEATURES as i64])
-                    .index_select(0, &indices);
-                let conditioning = modules
-                    .trunk
-                    .forecast_conditioning(&target_time, &decision_time);
-                let logits = modules.head.direct_logits(
-                    &decision_beliefs,
-                    &conditioning,
-                    &target_bins,
-                    horizon,
+    eval_forward(device, || {
+        std::thread::scope(|scope| {
+            let mut ready = prefetch_chunk_batches(scope, &set.sampler, &set.windows, batch);
+            for chunk in set.windows.chunks(batch.max(1)) {
+                let sample = {
+                    let _region = profile::region(profile::DIRECT_DATA);
+                    ready.next().to_device(device)
+                };
+                let direct_time_ids = sample
+                    .direct_time_ids
+                    .as_ref()
+                    .expect("direct evaluation sampler must carry forecast-safe h2/h3 clocks");
+                let direct_valid = sample
+                    .direct_valid
+                    .as_ref()
+                    .expect("direct evaluation sampler must carry ordinary-row masks");
+                let exact_target_time_all = set.sampler.one_step_forecast_time_ids(
+                    chunk,
+                    (set.context + 2) as usize,
+                    device,
                 );
-                let targets = supports.targets_from_class_ids(&target_bins, BarScoring::Hard);
-                let (batch_nll, batch_dof) = bar_nll_from_logits(&logits, &targets);
-                nll[slot] += batch_nll.double_value(&[]) * chunk_rows;
-                let values = dof_array(&batch_dof);
-                for dof in 0..BAR_DOF {
-                    nll_dof[slot][dof] += values[dof] * chunk_rows;
-                }
-
-                let exact_context =
-                    direct_exact_comparator_context(context, exact_belief_context, horizon);
-                let exact_indices = direct_valid
-                    .select(2, slot as i64)
-                    .narrow(1, 0, exact_context)
-                    .reshape([-1])
-                    .nonzero()
-                    .squeeze_dim(1);
-                let paired_rows = exact_indices.size()[0] as f64;
-                if paired_rows > 0.0 {
-                    exact_rows[slot] += paired_rows;
-                    let paired_target_bins = bins
-                        .narrow(1, horizon as i64, exact_context)
-                        .reshape([-1, BAR_DOF as i64])
-                        .index_select(0, &exact_indices);
-                    let paired_target_time = direct_time_ids
+                let context = set.context;
+                let exact_belief_context = direct_exact_belief_context(context);
+                let trunk_region = profile::region(profile::DIRECT_TRUNK);
+                let bins = supports.bin_ids(&sample.dof);
+                let beliefs_all = modules.trunk.forward(
+                    &sample.dof.narrow(1, 0, exact_belief_context),
+                    &bins.narrow(1, 0, exact_belief_context),
+                    &sample.time_ids.narrow(1, 0, exact_belief_context),
+                    0,
+                    false,
+                );
+                drop(trunk_region);
+                let beliefs = beliefs_all.narrow(1, 0, context);
+                let current_time = sample.time_ids.narrow(1, 0, context);
+                possible_rows += (chunk.len() as i64 * context) as f64;
+                for (slot, horizon) in [2usize, 3].into_iter().enumerate() {
+                    let select_region = profile::region(profile::DIRECT_SELECT);
+                    let indices = direct_valid
                         .select(2, slot as i64)
-                        .narrow(1, 0, exact_context)
+                        .reshape([-1])
+                        .nonzero()
+                        .squeeze_dim(1);
+                    let chunk_rows = indices.size()[0] as f64;
+                    drop(select_region);
+                    if chunk_rows == 0.0 {
+                        continue;
+                    }
+                    rows[slot] += chunk_rows;
+                    let target = sample
+                        .dof
+                        .narrow(1, horizon as i64, context)
+                        .reshape([-1, BAR_DOF as i64])
+                        .index_select(0, &indices);
+                    let target_bins = bins
+                        .narrow(1, horizon as i64, context)
+                        .reshape([-1, BAR_DOF as i64])
+                        .index_select(0, &indices);
+                    let target_time = direct_time_ids
+                        .select(2, slot as i64)
                         .reshape([-1, BAR_TIME_FEATURES as i64])
-                        .index_select(0, &exact_indices);
-                    let paired_decision_beliefs = beliefs
-                        .narrow(1, 0, exact_context)
+                        .index_select(0, &indices);
+                    let decision_beliefs = beliefs
                         .reshape([-1, BAR_MODEL_DIM])
-                        .index_select(0, &exact_indices);
-                    let paired_decision_time = current_time
-                        .narrow(1, 0, exact_context)
+                        .index_select(0, &indices);
+                    let decision_time = current_time
                         .reshape([-1, BAR_TIME_FEATURES as i64])
-                        .index_select(0, &exact_indices);
-                    let paired_conditioning = modules
+                        .index_select(0, &indices);
+                    let score_region = profile::region(profile::DIRECT_SCORE);
+                    let conditioning = modules
                         .trunk
-                        .forecast_conditioning(&paired_target_time, &paired_decision_time);
-                    let paired_direct_logits = modules.head.direct_logits(
-                        &paired_decision_beliefs,
-                        &paired_conditioning,
-                        &paired_target_bins,
+                        .forecast_conditioning(&target_time, &decision_time);
+                    let logits = modules.head.direct_logits(
+                        &decision_beliefs,
+                        &conditioning,
+                        &target_bins,
                         horizon,
                     );
-                    let paired_targets =
-                        supports.targets_from_class_ids(&paired_target_bins, BarScoring::Hard);
-                    let (paired_direct_nll, _) =
-                        bar_nll_from_logits(&paired_direct_logits, &paired_targets);
-                    direct_on_exact_rows_nll[slot] +=
-                        paired_direct_nll.double_value(&[]) * paired_rows;
+                    let targets = supports.targets_from_class_ids(&target_bins, BarScoring::Hard);
+                    let (batch_nll, batch_dof) = bar_nll_from_logits(&logits, &targets);
+                    nll[slot] += batch_nll.double_value(&[]) * chunk_rows;
+                    let values = dof_array(&batch_dof);
+                    for dof in 0..BAR_DOF {
+                        nll_dof[slot][dof] += values[dof] * chunk_rows;
+                    }
 
-                    let exact_beliefs = beliefs_all
-                        .narrow(1, horizon as i64 - 1, exact_context)
-                        .reshape([-1, BAR_MODEL_DIM])
-                        .index_select(0, &exact_indices);
-                    let exact_current_time = sample
-                        .time_ids
-                        .narrow(1, horizon as i64 - 1, exact_context)
-                        .reshape([-1, BAR_TIME_FEATURES as i64])
-                        .index_select(0, &exact_indices);
-                    let exact_target_time = exact_target_time_all
-                        .narrow(1, horizon as i64 - 1, exact_context)
-                        .reshape([-1, BAR_TIME_FEATURES as i64])
-                        .index_select(0, &exact_indices);
-                    let exact_conditioning = modules
-                        .trunk
-                        .forecast_conditioning(&exact_target_time, &exact_current_time);
-                    let quadraticits = modules.head.logits(
-                        &exact_beliefs,
-                        &exact_conditioning,
-                        &paired_target_bins,
+                    let exact_context =
+                        direct_exact_comparator_context(context, exact_belief_context, horizon);
+                    // `exact_context == context` is the ordinary case: the comparator context is
+                    // `min(context, belief_context - (horizon - 1))` against a belief span of
+                    // `context + 2`, so only a context pinned at `BAR_MAX_CONTEXT` shortens it.
+                    // Where it does not shorten, the narrow covers the whole mask and the scan
+                    // would reproduce `indices` and its row count exactly, so both are reused.
+                    // `nonzero` sizes its own output from the data and therefore drains the
+                    // device, so the duplicate cost a synchronization as well as a scan.
+                    let shortened = exact_context != context;
+                    let exact_indices = if shortened {
+                        direct_valid
+                            .select(2, slot as i64)
+                            .narrow(1, 0, exact_context)
+                            .reshape([-1])
+                            .nonzero()
+                            .squeeze_dim(1)
+                    } else {
+                        indices.shallow_clone()
+                    };
+                    let paired_rows = if shortened {
+                        exact_indices.size()[0] as f64
+                    } else {
+                        chunk_rows
+                    };
+                    if paired_rows > 0.0 {
+                        exact_rows[slot] += paired_rows;
+                        let paired_target_bins = bins
+                            .narrow(1, horizon as i64, exact_context)
+                            .reshape([-1, BAR_DOF as i64])
+                            .index_select(0, &exact_indices);
+                        let paired_target_time = direct_time_ids
+                            .select(2, slot as i64)
+                            .narrow(1, 0, exact_context)
+                            .reshape([-1, BAR_TIME_FEATURES as i64])
+                            .index_select(0, &exact_indices);
+                        let paired_decision_beliefs = beliefs
+                            .narrow(1, 0, exact_context)
+                            .reshape([-1, BAR_MODEL_DIM])
+                            .index_select(0, &exact_indices);
+                        let paired_decision_time = current_time
+                            .narrow(1, 0, exact_context)
+                            .reshape([-1, BAR_TIME_FEATURES as i64])
+                            .index_select(0, &exact_indices);
+                        let paired_conditioning = modules
+                            .trunk
+                            .forecast_conditioning(&paired_target_time, &paired_decision_time);
+                        let paired_direct_logits = modules.head.direct_logits(
+                            &paired_decision_beliefs,
+                            &paired_conditioning,
+                            &paired_target_bins,
+                            horizon,
+                        );
+                        let paired_targets =
+                            supports.targets_from_class_ids(&paired_target_bins, BarScoring::Hard);
+                        let (paired_direct_nll, _) =
+                            bar_nll_from_logits(&paired_direct_logits, &paired_targets);
+                        direct_on_exact_rows_nll[slot] +=
+                            paired_direct_nll.double_value(&[]) * paired_rows;
+
+                        let exact_beliefs = beliefs_all
+                            .narrow(1, horizon as i64 - 1, exact_context)
+                            .reshape([-1, BAR_MODEL_DIM])
+                            .index_select(0, &exact_indices);
+                        let exact_current_time = sample
+                            .time_ids
+                            .narrow(1, horizon as i64 - 1, exact_context)
+                            .reshape([-1, BAR_TIME_FEATURES as i64])
+                            .index_select(0, &exact_indices);
+                        let exact_target_time = exact_target_time_all
+                            .narrow(1, horizon as i64 - 1, exact_context)
+                            .reshape([-1, BAR_TIME_FEATURES as i64])
+                            .index_select(0, &exact_indices);
+                        let exact_conditioning = modules
+                            .trunk
+                            .forecast_conditioning(&exact_target_time, &exact_current_time);
+                        let quadraticits = modules.head.logits(
+                            &exact_beliefs,
+                            &exact_conditioning,
+                            &paired_target_bins,
+                        );
+                        let (exact_batch_nll, _) =
+                            bar_nll_from_logits(&quadraticits, &paired_targets);
+                        exact_nll[slot] += exact_batch_nll.double_value(&[]) * paired_rows;
+                    }
+
+                    let crps = dof_array(&bar_crps_from_logits(&logits, &target, supports));
+                    for dof in 0..BAR_DOF {
+                        crps_dof[slot][dof] += crps[dof] * chunk_rows;
+                    }
+                    let probabilities = logits.select(-2, DOF_R as i64).softmax(-1, Kind::Double);
+                    let centers = Tensor::from_slice(supports.centers(DOF_R))
+                        .to_device(device)
+                        .to_kind(Kind::Double);
+                    let (hits, total) = direction_counts_from_law(
+                        &probabilities,
+                        &centers,
+                        &target.select(-1, DOF_R as i64).to_kind(Kind::Double),
                     );
-                    let (exact_batch_nll, _) = bar_nll_from_logits(&quadraticits, &paired_targets);
-                    exact_nll[slot] += exact_batch_nll.double_value(&[]) * paired_rows;
+                    dir_hits[slot] += hits;
+                    dir_total[slot] += total;
+                    drop(score_region);
                 }
-
-                let crps = dof_array(&bar_crps_from_logits(&logits, &target, supports));
-                for dof in 0..BAR_DOF {
-                    crps_dof[slot][dof] += crps[dof] * chunk_rows;
-                }
-                let probabilities = logits.select(-2, DOF_R as i64).softmax(-1, Kind::Double);
-                let centers = Tensor::from_slice(supports.centers(DOF_R))
-                    .to_device(device)
-                    .to_kind(Kind::Double);
-                let (hits, total) = direction_counts_from_law(
-                    &probabilities,
-                    &centers,
-                    &target.select(-1, DOF_R as i64).to_kind(Kind::Double),
-                );
-                dir_hits[slot] += hits;
-                dir_total[slot] += total;
             }
-        }
+            ready.report("direct horizons", set.sampler.split().as_str(), set.context);
+        });
     });
     DirectEvalDiagnostics {
         nll: std::array::from_fn(|slot| nll[slot] / rows[slot]),
@@ -9462,6 +9789,10 @@ fn pinned_snapshot_window(set: &PinnedSet, device: Device) -> SnapshotWindow {
 /// `future_time_ids`, generated from the decision timestamp by [`pinned_snapshot_window`].
 /// One window at a time bounds the exact-mode KV cache at `samples` sequences rather than
 /// `windows * samples`.
+///
+/// [`eval_forward`] here rather than at the two call sites, so the epoch snapshots a run
+/// writes and the standalone [`pretrain_candles`] pictures cannot depict the same checkpoint
+/// in two different precisions.
 fn rollout_pinned_windows(
     world: &BarWorldModel,
     history_dof: &Tensor,
@@ -9470,21 +9801,23 @@ fn rollout_pinned_windows(
     samples: usize,
     mode: RolloutMode,
 ) -> Tensor {
-    let parts: Vec<Tensor> = (0..history_dof.size()[0])
-        .map(|index| {
-            world
-                .rollout_with(
-                    &history_dof.narrow(0, index, 1),
-                    &history_time_ids.narrow(0, index, 1),
-                    &future_time_ids.narrow(0, index, 1),
-                    samples,
-                    1.0,
-                    mode,
-                )
-                .dof
-        })
-        .collect();
-    Tensor::cat(&parts, 0)
+    eval_forward(history_dof.device(), || {
+        let parts: Vec<Tensor> = (0..history_dof.size()[0])
+            .map(|index| {
+                world
+                    .rollout_with(
+                        &history_dof.narrow(0, index, 1),
+                        &history_time_ids.narrow(0, index, 1),
+                        &future_time_ids.narrow(0, index, 1),
+                        samples,
+                        1.0,
+                        mode,
+                    )
+                    .dof
+            })
+            .collect();
+        Tensor::cat(&parts, 0)
+    })
 }
 
 /// The `full`-only diagnostics of one evaluation chunk.
@@ -9685,8 +10018,45 @@ pub(super) fn evaluate_with_trunk(
     )
 }
 
-/// Teacher-forced evaluation over a pinned window set, in full precision so the
-/// number is reproducible independently of the training autocast policy. `full` adds
+/// Every evaluation forward, in the precision the deployed planner runs.
+///
+/// The planner wraps every world-model forward in `tch::autocast` (see
+/// `crate::torch::planner`), and so does the training step at [`Trainer::optimizer_step`].
+/// Evaluation used to be the one path that did not, on the argument that fp32 makes the
+/// reported number reproducible independently of the training autocast policy. It does — but
+/// the number it reproduces describes a model in a precision nothing ever deploys, and the
+/// four evaluation sweeps that produce it are half of a validation boundary's wall clock.
+///
+/// What bf16 changes is GEMMs: the trunk's qkv and feed-forward projections and the emission
+/// head's readout contraction, which `bar_dist::readout_kind` switches on the ambient
+/// autocast state exactly as it already does for the training step. It changes nothing about
+/// the reducers, because every one of them names its own accumulation dtype —
+/// `log_softmax(.., Kind::Float)` in [`bar_nll_terms`], `sum_dim_intlist(.., Kind::Double)`
+/// throughout `trade_bench` — so no NLL, CRPS, PIT, decomposition or economic sum acquires
+/// a bf16 accumulator. It also changes nothing about attention, which
+/// `world_model::attention_kind` has always forced to bf16 on CUDA so the strict FA4 bridge
+/// can accept it; fp32 evaluation was already scoring through the bf16 flash kernel.
+///
+/// Exactly one diagnostic opts back out, at its own call site: [`belief_rank_fp32`], a
+/// participation ratio over a deliberately widened covariance rather than a model forward.
+/// Everything that scores or certifies the model runs the deployed policy. [`dyn_identity_ratio`]
+/// was the other exception until its fp32 hold-out was measured against bf16 on fixed weights
+/// and found to change nothing; its doc comment carries the table.
+fn eval_forward<T>(device: Device, forward: impl FnOnce() -> T) -> T {
+    tch::no_grad(|| autocast(device.is_cuda(), forward))
+}
+
+/// [`belief_effective_rank`] with autocast OFF.
+///
+/// The function widens the beliefs to fp32 on purpose, and its covariance is a `[D, D]` GEMM
+/// over a strided belief sample: under an enclosing autocast that widening would be undone on
+/// the way into the matmul, and a participation ratio built from `centered` values rounded to
+/// eight mantissa bits is not the diagnostic this exists to provide.
+fn belief_rank_fp32(beliefs: &Tensor) -> f64 {
+    autocast(false, || belief_effective_rank(&flatten_beliefs(beliefs)))
+}
+
+/// Teacher-forced evaluation over a pinned window set, under [`eval_forward`]. `full` adds
 /// the calibration diagnostics; promotion only needs the NLL, and the diagnostics
 /// it does not compute are returned as NaN rather than zero.
 ///
@@ -9730,6 +10100,87 @@ pub(super) fn evaluate(
         EvaluationTrunk::Parallel,
         false,
     )
+}
+
+/// One-deep host-batch producer for a chunk schedule known in full before the pass starts.
+///
+/// The training draw has to guess which ramp stage the next step will read, which is why
+/// [`BatchPrefetcher`] can miss and has to carry a fallback staging buffer. An evaluation pass
+/// has no such problem: the pinned window order is fixed, so chunk `n + 1` is queued
+/// unconditionally while the device is still consuming chunk `n`. Only
+/// [`HostSample::to_device`] stays on the scoring thread, because it is a synchronous copy on
+/// that thread's stream and issuing it from the worker would serialize against the very
+/// kernels the overlap exists to hide behind.
+///
+/// Bit-identical to the synchronous call by construction: [`BarSampler::batch_of`] IS
+/// `host_batch_of_into(..).to_device(..)`, and `host_batch_of_into` is a pure function of the
+/// window refs and the mmapped corpus — `scratch` is staging that every call overwrites.
+fn prefetch_chunk_batches<'scope, 'env>(
+    scope: &'scope std::thread::Scope<'scope, 'env>,
+    sampler: &'env BarSampler,
+    windows: &'env [WindowRef],
+    batch: usize,
+) -> ChunkBatches {
+    let (outgoing, ready) = std::sync::mpsc::sync_channel::<HostSample>(1);
+    scope.spawn(move || {
+        // One scratch for the whole pass: the staging buffers are sized by the first chunk and
+        // only the short final chunk ever resizes them.
+        let mut scratch = sampler.scratch();
+        for chunk in windows.chunks(batch.max(1)) {
+            if outgoing
+                .send(sampler.host_batch_of_into(chunk, &mut scratch))
+                .is_err()
+            {
+                break;
+            }
+        }
+    });
+    ChunkBatches {
+        ready,
+        chunks: 0,
+        stalls: 0,
+    }
+}
+
+/// The consumer half of [`prefetch_chunk_batches`], counting the chunks whose build did NOT
+/// come for free.
+///
+/// A key MISS in [`BatchPrefetcher`]'s sense cannot happen here: the schedule is fixed, so the
+/// worker sends exactly one batch per chunk in chunk order and there is nothing to mispredict.
+/// The failure this path can actually have is the overlap not paying — the worker still
+/// building chunk `n` when the scoring thread has already finished chunk `n - 1` — which is
+/// silent and looks exactly like the synchronous loop it replaced. That is what `stalls`
+/// counts, and it is reported for the same reason the training counts are: the numbers are
+/// identical either way, so nothing else would say the overlap had stopped working.
+struct ChunkBatches {
+    ready: std::sync::mpsc::Receiver<HostSample>,
+    chunks: u64,
+    stalls: u64,
+}
+
+impl ChunkBatches {
+    /// The next chunk's host batch, blocking only when the worker is behind.
+    fn next(&mut self) -> HostSample {
+        self.chunks += 1;
+        if let Ok(host) = self.ready.try_recv() {
+            return host;
+        }
+        self.stalls += 1;
+        self.ready
+            .recv()
+            .expect("the evaluation prefetch thread produces one batch per chunk")
+    }
+
+    /// One line per pass, always. `stalls` has a floor of ONE — the first chunk has nothing to
+    /// overlap with and is necessarily built synchronously — so `1` is the healthy reading and
+    /// a count that tracks `chunks` means the host has become the bottleneck.
+    fn report(&self, pass: &str, split: &str, context: i64) {
+        println!(
+            "  eval prefetch [{pass}] {split} at {context} bars: {} chunks, {} stalled on the \
+             host build (floor 1, the unoverlappable first chunk)",
+            self.chunks, self.stalls,
+        );
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -9795,110 +10246,142 @@ fn evaluate_impl(
     };
     let mut trade_paths = ChunkPaths::default();
 
-    for (chunk_index, chunk) in set.windows.chunks(batch.max(1)).enumerate() {
-        let sample = set.sampler.batch_of(chunk, device);
-        let context = set.context;
-        let rows = chunk.len() as f64;
-        // Predictive losses are measured in the artifact's target geometry. Economics,
-        // calibration, and realized-volatility diagnostics are always paid on the original
-        // raw bar: standardized z may be clamped and is not an invertible outcome ledger.
-        let realized_target = sample
-            .raw_dof
-            .as_ref()
-            .unwrap_or(&sample.dof)
-            .narrow(1, 1, context);
+    std::thread::scope(|scope| -> Result<()> {
+        let mut ready = prefetch_chunk_batches(scope, &set.sampler, &set.windows, batch);
+        for (chunk_index, chunk) in set.windows.chunks(batch.max(1)).enumerate() {
+            let sample = {
+                let _region = profile::region(profile::EVAL_DATA);
+                ready.next().to_device(device)
+            };
+            let context = set.context;
+            let rows = chunk.len() as f64;
+            // Predictive losses are measured in the artifact's target geometry. Economics,
+            // calibration, and realized-volatility diagnostics are always paid on the original
+            // raw bar: standardized z may be clamped and is not an invertible outcome ledger.
+            let realized_target = sample
+                .raw_dof
+                .as_ref()
+                .unwrap_or(&sample.dof)
+                .narrow(1, 1, context);
 
-        let (per_window, live, extras, focused) = tch::no_grad(|| {
-            let input = sample.dof.narrow(1, 0, context);
-            let target = sample.dof.narrow(1, 1, context);
-            let bin_ids = supports.bin_ids(&input);
-            let beliefs = match trunk {
-                EvaluationTrunk::Parallel => modules.trunk.forward(
-                    &input,
-                    &bin_ids,
-                    &sample.time_ids.narrow(1, 0, context),
-                    0,
-                    false,
-                ),
-                EvaluationTrunk::Serialized => modules.trunk.forward_serialized(
-                    &input,
-                    &bin_ids,
-                    &sample.time_ids.narrow(1, 0, context),
-                ),
-                EvaluationTrunk::Recirculated(config) => modules
-                    .trunk
-                    .forward_recirculated(
+            let (per_window, live, extras, focused) = eval_forward(device, || {
+                let input = sample.dof.narrow(1, 0, context);
+                let target = sample.dof.narrow(1, 1, context);
+                let bin_ids = {
+                    let _region = profile::region(profile::EVAL_BINS);
+                    supports.bin_ids(&input)
+                };
+                let trunk_region = profile::region(profile::EVAL_TRUNK);
+                let beliefs = match trunk {
+                    EvaluationTrunk::Parallel => modules.trunk.forward(
                         &input,
                         &bin_ids,
                         &sample.time_ids.narrow(1, 0, context),
-                        config,
-                    )
-                    .expect("recirculation config was validated before evaluation"),
-            };
-            let soft_targets = supports.targets(&target, scoring);
-            let target_bins = supports.bin_ids(&target);
-            let current_time = sample.time_ids.narrow(1, 0, context);
-            let target_time = sample.time_ids.narrow(1, 1, context);
-            let conditioning = modules
-                .trunk
-                .forecast_conditioning(&target_time, &current_time);
-            let logits = modules.head.logits(&beliefs, &conditioning, &target_bins);
-            // `[B, T, BAR_DOF]`, unreduced: everything below is a reduction of this.
-            let terms = bar_nll_terms(&logits, &soft_targets);
-            // A bar is LIVE when `s != 0`. On a flat bar the encoding fixes `u = v = 0.5`,
-            // so those two factors carry no information and must not be counted as skill.
-            let live_mask = target
-                .select(-1, DOF_S as i64)
-                .not_equal(0.0)
-                .to_kind(Kind::Float);
-            let per_window_dof = terms.mean_dim([1i64].as_slice(), false, Kind::Float);
-            let live_dof = (&terms * live_mask.unsqueeze(-1)).sum_dim_intlist(
-                [1i64].as_slice(),
-                false,
-                Kind::Float,
-            );
-            let live_count = live_mask.sum_dim_intlist([1i64].as_slice(), false, Kind::Float);
-
-            let focused = focused_diagnostics.then(|| {
-                (
-                    direction_hits(modules, supports, &beliefs, &conditioning, &target, context),
-                    (chunk_index == 0).then(|| belief_effective_rank(&flatten_beliefs(&beliefs))),
-                )
-            });
-            let extras = full.then(|| {
-                let crps = dof_array(&bar_crps_from_logits(&logits, &target, supports));
-                // A per-chunk key, not one stream reused 171 times: `counter_uniforms` is
-                // keyed by (seed, flat element index), so a constant seed makes element j of
-                // every chunk draw the identical uniform and the atom half of the PIT
-                // histogram — half the u/v mass — has a far smaller effective sample size
-                // than its counts suggest.
-                let pit_values = bar_pit_from_logits(
-                    &logits,
-                    &target,
-                    supports,
-                    mix64(EVAL_WINDOW_SEED, chunk_index as u64),
-                );
-                let direction =
-                    direction_hits(modules, supports, &beliefs, &conditioning, &target, context);
-                let rank =
-                    (chunk_index == 0).then(|| belief_effective_rank(&flatten_beliefs(&beliefs)));
-                let parts = bar_nll_decomposition(&logits, &soft_targets, supports);
-                ChunkExtras {
-                    crps,
-                    pit: pit_values,
-                    direction,
-                    rank,
-                    class: dof_array(&parts.class),
-                    shape: dof_array(&parts.shape),
-                    independent_marginals: chunk_independent_marginals(
-                        modules,
-                        supports,
-                        &beliefs,
-                        &conditioning,
-                        &target,
-                        scoring,
-                        mix64(EVAL_WINDOW_SEED, chunk_index as u64),
+                        0,
+                        false,
                     ),
+                    EvaluationTrunk::Serialized => modules.trunk.forward_serialized(
+                        &input,
+                        &bin_ids,
+                        &sample.time_ids.narrow(1, 0, context),
+                    ),
+                    EvaluationTrunk::Recirculated(config) => modules
+                        .trunk
+                        .forward_recirculated(
+                            &input,
+                            &bin_ids,
+                            &sample.time_ids.narrow(1, 0, context),
+                            config,
+                        )
+                        .expect("recirculation config was validated before evaluation"),
+                };
+                drop(trunk_region);
+                let head_region = profile::region(profile::EVAL_HEAD);
+                let soft_targets = supports.targets(&target, scoring);
+                let target_bins = supports.bin_ids(&target);
+                let current_time = sample.time_ids.narrow(1, 0, context);
+                let target_time = sample.time_ids.narrow(1, 1, context);
+                let conditioning = modules
+                    .trunk
+                    .forecast_conditioning(&target_time, &current_time);
+                let logits = modules.head.logits(&beliefs, &conditioning, &target_bins);
+                drop(head_region);
+                let terms_region = profile::region(profile::EVAL_TERMS);
+                // `[B, T, BAR_DOF]`, unreduced: everything below is a reduction of this.
+                let terms = bar_nll_terms(&logits, &soft_targets);
+                // A bar is LIVE when `s != 0`. On a flat bar the encoding fixes `u = v = 0.5`,
+                // so those two factors carry no information and must not be counted as skill.
+                let live_mask = target
+                    .select(-1, DOF_S as i64)
+                    .not_equal(0.0)
+                    .to_kind(Kind::Float);
+                let per_window_dof = terms.mean_dim([1i64].as_slice(), false, Kind::Float);
+                let live_dof = (&terms * live_mask.unsqueeze(-1)).sum_dim_intlist(
+                    [1i64].as_slice(),
+                    false,
+                    Kind::Float,
+                );
+                let live_count = live_mask.sum_dim_intlist([1i64].as_slice(), false, Kind::Float);
+                drop(terms_region);
+
+                let focused = focused_diagnostics.then(|| {
+                    let _region = profile::region(profile::EVAL_DIRECTION);
+                    (
+                        direction_hits(
+                            modules,
+                            supports,
+                            &beliefs,
+                            &conditioning,
+                            &target,
+                            context,
+                        ),
+                        (chunk_index == 0).then(|| belief_rank_fp32(&beliefs)),
+                    )
+                });
+                let extras = full.then(|| {
+                    let crps = {
+                        let _region = profile::region(profile::EVAL_CRPS);
+                        dof_array(&bar_crps_from_logits(&logits, &target, supports))
+                    };
+                    // A per-chunk key, not one stream reused 171 times: `counter_uniforms` is
+                    // keyed by (seed, flat element index), so a constant seed makes element j of
+                    // every chunk draw the identical uniform and the atom half of the PIT
+                    // histogram — half the u/v mass — has a far smaller effective sample size
+                    // than its counts suggest.
+                    let pit_values = {
+                        let _region = profile::region(profile::EVAL_PIT);
+                        bar_pit_from_logits(
+                            &logits,
+                            &target,
+                            supports,
+                            mix64(EVAL_WINDOW_SEED, chunk_index as u64),
+                        )
+                    };
+                    let direction = {
+                        let _region = profile::region(profile::EVAL_DIRECTION);
+                        direction_hits(modules, supports, &beliefs, &conditioning, &target, context)
+                    };
+                    let rank = (chunk_index == 0).then(|| {
+                        let _region = profile::region(profile::EVAL_RANK);
+                        belief_rank_fp32(&beliefs)
+                    });
+                    let decomp_region = profile::region(profile::EVAL_DECOMP);
+                    let parts = bar_nll_decomposition(&logits, &soft_targets, supports);
+                    let class = dof_array(&parts.class);
+                    let shape = dof_array(&parts.shape);
+                    drop(decomp_region);
+                    let independent_marginals = {
+                        let _region = profile::region(profile::EVAL_MARGINALS);
+                        chunk_independent_marginals(
+                            modules,
+                            supports,
+                            &beliefs,
+                            &conditioning,
+                            &target,
+                            scoring,
+                            mix64(EVAL_WINDOW_SEED, chunk_index as u64),
+                        )
+                    };
                     // Only `r`, only from strictly past bars: `TradeSetup::paths` takes the
                     // beliefs and selects the realized `r` itself, so no part of the bar
                     // being bet on can reach the position. The budget makes the bench cost
@@ -9907,9 +10390,10 @@ fn evaluate_impl(
                     // `sigma` is the target rows' causal divisor. Under standardized targets it
                     // parameterizes the PREDICTIVE payoff law at decision time; realized
                     // outcomes come from `realized_target`, the unclipped raw bar DOF.
-                    trade: trade_setup
+                    let trade = trade_setup
                         .as_ref()
                         .map(|setup| {
+                            let _region = profile::region(profile::EVAL_TRADE);
                             setup
                                 .paths(
                                     &modules.head,
@@ -9921,85 +10405,102 @@ fn evaluate_impl(
                                 )
                                 .expect("the evaluation loop shapes its own beliefs and targets")
                         })
-                        .unwrap_or_default(),
-                }
-            });
-            (
-                host_rows(&per_window_dof, chunk.len()),
+                        .unwrap_or_default();
+                    ChunkExtras {
+                        crps,
+                        pit: pit_values,
+                        direction,
+                        rank,
+                        class,
+                        shape,
+                        independent_marginals,
+                        trade,
+                    }
+                });
+                let _region = profile::region(profile::EVAL_HOST);
                 (
-                    host_rows(&live_dof, chunk.len()),
-                    Vec::<f64>::try_from(live_count.to_kind(Kind::Double).reshape([-1]))
-                        .expect("live-bar counts are convertible"),
-                ),
-                extras,
-                focused,
-            )
-        });
+                    host_rows(&per_window_dof, chunk.len()),
+                    (
+                        host_rows(&live_dof, chunk.len()),
+                        Vec::<f64>::try_from(live_count.to_kind(Kind::Double).reshape([-1]))
+                            .expect("live-bar counts are convertible"),
+                    ),
+                    extras,
+                    focused,
+                )
+            });
 
-        for row in &per_window {
-            let total: f64 = row.iter().sum();
-            ensure!(
-                total.is_finite(),
-                "held-out nll is not finite on window chunk {chunk_index} of the {} split: \
+            for row in &per_window {
+                let total: f64 = row.iter().sum();
+                ensure!(
+                    total.is_finite(),
+                    "held-out nll is not finite on window chunk {chunk_index} of the {} split: \
                  {total}",
-                set.sampler.split().as_str()
-            );
-            window_nll.push(total);
-            window_nll_dof.push(*row);
-            for (acc, value) in nll_dof_sum.iter_mut().zip(row) {
-                *acc += value;
+                    set.sampler.split().as_str()
+                );
+                window_nll.push(total);
+                window_nll_dof.push(*row);
+                for (acc, value) in nll_dof_sum.iter_mut().zip(row) {
+                    *acc += value;
+                }
             }
-        }
-        let (live_dof, live_counts) = live;
-        for (index, row) in live_dof.iter().enumerate() {
-            let stats = conditional_window_stats(
-                &per_window[index],
-                row,
-                live_counts[index],
-                context as f64,
-            );
-            window_nll_conditional.push(stats.point_estimate());
-            window_conditional_nll_stats.push(stats);
-        }
+            let (live_dof, live_counts) = live;
+            for (index, row) in live_dof.iter().enumerate() {
+                let stats = conditional_window_stats(
+                    &per_window[index],
+                    row,
+                    live_counts[index],
+                    context as f64,
+                );
+                window_nll_conditional.push(stats.point_estimate());
+                window_conditional_nll_stats.push(stats);
+            }
 
-        if let Some(extras) = extras {
-            for (acc, value) in crps_dof_sum.iter_mut().zip(extras.crps) {
-                *acc += value * rows;
+            if let Some(extras) = extras {
+                for (acc, value) in crps_dof_sum.iter_mut().zip(extras.crps) {
+                    *acc += value * rows;
+                }
+                for (acc, value) in class_dof_sum.iter_mut().zip(extras.class) {
+                    *acc += value * rows;
+                }
+                for (acc, value) in shape_dof_sum.iter_mut().zip(extras.shape) {
+                    *acc += value * rows;
+                }
+                pit.accumulate(&extras.pit);
+                direction_correct += extras.direction.0;
+                direction_total += extras.direction.1;
+                if let Some(rank) = extras.rank {
+                    effective_rank = rank;
+                }
+                let marginal = extras.independent_marginals;
+                marginal_rows += marginal.rows;
+                for (acc, value) in marginal_dof_sum.iter_mut().zip(marginal.marginal_dof) {
+                    *acc += value * marginal.rows;
+                }
+                for (acc, value) in chain_dof_sum.iter_mut().zip(marginal.chain_dof) {
+                    *acc += value * marginal.rows;
+                }
+                for (acc, value) in marginal_group_sums.iter_mut().zip(marginal.group_totals) {
+                    *acc += value * marginal.rows;
+                }
+                trade_paths.absorb(extras.trade);
             }
-            for (acc, value) in class_dof_sum.iter_mut().zip(extras.class) {
-                *acc += value * rows;
+            if let Some((direction, rank)) = focused {
+                direction_correct += direction.0;
+                direction_total += direction.1;
+                if let Some(rank) = rank {
+                    effective_rank = rank;
+                }
             }
-            for (acc, value) in shape_dof_sum.iter_mut().zip(extras.shape) {
-                *acc += value * rows;
-            }
-            pit.accumulate(&extras.pit);
-            direction_correct += extras.direction.0;
-            direction_total += extras.direction.1;
-            if let Some(rank) = extras.rank {
-                effective_rank = rank;
-            }
-            let marginal = extras.independent_marginals;
-            marginal_rows += marginal.rows;
-            for (acc, value) in marginal_dof_sum.iter_mut().zip(marginal.marginal_dof) {
-                *acc += value * marginal.rows;
-            }
-            for (acc, value) in chain_dof_sum.iter_mut().zip(marginal.chain_dof) {
-                *acc += value * marginal.rows;
-            }
-            for (acc, value) in marginal_group_sums.iter_mut().zip(marginal.group_totals) {
-                *acc += value * marginal.rows;
-            }
-            trade_paths.absorb(extras.trade);
+            rows_total += rows;
         }
-        if let Some((direction, rank)) = focused {
-            direction_correct += direction.0;
-            direction_total += direction.1;
-            if let Some(rank) = rank {
-                effective_rank = rank;
-            }
-        }
-        rows_total += rows;
-    }
+        ready.report(
+            if full { "scoring" } else { "nll only" },
+            set.sampler.split().as_str(),
+            set.context,
+        );
+        Ok(())
+    })?;
 
     ensure!(rows_total > 0.0, "evaluation set produced no windows");
     let scale = 1.0 / rows_total;
@@ -10117,33 +10618,42 @@ fn marginal_nll_dof_on(
     let bins = NUM_BAR_BINS;
     let mut totals = Tensor::zeros([BAR_DOF as i64, bins], (Kind::Double, Device::Cpu));
     let mut rows_total = 0.0f64;
-    for chunk in set.windows.chunks(batch.max(1)) {
-        let sample = set.sampler.batch_of(chunk, device);
-        let context = sample.dof.size()[1] - 1;
-        let chunk_total = tch::no_grad(|| {
-            let target = sample.dof.narrow(1, 1, context);
-            let targets = supports.targets(&target, scoring);
-            let histogram = if scoring.is_smoothed() {
-                targets
-                    .smoothed_probabilities()
-                    .reshape([-1, BAR_DOF as i64, bins])
-                    .sum_dim_intlist([0i64].as_slice(), false, Kind::Double)
-            } else {
-                // One dense histogram, not one dense one-hot row per observation. Offset
-                // each DOF's class IDs into its own segment, then scatter counts once.
-                let offsets =
-                    Tensor::arange(BAR_DOF as i64, (Kind::Int64, device)).view([1, 1, -1]) * bins;
-                let flat_index = (targets.class_ids() + offsets).reshape([-1]);
-                let counts = Tensor::ones(flat_index.size().as_slice(), (Kind::Double, device));
-                Tensor::zeros([BAR_DOF as i64 * bins], (Kind::Double, device))
-                    .scatter_add(0, &flat_index, &counts)
-                    .view([BAR_DOF as i64, bins])
-            };
-            histogram.to_device(Device::Cpu)
-        });
-        totals += chunk_total;
-        rows_total += (chunk.len() as i64 * context) as f64;
-    }
+    std::thread::scope(|scope| {
+        let mut ready = prefetch_chunk_batches(scope, &set.sampler, &set.windows, batch);
+        for chunk in set.windows.chunks(batch.max(1)) {
+            let sample = ready.next().to_device(device);
+            let context = sample.dof.size()[1] - 1;
+            let chunk_total = tch::no_grad(|| {
+                let target = sample.dof.narrow(1, 1, context);
+                let targets = supports.targets(&target, scoring);
+                let histogram = if scoring.is_smoothed() {
+                    targets
+                        .smoothed_probabilities()
+                        .reshape([-1, BAR_DOF as i64, bins])
+                        .sum_dim_intlist([0i64].as_slice(), false, Kind::Double)
+                } else {
+                    // One dense histogram, not one dense one-hot row per observation. Offset
+                    // each DOF's class IDs into its own segment, then scatter counts once.
+                    let offsets = Tensor::arange(BAR_DOF as i64, (Kind::Int64, device))
+                        .view([1, 1, -1])
+                        * bins;
+                    let flat_index = (targets.class_ids() + offsets).reshape([-1]);
+                    let counts = Tensor::ones(flat_index.size().as_slice(), (Kind::Double, device));
+                    Tensor::zeros([BAR_DOF as i64 * bins], (Kind::Double, device))
+                        .scatter_add(0, &flat_index, &counts)
+                        .view([BAR_DOF as i64, bins])
+                };
+                histogram.to_device(Device::Cpu)
+            });
+            totals += chunk_total;
+            rows_total += (chunk.len() as i64 * context) as f64;
+        }
+        ready.report(
+            "held-out marginal",
+            set.sampler.split().as_str(),
+            set.context,
+        );
+    });
     ensure!(
         rows_total > 0.0,
         "the pinned {} set produced no bars to measure the held-out marginal on",
@@ -10347,7 +10857,10 @@ fn forward_losses(
 ) -> TrainingGraph {
     let input = dof.narrow(1, 0, context);
     let target = dof.narrow(1, 1, context);
+    let bins_region = profile::region(profile::FORWARD_BINS);
     let bins = supports.bin_ids(dof);
+    drop(bins_region);
+    let trunk_region = profile::region(profile::FORWARD_TRUNK);
     let beliefs = modules.trunk.forward(
         &input,
         &bins.narrow(1, 0, context),
@@ -10355,7 +10868,9 @@ fn forward_losses(
         0,
         true,
     );
+    drop(trunk_region);
 
+    let head_region = profile::region(profile::FORWARD_HEAD);
     let current_time = time_ids.narrow(1, 0, context);
     let target_time = time_ids.narrow(1, 1, context);
     let conditioning = modules
@@ -10369,7 +10884,9 @@ fn forward_losses(
         supports.targets_from_class_ids(&target_bins, scoring)
     };
     let (nll, nll_dof) = bar_nll_from_logits(&logits, &targets);
+    drop(head_region);
 
+    let direct_region = profile::region(profile::FORWARD_DIRECT);
     let direct = if let (Some(direct_time_ids), Some(direct_valid)) =
         (direct_time_ids, direct_valid)
     {
@@ -10387,6 +10904,19 @@ fn forward_losses(
             [dof.size()[0], context, 2],
             "direct ordinary-row mask must be [batch, context, h2+h3]"
         );
+        // Both branches always run — matched compute, and `direct_nll`/`direct_nll_dof`/
+        // `direct_target_count` are reported every step whatever the weights are. What the
+        // weights decide is whether the loss below READS them: at (0.0, 0.0) it does not.
+        //
+        // Their activations are therefore retained for a backward that never touches them,
+        // which is real VRAM. Computing them under `no_grad` instead was tried and REVERTED:
+        // it reproducibly SIGSEGVs libtorch's autograd engine in
+        // `Engine::compute_dependencies` on the first training backward, 4/4 runs at
+        // `--steps 80 --validate-every 40` against 0/2 for the attached path on the same
+        // command and card. The forward math and all three reported figures were verified
+        // bit-identical, so the saving is real and the blocker is not numerical — but a
+        // crash in the training backward is not a trade worth any amount of VRAM until the
+        // engine interaction is understood.
         [2usize, 3usize].map(|direct_horizon| {
             let slot = direct_horizon as i64 - 2;
             let target_bins = bins.narrow(1, direct_horizon as i64, context);
@@ -10435,10 +10965,14 @@ fn forward_losses(
     };
     let [(direct_t2, direct_t2_dof, direct_t2_count), (direct_t3, direct_t3_dof, direct_t3_count)] =
         direct;
+    drop(direct_region);
 
+    let dynamics_region = profile::region(profile::FORWARD_DYNAMICS);
     let (dyn_loss, kl_loss, identity) = dynamics_losses(
         modules, dof, &bins, time_ids, &beliefs, context, horizon, device,
     );
+    drop(dynamics_region);
+    let growth_region = profile::region(profile::FORWARD_GROWTH);
     let growth::GrowthDiagnostic {
         value: growth_diagnostic,
         stats: growth_stats,
@@ -10452,8 +10986,11 @@ fn forward_losses(
             growth_support,
         )
     });
+    drop(growth_region);
+    let autocorr_region = profile::region(profile::FORWARD_AUTOCORR);
     let autocorr = belief_autocorrelation(&beliefs);
-    let loss = if direct_weights.0 == 0.0 && direct_weights.1 == 0.0 {
+    drop(autocorr_region);
+    let loss = if direct_weights == (0.0, 0.0) {
         // Preserve the exact legacy scalar/autograd graph for the control while still
         // executing both direct branches above for matched compute and diagnostics.
         &nll + lambda_dyn * &dyn_loss + lambda_kl * &kl_loss
@@ -10515,6 +11052,9 @@ fn dynamics_losses(
     let mut kl_total: Option<Tensor> = None;
     let mut identity_total: Option<Tensor> = None;
 
+    // Both KL readouts per horizon step share one frozen bank. Packing it inside the loop
+    // restacked the whole head for every call.
+    let frozen_bank = modules.head.bank(true);
     for k in 1..=horizon {
         // The shared trunk token structurally drops same-instant market ids, matching every
         // imagined dynamics call while reusing exactly the embedding the exact trunk consumes.
@@ -10549,9 +11089,11 @@ fn dynamics_losses(
             .forecast_conditioning(&emitted_time, &missing_market);
         let target_logits = modules
             .head
-            .logits_frozen(&target, &conditioning, &emitted)
+            .logits_with(&frozen_bank, &target, &conditioning, &emitted)
             .detach();
-        let predicted_logits = modules.head.logits_frozen(&z, &conditioning, &emitted);
+        let predicted_logits = modules
+            .head
+            .logits_with(&frozen_bank, &z, &conditioning, &emitted);
         let (kl, _) = bar_categorical_kl(&target_logits, &predicted_logits);
         kl_total = Some(match kl_total {
             Some(acc) => acc + kl,
@@ -10568,13 +11110,45 @@ fn dynamics_losses(
     )
 }
 
-/// The NextLat residual of the dynamics head over the trivial-identity baseline, measured
-/// on a pinned set in full precision under `no_grad`.
+/// The NextLat residual of the dynamics head over the trivial-identity baseline, measured on
+/// a pinned set through [`eval_forward`], so under the deployed bf16 autocast like every other
+/// evaluation forward and like the training step itself.
 ///
-/// The step-time `dyn_vs_identity` reads the same ratio off the training graph, but that one
-/// is an autocast bf16 number on the current training batch and it stops existing the moment
-/// the run ends. This is the end-of-run measurement on the RELOADED promoted checkpoint and
-/// the held-out split, which is the artifact and the data a guard has to speak about.
+/// This used to be the one evaluation path held out of autocast, on the theory that the guard's
+/// threshold is the exact constant 1.0 and both sides of the ratio are `smooth_l1` differences
+/// between rms-normalized beliefs that barely move at `horizon` 1 — a cancelling reduction that
+/// eight mantissa bits would destroy. That is a real mechanism and it is measurably NOT what
+/// happens. Holding the weights fixed with `--weights` and scoring the same checkpoint twice
+/// per arm, the reported ratio is bit-stable and identical across precisions at both operating
+/// points that matter:
+///
+/// | checkpoint | fp32 | fp32 | bf16 | bf16 |
+/// |------------|--------|--------|--------|--------|
+/// | healthy    | 1.276  | 1.276  | 1.276  | 1.276  |
+/// | degenerate | 13.144 | 13.144 | 13.144 | 13.144 |
+///
+/// The healthy row is the load-bearing one: 1.276 is close enough to the 1.0 threshold that the
+/// two losses are comparable in magnitude, which is exactly where cancellation would show up.
+/// It does not. So the fp32 exception bought nothing and cost a special case, and evaluation now
+/// has one precision policy end to end.
+///
+/// Testing this requires fixed weights, and a paired TRAINING run will mislead you. This ratio
+/// is not reproducible across training runs at short step counts: one binary, seed 24301,
+/// `--steps 60 --batch-size 4 --exact-batch` produced 0.955, 17.042, 23.397 and 30.853. That
+/// spread is training nondeterminism amplified by the conditioning described above, and it is
+/// wide enough to manufacture or hide any precision effect a short A/B could claim. Given fixed
+/// weights the same measurement repeats exactly, which is what localizes the variance to
+/// training rather than to this function.
+///
+/// That spread is a live problem in its own right, because [`check_dynamics_beats_identity`]
+/// aborts the run on this number: at 60 steps it is aborting on noise. Whether a converged head
+/// is equally ill-conditioned is NOT established here — every measurement above is at 60 steps
+/// or one step from a reload, and the promotion rule only ships a head that beat the marginal.
+///
+/// The step-time `dyn_vs_identity` reads the same ratio off the training graph, but that one is
+/// on the current training batch and it stops existing the moment the run ends. This is the
+/// end-of-run measurement on the RELOADED promoted checkpoint and the held-out split, which is
+/// the artifact and the data a guard has to speak about.
 ///
 /// Weighted by window count so the last short chunk cannot outvote the full ones, and summed
 /// as two separate totals rather than as a mean of per-chunk ratios: the ratio of sums is the
@@ -10594,41 +11168,48 @@ fn dyn_identity_ratio(
     );
     let mut dyn_sum = 0.0f64;
     let mut identity_sum = 0.0f64;
-    for chunk in set.windows.chunks(batch.max(1)) {
-        let sample = set.sampler.batch_of(chunk, device);
-        let context = sample.dof.size()[1] - 1;
-        ensure!(
-            horizon < context,
-            "--dyn-horizon {horizon} does not fit in a {context}-bar evaluation window"
-        );
-        let (chunk_dyn, chunk_identity) = tch::no_grad(|| {
-            let bins = supports.bin_ids(&sample.dof);
-            // `train = false`, so the trunk runs detached and the dynamics terms below carry
-            // no graph. Full precision, unlike the training step: the guard's threshold is
-            // 1.0 and a bf16 rounding of a ratio near it would decide the run.
-            let beliefs = modules.trunk.forward(
-                &sample.dof.narrow(1, 0, context),
-                &bins.narrow(1, 0, context),
-                &sample.time_ids.narrow(1, 0, context),
-                0,
-                false,
+    std::thread::scope(|scope| -> Result<()> {
+        let mut ready = prefetch_chunk_batches(scope, &set.sampler, &set.windows, batch);
+        for chunk in set.windows.chunks(batch.max(1)) {
+            let sample = ready.next().to_device(device);
+            let context = sample.dof.size()[1] - 1;
+            ensure!(
+                horizon < context,
+                "--dyn-horizon {horizon} does not fit in a {context}-bar evaluation window"
             );
-            let (dyn_loss, _, identity) = dynamics_losses(
-                modules,
-                &sample.dof,
-                &bins,
-                &sample.time_ids,
-                &beliefs,
-                context,
-                horizon,
-                device,
-            );
-            (dyn_loss.double_value(&[]), identity.double_value(&[]))
-        });
-        let weight = chunk.len() as f64;
-        dyn_sum += chunk_dyn * weight;
-        identity_sum += chunk_identity * weight;
-    }
+            let (chunk_dyn, chunk_identity) = eval_forward(device, || {
+                let bins = supports.bin_ids(&sample.dof);
+                // `train = false`, so the trunk runs detached and the dynamics terms below
+                // carry no graph. Under the deployed bf16 autocast like every other evaluation
+                // forward: measured identical to fp32 at 1.276 and 13.144 on fixed weights,
+                // two repeats per arm. Do not test this with a paired training run - the ratio
+                // spans 0.955 to 30.853 across identical-config runs. See the doc comment.
+                let beliefs = modules.trunk.forward(
+                    &sample.dof.narrow(1, 0, context),
+                    &bins.narrow(1, 0, context),
+                    &sample.time_ids.narrow(1, 0, context),
+                    0,
+                    false,
+                );
+                let (dyn_loss, _, identity) = dynamics_losses(
+                    modules,
+                    &sample.dof,
+                    &bins,
+                    &sample.time_ids,
+                    &beliefs,
+                    context,
+                    horizon,
+                    device,
+                );
+                (dyn_loss.double_value(&[]), identity.double_value(&[]))
+            });
+            let weight = chunk.len() as f64;
+            dyn_sum += chunk_dyn * weight;
+            identity_sum += chunk_identity * weight;
+        }
+        ready.report("dyn/identity", set.sampler.split().as_str(), set.context);
+        Ok(())
+    })?;
     // A zero baseline means the beliefs never move, so there is nothing for the head to
     // predict and no ratio to report. NaN propagates to the caller's finiteness check rather
     // than being papered over with a passing number.
@@ -10903,7 +11484,7 @@ fn rollout_nll(
     let deployment = supports.only();
     let mut out = [f64::NAN; ROLLOUT_HORIZONS.len()];
     let steps = window.future_dof.size()[1];
-    tch::no_grad(|| {
+    eval_forward(window.future_dof.device(), || {
         let belief_time_ids = match mode {
             RolloutMode::Exact => &window.teacher_forced_time_ids,
             RolloutMode::Dynamics => &window.future_time_ids,
@@ -10961,6 +11542,14 @@ fn dof_array(per_dof: &Tensor) -> [f64; BAR_DOF] {
     out
 }
 
+/// Mean nats per bar over a per-window score vector, NaN on an empty slice.
+fn mean_nats(window_nll: &[f64]) -> f64 {
+    if window_nll.is_empty() {
+        return f64::NAN;
+    }
+    window_nll.iter().sum::<f64>() / window_nll.len() as f64
+}
+
 const STEP_METRIC_TOTAL: usize = 0;
 const STEP_METRIC_NLL: usize = 1;
 const STEP_METRIC_NLL_DOF: std::ops::Range<usize> = 2..2 + BAR_DOF;
@@ -10978,7 +11567,12 @@ const STEP_METRIC_GROWTH_STATS: std::ops::Range<usize> = STEP_METRIC_GROWTH_DIAG
 const STEP_METRIC_IDENTITY: usize = STEP_METRIC_GROWTH_STATS.end;
 const STEP_METRIC_AUTOCORR: usize = STEP_METRIC_IDENTITY + 1;
 const STEP_METRIC_GRAD_NORM: usize = STEP_METRIC_AUTOCORR + 1;
-const STEP_METRIC_BASE_COUNT: usize = STEP_METRIC_GRAD_NORM + 1;
+/// The two direct ordinary-row counts ride the same packet. They were two separate
+/// `double_value` reads, i.e. two extra full device drains per step for numbers the forward
+/// already produced as device scalars.
+const STEP_METRIC_DIRECT_COUNT: std::ops::Range<usize> =
+    STEP_METRIC_GRAD_NORM + 1..STEP_METRIC_GRAD_NORM + 1 + 2;
+const STEP_METRIC_BASE_COUNT: usize = STEP_METRIC_DIRECT_COUNT.end;
 const STEP_METRIC_ROW_LR: std::ops::Range<usize> =
     STEP_METRIC_BASE_COUNT..STEP_METRIC_BASE_COUNT + ROW_LR_METRIC_COUNT;
 const STEP_METRIC_SMD_IDBD: std::ops::Range<usize> =
@@ -11012,6 +11606,8 @@ fn pack_step_metrics(
         flat_f32(&graph.identity),
         flat_f32(&graph.autocorr),
         flat_f32(grad_norm),
+        flat_f32(&graph.direct_target_count[0]),
+        flat_f32(&graph.direct_target_count[1]),
     ];
     let mut tensors = Vec::from(base);
     if let Some(metrics) = row_lr_metrics {
@@ -11089,21 +11685,24 @@ fn ensure_finite_step_metrics(metrics: &[f64; STEP_METRIC_COUNT], step: usize) -
 /// whose iteration order is seeded per process, and an fp32 sum is order-dependent.
 fn global_grad_norm_tensor(vs: &nn::VarStore, device: Device) -> Tensor {
     tch::no_grad(|| {
-        let squares: Vec<Tensor> = named_trainable_variables(vs)
+        // `norm()` is one fused reduction. `square().sum()` was two passes plus a full-size
+        // fp32 temporary per parameter — 127 MB written and read back per step across the
+        // 31.8M parameters, for a scalar. Norms stack into the global norm directly because
+        // the L2 norm of the vector of per-parameter L2 norms IS the global L2 norm.
+        let norms: Vec<Tensor> = named_trainable_variables(vs)
             .into_iter()
             .filter_map(|(_, tensor)| {
                 let grad = tensor.grad();
-                grad.defined()
-                    .then(|| grad.to_kind(Kind::Float).square().sum(Kind::Float))
+                grad.defined().then(|| grad.to_kind(Kind::Float).norm())
             })
             .collect();
-        if squares.is_empty() {
+        if norms.is_empty() {
             Tensor::zeros([], (Kind::Float, device))
         } else {
-            Tensor::stack(&squares, 0)
+            Tensor::stack(&norms, 0)
                 .to_device(device)
-                .sum(Kind::Float)
-                .sqrt()
+                .to_kind(Kind::Float)
+                .norm()
         }
     })
 }
@@ -14036,6 +14635,7 @@ mod tests {
                 26.0, // identity baseline
                 27.0, // autocorrelation
                 28.0, // gradient norm
+                29.0, 30.0, // direct t+2 and t+3 ordinary-row counts
             ]
         );
         assert!(read[STEP_METRIC_ROW_LR].iter().all(|value| value.is_nan()));
@@ -14461,11 +15061,19 @@ mod tests {
         assert!(reached_deployed_stage);
     }
 
+    /// Also pins the predicate [`evaluate_direct_horizons`] reuses its ordinary-row scan on.
+    /// That loop derives `indices` from the full `[B, context]` mask and, when the comparator
+    /// context is not shortened, reuses them for the paired exact comparator instead of running
+    /// a second `nonzero`. The reuse is only sound while `paired_context == context`, so the
+    /// case split is asserted here rather than left implicit at the call site: at the
+    /// diagnostic context nothing is shortened and the scan is shared, at the deployed context
+    /// both horizons shorten and it must not be.
     #[test]
     fn direct_exact_comparator_slices_fit_diagnostic_and_deployed_boundaries() {
-        for (context, expected_beliefs, expected_pairs) in
-            [(896, 898, [896, 896]), (2048, 2048, [2047, 2046])]
-        {
+        for (context, expected_beliefs, expected_pairs, expected_shared) in [
+            (896, 898, [896, 896], [true, true]),
+            (2048, 2048, [2047, 2046], [false, false]),
+        ] {
             let belief_context = direct_exact_belief_context(context);
             assert_eq!(belief_context, expected_beliefs);
             let beliefs = Tensor::zeros([1, belief_context, 1], (Kind::Float, Device::Cpu));
@@ -14473,6 +15081,12 @@ mod tests {
                 let paired_context =
                     direct_exact_comparator_context(context, belief_context, horizon);
                 assert_eq!(paired_context, expected_pairs[slot]);
+                assert_eq!(
+                    paired_context == context,
+                    expected_shared[slot],
+                    "the ordinary-row scan sharing predicate moved at context {context} \
+                     horizon {horizon}"
+                );
                 let slice = beliefs.narrow(1, horizon as i64 - 1, paired_context);
                 assert_eq!(slice.size(), [1, paired_context, 1]);
             }

@@ -10,12 +10,53 @@ pub(crate) struct CudaGraph {
     device_index: i64,
 }
 
+/// A private CUDA memory pool that several graphs can capture into.
+///
+/// Each graph otherwise takes libtorch's default of a fresh private pool, whose
+/// blocks are retained for the process's lifetime. Two graphs whose captured
+/// bodies overlap therefore reserve the same transient working set twice; a
+/// shared pool reserves it once.
+pub(crate) struct CudaGraphPool {
+    id: [u64; 2],
+}
+
+impl CudaGraphPool {
+    /// Mint a fresh sharable pool id. Only meaningful once [`CudaGraph::is_available`]
+    /// holds; otherwise the underlying shim reports graphs as unsupported.
+    pub(crate) fn new() -> Result<Self, String> {
+        let mut id = [0u64; 2];
+        unsafe { torch_sys::at_cuda_graph_pool_handle(id.as_mut_ptr()) };
+        read_torch_error()?;
+        Ok(Self { id })
+    }
+}
+
 impl CudaGraph {
     pub(crate) fn is_available() -> bool {
         unsafe { torch_sys::at_cuda_graph_is_available() }
     }
 
+    /// A graph with a private pool of its own.
     pub(crate) fn new(device: Device) -> Result<Option<Self>, String> {
+        Self::build(device, || unsafe { torch_sys::at_cuda_graph_new() })
+    }
+
+    /// A graph capturing into `pool`, sharing its blocks with every other graph
+    /// built from the same pool. Safe only when the sharing graphs are replayed
+    /// in a fixed, non-interleaved order, since they may hold the same addresses.
+    pub(crate) fn new_in_pool(
+        device: Device,
+        pool: &CudaGraphPool,
+    ) -> Result<Option<Self>, String> {
+        Self::build(device, || unsafe {
+            torch_sys::at_cuda_graph_new_in_pool(pool.id[0], pool.id[1])
+        })
+    }
+
+    fn build<F>(device: Device, new_raw: F) -> Result<Option<Self>, String>
+    where
+        F: FnOnce() -> *mut C_cuda_graph,
+    {
         let device_index = match device {
             Device::Cuda(index) => index as i64,
             _ => return Ok(None),
@@ -24,7 +65,7 @@ impl CudaGraph {
             return Ok(None);
         }
 
-        let raw = unsafe { torch_sys::at_cuda_graph_new() };
+        let raw = new_raw();
         read_torch_error()?;
         let raw =
             NonNull::new(raw).ok_or_else(|| "torch_sys returned a null CUDA graph".to_string())?;

@@ -30,6 +30,7 @@ use serde::{Deserialize, Serialize};
 use tch::{autocast, nn, nn::Init, Device, Kind, Tensor};
 
 use crate::torch::{
+    backward_probe,
     bar_dist::{
         BarEmissionHead, BarSupports, DofScaling, BAR_CHAIN, BAR_DOF, BAR_DOF_NAMES,
         BAR_LABEL_SIGMA_RATIO, BAR_PREFIX_EMBED_DIM, BAR_VOLUME_EMA_SPAN, NUM_BAR_BINS,
@@ -42,9 +43,10 @@ use crate::torch::{
     hashing::file_sha256,
     load::load_var_store_partial,
     pope::{
-        init_pope_theta_bias, pope_expand_qk_fp32, PolarQk, PopeThetaInit, POPE_ATTENTION_SCALE,
-        POPE_DIM, POPE_FREQUENCY_BASE, POPE_QK_DIM,
+        init_pope_theta_bias, pope_expand_qk, PolarQk, PopePhases, PopeThetaInit,
+        POPE_ATTENTION_SCALE, POPE_DIM, POPE_FREQUENCY_BASE, POPE_QK_DIM,
     },
+    train::pretrain_profile as profile,
 };
 
 /// The exact unequal-width PoPE reference. Only the CPU test path uses it;
@@ -1679,35 +1681,53 @@ impl BarTrunk {
     }
 
     fn run(&self, dof: &Tensor, bin_ids: &Tensor, time_ids: &Tensor, window: i64) -> Tensor {
-        let x0 = self.token_embedding(dof, bin_ids, time_ids);
+        backward_probe::trace_step_boundary();
+        let embed_region = profile::region_fine(profile::TRUNK_EMBED);
+        let bin_table = self.bin_table();
+        let x0 = self.token_embedding_with_table(&bin_table, dof, bin_ids, time_ids);
+        drop(embed_region);
+        // Boundaries for the backward probe, named for the interval each one closes. `x0` also
+        // feeds every layer's attention residual, so its gradient is the last the trunk
+        // completes and the table's is the first below the trunk.
+        backward_probe::mark(&bin_table, profile::BACKWARD_EMBED);
+        backward_probe::mark(&x0, profile::BACKWARD_NORM);
         let mut x = x0.shallow_clone();
         let len = x.size()[1];
+        let phases_region = profile::region_fine(profile::TRUNK_POPE);
         let positions = Tensor::arange(len, (Kind::Int64, x.device()));
+        let phases = PopePhases::new(&positions, x.device(), POPE_FREQUENCY_BASE);
+        drop(phases_region);
         for layer in &self.layers {
-            let (query, key, value) = layer.qkv(&rms_norm(&x));
+            let norm_region = profile::region_fine(profile::TRUNK_NORM);
+            let normed = rms_norm(&x);
+            drop(norm_region);
+            backward_probe::mark(&normed, profile::BACKWARD_POPE);
+            let pope_region = profile::region_fine(profile::TRUNK_POPE);
+            let (query, key, value) = layer.qkv(&normed);
             let kind = attention_kind(&x);
-            let polar = pope_expand_qk_fp32(
-                &query,
-                &key,
-                &positions,
-                &positions,
-                &layer.pope_theta_bias,
-                POPE_FREQUENCY_BASE,
-            );
-            let polar = PolarQk {
-                query: polar.query.to_kind(kind).contiguous(),
-                key: polar.key.to_kind(kind).contiguous(),
-            };
+            let polar = pope_expand_qk(&query, &key, &phases, &layer.pope_theta_bias, kind);
             let value = value.to_kind(kind).contiguous();
+            drop(pope_region);
+            backward_probe::mark(&polar.query, profile::BACKWARD_ATTN);
+            let attn_region = profile::region_fine(profile::TRUNK_ATTN);
             let attention = if window > 0 && window < len {
                 windowed_attention(&polar.query, &polar.key, &value, window)
             } else {
                 strict_pope_prefill(&polar, &value)
             };
+            backward_probe::mark(&attention, profile::BACKWARD_FFN);
             x = layer.attention_residual(&x, &attention, &x0);
+            drop(attn_region);
+            let ffn_region = profile::region_fine(profile::TRUNK_FFN);
             x = layer.feed_forward(&x);
+            drop(ffn_region);
+            backward_probe::mark(&x, profile::BACKWARD_NORM);
         }
-        rms_norm(&x)
+        let norm_region = profile::region_fine(profile::TRUNK_NORM);
+        let belief = rms_norm(&x);
+        drop(norm_region);
+        backward_probe::begin(&belief);
+        belief
     }
 
     /// Cached forward. An empty cache is prefilled with the whole sequence; a
@@ -1734,11 +1754,30 @@ impl BarTrunk {
         })
     }
 
+    /// The five per-DOF tables as one `[BAR_DOF * NUM_BAR_BINS, D]` gather bank. Still
+    /// an autograd node over the same parameters, so hoisting it out of a multi-token
+    /// loop changes nothing but the number of concatenations.
+    pub fn bin_table(&self) -> Tensor {
+        Tensor::cat(&self.bin_embed, 0)
+    }
+
     /// Exact shared token embedding used by the trunk and dynamics: discrete bins,
     /// raw continuous DOF and exogenous clock, summed and normalized. The observed
     /// same-instant market channels are always replaced by `dataset::MARKET_MISSING` before
     /// lookup, so neither training nor cached serving can leak a bar's own market row.
     pub fn token_embedding(&self, dof: &Tensor, bin_ids: &Tensor, time_ids: &Tensor) -> Tensor {
+        self.token_embedding_with_table(&self.bin_table(), dof, bin_ids, time_ids)
+    }
+
+    /// [`Self::token_embedding`] against a [`Self::bin_table`] the caller already owns.
+    /// Rollouts that embed one token per step hoist the bank instead of rebuilding it.
+    pub fn token_embedding_with_table(
+        &self,
+        bin_table: &Tensor,
+        dof: &Tensor,
+        bin_ids: &Tensor,
+        time_ids: &Tensor,
+    ) -> Tensor {
         let shape = dof.size();
         assert_eq!(shape.len(), 3, "bar DOF must be [batch, len, BAR_DOF]");
         assert_eq!(shape[2], BAR_DOF as i64, "bar DOF must have BAR_DOF slots");
@@ -1751,7 +1790,7 @@ impl BarTrunk {
         );
         let device = self.dof_embed_w.device();
         let bins = Tensor::embedding(
-            &Tensor::cat(&self.bin_embed, 0),
+            bin_table,
             &(bin_ids.to_device(device) + self.bin_offsets.to_device(device)).reshape([-1]),
             -1,
             false,
@@ -1829,24 +1868,14 @@ impl BarTrunk {
             cache.max_tokens
         );
         let positions = Tensor::arange(len, (Kind::Int64, tokens.device()));
+        let phases = PopePhases::new(&positions, tokens.device(), POPE_FREQUENCY_BASE);
         let capacity = ((len as u64).next_power_of_two() as i64).min(cache.max_tokens);
         let mut x = tokens.shallow_clone();
         let mut layers = Vec::with_capacity(self.layers.len());
         for layer in &self.layers {
             let (query, key, value) = layer.qkv(&rms_norm(&x));
             let kind = attention_kind(&x);
-            let polar = pope_expand_qk_fp32(
-                &query,
-                &key,
-                &positions,
-                &positions,
-                &layer.pope_theta_bias,
-                POPE_FREQUENCY_BASE,
-            );
-            let polar = PolarQk {
-                query: polar.query.to_kind(kind).contiguous(),
-                key: polar.key.to_kind(kind).contiguous(),
-            };
+            let polar = pope_expand_qk(&query, &key, &phases, &layer.pope_theta_bias, kind);
             let value = value.to_kind(kind).contiguous();
             let attention = strict_pope_prefill(&polar, &value);
             x = layer.attention_residual(&x, &attention, tokens);
@@ -1867,6 +1896,7 @@ impl BarTrunk {
     ) -> Result<Tensor> {
         debug_assert_eq!(token.size()[1], 1);
         let position = Tensor::from_slice(&[0i64]).to_device(token.device());
+        let phases = PopePhases::new(&position, token.device(), POPE_FREQUENCY_BASE);
         let mut x = token.shallow_clone();
         let mut destination = None;
         let mut source = None;
@@ -1874,18 +1904,7 @@ impl BarTrunk {
         for (layer_index, layer) in self.layers.iter().enumerate() {
             let (query, key, value) = layer.qkv(&rms_norm(&x));
             let kind = attention_kind(&x);
-            let polar = pope_expand_qk_fp32(
-                &query,
-                &key,
-                &position,
-                &position,
-                &layer.pope_theta_bias,
-                POPE_FREQUENCY_BASE,
-            );
-            let polar = PolarQk {
-                query: polar.query.to_kind(kind).contiguous(),
-                key: polar.key.to_kind(kind).contiguous(),
-            };
+            let polar = pope_expand_qk(&query, &key, &phases, &layer.pope_theta_bias, kind);
             let value = value.to_kind(kind).contiguous();
             let attention = strict_pope_prefill(&polar, &value);
             x = layer.attention_residual(&x, &attention, token);
@@ -1931,6 +1950,7 @@ impl BarTrunk {
         source: Tensor,
     ) {
         let position = Tensor::from_slice(&[absolute_position]).to_device(token.device());
+        let phases = PopePhases::new(&position, token.device(), POPE_FREQUENCY_BASE);
         let mut x =
             Self::recirculate_residual(&destination, &source, config, absolute_position as usize);
         for (layer, layer_cache) in self
@@ -1941,21 +1961,12 @@ impl BarTrunk {
         {
             let (query, key, value) = layer.qkv(&rms_norm(&x));
             let kind = attention_kind(&x);
-            let polar = pope_expand_qk_fp32(
-                &query,
-                &key,
-                &position,
-                &position,
-                &layer.pope_theta_bias,
-                POPE_FREQUENCY_BASE,
-            );
-            let query = polar.query.to_kind(kind).contiguous();
-            let key = polar.key.to_kind(kind).contiguous();
+            let polar = pope_expand_qk(&query, &key, &phases, &layer.pope_theta_bias, kind);
             let value = value.to_kind(kind).contiguous();
-            layer_cache.key.narrow(1, write_index, 1).copy_(&key);
+            layer_cache.key.narrow(1, write_index, 1).copy_(&polar.key);
             layer_cache.value.narrow(1, write_index, 1).copy_(&value);
             let (active_key, active_value) = layer_cache.active_after_write(previous_length);
-            let attention = strict_pope_decode(&query, &active_key, &active_value);
+            let attention = strict_pope_decode(&polar.query, &active_key, &active_value);
             x = layer.attention_residual(&x, &attention, token);
             x = layer.feed_forward(&x);
         }
@@ -1975,6 +1986,7 @@ impl BarTrunk {
         cache.ensure_append_capacity();
         let absolute_position = cache.next_position;
         let position = Tensor::from_slice(&[absolute_position]).to_device(token.device());
+        let phases = PopePhases::new(&position, token.device(), POPE_FREQUENCY_BASE);
         let write_index = cache.write_index;
         let previous_length = cache.length;
         let mut x = token.shallow_clone();
@@ -1985,21 +1997,12 @@ impl BarTrunk {
         {
             let (query, key, value) = layer.qkv(&rms_norm(&x));
             let kind = attention_kind(&x);
-            let polar = pope_expand_qk_fp32(
-                &query,
-                &key,
-                &position,
-                &position,
-                &layer.pope_theta_bias,
-                POPE_FREQUENCY_BASE,
-            );
-            let query = polar.query.to_kind(kind).contiguous();
-            let key = polar.key.to_kind(kind).contiguous();
+            let polar = pope_expand_qk(&query, &key, &phases, &layer.pope_theta_bias, kind);
             let value = value.to_kind(kind).contiguous();
-            layer_cache.key.narrow(1, write_index, 1).copy_(&key);
+            layer_cache.key.narrow(1, write_index, 1).copy_(&polar.key);
             layer_cache.value.narrow(1, write_index, 1).copy_(&value);
             let (active_key, active_value) = layer_cache.active_after_write(previous_length);
-            let attention = strict_pope_decode(&query, &active_key, &active_value);
+            let attention = strict_pope_decode(&polar.query, &active_key, &active_value);
             x = layer.attention_residual(&x, &attention, token);
             x = layer.feed_forward(&x);
             if config.is_some_and(|config| layer_index == config.destination_layer) {
@@ -2036,27 +2039,19 @@ impl BarTrunk {
         );
         cache.ensure_append_capacity();
         let position = Tensor::from_slice(&[cache.next_position]).to_device(token.device());
+        let phases = PopePhases::new(&position, token.device(), POPE_FREQUENCY_BASE);
         let write_index = cache.write_index;
         let previous_length = cache.length;
         let mut x = token.shallow_clone();
         for (layer, layer_cache) in self.layers.iter().zip(cache.layers.iter_mut()) {
             let (query, key, value) = layer.qkv(&rms_norm(&x));
             let kind = attention_kind(&x);
-            let polar = pope_expand_qk_fp32(
-                &query,
-                &key,
-                &position,
-                &position,
-                &layer.pope_theta_bias,
-                POPE_FREQUENCY_BASE,
-            );
-            let query = polar.query.to_kind(kind).contiguous();
-            let key = polar.key.to_kind(kind).contiguous();
+            let polar = pope_expand_qk(&query, &key, &phases, &layer.pope_theta_bias, kind);
             let value = value.to_kind(kind).contiguous();
-            layer_cache.key.narrow(1, write_index, 1).copy_(&key);
+            layer_cache.key.narrow(1, write_index, 1).copy_(&polar.key);
             layer_cache.value.narrow(1, write_index, 1).copy_(&value);
             let (active_key, active_value) = layer_cache.active_after_write(previous_length);
-            let attention = strict_pope_decode(&query, &active_key, &active_value);
+            let attention = strict_pope_decode(&polar.query, &active_key, &active_value);
             x = layer.attention_residual(&x, &attention, token);
             x = layer.feed_forward(&x);
         }
@@ -2448,6 +2443,7 @@ impl BarModules {
             );
             let mut h = beliefs.narrow(1, history_len - 1, 1);
             let mut out = Vec::with_capacity(steps as usize);
+            let bin_table = self.trunk.bin_table();
             for step in 0..steps {
                 out.push(h.shallow_clone());
                 let dof = future_dof.narrow(1, step, 1);
@@ -2461,7 +2457,9 @@ impl BarModules {
                     ),
                     RolloutMode::Dynamics => {
                         let bins = supports.bin_ids(&dof, &time_ids);
-                        let token = self.trunk.token_embedding(&dof, &bins, &time_ids);
+                        let token =
+                            self.trunk
+                                .token_embedding_with_table(&bin_table, &dof, &bins, &time_ids);
                         self.dynamics.step(&h, &token)
                     }
                 };
@@ -2795,6 +2793,7 @@ impl BarWorldModel {
 
             let mut sampled = Vec::with_capacity(steps as usize);
             let mut beliefs = Vec::with_capacity(steps as usize);
+            let bin_table = self.modules.trunk.bin_table();
             for step in 0..steps {
                 // The belief recorded for a step is the one the step's bar was
                 // drawn from, so `beliefs[.., i]` conditions `dof[.., i]`.
@@ -2827,7 +2826,12 @@ impl BarWorldModel {
                         .trunk
                         .forward_cached(&dof, &bins, &time_ids, &mut cache),
                     RolloutMode::Dynamics => {
-                        let token = self.modules.trunk.token_embedding(&dof, &bins, &time_ids);
+                        let token = self.modules.trunk.token_embedding_with_table(
+                            &bin_table,
+                            &dof,
+                            &bins,
+                            &time_ids,
+                        );
                         self.modules.dynamics.step(&h, &token)
                     }
                 };
