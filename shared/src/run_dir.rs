@@ -66,6 +66,26 @@ pub struct RunDir {
 }
 
 impl RunDir {
+    /// Validate that a named run can be created (or claim an externally prepared empty run)
+    /// before expensive work begins.
+    pub fn ensure_creatable(runs_path: impl AsRef<Path>, name: &str) -> Result<()> {
+        validate_run_name(name)?;
+        let root = runs_path.as_ref().join(name);
+        if !root.exists() {
+            return Ok(());
+        }
+        let run = Self {
+            gens: root.join("gens"),
+            weights: root.join("weights"),
+            log_file: root.join("training.log"),
+            root,
+        };
+        if is_prepared_empty_run(&run)? {
+            return Ok(());
+        }
+        bail!("run dir already exists: {}", run.root.display())
+    }
+
     pub fn create_fresh(runs_path: &str, name: Option<&str>) -> Result<Self> {
         let dir_name = match name {
             Some(n) => {
@@ -455,6 +475,21 @@ mod tests {
 
         first.activate(&runs).unwrap();
         assert_eq!(RunDir::latest(runs_str).unwrap().root, first.root);
+        fs::remove_dir_all(runs).unwrap();
+    }
+
+    #[test]
+    fn creatable_name_check_rejects_conflicts_without_changing_latest() {
+        let runs = temp_runs();
+        let runs_str = runs.to_str().unwrap();
+        let active = RunDir::create_fresh(runs_str, Some("active")).unwrap();
+        fs::write(active.weights.join("checkpoint.ot"), b"checkpoint").unwrap();
+
+        RunDir::ensure_creatable(&runs, "probe").unwrap();
+        assert!(RunDir::ensure_creatable(&runs, "active").is_err());
+        assert!(RunDir::ensure_creatable(&runs, "../escape").is_err());
+        assert_eq!(RunDir::latest(runs_str).unwrap(), active);
+
         fs::remove_dir_all(runs).unwrap();
     }
 

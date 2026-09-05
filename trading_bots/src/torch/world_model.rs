@@ -1690,6 +1690,21 @@ impl BarTrunk {
         // feeds every layer's attention residual, so its gradient is the last the trunk
         // completes and the table's is the first below the trunk.
         backward_probe::mark(&bin_table, profile::BACKWARD_EMBED);
+        self.run_embedded(&x0, window)
+    }
+
+    /// The same causal trunk with caller-owned, single-ticker input embeddings.
+    pub fn forward_embedded(&self, tokens: &Tensor, window: i64, train: bool) -> Tensor {
+        assert_eq!(tokens.size()[2], BAR_MODEL_DIM);
+        assert!(tokens.size()[1] > 0 && tokens.size()[1] <= BAR_MAX_CONTEXT);
+        if train {
+            self.run_embedded(tokens, window)
+        } else {
+            tch::no_grad(|| self.run_embedded(tokens, window).detach())
+        }
+    }
+
+    fn run_embedded(&self, x0: &Tensor, window: i64) -> Tensor {
         backward_probe::mark(&x0, profile::BACKWARD_NORM);
         let mut x = x0.shallow_clone();
         let len = x.size()[1];
@@ -2457,9 +2472,9 @@ impl BarModules {
                     ),
                     RolloutMode::Dynamics => {
                         let bins = supports.bin_ids(&dof, &time_ids);
-                        let token =
-                            self.trunk
-                                .token_embedding_with_table(&bin_table, &dof, &bins, &time_ids);
+                        let token = self
+                            .trunk
+                            .token_embedding_with_table(&bin_table, &dof, &bins, &time_ids);
                         self.dynamics.step(&h, &token)
                     }
                 };
@@ -2826,12 +2841,10 @@ impl BarWorldModel {
                         .trunk
                         .forward_cached(&dof, &bins, &time_ids, &mut cache),
                     RolloutMode::Dynamics => {
-                        let token = self.modules.trunk.token_embedding_with_table(
-                            &bin_table,
-                            &dof,
-                            &bins,
-                            &time_ids,
-                        );
+                        let token = self
+                            .modules
+                            .trunk
+                            .token_embedding_with_table(&bin_table, &dof, &bins, &time_ids);
                         self.modules.dynamics.step(&h, &token)
                     }
                 };

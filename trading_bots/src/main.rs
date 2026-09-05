@@ -61,7 +61,7 @@ impl From<StreamingModelVariant> for ModelVariant {
 
 #[derive(Parser)]
 #[command(name = "trading_bot")]
-#[command(about = "Trading bot with PPO training and inference", long_about = None)]
+#[command(about = "Single-ticker segment forecasting and trading model tools", long_about = None)]
 struct Cli {
     /// Reuse `bar_market_supports.<res>.json` even when the proxy's history no longer
     /// reproduces the fit recorded in it.
@@ -84,6 +84,26 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Benchmark complete long-history TimeXer training steps and GPU occupancy.
+    BenchmarkTimexerSegment(torch::timexer_segment::benchmark::BenchmarkArgs),
+    /// Train upstream-style TimeXer on complete same-ticker OHLC segments.
+    TrainTimexerSegment(torch::timexer_segment::runner::TrainArgs),
+    /// Evaluate an authenticated OHLC segment checkpoint on held-out validation.
+    EvaluateTimexerSegment(torch::timexer_segment::runner::EvaluateArgs),
+    /// Render direct-horizon forecasts against observed validation candles.
+    TimexerCandles(torch::single_ticker_timexer::candles::CandleArgs),
+    /// Measure TimeXer batch and training throughput with numerical equivalence checks.
+    BenchmarkTimexer(torch::single_ticker_timexer::benchmark::BenchmarkArgs),
+    /// Train the probabilistic single-ticker direct cumulative-return forecaster.
+    TrainTimexer(torch::single_ticker_timexer::runner::TrainArgs),
+    /// Score direct horizon probabilities on an authenticated partition.
+    EvaluateTimexer(torch::single_ticker_timexer::runner::EvaluateArgs),
+    /// Freeze a selected architecture and checkpoint before terminal evaluation.
+    FreezeTimexer(torch::single_ticker_timexer::runner::FreezeArgs),
+    /// Apply all replacement gates to three frozen, paired initialization seeds.
+    CompareTimexer(torch::single_ticker_timexer::runner::CompareArgs),
+    /// Forecast six cumulative-return distributions from the latest completed bar.
+    ForecastTimexer(torch::single_ticker_timexer::runner::ForecastArgs),
     Genetic {
         #[arg(long, value_enum, default_value_t = genetic::GeneticFamily::TrendBreakout)]
         family: genetic::GeneticFamily,
@@ -456,13 +476,9 @@ enum Commands {
         #[arg(long, default_value_t = false)]
         defer_test: bool,
     },
-    /// Train the isolated c277 MSE-JEPA/LeJEPA causal latent model on mmap bars.
+    /// Train a c277 MSE-JEPA/LeJEPA core. Emission CE shapes causal beliefs by default;
+    /// `--emission-gradient detached` is retained only for matched ablations.
     PretrainMseJepa {
-        /// Authenticated `mse_jepa*.ot` bundle or historical `pretrain_heads*.ot` artifact.
-        /// A historical `pretrain_model*.ot` path resolves only to its sibling heads artifact.
-        #[arg(short, long)]
-        weights: Option<String>,
-
         #[arg(long)]
         run: Option<String>,
 
@@ -472,8 +488,15 @@ enum Commands {
         #[arg(long)]
         steps: Option<usize>,
 
+        /// Full 6,001-bar prediction windows per optimizer step. SIGReg always uses 128
+        /// independently sampled windows at 16 temporal views in the same backward pass.
         #[arg(long, default_value_t = trading_bot_0::torch::train::mse_jepa::DEFAULT_BATCH_SIZE)]
         batch_size: usize,
+
+        /// `attached` lets emission CE shape beliefs; `detached` stops only that edge while
+        /// leaving the online emission head trainable.
+        #[arg(long, value_enum, default_value_t = trading_bot_0::torch::train::mse_jepa::MseJepaEmissionGradientMode::Attached)]
+        emission_gradient: trading_bot_0::torch::train::mse_jepa::MseJepaEmissionGradientMode,
 
         #[arg(long, default_value_t = 0x5EED)]
         seed: u64,
@@ -496,9 +519,118 @@ enum Commands {
         #[arg(long, default_value_t = trading_bot_0::torch::train::mse_jepa::DEFAULT_CHECKPOINT_EVERY)]
         checkpoint_every: usize,
 
+        /// Conditional flow-matching weight on the latent transition.
+        #[arg(long, default_value_t = trading_bot_0::torch::train::mse_jepa::DEFAULT_LAMBDA_FLOW)]
+        lambda_flow: f64,
+
         /// LeWM future-latent SIGReg weight.
         #[arg(long, default_value_t = trading_bot_0::torch::lejepa::sigreg::DEFAULT_SIGREG_LAMBDA)]
         lambda_sigreg: f64,
+
+        /// Heun steps behind the validation sample diagnostics.
+        #[arg(long, default_value_t = trading_bot_0::torch::train::mse_jepa::DEFAULT_FLOW_STEPS)]
+        flow_steps: usize,
+
+        #[arg(long, value_parser = parse_split_bounds)]
+        split_bounds: Option<(i64, i64)>,
+
+        #[arg(long, default_value_t = false, conflicts_with = "split_bounds")]
+        derive_split_bounds: bool,
+    },
+    /// Freeze a completed MSE-JEPA core and jointly fit fresh emission and token readouts.
+    FitMseJepaReadouts {
+        /// Fully completed authenticated core checkpoint (raw or tail-EMA), never a fitted one.
+        #[arg(long)]
+        weights: String,
+
+        /// Fresh run receiving the fitted checkpoint, inherited core reports, and fit report.
+        #[arg(long)]
+        run: String,
+
+        /// Canonical AdamW updates. Official fitting rejects every value except 4096.
+        #[arg(long, default_value_t = trading_bot_0::torch::train::mse_jepa::DEFAULT_READOUT_FIT_STEPS)]
+        steps: usize,
+
+        /// Canonical full-window batch. Official fitting rejects every value except 8.
+        #[arg(long, default_value_t = trading_bot_0::torch::train::mse_jepa::DEFAULT_READOUT_FIT_BATCH_SIZE)]
+        batch_size: usize,
+
+        /// Canonical deterministic aligned rows per update; must be exactly 4096.
+        #[arg(long, default_value_t = trading_bot_0::torch::train::mse_jepa::DEFAULT_READOUT_TOKEN_ROWS)]
+        token_rows_per_step: usize,
+
+        /// Canonical pinned validation panel; must be exactly eight windows.
+        #[arg(long, default_value_t = trading_bot_0::torch::train::mse_jepa::DEFAULT_READOUT_VALIDATION_WINDOWS)]
+        validation_windows: usize,
+
+        /// Dedicated canonical head-reset, train-panel, and row-subsampling seed. Official
+        /// fitting rejects overrides so every published endpoint uses the common stream.
+        #[arg(long, default_value_t = trading_bot_0::torch::train::mse_jepa::DEFAULT_READOUT_FIT_SEED)]
+        seed: u64,
+
+        #[arg(long, default_value_t = trading_bot_0::data::ingest::bars_dir().to_string_lossy().into_owned())]
+        data_dir: String,
+
+        #[arg(long, default_value_t = 300)]
+        resolution_secs: u32,
+
+        #[arg(long, default_value_t = trading_bot_0::torch::lejepa::dataset::DEFAULT_MIN_BARS)]
+        min_bars: usize,
+
+        #[arg(long, value_parser = parse_split_bounds)]
+        split_bounds: Option<(i64, i64)>,
+
+        #[arg(long, default_value_t = false, conflicts_with = "split_bounds")]
+        derive_split_bounds: bool,
+    },
+
+    /// Score ancestral bar-mode and latent-mode rollouts of a posthoc-fitted DBWM endpoint.
+    EvaluateMseJepaRollout {
+        /// Completed authenticated `mse_jepa*_fitted.ot` endpoint. Core/online heads rejected.
+        #[arg(long)]
+        weights: String,
+
+        /// Completed LLM-style categorical `BarWorldModel` checkpoint scored on the same
+        /// windows/horizons/fan with matched conventions: the design's evaluation gate.
+        #[arg(long)]
+        baseline_weights: Option<String>,
+
+        /// Fresh run receiving rollout `.report.bin` diagnostics and candle fans.
+        #[arg(long)]
+        run: String,
+
+        #[arg(long, default_value_t = trading_bot_0::data::ingest::bars_dir().to_string_lossy().into_owned())]
+        data_dir: String,
+
+        #[arg(long, default_value_t = 300)]
+        resolution_secs: u32,
+
+        #[arg(long, default_value_t = trading_bot_0::torch::lejepa::dataset::DEFAULT_MIN_BARS)]
+        min_bars: usize,
+
+        /// Pinned validation windows scored per horizon.
+        #[arg(long, default_value_t = trading_bot_0::torch::train::mse_jepa::DEFAULT_ROLLOUT_VALIDATION_WINDOWS)]
+        validation_windows: usize,
+
+        /// Compatibility iteration grouping only. Each window uses its own deterministic RNG
+        /// stream, so changing this is bit-exact and intentionally does not GPU-batch windows.
+        #[arg(long, default_value_t = trading_bot_0::torch::train::mse_jepa::DEFAULT_ROLLOUT_WINDOW_CHUNK)]
+        window_chunk: usize,
+
+        /// Ancestral trajectories per window; the fan the predictive NLL marginalizes over.
+        #[arg(long, default_value_t = trading_bot_0::torch::train::mse_jepa::DEFAULT_ROLLOUT_SAMPLES)]
+        samples: usize,
+
+        /// Selected horizons highlighted in the rollout reports.
+        #[arg(long, value_delimiter = ',', default_value = "1,4,16,39,78,100")]
+        horizons: Vec<usize>,
+
+        /// Heun steps per latent-mode transition draw.
+        #[arg(long, default_value_t = trading_bot_0::torch::train::mse_jepa::DEFAULT_FLOW_STEPS)]
+        flow_steps: usize,
+
+        #[arg(long, default_value_t = 0x5EED)]
+        seed: u64,
 
         #[arg(long, value_parser = parse_split_bounds)]
         split_bounds: Option<(i64, i64)>,
@@ -1725,6 +1857,68 @@ async fn run() {
     enforce_cli_eval_budget(&cli).expect("evaluation work budget rejected command");
 
     match &cli.command {
+        Some(Commands::TimexerCandles(args)) => {
+            let args = args.clone();
+            tokio::task::spawn_blocking(move || torch::single_ticker_timexer::candles::run(args))
+                .await
+                .expect("TimeXer candles task panicked")
+                .expect("TimeXer candle generation failed");
+        }
+        Some(Commands::BenchmarkTimexer(args)) => {
+            let args = args.clone();
+            tokio::task::spawn_blocking(move || torch::single_ticker_timexer::benchmark::run(args))
+                .await
+                .expect("TimeXer benchmark panicked")
+                .expect("TimeXer benchmark failed");
+        }
+        Some(Commands::BenchmarkTimexerSegment(args)) => {
+            let args = args.clone();
+            tokio::task::spawn_blocking(move || torch::timexer_segment::benchmark::run(args))
+                .await.expect("TimeXer segment benchmark panicked").expect("TimeXer segment benchmark failed");
+        }
+        Some(Commands::TrainTimexerSegment(args)) => {
+            let args = args.clone();
+            tokio::task::spawn_blocking(move || torch::timexer_segment::runner::train(args))
+                .await.expect("TimeXer segment task panicked").expect("TimeXer segment training failed");
+        }
+        Some(Commands::EvaluateTimexerSegment(args)) => {
+            let args = args.clone();
+            tokio::task::spawn_blocking(move || torch::timexer_segment::runner::evaluate(args))
+                .await.expect("TimeXer segment evaluation panicked").expect("TimeXer segment evaluation failed");
+        }
+        Some(Commands::TrainTimexer(args)) => {
+            let args = args.clone();
+            tokio::task::spawn_blocking(move || torch::single_ticker_timexer::runner::train(args))
+                .await
+                .expect("TimeXer task panicked")
+                .expect("TimeXer training failed");
+        }
+        Some(Commands::EvaluateTimexer(args)) => {
+            let args = args.clone();
+            tokio::task::spawn_blocking(move || {
+                torch::single_ticker_timexer::runner::evaluate(args)
+            })
+            .await
+            .expect("TimeXer task panicked")
+            .expect("TimeXer evaluation failed");
+        }
+        Some(Commands::FreezeTimexer(args)) => {
+            torch::single_ticker_timexer::checkpoint::freeze(&args.checkpoint, &args.output)
+                .expect("TimeXer checkpoint freeze failed");
+        }
+        Some(Commands::CompareTimexer(args)) => {
+            torch::single_ticker_timexer::runner::compare(args.clone())
+                .expect("TimeXer comparison failed");
+        }
+        Some(Commands::ForecastTimexer(args)) => {
+            let args = args.clone();
+            tokio::task::spawn_blocking(move || {
+                torch::single_ticker_timexer::runner::forecast(args)
+            })
+            .await
+            .expect("TimeXer task panicked")
+            .expect("TimeXer forecast failed");
+        }
         Some(Commands::Genetic {
             family,
             run,
@@ -1853,11 +2047,11 @@ async fn run() {
                 .expect("pretraining failed");
         }
         Some(Commands::PretrainMseJepa {
-            weights,
             run,
             epochs,
             steps,
             batch_size,
+            emission_gradient,
             seed,
             data_dir,
             resolution_secs,
@@ -1865,16 +2059,18 @@ async fn run() {
             validation_windows,
             validate_every,
             checkpoint_every,
+            lambda_flow,
             lambda_sigreg,
+            flow_steps,
             split_bounds,
             derive_split_bounds,
         }) => {
             let args = torch::train::MseJepaArgs {
-                weights: weights.clone(),
                 run: run.clone(),
                 epochs: *epochs,
                 steps: *steps,
                 batch_size: *batch_size,
+                emission_gradient_mode: *emission_gradient,
                 seed: *seed,
                 data_dir: data_dir.clone(),
                 resolution_secs: *resolution_secs,
@@ -1882,7 +2078,9 @@ async fn run() {
                 validation_windows: *validation_windows,
                 validate_every: *validate_every,
                 checkpoint_every: *checkpoint_every,
+                lambda_flow: *lambda_flow,
                 lambda_sigreg: *lambda_sigreg,
+                flow_steps: *flow_steps,
                 split_bounds: *split_bounds,
                 derive_split_bounds: *derive_split_bounds,
             };
@@ -1890,6 +2088,76 @@ async fn run() {
                 .await
                 .expect("MSE-JEPA pretraining task panicked")
                 .expect("MSE-JEPA pretraining failed");
+        }
+        Some(Commands::FitMseJepaReadouts {
+            weights,
+            run,
+            steps,
+            batch_size,
+            token_rows_per_step,
+            validation_windows,
+            seed,
+            data_dir,
+            resolution_secs,
+            min_bars,
+            split_bounds,
+            derive_split_bounds,
+        }) => {
+            let args = torch::train::FitMseJepaReadoutsArgs {
+                weights: weights.clone(),
+                run: run.clone(),
+                steps: *steps,
+                batch_size: *batch_size,
+                token_rows_per_step: *token_rows_per_step,
+                validation_windows: *validation_windows,
+                seed: *seed,
+                data_dir: data_dir.clone(),
+                resolution_secs: *resolution_secs,
+                min_bars: *min_bars,
+                split_bounds: *split_bounds,
+                derive_split_bounds: *derive_split_bounds,
+            };
+            tokio::task::spawn_blocking(move || torch::train::fit_mse_jepa_readouts(args))
+                .await
+                .expect("MSE-JEPA readout-fitting task panicked")
+                .expect("MSE-JEPA readout fitting failed");
+        }
+        Some(Commands::EvaluateMseJepaRollout {
+            weights,
+            baseline_weights,
+            run,
+            data_dir,
+            resolution_secs,
+            min_bars,
+            validation_windows,
+            window_chunk,
+            samples,
+            horizons,
+            flow_steps,
+            seed,
+            split_bounds,
+            derive_split_bounds,
+        }) => {
+            let args = torch::train::EvaluateMseJepaRolloutArgs {
+                weights: weights.clone(),
+                baseline_weights: baseline_weights.clone(),
+                run: run.clone(),
+                data_dir: data_dir.clone(),
+                resolution_secs: *resolution_secs,
+                min_bars: *min_bars,
+                validation_windows: *validation_windows,
+                window_chunk: *window_chunk,
+                samples: *samples,
+                horizons: horizons.clone(),
+                flow_steps: *flow_steps,
+                seed: *seed,
+                split_bounds: *split_bounds,
+                derive_split_bounds: *derive_split_bounds,
+            };
+            tokio::task::spawn_blocking(move || torch::train::evaluate_mse_jepa_rollout(args))
+                .await
+                .expect("MSE-JEPA rollout evaluation task panicked")
+                .expect("MSE-JEPA rollout evaluation failed");
         }
         Some(Commands::PretrainCandles {
             weights,
@@ -2534,9 +2802,12 @@ async fn run() {
             .expect("deep daily ingest failed");
         }
         None => {
-            torch::train::train(None, ModelVariant::UniformStream, None, 20260811)
-                .await
-                .expect("PPO training failed");
+            tokio::task::spawn_blocking(|| {
+                torch::timexer_segment::runner::train(Default::default())
+            })
+            .await
+            .expect("TimeXer task panicked")
+            .expect("TimeXer training failed");
         }
     }
 
@@ -2559,6 +2830,70 @@ mod tests {
             .expect("spawn CLI contract")
             .join()
             .expect("CLI contract panicked");
+    }
+
+    #[test]
+    fn timexer_defaults_preserve_explicit_legacy_commands() {
+        with_large_cli_stack(|| {
+            let cli =
+                Cli::try_parse_from(["trading_bot", "train-timexer", "--ticker", "AAPL"]).unwrap();
+            let Some(Commands::TrainTimexer(args)) = cli.command else {
+                panic!("expected TimeXer")
+            };
+            assert_eq!(
+                args.model,
+                trading_bot_0::torch::single_ticker_timexer::model::ModelKind::SingleTickerTimeXer
+            );
+            assert_eq!(args.ticker.as_deref(), Some("AAPL"));
+            assert_eq!(args.seed, 20260904);
+            assert!(Cli::try_parse_from(["trading_bot"])
+                .unwrap()
+                .command
+                .is_none());
+            for command in ["train", "pretrain", "pretrain-mse-jepa"] {
+                assert!(Cli::try_parse_from(["trading_bot", command]).is_ok());
+            }
+        });
+    }
+
+    #[test]
+    fn timexer_gate_cli_requires_patchtst_and_three_seeds() {
+        with_large_cli_stack(|| {
+            assert!(Cli::try_parse_from([
+                "trading_bot",
+                "compare-timexer",
+                "--candidate",
+                "a",
+                "b",
+                "c",
+                "--baseline",
+                "d",
+                "e",
+                "f",
+                "--output",
+                "reports"
+            ])
+            .is_err());
+            assert!(Cli::try_parse_from([
+                "trading_bot",
+                "compare-timexer",
+                "--candidate",
+                "a",
+                "b",
+                "c",
+                "--baseline",
+                "d",
+                "e",
+                "f",
+                "--patch-tst",
+                "g",
+                "h",
+                "i",
+                "--output",
+                "reports"
+            ])
+            .is_ok());
+        });
     }
 
     #[test]
@@ -2687,19 +3022,21 @@ mod tests {
     fn mse_jepa_cli_defaults_are_family_isolated() {
         with_large_cli_stack(|| {
             let cli = Cli::try_parse_from(["trading_bot", "pretrain-mse-jepa"])
-                .expect("pretrain-mse-jepa should parse");
+                .expect("the evidence-backed attached core should be the default");
             let Some(Commands::PretrainMseJepa {
-                weights,
                 epochs,
                 steps,
                 batch_size,
+                emission_gradient,
                 seed,
                 resolution_secs,
                 min_bars,
                 validation_windows,
                 validate_every,
                 checkpoint_every,
+                lambda_flow,
                 lambda_sigreg,
+                flow_steps,
                 split_bounds,
                 derive_split_bounds,
                 ..
@@ -2707,7 +3044,39 @@ mod tests {
             else {
                 panic!("expected pretrain-mse-jepa command");
             };
-            assert_eq!(weights, None);
+            assert_eq!(
+                emission_gradient,
+                trading_bot_0::torch::train::mse_jepa::MseJepaEmissionGradientMode::Attached
+            );
+            assert!(matches!(
+                Cli::try_parse_from([
+                    "trading_bot",
+                    "pretrain-mse-jepa",
+                    "--emission-gradient",
+                    "detached",
+                ])
+                .unwrap()
+                .command,
+                Some(Commands::PretrainMseJepa {
+                    emission_gradient:
+                        trading_bot_0::torch::train::mse_jepa::MseJepaEmissionGradientMode::Detached,
+                    ..
+                })
+            ));
+            assert_eq!(lambda_flow, 1.0);
+            assert_eq!(flow_steps, 8);
+            assert!(
+                Cli::try_parse_from([
+                    "trading_bot",
+                    "pretrain-mse-jepa",
+                    "--emission-gradient",
+                    "attached",
+                    "--weights",
+                    "mse_jepa.ot",
+                ])
+                .is_err(),
+                "core pretraining has no warm-start path"
+            );
             assert_eq!(epochs, 1);
             assert_eq!(steps, None);
             assert_eq!(
@@ -2732,6 +3101,159 @@ mod tests {
             assert_eq!(lambda_sigreg, 0.09);
             assert_eq!(split_bounds, None);
             assert!(!derive_split_bounds);
+        });
+    }
+
+    #[test]
+    fn mse_jepa_readout_fit_cli_defaults_pin_the_leak_free_schedule() {
+        with_large_cli_stack(|| {
+            let cli = Cli::try_parse_from([
+                "trading_bot",
+                "fit-mse-jepa-readouts",
+                "--weights",
+                "mse_jepa.ot",
+                "--run",
+                "fitted",
+            ])
+            .expect("fit-mse-jepa-readouts should parse");
+            let Some(Commands::FitMseJepaReadouts {
+                steps,
+                batch_size,
+                token_rows_per_step,
+                validation_windows,
+                seed,
+                resolution_secs,
+                split_bounds,
+                derive_split_bounds,
+                ..
+            }) = cli.command
+            else {
+                panic!("expected fit-mse-jepa-readouts command");
+            };
+            assert_eq!(
+                steps,
+                trading_bot_0::torch::train::mse_jepa::DEFAULT_READOUT_FIT_STEPS
+            );
+            assert_eq!(
+                batch_size,
+                trading_bot_0::torch::train::mse_jepa::DEFAULT_READOUT_FIT_BATCH_SIZE
+            );
+            assert_eq!(
+                token_rows_per_step,
+                trading_bot_0::torch::train::mse_jepa::DEFAULT_READOUT_TOKEN_ROWS
+            );
+            assert_eq!(
+                validation_windows,
+                trading_bot_0::torch::train::mse_jepa::DEFAULT_READOUT_VALIDATION_WINDOWS
+            );
+            assert_eq!(
+                seed,
+                trading_bot_0::torch::train::mse_jepa::DEFAULT_READOUT_FIT_SEED
+            );
+            assert_eq!(resolution_secs, 300);
+            assert_eq!(split_bounds, None);
+            assert!(!derive_split_bounds);
+        });
+    }
+
+    #[test]
+    fn mse_jepa_rollout_cli_defaults_pin_the_evaluation_contract() {
+        with_large_cli_stack(|| {
+            let cli = Cli::try_parse_from([
+                "trading_bot",
+                "evaluate-mse-jepa-rollout",
+                "--weights",
+                "mse_jepa_fitted.ot",
+                "--run",
+                "rollout",
+            ])
+            .expect("evaluate-mse-jepa-rollout should parse");
+            let Some(Commands::EvaluateMseJepaRollout {
+                weights,
+                baseline_weights,
+                run,
+                resolution_secs,
+                min_bars,
+                validation_windows,
+                window_chunk,
+                samples,
+                horizons,
+                flow_steps,
+                seed,
+                split_bounds,
+                derive_split_bounds,
+                ..
+            }) = cli.command
+            else {
+                panic!("expected evaluate-mse-jepa-rollout command");
+            };
+            assert_eq!(
+                flow_steps,
+                trading_bot_0::torch::train::mse_jepa::DEFAULT_FLOW_STEPS
+            );
+            assert_eq!(weights, "mse_jepa_fitted.ot");
+            assert_eq!(baseline_weights, None);
+            assert_eq!(run, "rollout");
+            assert_eq!(resolution_secs, 300);
+            assert_eq!(
+                min_bars,
+                trading_bot_0::torch::lejepa::dataset::DEFAULT_MIN_BARS
+            );
+            assert_eq!(
+                validation_windows,
+                trading_bot_0::torch::train::mse_jepa::DEFAULT_ROLLOUT_VALIDATION_WINDOWS
+            );
+            assert_eq!(
+                window_chunk,
+                trading_bot_0::torch::train::mse_jepa::DEFAULT_ROLLOUT_WINDOW_CHUNK
+            );
+            assert_eq!(
+                samples,
+                trading_bot_0::torch::train::mse_jepa::DEFAULT_ROLLOUT_SAMPLES
+            );
+            assert_eq!(
+                horizons,
+                trading_bot_0::torch::train::mse_jepa::DEFAULT_ROLLOUT_HORIZONS
+            );
+            assert_eq!(seed, 0x5EED);
+            assert_eq!(split_bounds, None);
+            assert!(!derive_split_bounds);
+        });
+    }
+
+    #[test]
+    fn mse_jepa_rollout_cli_rejects_the_retired_probe_commands_and_controls() {
+        with_large_cli_stack(|| {
+            for retired in ["probe-mse-jepa", "evaluate-mse-jepa-probe"] {
+                assert!(
+                    Cli::try_parse_from([
+                        "trading_bot",
+                        retired,
+                        "--weights",
+                        "mse_jepa.ot",
+                        "--run",
+                        "probe",
+                    ])
+                    .is_err(),
+                    "{retired} must stay deleted with the separately-fitted probe"
+                );
+            }
+            for removed in ["--probe-weights", "--learning-rate", "--window-batch-size"] {
+                assert!(
+                    Cli::try_parse_from([
+                        "trading_bot",
+                        "evaluate-mse-jepa-rollout",
+                        "--weights",
+                        "mse_jepa.ot",
+                        "--run",
+                        "rollout",
+                        removed,
+                        "1",
+                    ])
+                    .is_err(),
+                    "{removed} belonged to the retired probe contract"
+                );
+            }
         });
     }
 
@@ -3183,10 +3705,7 @@ mod tests {
             assert_eq!(split, PlannerDataSplit::Validation);
             assert!(!allow_test);
             assert_eq!(mean_sign_hysteresis_bps, None);
-            assert_eq!(
-                min_bars,
-                trading_bot_0::torch::dataset::DEFAULT_MIN_BARS
-            );
+            assert_eq!(min_bars, trading_bot_0::torch::dataset::DEFAULT_MIN_BARS);
             assert_eq!(
                 forecast_horizon,
                 trading_bot_0::torch::train::horizon::DEFAULT_FORECAST_HORIZON

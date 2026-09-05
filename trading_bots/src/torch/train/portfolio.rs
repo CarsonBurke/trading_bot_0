@@ -8329,7 +8329,10 @@ mod tests {
             *weight = -0.05;
         }
         held[20] = -0.026_371_766_303_138_42;
-        assert!((held.iter().map(|weight| weight.abs()).sum::<f64>() - 1.004_049_935_551_701_4).abs() < 1.0e-14);
+        assert!(
+            (held.iter().map(|weight| weight.abs()).sum::<f64>() - 1.004_049_935_551_701_4).abs()
+                < 1.0e-14
+        );
         assert!((held.iter().sum::<f64>() - 0.251_306_402_945_424_6).abs() < 1.0e-14);
 
         let mut adv = vec![0.0; names];

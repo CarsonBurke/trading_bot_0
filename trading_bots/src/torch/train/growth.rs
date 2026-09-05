@@ -1311,8 +1311,7 @@ mod tests {
         let (host_first, host_second) = supports
             .simple_return_bin_moments_at(SIGMA as f64)
             .expect("host quadrature");
-        let device_first =
-            Vec::<f64>::try_from(first.reshape([-1])).expect("device first moments");
+        let device_first = Vec::<f64>::try_from(first.reshape([-1])).expect("device first moments");
         let device_second =
             Vec::<f64>::try_from(second.reshape([-1])).expect("device second moments");
         let first_gap = host_first
@@ -1402,8 +1401,7 @@ mod tests {
         let device = Device::Cuda(0);
         let support = GrowthSupport::new(&supports, device)
             .expect("a CPU support can build a device-resident growth law");
-        let probabilities =
-            Tensor::ones([2, NUM_BAR_BINS], (Kind::Float, device)) / NUM_BAR_BINS;
+        let probabilities = Tensor::ones([2, NUM_BAR_BINS], (Kind::Float, device)) / NUM_BAR_BINS;
         let sigma = Tensor::full([2], 0.003, (Kind::Float, device));
         let (first, second) = r_moments(&probabilities, &sigma, &support);
         assert_eq!(first.device(), device);

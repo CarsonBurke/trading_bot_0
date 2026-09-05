@@ -5,6 +5,8 @@
 
 use anyhow::{anyhow, bail, ensure, Context, Result};
 use bytemuck::{Pod, Zeroable};
+#[cfg(unix)]
+use memmap2::Advice;
 use memmap2::Mmap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufWriter, ErrorKind, Read, Seek, SeekFrom, Write};
@@ -399,6 +401,18 @@ impl BarFile {
             res_secs: header.res_secs,
             count,
         })
+    }
+    /// Disable speculative sequential readahead for corpus consumers that issue sparse,
+    /// independently shuffled windows. The exact mapped bytes remain unchanged.
+    pub fn advise_random_access(&self) -> Result<()> {
+        #[cfg(unix)]
+        self.mmap.advise(Advice::Random).with_context(|| {
+            format!(
+                "setting random-access mmap advice for bar file {}",
+                self.path.display()
+            )
+        })?;
+        Ok(())
     }
 
     /// Zero-copy view of the mapped records.

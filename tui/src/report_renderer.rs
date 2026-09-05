@@ -1,10 +1,11 @@
 use anyhow::{anyhow, Result};
 use image::{DynamicImage, RgbImage};
-use plotters::coord::Shift;
+use plotters::coord::{types::RangedCoordf64, Shift};
 use plotters::prelude::*;
 use plotters::style::text_anchor::{HPos, Pos, VPos};
 use shared::report::{
-    CandleBar, QuantileBand, Report, ReportKind, ReportSeries, ScaleKind, TradePoint,
+    CandleBar, HorizonForecast, QuantileBand, Report, ReportKind, ReportSeries, ScaleKind,
+    TradePoint,
 };
 use shared::theme::plotters_colors as theme;
 
@@ -38,7 +39,7 @@ pub fn render_report_with_options(
                     solo_series,
                 )?;
             }
-            ReportKind::MultiLine { series } => {
+            ReportKind::MultiLine { series } | ReportKind::Evidence { series, .. } => {
                 let series: Vec<ReportSeries> = series
                     .iter()
                     .map(|s| ReportSeries {
@@ -46,7 +47,38 @@ pub fn render_report_with_options(
                         values: skip_slice(&s.values, skip).to_vec(),
                     })
                     .collect();
-                render_multi_line(&root, report, &series, x_offset, show_legend, solo_series)?;
+                render_multi_line(
+                    &root,
+                    report,
+                    &series,
+                    x_offset,
+                    None,
+                    show_legend,
+                    solo_series,
+                )?;
+            }
+            ReportKind::IndexedLines { steps, series } => {
+                anyhow::ensure!(
+                    steps.windows(2).all(|pair| pair[0] < pair[1])
+                        && series.iter().all(|s| s.values.len() == steps.len()),
+                    "invalid indexed report shape"
+                );
+                let series: Vec<_> = series
+                    .iter()
+                    .map(|s| ReportSeries {
+                        label: s.label.clone(),
+                        values: skip_slice(&s.values, skip).to_vec(),
+                    })
+                    .collect();
+                render_multi_line(
+                    &root,
+                    report,
+                    &series,
+                    x_offset,
+                    Some(skip_slice(steps, skip)),
+                    show_legend,
+                    solo_series,
+                )?;
             }
             ReportKind::Assets {
                 total,
@@ -122,6 +154,38 @@ pub fn render_report_with_options(
                     &bands,
                     &samples,
                     x_offset,
+                    show_legend,
+                    solo_series,
+                )?;
+            }
+            ReportKind::CandleForecast {
+                actual,
+                origin,
+                forecasts,
+            } => {
+                render_candle_forecast(
+                    &root,
+                    report,
+                    actual,
+                    *origin,
+                    forecasts,
+                    skip,
+                    show_legend,
+                    solo_series,
+                )?;
+            }
+            ReportKind::CandleSegment {
+                actual,
+                origin,
+                predicted,
+            } => {
+                render_candle_segment(
+                    &root,
+                    report,
+                    actual,
+                    *origin,
+                    predicted,
+                    skip,
                     show_legend,
                     solo_series,
                 )?;
@@ -296,6 +360,7 @@ fn render_multi_line(
     report: &Report,
     series: &[ReportSeries],
     x_offset: u32,
+    steps: Option<&[u64]>,
     show_legend: bool,
     solo_series: Option<usize>,
 ) -> Result<()> {
@@ -320,8 +385,14 @@ fn render_multi_line(
 
     let scale = report.scale;
     let (y_min, y_max) = range_for(&all_values, scale == ScaleKind::Symlog)?;
-    let x_len = series.iter().map(|s| s.values.len()).max().unwrap_or(1) as u32;
-    let x_end = x_offset + x_len;
+    let x_len = series.iter().map(|s| s.values.len()).max().unwrap_or(1) as u64;
+    let x_start = steps
+        .and_then(|s| s.first().copied())
+        .unwrap_or(x_offset as u64);
+    let x_end = steps
+        .and_then(|s| s.last().copied())
+        .map(|v| v.saturating_add(1))
+        .unwrap_or(x_start + x_len);
 
     let title = normalize_title(&report.title);
     let mut chart = plotters::chart::ChartBuilder::on(root)
@@ -329,7 +400,7 @@ fn render_multi_line(
         .margin(5)
         .x_label_area_size(30)
         .y_label_area_size(50)
-        .build_cartesian_2d(x_offset..x_end, y_min..y_max)?;
+        .build_cartesian_2d(x_start..x_end, y_min..y_max)?;
 
     let mut mesh = chart.configure_mesh();
     mesh.label_style(("sans-serif", 15, &theme::TEXT))
@@ -363,7 +434,12 @@ fn render_multi_line(
                 .iter()
                 .enumerate()
                 .filter(|(_, v)| v.is_finite())
-                .map(|(idx, v)| (x_offset + idx as u32, map_value(*v as f64, scale)))
+                .map(|(idx, v)| {
+                    (
+                        steps.map_or(x_start + idx as u64, |s| s[idx]),
+                        map_value(*v as f64, scale),
+                    )
+                })
                 .collect();
             chart
                 .draw_series(LineSeries::new(
@@ -383,7 +459,7 @@ fn render_multi_line(
             // Empty series to reserve legend entry, keep original color
             chart
                 .draw_series(LineSeries::new(
-                    std::iter::empty::<(u32, f64)>(),
+                    std::iter::empty::<(u64, f64)>(),
                     ShapeStyle::from(&theme::SURFACE2).stroke_width(1),
                 ))?
                 .label(s.label.as_str())
@@ -800,26 +876,7 @@ fn render_candle_fan(
 
     // Realized bars last, on top, in the up=green / down=red language.
     if actual_active {
-        chart
-            .draw_series(actual.iter().enumerate().map(|(idx, candle)| {
-                let x = x_start + idx as f64;
-                Rectangle::new(
-                    [
-                        (x + 0.2, candle_body_low(candle)),
-                        (x + 0.8, candle_body_high(candle)),
-                    ],
-                    direction_color(candle).filled(),
-                )
-            }))?
-            .label("realized")
-            .legend(legend_rect(&theme::GREEN));
-        chart.draw_series(actual.iter().enumerate().map(|(idx, candle)| {
-            let mid = x_start + idx as f64 + 0.5;
-            PathElement::new(
-                vec![(mid, candle.low as f64), (mid, candle.high as f64)],
-                ShapeStyle::from(&direction_color(candle)).stroke_width(2),
-            )
-        }))?;
+        draw_candles(&mut chart, actual, x_start, 1.0, "realized")?;
     } else {
         chart
             .draw_series(LineSeries::new(
@@ -840,6 +897,302 @@ fn render_candle_fan(
             .draw()?;
     }
 
+    Ok(())
+}
+
+fn render_candle_segment(
+    root: &DrawingArea<BitMapBackend, Shift>,
+    report: &Report,
+    actual: &[CandleBar],
+    origin: usize,
+    predicted: &[CandleBar],
+    skip: usize,
+    show_legend: bool,
+    solo_series: Option<usize>,
+) -> Result<()> {
+    anyhow::ensure!(
+        origin < actual.len(),
+        "forecast origin is outside actual candles"
+    );
+    let solo = solo_series.filter(|&index| index < 2);
+    let active = |index| solo.is_none() || solo == Some(index);
+    let visible_predictions = || {
+        predicted
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| origin + 1 + i >= skip)
+    };
+    let mut values = Vec::new();
+    if active(0) {
+        values.extend(
+            skip_slice(actual, skip)
+                .iter()
+                .flat_map(|c| [c.open, c.high, c.low, c.close]),
+        );
+    }
+    if active(1) {
+        values.extend(visible_predictions().flat_map(|(_, c)| [c.open, c.high, c.low, c.close]));
+    }
+    if !values.iter().any(|v| v.is_finite()) {
+        return Ok(());
+    }
+    let (y_min, y_max) = range_for(&values, false)?;
+    let length = actual.len().max(origin + 1 + predicted.len());
+    let title = normalize_title(&report.title);
+    let mut chart = ChartBuilder::on(root)
+        .caption(title, ("sans-serif", 18, &theme::TEXT))
+        .margin(5)
+        .x_label_area_size(35)
+        .y_label_area_size(65)
+        .build_cartesian_2d(skip as f64..length as f64, y_min..y_max)?;
+    let format_x = |x: &f64| format!("{:.0}", x - origin as f64 - 0.5);
+    let mut mesh = chart.configure_mesh();
+    mesh.label_style(("sans-serif", 15, &theme::TEXT))
+        .axis_style(&theme::SURFACE1)
+        .light_line_style(&TRANSPARENT)
+        .bold_line_style(&theme::OVERLAY0)
+        .x_label_formatter(&format_x)
+        .x_labels(12)
+        .y_labels(6);
+    if let Some(label) = report.x_label.as_deref() {
+        mesh.x_desc(label);
+    }
+    if let Some(label) = report.y_label.as_deref() {
+        mesh.y_desc(label);
+    }
+    mesh.draw()?;
+    if origin >= skip {
+        chart.draw_series(std::iter::once(PathElement::new(
+            vec![(origin as f64 + 1.0, y_min), (origin as f64 + 1.0, y_max)],
+            theme::OVERLAY1.stroke_width(2),
+        )))?;
+    }
+    if active(0) {
+        draw_candles(
+            &mut chart,
+            skip_slice(actual, skip),
+            skip as f64,
+            1.0,
+            "observed OHLC",
+        )?;
+    }
+    if active(1) {
+        let prediction_skip = skip.saturating_sub(origin + 1);
+        draw_candles(
+            &mut chart,
+            skip_slice(predicted, prediction_skip),
+            (origin + 1 + prediction_skip) as f64,
+            0.45,
+            "predicted OHLC (transparent)",
+        )?;
+    }
+    if show_legend {
+        chart
+            .configure_series_labels()
+            .position(LegendConfig::position())
+            .background_style(LegendConfig::background())
+            .border_style(LegendConfig::border())
+            .label_font(LegendConfig::font())
+            .draw()?;
+    }
+    Ok(())
+}
+
+fn render_candle_forecast(
+    root: &DrawingArea<BitMapBackend, Shift>,
+    report: &Report,
+    actual: &[CandleBar],
+    origin: usize,
+    forecasts: &[HorizonForecast],
+    skip: usize,
+    show_legend: bool,
+    solo_series: Option<usize>,
+) -> Result<()> {
+    anyhow::ensure!(
+        origin < actual.len(),
+        "forecast origin is outside actual candles"
+    );
+    anyhow::ensure!(
+        forecasts.iter().all(|f| f.horizon > 0
+            && origin.checked_add(f.horizon).is_some()
+            && f.lower.is_finite()
+            && f.median.is_finite()
+            && f.upper.is_finite()
+            && f.lower <= f.median
+            && f.median <= f.upper),
+        "invalid horizon price interval"
+    );
+    let solo = solo_series.filter(|&index| index < 3);
+    let active = |index| solo.is_none() || solo == Some(index);
+    let visible = || forecasts.iter().filter(|f| origin + f.horizon >= skip);
+    let candles = skip_slice(actual, skip);
+    let mut values = Vec::new();
+    if active(0) {
+        values.extend(
+            candles
+                .iter()
+                .flat_map(|c| [c.open, c.high, c.low, c.close]),
+        );
+    }
+    if active(1) {
+        values.extend(visible().flat_map(|f| [f.lower, f.upper]));
+    }
+    if active(2) {
+        values.extend(visible().map(|f| f.median));
+    }
+    if values.is_empty() {
+        return Ok(());
+    }
+    let (y_min, y_max) = range_for(&values, false)?;
+    let last = actual.len() - 1;
+    let last = forecasts
+        .iter()
+        .map(|f| origin + f.horizon)
+        .max()
+        .unwrap_or(last)
+        .max(last);
+    let mut chart = ChartBuilder::on(root)
+        .caption(report.title.as_str(), ("sans-serif", 20, &theme::TEXT))
+        .margin(5)
+        .x_label_area_size(40)
+        .y_label_area_size(70)
+        .build_cartesian_2d(skip as f64..last as f64 + 1.0, y_min..y_max)?;
+    let format_x = |x: &f64| format!("{:.0}", x - origin as f64 - 0.5);
+    let mut mesh = chart.configure_mesh();
+    mesh.label_style(("sans-serif", 15, &theme::TEXT))
+        .axis_style(&theme::SURFACE1)
+        .x_labels(10)
+        .y_labels(6)
+        .x_label_formatter(&format_x)
+        .bold_line_style(&theme::OVERLAY0)
+        .light_line_style(&TRANSPARENT);
+    if let Some(label) = report.x_label.as_deref() {
+        mesh.x_desc(label);
+    }
+    if let Some(label) = report.y_label.as_deref() {
+        mesh.y_desc(label);
+    }
+    mesh.draw()?;
+
+    if active(0) {
+        chart
+            .draw_series(candles.iter().enumerate().map(|(index, candle)| {
+                let x = (skip + index) as f64;
+                Rectangle::new(
+                    [
+                        (x + 0.2, candle_body_low(candle)),
+                        (x + 0.8, candle_body_high(candle)),
+                    ],
+                    direction_color(candle).filled(),
+                )
+            }))?
+            .label("Actual OHLC")
+            .legend(legend_rect(&theme::GREEN));
+        chart.draw_series(candles.iter().enumerate().map(|(index, candle)| {
+            let x = (skip + index) as f64 + 0.5;
+            PathElement::new(
+                vec![(x, candle.low as f64), (x, candle.high as f64)],
+                direction_color(candle).stroke_width(2),
+            )
+        }))?;
+    }
+    if origin >= skip {
+        let x = origin as f64 + 1.0;
+        chart
+            .draw_series(std::iter::once(PathElement::new(
+                vec![(x, y_min), (x, y_max)],
+                theme::LAVENDER.mix(0.65).stroke_width(2),
+            )))?
+            .label("Forecast origin")
+            .legend(legend_rect(&theme::LAVENDER));
+    }
+    if active(1) {
+        chart
+            .draw_series(visible().map(|f| {
+                let x = (origin + f.horizon) as f64 + 0.5;
+                PathElement::new(
+                    vec![(x, f.lower as f64), (x, f.upper as f64)],
+                    theme::TEAL.stroke_width(3),
+                )
+            }))?
+            .label("Independent 90% close intervals")
+            .legend(legend_rect(&theme::TEAL));
+        for f in visible() {
+            let x = (origin + f.horizon) as f64 + 0.5;
+            chart.draw_series([f.lower, f.upper].into_iter().map(|y| {
+                EmptyElement::at((x, y as f64))
+                    + PathElement::new(vec![(-5, 0), (5, 0)], theme::TEAL.stroke_width(3))
+            }))?;
+        }
+    }
+    if active(2) {
+        chart
+            .draw_series(visible().map(|f| {
+                Circle::new(
+                    ((origin + f.horizon) as f64 + 0.5, f.median as f64),
+                    5,
+                    theme::YELLOW.filled(),
+                )
+            }))?
+            .label("Horizon medians")
+            .legend(legend_rect(&theme::YELLOW));
+    }
+    if show_legend {
+        chart
+            .configure_series_labels()
+            .position(LegendConfig::position())
+            .background_style(LegendConfig::background())
+            .border_style(LegendConfig::border())
+            .label_font(LegendConfig::font())
+            .draw()?;
+    }
+    Ok(())
+}
+
+fn draw_candles(
+    chart: &mut ChartContext<'_, BitMapBackend<'_>, Cartesian2d<RangedCoordf64, RangedCoordf64>>,
+    candles: &[CandleBar],
+    x_start: f64,
+    opacity: f64,
+    label: &str,
+) -> Result<()> {
+    chart
+        .draw_series(
+            candles
+                .iter()
+                .enumerate()
+                .filter(|(_, candle)| candle.open.is_finite() && candle.close.is_finite())
+                .map(|(index, candle)| {
+                    let x = x_start + index as f64;
+                    Rectangle::new(
+                        [
+                            (x + 0.2, candle_body_low(candle)),
+                            (x + 0.8, candle_body_high(candle)),
+                        ],
+                        direction_color(candle).mix(opacity).filled(),
+                    )
+                }),
+        )?
+        .label(label)
+        .legend(move |(x, y)| {
+            Rectangle::new(
+                [(x, y - 5), (x + 20, y + 5)],
+                theme::GREEN.mix(opacity * 0.8).filled(),
+            )
+        });
+    chart.draw_series(
+        candles
+            .iter()
+            .enumerate()
+            .filter(|(_, candle)| candle.low.is_finite() && candle.high.is_finite())
+            .map(|(index, candle)| {
+                let mid = x_start + index as f64 + 0.5;
+                PathElement::new(
+                    vec![(mid, candle.low as f64), (mid, candle.high as f64)],
+                    direction_color(candle).mix(opacity).stroke_width(2),
+                )
+            }),
+    )?;
     Ok(())
 }
 
@@ -978,6 +1331,145 @@ fn legend_rect(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn candle_forecast_intervals_are_sparse_and_survive_skipping_the_origin() {
+        let report = Report {
+            title: "Direct horizon prices".into(),
+            x_label: None,
+            y_label: None,
+            scale: ScaleKind::Linear,
+            kind: ReportKind::CandleForecast {
+                actual: vec![
+                    CandleBar {
+                        open: 10.0,
+                        high: 10.5,
+                        low: 9.5,
+                        close: 10.2
+                    };
+                    8
+                ],
+                origin: 1,
+                forecasts: vec![
+                    HorizonForecast {
+                        horizon: 1,
+                        lower: 9.0,
+                        median: 10.0,
+                        upper: 11.0,
+                    },
+                    HorizonForecast {
+                        horizon: 4,
+                        lower: 8.0,
+                        median: 10.2,
+                        upper: 12.0,
+                    },
+                ],
+            },
+        };
+        let teal_columns = |skip| {
+            let image = render_report_with_options(&report, skip, false, Some(1))
+                .unwrap()
+                .to_rgb8();
+            (0..image.width())
+                .filter(|&x| {
+                    (0..image.height()).any(|y| {
+                        image.get_pixel(x, y).0 == [theme::TEAL.0, theme::TEAL.1, theme::TEAL.2]
+                    })
+                })
+                .count()
+        };
+        let all = teal_columns(0);
+        let later = teal_columns(3);
+        assert!(
+            (20..40).contains(&all),
+            "whiskers must occupy sparse columns: {all}"
+        );
+        assert!(
+            (10..20).contains(&later),
+            "skip must retain only the later whisker: {later}"
+        );
+        assert!(render_report_with_options(&report, 8, true, None).is_ok());
+        assert!(render_report_with_options(&report, 0, true, Some(0)).is_ok());
+        assert!(render_report_with_options(&report, 0, true, Some(2)).is_ok());
+    }
+
+    #[test]
+    fn segment_reuses_normal_candles_with_transparent_predictions() {
+        let actual = vec![
+            CandleBar {
+                open: 10.0,
+                high: 12.0,
+                low: 9.0,
+                close: 11.0
+            };
+            3
+        ];
+        let predicted = vec![CandleBar {
+            open: 10.0,
+            high: 8.0,
+            low: 13.0,
+            close: 11.0,
+        }];
+        let report = Report {
+            title: "deterministic segment".to_owned(),
+            x_label: None,
+            y_label: None,
+            scale: ScaleKind::Linear,
+            kind: ReportKind::CandleSegment {
+                actual,
+                origin: 1,
+                predicted,
+            },
+        };
+        let image = render_report_with_options(&report, 0, false, Some(1))
+            .unwrap()
+            .to_rgb8();
+        let blended: [u8; 3] = std::array::from_fn(|i| {
+            let base = [theme::BASE.0, theme::BASE.1, theme::BASE.2][i] as f64;
+            let green = [theme::GREEN.0, theme::GREEN.1, theme::GREEN.2][i] as f64;
+            (base + (green - base) * 0.45) as u8
+        });
+        let near_blended = |p: &image::Rgb<u8>| {
+            p.0.iter()
+                .zip(blended)
+                .all(|(actual, expected)| actual.abs_diff(expected) <= 1)
+        };
+        assert!(
+            image
+                .enumerate_pixels()
+                .filter(|(_, y, p)| *y > 100 && near_blended(p))
+                .count()
+                > 100
+        );
+        assert!(!image
+            .enumerate_pixels()
+            .any(|(_, y, p)| y > 100 && p.0 == [theme::RED.0, theme::RED.1, theme::RED.2]));
+        assert!(render_report_with_options(&report, 2, true, None).is_ok());
+    }
+
+    #[test]
+    fn indexed_renderer_accepts_irregular_steps_and_rejects_mismatches() {
+        let mut report = Report {
+            title: "indexed".to_owned(),
+            x_label: None,
+            y_label: None,
+            scale: ScaleKind::Linear,
+            kind: ReportKind::IndexedLines {
+                steps: vec![1000, 1907],
+                series: vec![ReportSeries {
+                    label: "loss".to_owned(),
+                    values: vec![1.0, 0.5],
+                }],
+            },
+        };
+        assert!(render_report_with_options(&report, 0, true, None).is_ok());
+        assert!(render_report_with_options(&report, 1, true, None).is_ok());
+        let ReportKind::IndexedLines { steps, .. } = &mut report.kind else {
+            unreachable!()
+        };
+        steps.pop();
+        assert!(render_report_with_options(&report, 0, true, None).is_err());
+    }
 
     #[test]
     fn multiline_single_point_is_visible() {

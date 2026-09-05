@@ -1,5 +1,7 @@
 use std::{marker::PhantomData, rc::Rc, sync::Once};
 
+use anyhow::{ensure, Result};
+use pyo3::prelude::*;
 use tch::Cuda;
 
 static CONFIGURE: Once = Once::new();
@@ -39,6 +41,32 @@ pub fn configure_cuda() {
 
         println!("CUDA configured: autocast bf16, SDPA flash only");
     });
+}
+/// Enable TensorFloat-32 for fp32 GEMMs while retaining fp32 inputs, outputs, accumulation,
+/// reductions, and loss arithmetic. This is materially more precise than moving the attached
+/// encoder or SIGReg statistic to bf16.
+pub(crate) fn enable_tf32_matmul() -> Result<()> {
+    set_float32_matmul_precision("high")
+}
+
+/// Restore exact fp32 GEMMs for validation and checkpoint selection.
+pub(crate) fn enable_exact_fp32_matmul() -> Result<()> {
+    set_float32_matmul_precision("highest")
+}
+
+fn set_float32_matmul_precision(wanted: &'static str) -> Result<()> {
+    let precision = Python::attach(|py| -> PyResult<String> {
+        let torch = py.import("torch")?;
+        torch.call_method1("set_float32_matmul_precision", (wanted,))?;
+        torch
+            .call_method0("get_float32_matmul_precision")?
+            .extract()
+    })?;
+    ensure!(
+        precision == wanted,
+        "failed to select {wanted} float32 matmul policy: {precision}"
+    );
+    Ok(())
 }
 
 /// Pin ATen's thread-local CUDA autocast dtype before entering an autocast scope.

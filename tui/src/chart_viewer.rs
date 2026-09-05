@@ -106,7 +106,9 @@ impl ChartViewer {
         let report = load_report(path).ok()?;
         match report.kind {
             ReportKind::Simple { ema_alpha, .. } => Some(if ema_alpha.is_some() { 2 } else { 1 }),
-            ReportKind::MultiLine { series } => Some(series.len()),
+            ReportKind::MultiLine { series }
+            | ReportKind::Evidence { series, .. }
+            | ReportKind::IndexedLines { series, .. } => Some(series.len()),
             ReportKind::Assets {
                 positioned,
                 benchmark,
@@ -117,6 +119,8 @@ impl ChartViewer {
             )),
             // Solo cycles the realized path, then each quantile locus, then each draw.
             ReportKind::CandleFan { bands, samples, .. } => Some(1 + bands.len() + samples.len()),
+            ReportKind::CandleForecast { .. } => Some(3),
+            ReportKind::CandleSegment { .. } => Some(2),
             ReportKind::BuySell { .. } | ReportKind::Observations { .. } => None,
         }
     }

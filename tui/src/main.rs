@@ -339,6 +339,23 @@ fn is_selectable_primary_weight(path: &Path, name: &str) -> bool {
 /// exported registry yet; extend from one the moment they grow it.
 fn meta_chart_bases() -> Vec<&'static str> {
     let mut bases = vec![
+        "timexer_training",
+        "timexer_candles",
+        "timexer_performance",
+        "timexer_nll",
+        "timexer_crps",
+        "timexer_return_error",
+        "timexer_standardized_error",
+        "timexer_direction",
+        "timexer_pit",
+        "timexer_coverage",
+        "timexer_tails",
+        "timexer_resources",
+        "timexer_evidence",
+        "timexer_gates",
+        "timexer_gate_statistics",
+        "timexer_forecast",
+        "timexer_forecast_probabilities",
         "assets",
         "reward",
         "normalized_reward",
@@ -406,6 +423,7 @@ fn meta_chart_bases() -> Vec<&'static str> {
     ];
     bases.extend_from_slice(RL_META_REPORT_BASES);
     bases.extend_from_slice(PRETRAIN_REPORT_BASES);
+    bases.extend_from_slice(shared::report::TIMEXER_SEGMENT_REPORT_BASES);
     bases.sort_unstable();
     bases.dedup();
     bases
@@ -510,7 +528,7 @@ impl App {
             episodes_input: String::new(),
             weights_path: None,
             training_model_size: "uniform-stream".to_string(),
-            training_kind: TrainingKind::Rl,
+            training_kind: TrainingKind::Pretrain,
             genetic_family: TuiGeneticFamily::TrendBreakout,
             latest_meta_charts: Vec::new(),
             meta_reports_revision: 0,
@@ -1209,6 +1227,13 @@ mod planner_inference_discovery_tests {
             "mse_jepa_objective",
             "mse_jepa_representation",
             "mse_jepa_optimization",
+            "mse_jepa_tail_ema",
+            "mse_jepa_emission",
+            "mse_jepa_flow",
+            "mse_jepa_flow_samples",
+            "mse_jepa_posthoc_readout",
+            "mse_jepa_rollout_nll",
+            "mse_jepa_rollout_calibration",
         ] {
             assert!(
                 bases.contains(&mse_jepa),
@@ -1740,10 +1765,7 @@ fn run_app<B: ratatui::backend::Backend>(terminal: &mut Terminal<B>, app: &mut A
                                     }
                                     KeyCode::Char('s') => {
                                         if !app.is_training_running() {
-                                            if matches!(
-                                                app.training_kind,
-                                                TrainingKind::Rl | TrainingKind::Pretrain
-                                            ) {
+                                            if app.training_kind == TrainingKind::Rl {
                                                 app.open_run_selector(RunSelectorPurpose::Train);
                                             } else {
                                                 app.start_training(None)?;

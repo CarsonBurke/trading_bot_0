@@ -6,6 +6,16 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 static TEMP_FILE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
+pub const TIMEXER_SEGMENT_REPORT_BASES: &[&str] = &[
+    "timexer_segment_validation",
+    "timexer_segment_progress",
+    "timexer_segment_timing",
+    "timexer_segment_candles",
+    "timexer_segment_hardware",
+    "timexer_segment_benchmark",
+    "timexer_segment_benchmark_phases",
+];
+
 pub const RL_META_REPORT_BASES: &[&str] = &[
     "final_assets",
     "cumulative_reward",
@@ -369,6 +379,13 @@ pub const PRETRAIN_REPORT_BASES: &[&str] = &[
     "mse_jepa_objective",
     "mse_jepa_representation",
     "mse_jepa_optimization",
+    "mse_jepa_tail_ema",
+    "mse_jepa_emission",
+    "mse_jepa_flow",
+    "mse_jepa_flow_samples",
+    "mse_jepa_posthoc_readout",
+    "mse_jepa_rollout_nll",
+    "mse_jepa_rollout_calibration",
 ];
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -397,6 +414,25 @@ pub struct CandleBar {
     pub high: f32,
     pub low: f32,
     pub close: f32,
+}
+
+impl CandleBar {
+    pub fn is_valid_ohlc(&self) -> bool {
+        [self.open, self.high, self.low, self.close]
+            .iter()
+            .all(|value| value.is_finite() && *value > 0.0)
+            && self.low <= self.open.min(self.close)
+            && self.high >= self.open.max(self.close)
+    }
+}
+
+/// Independent close-price marginal at a fixed horizon, with a central 90% interval.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HorizonForecast {
+    pub horizon: usize,
+    pub lower: f32,
+    pub median: f32,
+    pub upper: f32,
 }
 
 /// One marginal-quantile locus of a sampled path, e.g. the p10 of the sampled
@@ -457,6 +493,27 @@ pub enum ReportKind {
         action_step0: Option<Vec<f32>>,
         action_final: Option<Vec<f32>>,
     },
+    /// Plot-compatible diagnostics with an exact, versioned evidence payload.
+    Evidence {
+        series: Vec<ReportSeries>,
+        metadata: Vec<u8>,
+    },
+    CandleForecast {
+        actual: Vec<CandleBar>,
+        /// Index of the final observed candle at the forecast origin.
+        origin: usize,
+        forecasts: Vec<HorizonForecast>,
+    },
+    /// Direct deterministic OHLC predictions, beginning one bar after `origin`.
+    CandleSegment {
+        actual: Vec<CandleBar>,
+        origin: usize,
+        predicted: Vec<CandleBar>,
+    },
+    IndexedLines {
+        steps: Vec<u64>,
+        series: Vec<ReportSeries>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
@@ -473,7 +530,7 @@ impl ReportKind {
                 .enumerate()
                 .map(|(i, v)| format!("{i}\t{v}"))
                 .collect(),
-            ReportKind::MultiLine { series } => {
+            ReportKind::MultiLine { series } | ReportKind::Evidence { series, .. } => {
                 let max_len = series.iter().map(|s| s.values.len()).max().unwrap_or(0);
                 let mut lines = Vec::with_capacity(max_len);
                 for i in 0..max_len {
@@ -579,6 +636,94 @@ impl ReportKind {
                 }
                 lines
             }
+            ReportKind::CandleForecast {
+                actual,
+                origin,
+                forecasts,
+            } => {
+                let mut lines = Vec::with_capacity(actual.len());
+                let max_len = forecasts
+                    .iter()
+                    .filter_map(|f| origin.checked_add(f.horizon))
+                    .filter_map(|index| index.checked_add(1))
+                    .max()
+                    .unwrap_or(0)
+                    .max(actual.len());
+                for i in 0..max_len {
+                    let mut line = format!("{i}\tbar_from_origin={}", i as i64 - *origin as i64);
+                    if let Some(c) = actual.get(i) {
+                        line.push_str(&format!(
+                            "\tactual=o:{:.6},h:{:.6},l:{:.6},c:{:.6}",
+                            c.open, c.high, c.low, c.close
+                        ));
+                    }
+                    if i == *origin {
+                        line.push_str("\tforecast_origin=1");
+                    }
+                    for forecast in forecasts
+                        .iter()
+                        .filter(|f| origin.checked_add(f.horizon) == Some(i))
+                    {
+                        line.push_str(&format!(
+                            "\thorizon={}\tp05={:.6}\tp50={:.6}\tp95={:.6}",
+                            forecast.horizon, forecast.lower, forecast.median, forecast.upper
+                        ));
+                    }
+                    lines.push(line);
+                }
+                lines
+            }
+            ReportKind::CandleSegment {
+                actual,
+                origin,
+                predicted,
+            } => {
+                let length = actual
+                    .len()
+                    .max(origin.saturating_add(1).saturating_add(predicted.len()));
+                (0..length)
+                    .map(|index| {
+                        let mut line =
+                            format!("{index}\tbar_from_origin={}", index as i64 - *origin as i64);
+                        if let Some(c) = actual.get(index) {
+                            line.push_str(&format!(
+                                "\tactual=o:{:.6},h:{:.6},l:{:.6},c:{:.6}",
+                                c.open, c.high, c.low, c.close
+                            ));
+                        }
+                        if let Some(c) = index
+                            .checked_sub(origin.saturating_add(1))
+                            .and_then(|i| predicted.get(i))
+                        {
+                            line.push_str(&format!(
+                                "\tpredicted=o:{:.6},h:{:.6},l:{:.6},c:{:.6}\tinvalid_ohlc={}",
+                                c.open,
+                                c.high,
+                                c.low,
+                                c.close,
+                                u8::from(!c.is_valid_ohlc())
+                            ));
+                        }
+                        if index == *origin {
+                            line.push_str("\tforecast_origin=1");
+                        }
+                        line
+                    })
+                    .collect()
+            }
+            ReportKind::IndexedLines { steps, series } => steps
+                .iter()
+                .enumerate()
+                .map(|(index, step)| {
+                    let mut line = format!("{step}");
+                    for s in series {
+                        if let Some(value) = s.values.get(index) {
+                            line.push_str(&format!("\t{}={value}", s.label));
+                        }
+                    }
+                    line
+                })
+                .collect(),
             ReportKind::Observations {
                 observation_tickers,
                 action_tickers,
@@ -708,6 +853,98 @@ mod tests {
     use super::*;
     use std::sync::Arc;
     use std::thread;
+
+    #[test]
+    fn candle_forecast_roundtrip_preserves_sparse_horizons_and_old_variant_tags() {
+        let kind = ReportKind::CandleForecast {
+            actual: vec![
+                CandleBar {
+                    open: 10.0,
+                    high: 11.0,
+                    low: 9.0,
+                    close: 10.5
+                };
+                5
+            ],
+            origin: 1,
+            forecasts: vec![HorizonForecast {
+                horizon: 3,
+                lower: 8.0,
+                median: 10.0,
+                upper: 12.0,
+            }],
+        };
+        let bytes = postcard::to_allocvec(&kind).unwrap();
+        assert_eq!(bytes[0], 7);
+        let decoded: ReportKind = postcard::from_bytes(&bytes).unwrap();
+        let lines = decoded.to_lines();
+        assert!(lines[1].contains("forecast_origin=1"));
+        assert!(!lines[2].contains("p50="));
+        assert!(!lines[3].contains("p50="));
+        assert!(lines[4].contains("horizon=3\tp05=8.000000\tp50=10.000000\tp95=12.000000"));
+        assert_eq!(
+            postcard::to_allocvec(&ReportKind::CandleFan {
+                actual: vec![],
+                bands: vec![],
+                samples: vec![]
+            })
+            .unwrap()[0],
+            4
+        );
+        assert_eq!(
+            postcard::to_allocvec(&ReportKind::Evidence {
+                series: vec![],
+                metadata: vec![]
+            })
+            .unwrap()[0],
+            6
+        );
+    }
+
+    #[test]
+    fn segment_reports_preserve_invalid_predictions_and_origin_alignment() {
+        let actual = CandleBar {
+            open: 10.0,
+            high: 12.0,
+            low: 9.0,
+            close: 11.0,
+        };
+        let invalid = CandleBar {
+            open: 10.0,
+            high: 8.0,
+            low: 13.0,
+            close: 11.0,
+        };
+        assert!(actual.is_valid_ohlc());
+        assert!(!invalid.is_valid_ohlc());
+        let kind = ReportKind::CandleSegment {
+            actual: vec![actual; 3],
+            origin: 1,
+            predicted: vec![invalid],
+        };
+        let bytes = postcard::to_allocvec(&kind).unwrap();
+        assert_eq!(bytes[0], 8);
+        let decoded: ReportKind = postcard::from_bytes(&bytes).unwrap();
+        let lines = decoded.to_lines();
+        assert!(!lines[1].contains("predicted="));
+        assert!(lines[1].contains("forecast_origin=1"));
+        assert!(lines[2].contains("predicted=o:10.000000,h:8.000000,l:13.000000,c:11.000000"));
+        assert!(lines[2].contains("invalid_ohlc=1"));
+    }
+
+    #[test]
+    fn indexed_lines_keep_real_steps() {
+        let kind = ReportKind::IndexedLines {
+            steps: vec![1000, 1907],
+            series: vec![ReportSeries {
+                label: "MSE".to_owned(),
+                values: vec![1.0, 2.0],
+            }],
+        };
+        let decoded: ReportKind =
+            postcard::from_bytes(&postcard::to_allocvec(&kind).unwrap()).unwrap();
+        assert_eq!(decoded.to_lines(), ["1000\tMSE=1", "1907\tMSE=2"]);
+    }
 
     fn test_report(value: f32) -> Report {
         Report {

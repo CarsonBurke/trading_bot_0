@@ -37,7 +37,10 @@ pub use horizon::{
     FORECAST_HORIZONS,
 };
 pub use loop_::train;
-pub use mse_jepa::{pretrain_mse_jepa, MseJepaArgs};
+pub use mse_jepa::{
+    evaluate_mse_jepa_rollout, fit_mse_jepa_readouts, pretrain_mse_jepa,
+    EvaluateMseJepaRolloutArgs, FitMseJepaReadoutsArgs, MseJepaArgs,
+};
 pub use pretrain::{
     pretrain, pretrain_calibration, pretrain_candles, pretrain_trade, CalibrationArgs, CandleArgs,
     CorpusFlags, PretrainArgs, TradeArgs,

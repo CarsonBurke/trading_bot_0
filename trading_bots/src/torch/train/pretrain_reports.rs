@@ -6963,6 +6963,13 @@ impl CandleSummary {
     }
 }
 
+/// Caller-specific truth carried in the shared CandleFan title.
+#[derive(Clone, Copy, Debug)]
+pub struct CandleFanLabels<'a> {
+    pub title_prefix: &'a str,
+    pub coverage_reference: Option<&'a str>,
+}
+
 /// Write one `CandleFan` per window into `dir` — the realized bars against the
 /// ancestral quantile fan, with [`SNAPSHOT_OVERLAY_PATHS`] genuine draws overlaid —
 /// and return the fans they depict.
@@ -6991,12 +6998,34 @@ impl CandleSummary {
 /// in-run by [`PretrainReporter::record_snapshot`] and standalone by
 /// `pretrain-candles`, and neither may drift from the other's chaining or quantile
 /// convention.
+
 pub fn write_candle_windows(
     dir: &Path,
     global_step: usize,
     epoch: Option<usize>,
     drawn: &Tensor,
     future_dof: &Tensor,
+) -> Result<Vec<CandleWindow>> {
+    write_candle_windows_labeled(
+        dir,
+        global_step,
+        epoch,
+        drawn,
+        future_dof,
+        CandleFanLabels {
+            title_prefix: "Pretrain Exact-Cache Rollout Fan",
+            coverage_reference: Some("pretrain_candle_rollout_coverage"),
+        },
+    )
+}
+
+pub fn write_candle_windows_labeled(
+    dir: &Path,
+    global_step: usize,
+    epoch: Option<usize>,
+    drawn: &Tensor,
+    future_dof: &Tensor,
+    labels: CandleFanLabels<'_>,
 ) -> Result<Vec<CandleWindow>> {
     let (windows, steps) = match future_dof.size().as_slice() {
         [w, horizon, dof] if *dof == BAR_DOF as i64 && *w > 0 && *horizon > 0 => {
@@ -7085,6 +7114,15 @@ pub fn write_candle_windows(
             Some(epoch) => format!("step{global_step}_epoch{epoch:03}_window{:02}", window + 1),
             None => format!("step{global_step}_window{:02}", window + 1),
         };
+        let coverage_reference = labels
+            .coverage_reference
+            .map(|reference| {
+                format!(
+                    "; the nominal {:.0}% is a rate ACROSS windows - see {reference}",
+                    NOMINAL_COVERAGE * 100.0
+                )
+            })
+            .unwrap_or_default();
         write_report_at(
             &dir.join(format!("{tag}_fan.report.bin")),
             &Report {
@@ -7092,18 +7130,17 @@ pub fn write_candle_windows(
                 // pointedly NOT against the nominal: a calibrated path that leaves the
                 // band early tends to stay out, so 5/100 is an ordinary outcome that a
                 // binomial read on 100 "trials" would score as an 18-sigma miss. The
-                // nominal belongs to the across-window rate, which has its own chart.
+                // nominal belongs to the across-window rate, when the caller has one.
                 title: format!(
-                    "Pretrain Exact-Cache Rollout Fan - step {global_step} - window {:02} - \
-                     realized CLOSE inside the {:.0}/{:.0} band on {}/{steps} bars (ONE \
-                     dependent path; the nominal {:.0}% is a rate ACROSS windows - see \
-                     pretrain_candle_rollout_coverage) - fan-centre se {:.1}e-4 at h1, \
-                     {:.1}e-4 at h{steps} (log, from {samples} draws)",
+                    "{} - step {global_step} - window {:02} - realized CLOSE inside the \
+                     {:.0}/{:.0} band on {}/{steps} bars (ONE dependent path{}) - fan-centre \
+                     se {:.1}e-4 at h1, {:.1}e-4 at h{steps} (log, from {samples} draws)",
+                    labels.title_prefix,
                     window + 1,
                     BAND_LOW * 100.0,
                     BAND_HIGH * 100.0,
                     fan.in_band_count(),
-                    NOMINAL_COVERAGE * 100.0,
+                    coverage_reference,
                     fan.centre_log_se(0) * 1.0e4,
                     fan.centre_log_se(steps - 1) * 1.0e4,
                 ),
@@ -9112,6 +9149,12 @@ mod tests {
         "mse_jepa_objective",
         "mse_jepa_representation",
         "mse_jepa_optimization",
+        "mse_jepa_tail_ema",
+        "mse_jepa_emission",
+        "mse_jepa_flow",
+        "mse_jepa_flow_samples",
+        "mse_jepa_rollout_nll",
+        "mse_jepa_rollout_calibration",
         // `finish` writes it and consumes the reporter, so it belongs to the end of a run.
         // Executed by `the_held_out_battery_is_written_once_with_every_scalar`.
         "pretrain_test",
@@ -9477,6 +9520,45 @@ mod tests {
                 .clamp(1, 4);
             tch::set_num_threads(ceiling.min(tch::get_num_threads()).max(1));
         });
+    }
+
+    #[test]
+    fn labeled_candle_writer_preserves_categorical_title_and_omits_absent_reference() {
+        let rollout = Tensor::zeros([1, 4, 2, BAR_DOF as i64], (Kind::Float, Device::Cpu));
+        let future = Tensor::zeros([1, 2, BAR_DOF as i64], (Kind::Float, Device::Cpu));
+        let categorical_dir = scratch_dir("categorical_candle_title");
+        write_candle_windows(&categorical_dir, 7, None, &rollout, &future).unwrap();
+        let categorical =
+            read_report(&categorical_dir.join("step7_window01_fan.report.bin")).unwrap();
+        assert_eq!(
+            categorical.title,
+            "Pretrain Exact-Cache Rollout Fan - step 7 - window 01 - realized CLOSE inside the \
+             10/90 band on 2/2 bars (ONE dependent path; the nominal 80% is a rate ACROSS windows \
+             - see pretrain_candle_rollout_coverage) - fan-centre se 0.0e-4 at h1, 0.0e-4 at h2 \
+             (log, from 4 draws)"
+        );
+
+        let probe_dir = scratch_dir("probe_candle_title");
+        write_candle_windows_labeled(
+            &probe_dir,
+            3,
+            None,
+            &rollout,
+            &future,
+            CandleFanLabels {
+                title_prefix: "MSE-JEPA World-Model Predicted-Token Emission Rollout Fan",
+                coverage_reference: None,
+            },
+        )
+        .unwrap();
+        let probe = read_report(&probe_dir.join("step3_window01_fan.report.bin")).unwrap();
+        assert!(probe
+            .title
+            .starts_with("MSE-JEPA World-Model Predicted-Token Emission"));
+        assert!(!probe.title.contains("pretrain_candle_rollout_coverage"));
+        assert!(!probe.title.contains("nominal"));
+        fs::remove_dir_all(categorical_dir).ok();
+        fs::remove_dir_all(probe_dir).ok();
     }
 
     fn write_windows(name: &str, rollout: &Tensor, future: &Tensor) -> Vec<CandleWindow> {

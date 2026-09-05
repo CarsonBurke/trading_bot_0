@@ -143,16 +143,17 @@ pub fn trace_step_boundary() {
 
 fn drive_trace(start: bool) -> Result<()> {
     Python::attach(|py| -> Result<()> {
-        let (open, close) = TRACE_CONTROL.get_or_try_init(py, || -> Result<(Py<PyAny>, Py<PyAny>)> {
-            let source = CString::new(TRACE_HELPER)?;
-            py.run(source.as_c_str(), None, None)
-                .map_err(|error| anyhow!("installing the trace helper failed: {error:?}"))?;
-            let main = py.import("__main__")?;
-            Ok((
-                main.getattr("_rust_probe_trace_start")?.unbind(),
-                main.getattr("_rust_probe_trace_stop")?.unbind(),
-            ))
-        })?;
+        let (open, close) =
+            TRACE_CONTROL.get_or_try_init(py, || -> Result<(Py<PyAny>, Py<PyAny>)> {
+                let source = CString::new(TRACE_HELPER)?;
+                py.run(source.as_c_str(), None, None)
+                    .map_err(|error| anyhow!("installing the trace helper failed: {error:?}"))?;
+                let main = py.import("__main__")?;
+                Ok((
+                    main.getattr("_rust_probe_trace_start")?.unbind(),
+                    main.getattr("_rust_probe_trace_stop")?.unbind(),
+                ))
+            })?;
         let control = if start { open } else { close };
         control
             .bind(py)

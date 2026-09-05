@@ -25,6 +25,7 @@ use std::str::FromStr;
 
 use anyhow::{anyhow, bail, ensure, Context, Result};
 use rayon::slice::ParallelSliceMut;
+use ring::digest::{Context as DigestContext, SHA256};
 use serde::{Deserialize, Serialize};
 use shared::bars::PackedBar;
 use tch::nn::Init;
@@ -1428,11 +1429,8 @@ impl TradedZLaw {
         let (lower_first, lower_second) = {
             let lower_return = (&sigma * self.lower.unsqueeze(0)).expm1();
             let first = lower_return.mean_dim([-1].as_slice(), false, Kind::Double);
-            let second = (&lower_return * &lower_return).mean_dim(
-                [-1].as_slice(),
-                false,
-                Kind::Double,
-            );
+            let second =
+                (&lower_return * &lower_return).mean_dim([-1].as_slice(), false, Kind::Double);
             // The opposite side is allocated only after both reductions have stopped borrowing
             // this full payoff tensor.
             drop(lower_return);
@@ -1440,14 +1438,9 @@ impl TradedZLaw {
         };
         let (first, second) = {
             let upper_return = (&sigma * self.upper.unsqueeze(0)).expm1();
-            let first = lower_first
-                + upper_return.mean_dim([-1].as_slice(), false, Kind::Double);
+            let first = lower_first + upper_return.mean_dim([-1].as_slice(), false, Kind::Double);
             let second = lower_second
-                + (&upper_return * &upper_return).mean_dim(
-                    [-1].as_slice(),
-                    false,
-                    Kind::Double,
-                );
+                + (&upper_return * &upper_return).mean_dim([-1].as_slice(), false, Kind::Double);
             drop(upper_return);
             (first * 0.5, second * 0.5)
         };
@@ -2361,8 +2354,7 @@ impl BarSupports {
                 let lower_return = (sigma * lower).exp_m1();
                 let upper_return = (sigma * upper).exp_m1();
                 first_sum += lower_return + upper_return;
-                second_sum +=
-                    lower_return * lower_return + upper_return * upper_return;
+                second_sum += lower_return * lower_return + upper_return * upper_return;
             }
             let mean = first_sum / (2 * nodes) as f64;
             first[bin] = mean;
@@ -2679,6 +2671,111 @@ impl BarSupports {
     /// not "unchanged": it means the file cannot be checked at all.
     pub fn provenance(&self) -> Option<&BarSupportsProvenance> {
         self.provenance.as_ref()
+    }
+
+    /// Deterministic semantic identity of every field that can affect target encoding, NLL,
+    /// sampling, or fitted-moment decoding. It intentionally excludes serialization details and
+    /// the support's wall-clock `fitted_utc`, neither of which changes scoring.
+    pub fn scoring_sha256(&self) -> Result<String> {
+        fn update_bytes(digest: &mut DigestContext, bytes: &[u8]) {
+            digest.update(&(bytes.len() as u64).to_be_bytes());
+            digest.update(bytes);
+        }
+        fn update_f64s(digest: &mut DigestContext, values: &[f64]) {
+            digest.update(&(values.len() as u64).to_be_bytes());
+            for value in values {
+                digest.update(&value.to_bits().to_be_bytes());
+            }
+        }
+
+        let moments = self
+            .bin_moments
+            .as_ref()
+            .context("BarSupports scoring identity requires fitted bin moments")?;
+        let simple = moments
+            .simple_return
+            .as_ref()
+            .context("BarSupports scoring identity requires fitted simple-return moments")?;
+        let mut digest = DigestContext::new(&SHA256);
+        digest.update(b"bar-supports-scoring-content-v1");
+        digest.update(&NUM_BAR_BINS.to_be_bytes());
+        digest.update(&BAR_LABEL_SIGMA_RATIO.to_bits().to_be_bytes());
+        update_bytes(&mut digest, BAR_SUPPORTS_SEMANTICS_CONTRACT.as_bytes());
+        update_bytes(
+            &mut digest,
+            match self.scaling {
+                DofScaling::Raw => RAW_SCALING_CONTRACT,
+                DofScaling::VolStandardized => standardized_scaling_contract(),
+            }
+            .as_bytes(),
+        );
+        digest.update(&[match self.scaling {
+            DofScaling::Raw => 0,
+            DofScaling::VolStandardized => 1,
+        }]);
+        for dof in 0..BAR_DOF {
+            update_bytes(&mut digest, BAR_DOF_NAMES[dof].as_bytes());
+            update_f64s(&mut digest, &self.lo[dof]);
+            update_f64s(&mut digest, &self.hi[dof]);
+            update_f64s(&mut digest, &self.centers[dof]);
+            update_f64s(&mut digest, &self.widths[dof]);
+            update_f64s(&mut digest, &self.masses[dof]);
+            update_f64s(&mut digest, &self.smoothed_marginal[dof]);
+            update_f64s(&mut digest, &moments.mean[dof]);
+            update_f64s(&mut digest, &moments.second[dof]);
+            digest.update(&(self.atoms[dof].len() as u64).to_be_bytes());
+            for atom in &self.atoms[dof] {
+                digest.update(&atom.value.to_bits().to_be_bytes());
+                digest.update(&(atom.bin as u64).to_be_bytes());
+                digest.update(&atom.mass.to_bits().to_be_bytes());
+            }
+        }
+        update_f64s(&mut digest, &simple.mean);
+        update_f64s(&mut digest, &simple.second);
+        match &simple.z_subbin {
+            Some(subbin) => {
+                digest.update(&[1]);
+                update_f64s(&mut digest, &subbin.mean);
+                update_f64s(&mut digest, &subbin.second);
+                update_bytes(&mut digest, standardized_scaling_contract().as_bytes());
+            }
+            None => digest.update(&[0]),
+        }
+        match &self.provenance {
+            Some(provenance) => {
+                digest.update(&[1]);
+                update_bytes(&mut digest, provenance.corpus_fingerprint.as_bytes());
+                digest.update(&provenance.split_bounds.0.to_be_bytes());
+                digest.update(&provenance.split_bounds.1.to_be_bytes());
+                digest.update(&(provenance.sample_count as u64).to_be_bytes());
+                match provenance.fit_seed {
+                    Some(seed) => {
+                        digest.update(&[1]);
+                        digest.update(&seed.to_be_bytes());
+                    }
+                    None => digest.update(&[0]),
+                }
+                for contract in [
+                    provenance.scaling_contract.as_deref(),
+                    provenance.support_semantics.as_deref(),
+                ] {
+                    match contract {
+                        Some(contract) => {
+                            digest.update(&[1]);
+                            update_bytes(&mut digest, contract.as_bytes());
+                        }
+                        None => digest.update(&[0]),
+                    }
+                }
+            }
+            None => digest.update(&[0]),
+        }
+        Ok(digest
+            .finish()
+            .as_ref()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect())
     }
 
     pub fn device(&self) -> Device {
@@ -3357,7 +3454,9 @@ impl BarSupports {
                             let second = z_second[bin][node] as f32 as f64;
                             let rounding_tolerance = 8.0
                                 * f64::from(f32::EPSILON)
-                                * (mean * mean).max(second.abs()).max(f64::from(f32::MIN_POSITIVE));
+                                * (mean * mean)
+                                    .max(second.abs())
+                                    .max(f64::from(f32::MIN_POSITIVE));
                             if !mean.is_finite()
                                 || !second.is_finite()
                                 || mean.abs() > BAR_Z_LIMIT
@@ -4098,11 +4197,16 @@ pub struct BarEmissionHead {
     prefix_embed: Tensor,
     /// Private complete-bar emission banks for horizons t+2 and t+3. The trunk and forecast
     /// conditioning stay shared, but a direct objective cannot update the deployed h1 readout.
-    direct_heads: [Vec<nn::Linear>; 2],
-    direct_prefix_embed: [Tensor; 2],
+    /// Only the conditioned construction carries them; [`Self::new_unconditioned`] has no
+    /// direct-horizon consumer and allocates none.
+    direct: Option<DirectEmissionBanks>,
     latent_dim: i64,
-    /// `[BAR_DOF, 1, 2 * latent_dim + BAR_PREFIX_WIDTH]`, constant, not a VarStore
-    /// variable: ones over the two readout blocks, and over the prefix block a one
+    /// Width of the forecast-conditioning input block: `latent_dim` for [`Self::new`],
+    /// `0` for [`Self::new_unconditioned`], which drops those weight columns from every
+    /// bank instead of contracting them against zeros.
+    conditioning_dim: i64,
+    /// `[BAR_DOF, 1, latent_dim + conditioning_dim + BAR_PREFIX_WIDTH]`, constant, not a
+    /// VarStore variable: ones over the readout blocks, and over the prefix block a one
     /// exactly where the slot precedes that DOF in [`BAR_CHAIN`]. Folded into a bank's
     /// packed weights once per forward pass by [`BarEmissionHead::pack`].
     input_mask: Tensor,
@@ -4111,6 +4215,14 @@ pub struct BarEmissionHead {
     prefix_row_base: Tensor,
     /// `[BAR_PREFIX_SLOTS]` constant, the DOF slot occupying each prefix slot.
     prefix_slot_dof: Tensor,
+}
+
+/// The private direct-supervision banks of a conditioned emission head. See
+/// [`BarEmissionHead::direct_bank`].
+#[derive(Debug)]
+struct DirectEmissionBanks {
+    heads: [Vec<nn::Linear>; 2],
+    prefix_embed: [Tensor; 2],
 }
 
 /// One forward pass's packing of an emission bank: the five per-DOF [`nn::Linear`]
@@ -4180,11 +4292,27 @@ fn prefix_stream_seed(seed: u64, draw: usize, position: usize) -> u64 {
 
 impl BarEmissionHead {
     pub fn new(vs: &nn::Path, latent_dim: i64) -> Self {
+        Self::build(vs, latent_dim, latent_dim, true)
+    }
+
+    /// A head whose readout consumes only the belief and the same-bar prefix: no forecast
+    /// conditioning columns and no direct-horizon banks. For consumers with nothing to
+    /// condition on, this removes a dead `latent_dim`-wide block from every readout GEMM
+    /// rather than contracting it against zeros.
+    pub fn new_unconditioned(vs: &nn::Path, latent_dim: i64) -> Self {
+        Self::build(vs, latent_dim, 0, false)
+    }
+
+    fn build(vs: &nn::Path, latent_dim: i64, conditioning_dim: i64, direct_banks: bool) -> Self {
         assert!(
             latent_dim > 0,
             "bar emission head needs a positive latent dim"
         );
-        let in_features = 2 * latent_dim + BAR_PREFIX_WIDTH;
+        assert!(
+            conditioning_dim == 0 || conditioning_dim == latent_dim,
+            "forecast conditioning is either absent or latent-sized"
+        );
+        let in_features = latent_dim + conditioning_dim + BAR_PREFIX_WIDTH;
         let weight_bound = 3f64.sqrt() * 0.5 / (in_features as f64).sqrt();
         let heads: Vec<nn::Linear> = (0..BAR_DOF)
             .map(|dof| {
@@ -4213,43 +4341,49 @@ impl BarEmissionHead {
         );
         // Private banks start as exact copies without consuming RNG, so adding them cannot move
         // the already-initialized trunk, h1 head, or following dynamics initialization stream.
-        let mut direct_heads: [Vec<nn::Linear>; 2] = std::array::from_fn(|slot| {
-            let horizon = slot + 2;
-            (0..BAR_DOF)
-                .map(|dof| {
-                    nn::linear(
-                        vs / format!("bar_dof_head_direct_h{horizon}_{}", BAR_DOF_NAMES[dof]),
-                        in_features,
-                        NUM_BAR_BINS,
-                        nn::LinearConfig {
-                            ws_init: Init::Const(0.0),
-                            bs_init: Some(Init::Const(0.0)),
-                            bias: true,
-                        },
-                    )
-                })
-                .collect::<Vec<_>>()
-        });
-        let mut direct_prefix_embed: [Tensor; 2] = std::array::from_fn(|slot| {
-            vs.var(
-                &format!("bar_prefix_embed_direct_h{}", slot + 2),
-                &[BAR_PREFIX_SLOTS as i64 * NUM_BAR_BINS, BAR_PREFIX_EMBED_DIM],
-                Init::Const(0.0),
-            )
-        });
-        tch::no_grad(|| {
-            for bank in &mut direct_heads {
-                for (private, shared) in bank.iter_mut().zip(&heads) {
-                    private.ws.copy_(&shared.ws);
-                    private
-                        .bs
-                        .as_mut()
-                        .expect("private head bias")
-                        .copy_(shared.bs.as_ref().expect("shared head bias"));
+        let direct = direct_banks.then(|| {
+            let mut direct_heads: [Vec<nn::Linear>; 2] = std::array::from_fn(|slot| {
+                let horizon = slot + 2;
+                (0..BAR_DOF)
+                    .map(|dof| {
+                        nn::linear(
+                            vs / format!("bar_dof_head_direct_h{horizon}_{}", BAR_DOF_NAMES[dof]),
+                            in_features,
+                            NUM_BAR_BINS,
+                            nn::LinearConfig {
+                                ws_init: Init::Const(0.0),
+                                bs_init: Some(Init::Const(0.0)),
+                                bias: true,
+                            },
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            });
+            let mut direct_prefix_embed: [Tensor; 2] = std::array::from_fn(|slot| {
+                vs.var(
+                    &format!("bar_prefix_embed_direct_h{}", slot + 2),
+                    &[BAR_PREFIX_SLOTS as i64 * NUM_BAR_BINS, BAR_PREFIX_EMBED_DIM],
+                    Init::Const(0.0),
+                )
+            });
+            tch::no_grad(|| {
+                for bank in &mut direct_heads {
+                    for (private, shared) in bank.iter_mut().zip(&heads) {
+                        private.ws.copy_(&shared.ws);
+                        private
+                            .bs
+                            .as_mut()
+                            .expect("private head bias")
+                            .copy_(shared.bs.as_ref().expect("shared head bias"));
+                    }
                 }
-            }
-            for table in &mut direct_prefix_embed {
-                table.copy_(&prefix_embed);
+                for table in &mut direct_prefix_embed {
+                    table.copy_(&prefix_embed);
+                }
+            });
+            DirectEmissionBanks {
+                heads: direct_heads,
+                prefix_embed: direct_prefix_embed,
             }
         });
 
@@ -4257,8 +4391,8 @@ impl BarEmissionHead {
         let mut mask = vec![1f32; BAR_DOF * width];
         for dof in 0..BAR_DOF {
             for slot in CHAIN_POS[dof]..BAR_PREFIX_SLOTS {
-                let base =
-                    dof * width + (2 * latent_dim + slot as i64 * BAR_PREFIX_EMBED_DIM) as usize;
+                let base = dof * width
+                    + (latent_dim + conditioning_dim + slot as i64 * BAR_PREFIX_EMBED_DIM) as usize;
                 mask[base..base + BAR_PREFIX_EMBED_DIM as usize].fill(0.0);
             }
         }
@@ -4277,9 +4411,9 @@ impl BarEmissionHead {
         Self {
             heads,
             prefix_embed,
-            direct_heads,
-            direct_prefix_embed,
+            direct,
             latent_dim,
+            conditioning_dim,
             input_mask,
             prefix_row_base,
             prefix_slot_dof,
@@ -4288,6 +4422,59 @@ impl BarEmissionHead {
 
     pub fn latent_dim(&self) -> i64 {
         self.latent_dim
+    }
+
+    /// Combined belief+conditioning input width ahead of the prefix block.
+    fn readout_dim(&self) -> i64 {
+        self.latent_dim + self.conditioning_dim
+    }
+
+    fn assert_conditioned(&self) {
+        assert!(
+            self.conditioning_dim > 0,
+            "this emission head was built without forecast conditioning"
+        );
+    }
+
+    fn assert_unconditioned(&self) {
+        assert_eq!(
+            self.conditioning_dim, 0,
+            "a conditioned emission head requires its forecast conditioning input"
+        );
+    }
+
+    /// `[rows, readout_dim]` belief(+conditioning) block ahead of the prefix columns.
+    fn readout_features(
+        &self,
+        h: &Tensor,
+        conditioning: Option<&Tensor>,
+        lead: &[i64],
+        kind: Kind,
+    ) -> Tensor {
+        assert_eq!(
+            conditioning.is_some(),
+            self.conditioning_dim > 0,
+            "forecast conditioning presence must match the head's construction"
+        );
+        match conditioning {
+            Some(conditioning) => {
+                assert_eq!(
+                    lead,
+                    leading_dims(conditioning, self.conditioning_dim, "forecast conditioning"),
+                    "latent and forecast conditioning must share leading dimensions"
+                );
+                Tensor::cat(
+                    &[
+                        h.reshape([-1, self.latent_dim]).to_kind(kind),
+                        conditioning
+                            .reshape([-1, self.conditioning_dim])
+                            .to_kind(kind),
+                    ],
+                    -1,
+                )
+            }
+            None => h.reshape([-1, self.latent_dim]).to_kind(kind),
+        }
     }
 
     /// The five per-DOF weights and biases of one emission bank, packed for the whole of
@@ -4335,6 +4522,31 @@ impl BarEmissionHead {
         self.logits_with(&self.bank(false), h, conditioning, target_bins)
     }
 
+    /// [`Self::logits`] for a head built with [`Self::new_unconditioned`].
+    pub fn logits_unconditioned(&self, h: &Tensor, target_bins: &Tensor) -> Tensor {
+        self.assert_unconditioned();
+        self.logits_with_opt(&self.bank(false), h, None, target_bins)
+    }
+
+    /// Deterministically restore an unconditioned factorized head to its construction
+    /// distribution without constructing or perturbing any backbone parameters.
+    pub fn reset_unconditioned(&mut self, seed: u64) {
+        self.assert_unconditioned();
+        tch::manual_seed(seed as i64);
+        if self.prefix_embed.device().is_cuda() {
+            tch::Cuda::manual_seed_all(seed);
+        }
+        let in_features = self.latent_dim + BAR_PREFIX_WIDTH;
+        let weight_bound = 3f64.sqrt() * 0.5 / (in_features as f64).sqrt();
+        tch::no_grad(|| {
+            for head in &mut self.heads {
+                let _ = head.ws.uniform_(-weight_bound, weight_bound);
+                let _ = head.bs.as_mut().expect("emission bias").zero_();
+            }
+            let _ = self.prefix_embed.zero_();
+        });
+    }
+
     /// Teacher-forced logits for a complete bar at direct horizon `2` or `3`.
     ///
     /// The caller supplies the unchanged decision belief `h[t]`, forecast conditioning built
@@ -4375,11 +4587,11 @@ impl BarEmissionHead {
             "direct horizon must be 2 or 3, got {horizon}"
         );
         let slot = horizon - 2;
-        self.pack(
-            &self.direct_heads[slot],
-            &self.direct_prefix_embed[slot],
-            detach,
-        )
+        let direct = self
+            .direct
+            .as_ref()
+            .expect("an unconditioned emission head carries no direct-horizon banks");
+        self.pack(&direct.heads[slot], &direct.prefix_embed[slot], detach)
     }
 
     /// [`Self::logits`] against a bank packed once for the whole forward pass, with the
@@ -4396,23 +4608,37 @@ impl BarEmissionHead {
         conditioning: &Tensor,
         target_bins: &Tensor,
     ) -> Tensor {
+        self.assert_conditioned();
+        self.logits_with_opt(bank, h, Some(conditioning), target_bins)
+    }
+
+    fn logits_with_opt(
+        &self,
+        bank: &HeadBank,
+        h: &Tensor,
+        conditioning: Option<&Tensor>,
+        target_bins: &Tensor,
+    ) -> Tensor {
         let lead = self.readout_lead(h, conditioning, target_bins);
         let rows = lead.iter().product::<i64>();
         let kind = readout_kind(h);
-        let inputs = Tensor::cat(
-            &[
-                h.reshape([-1, self.latent_dim]).to_kind(kind),
-                conditioning.reshape([-1, self.latent_dim]).to_kind(kind),
-                self.prefix_features(bank, target_bins, rows).to_kind(kind),
-            ],
-            -1,
-        );
+        let mut blocks = Vec::with_capacity(3);
+        blocks.push(h.reshape([-1, self.latent_dim]).to_kind(kind));
+        if let Some(conditioning) = conditioning {
+            blocks.push(
+                conditioning
+                    .reshape([-1, self.conditioning_dim])
+                    .to_kind(kind),
+            );
+        }
+        blocks.push(self.prefix_features(bank, target_bins, rows).to_kind(kind));
+        let inputs = Tensor::cat(&blocks, -1);
         (Tensor::einsum(
             "nj,koj->nko",
             &[&inputs, &bank.weights.to_kind(kind)],
             None::<&[i64]>,
         ) + bank.biases.unsqueeze(0))
-            .reshape(with_tail(&lead, &[BAR_DOF as i64, NUM_BAR_BINS]))
+        .reshape(with_tail(&lead, &[BAR_DOF as i64, NUM_BAR_BINS]))
     }
 
     /// [`Self::logits_with`] for ONE chain factor, returning `[..., NUM_BAR_BINS]` with no
@@ -4438,8 +4664,9 @@ impl BarEmissionHead {
         target_bins: &Tensor,
         dof: usize,
     ) -> Tensor {
+        self.assert_conditioned();
         assert!(dof < BAR_DOF, "bar DOF {dof} is outside the five slots");
-        let lead = self.readout_lead(h, conditioning, target_bins);
+        let lead = self.readout_lead(h, Some(conditioning), target_bins);
         let rows = lead.iter().product::<i64>();
         let kind = readout_kind(h);
         let mut inputs = Vec::with_capacity(3);
@@ -4447,14 +4674,14 @@ impl BarEmissionHead {
         inputs.push(conditioning.reshape([-1, self.latent_dim]).to_kind(kind));
         let weights = bank.weights.select(0, dof as i64);
         let weights = if CHAIN_POS[dof] == 0 {
-            weights.narrow(1, 0, 2 * self.latent_dim)
+            weights.narrow(1, 0, self.readout_dim())
         } else {
             inputs.push(self.prefix_features(bank, target_bins, rows).to_kind(kind));
             weights
         };
         (Tensor::cat(&inputs, -1).linear(&weights.to_kind(kind), None::<Tensor>)
             + bank.biases.select(0, dof as i64).unsqueeze(0))
-            .reshape(with_tail(&lead, &[NUM_BAR_BINS]))
+        .reshape(with_tail(&lead, &[NUM_BAR_BINS]))
     }
 
     /// [`Self::logits`] for ONE chain factor. See [`Self::logits_dof_with`].
@@ -4470,13 +4697,25 @@ impl BarEmissionHead {
 
     /// The leading dimensions every teacher-forced readout shares, with the
     /// [`BarSupports::bin_ids`] provenance of `target_bins` checked.
-    fn readout_lead(&self, h: &Tensor, conditioning: &Tensor, target_bins: &Tensor) -> Vec<i64> {
-        let lead = leading_dims(h, self.latent_dim, "latent");
+    fn readout_lead(
+        &self,
+        h: &Tensor,
+        conditioning: Option<&Tensor>,
+        target_bins: &Tensor,
+    ) -> Vec<i64> {
         assert_eq!(
-            lead,
-            leading_dims(conditioning, self.latent_dim, "forecast conditioning"),
-            "latent and forecast conditioning must share leading dimensions"
+            conditioning.is_some(),
+            self.conditioning_dim > 0,
+            "forecast conditioning presence must match the head's construction"
         );
+        let lead = leading_dims(h, self.latent_dim, "latent");
+        if let Some(conditioning) = conditioning {
+            assert_eq!(
+                lead,
+                leading_dims(conditioning, self.conditioning_dim, "forecast conditioning"),
+                "latent and forecast conditioning must share leading dimensions"
+            );
+        }
         assert_eq!(
             lead,
             leading_dims(target_bins, BAR_DOF as i64, "target bins"),
@@ -4514,6 +4753,17 @@ impl BarEmissionHead {
         self.sample_binned(h, conditioning, supports, temperature).0
     }
 
+    /// [`Self::sample`] for a head built with [`Self::new_unconditioned`].
+    pub fn sample_unconditioned(
+        &self,
+        h: &Tensor,
+        supports: &BarSupports,
+        temperature: f64,
+    ) -> Tensor {
+        self.assert_unconditioned();
+        self.sample_binned_opt(h, None, supports, temperature).0
+    }
+
     /// Ancestral sample returning both the decoded DOF values and the exact bins drawn,
     /// each shaped `[..., BAR_DOF]`.
     ///
@@ -4530,36 +4780,36 @@ impl BarEmissionHead {
         supports: &BarSupports,
         temperature: f64,
     ) -> (Tensor, Tensor) {
+        self.assert_conditioned();
+        self.sample_binned_opt(h, Some(conditioning), supports, temperature)
+    }
+
+    fn sample_binned_opt(
+        &self,
+        h: &Tensor,
+        conditioning: Option<&Tensor>,
+        supports: &BarSupports,
+        temperature: f64,
+    ) -> (Tensor, Tensor) {
         tch::no_grad(|| {
             let lead = leading_dims(h, self.latent_dim, "latent");
-            assert_eq!(
-                lead,
-                leading_dims(conditioning, self.latent_dim, "forecast conditioning"),
-                "latent and forecast conditioning must share leading dimensions"
-            );
             let device = h.device();
             let rows = lead.iter().product::<i64>();
             let bank = self.bank(false);
             let kind = readout_kind(h);
-            let readout = Tensor::cat(
-                &[
-                    h.reshape([-1, self.latent_dim]).to_kind(kind),
-                    conditioning.reshape([-1, self.latent_dim]).to_kind(kind),
-                ],
-                -1,
-            );
+            let readout = self.readout_features(h, conditioning, &lead, kind);
 
             let base = Tensor::einsum(
                 "nl,kol->nko",
                 &[
                     &readout,
-                    &bank.weights.narrow(2, 0, 2 * self.latent_dim).to_kind(kind),
+                    &bank.weights.narrow(2, 0, self.readout_dim()).to_kind(kind),
                 ],
                 None::<&[i64]>,
             ) + bank.biases.unsqueeze(0);
             let prefix_w_all = bank
                 .weights
-                .narrow(2, 2 * self.latent_dim, BAR_PREFIX_WIDTH)
+                .narrow(2, self.readout_dim(), BAR_PREFIX_WIDTH)
                 .to_kind(kind);
 
             // Unvisited slots hold bin 0; the pack zeroes their weight columns, so the
@@ -4639,35 +4889,25 @@ impl BarEmissionHead {
         seed: u64,
     ) -> Tensor {
         assert!(draws > 0, "the forecast mixture needs at least one draw");
+        self.assert_conditioned();
         tch::no_grad(|| {
             let lead = leading_dims(h, self.latent_dim, "latent");
-            assert_eq!(
-                lead,
-                leading_dims(conditioning, self.latent_dim, "forecast conditioning"),
-                "latent and forecast conditioning must share leading dimensions"
-            );
             let device = h.device();
             let rows = lead.iter().product::<i64>();
             let bank = self.bank(false);
             let kind = readout_kind(h);
-            let readout = Tensor::cat(
-                &[
-                    h.reshape([-1, self.latent_dim]).to_kind(kind),
-                    conditioning.reshape([-1, self.latent_dim]).to_kind(kind),
-                ],
-                -1,
-            );
+            let readout = self.readout_features(h, Some(conditioning), &lead, kind);
             let base = Tensor::einsum(
                 "nl,kol->nko",
                 &[
                     &readout,
-                    &bank.weights.narrow(2, 0, 2 * self.latent_dim).to_kind(kind),
+                    &bank.weights.narrow(2, 0, self.readout_dim()).to_kind(kind),
                 ],
                 None::<&[i64]>,
             ) + bank.biases.unsqueeze(0);
             let prefix_w_all = bank
                 .weights
-                .narrow(2, 2 * self.latent_dim, BAR_PREFIX_WIDTH)
+                .narrow(2, self.readout_dim(), BAR_PREFIX_WIDTH)
                 .to_kind(kind);
 
             // Draw `d`'s rows live at offset `d * rows`, which is what lets the per-draw
@@ -5206,6 +5446,28 @@ mod tests {
         let mut rng = Rng::new(seed);
         let samples: Vec<BarDof> = (0..count).map(|_| synthetic_dof(&mut rng)).collect();
         BarSupports::fit(&samples)
+    }
+
+    #[test]
+    fn scoring_digest_is_deterministic_and_binds_full_geometry_content() {
+        let first = synthetic_supports(2_048, 17);
+        let mut replay = synthetic_supports(2_048, 17);
+        assert_eq!(
+            first.scoring_sha256().unwrap(),
+            replay.scoring_sha256().unwrap()
+        );
+        replay.lo[0][0] = f64::from_bits(replay.lo[0][0].to_bits() ^ 1);
+        assert_ne!(
+            first.scoring_sha256().unwrap(),
+            replay.scoring_sha256().unwrap()
+        );
+        replay = synthetic_supports(2_048, 17);
+        replay.smoothed_marginal[BAR_DOF - 1][0] =
+            f64::from_bits(replay.smoothed_marginal[BAR_DOF - 1][0].to_bits() ^ 1);
+        assert_ne!(
+            first.scoring_sha256().unwrap(),
+            replay.scoring_sha256().unwrap()
+        );
     }
 
     /// A fixture whose EQUAL-MASS bins have the pathological width spread the live corpus
@@ -7017,6 +7279,72 @@ mod tests {
     }
 
     #[test]
+    fn unconditioned_head_drops_conditioning_columns_and_direct_banks_exactly() {
+        let _torch_rng_guard = test_rng::exclusive();
+        let _ = tch::manual_seed(0xDB70);
+        let supports = synthetic_supports(20_000, 0xDB70);
+        let latent_dim = 24;
+        let bare_vs = nn::VarStore::new(Device::Cpu);
+        let bare = BarEmissionHead::new_unconditioned(&bare_vs.root(), latent_dim);
+        let mut names: Vec<String> = bare_vs
+            .variables()
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect();
+        names.sort();
+        let mut expected: Vec<String> = BAR_DOF_NAMES
+            .iter()
+            .flat_map(|dof| {
+                [
+                    format!("bar_dof_head_{dof}.weight"),
+                    format!("bar_dof_head_{dof}.bias"),
+                ]
+            })
+            .chain(std::iter::once("bar_prefix_embed".to_owned()))
+            .collect();
+        expected.sort();
+        assert_eq!(names, expected);
+        assert_eq!(
+            bare.heads[0].ws.size(),
+            [NUM_BAR_BINS, latent_dim + BAR_PREFIX_WIDTH],
+            "unconditioned readout width must exclude the conditioning block"
+        );
+
+        // A conditioned head with the same parameters and a zeroed conditioning block must
+        // produce bit-equal logits on zero conditioning: the unconditioned head is exactly
+        // the conditioned computation with the dead columns removed.
+        let full_vs = nn::VarStore::new(Device::Cpu);
+        let mut full = BarEmissionHead::new(&full_vs.root(), latent_dim);
+        tch::no_grad(|| {
+            for (bare_head, full_head) in bare.heads.iter().zip(full.heads.iter_mut()) {
+                let ws = full_head.ws.shallow_clone();
+                ws.narrow(1, 0, latent_dim)
+                    .copy_(&bare_head.ws.narrow(1, 0, latent_dim));
+                ws.narrow(1, latent_dim, latent_dim).zero_();
+                ws.narrow(1, 2 * latent_dim, BAR_PREFIX_WIDTH)
+                    .copy_(&bare_head.ws.narrow(1, latent_dim, BAR_PREFIX_WIDTH));
+                full_head
+                    .bs
+                    .as_mut()
+                    .expect("head bias")
+                    .copy_(bare_head.bs.as_ref().expect("head bias"));
+            }
+            full.prefix_embed.copy_(&bare.prefix_embed);
+        });
+        let h = Tensor::randn([7, latent_dim], (Kind::Float, Device::Cpu));
+        let dof = Tensor::rand([7, BAR_DOF as i64], (Kind::Float, Device::Cpu)) * 0.01;
+        let bins = supports.bin_ids(&dof);
+        let bare_logits = bare.logits_unconditioned(&h, &bins);
+        let full_logits = full.logits(&h, &Tensor::zeros_like(&h), &bins);
+        assert_eq!(bare_logits.size(), [7, BAR_DOF as i64, NUM_BAR_BINS]);
+        assert!(bool::try_from(bare_logits.eq_tensor(&full_logits).all()).unwrap());
+
+        let sampled = bare.sample_unconditioned(&h, &supports, 1.0);
+        assert_eq!(sampled.size(), [7, BAR_DOF as i64]);
+        assert!(bool::try_from(sampled.isfinite().all()).unwrap());
+    }
+
+    #[test]
     fn fresh_hard_categorical_nll_has_a_finite_nonzero_belief_gradient() {
         let _torch_rng_guard = test_rng::exclusive();
         let _ = tch::manual_seed(0xE115_510);
@@ -8795,11 +9123,8 @@ mod tests {
         let observed: Vec<f64> = (0..bins)
             .map(|bin| if bin % 11 == 0 { 0.0 } else { 1.0 })
             .collect();
-        let mut law = TradedZLaw::from_subbin_moments_for_test(
-            means.clone(),
-            seconds.clone(),
-            Device::Cpu,
-        );
+        let mut law =
+            TradedZLaw::from_subbin_moments_for_test(means.clone(), seconds.clone(), Device::Cpu);
         law.observed = Tensor::from_slice(&observed).view([1, NUM_BAR_BINS]);
 
         let sigmas = [0.003, 0.1, 0.9];
@@ -8829,12 +9154,10 @@ mod tests {
                     let lower_return = (sigma * (mean - deviation)).exp_m1();
                     let upper_return = (sigma * (mean + deviation)).exp_m1();
                     first_sum += lower_return + upper_return;
-                    second_sum +=
-                        lower_return * lower_return + upper_return * upper_return;
+                    second_sum += lower_return * lower_return + upper_return * upper_return;
                 }
                 let first = first_sum / (2 * nodes) as f64;
-                let second =
-                    (second_sum / (2 * nodes) as f64).max(first * first);
+                let second = (second_sum / (2 * nodes) as f64).max(first * first);
                 host_first[bin] = first;
                 host_second[bin] = second;
                 conservative_second = conservative_second.max(second);

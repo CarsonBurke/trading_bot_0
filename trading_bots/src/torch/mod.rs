@@ -8,12 +8,14 @@ pub mod env;
 pub mod fa4;
 pub(crate) mod hashing;
 pub mod infer;
-pub mod load;
 pub mod lejepa;
+pub mod load;
 pub mod model;
 pub mod optim;
 pub mod planner;
 pub mod pope;
+pub mod single_ticker_timexer;
+pub mod timexer_segment;
 /// Test-only serialization of libtorch's process-global RNG. See the module
 /// docs: any test that seeds it or draws from it must hold one of its guards.
 #[cfg(test)]

@@ -10,6 +10,7 @@ categories = ["science"]
 default-run = "trading_bot_0"
 
 [dependencies]
+bytemuck = "1.24"
 shared = { path = "../shared", features = ["plotters"] }
 anyhow = "1.0.98"
 # conflicts with torch > 0.19, have to disable for torch variant
@@ -40,12 +41,13 @@ ring = "0.17"
 ringbuffer = "0.16.0"
 rust_neural_network = "0.18.0"
 serde = "1.0.228"
-serde_json = "1.0"
+serde_json = { version = "1.0", features = ["float_roundtrip"] }
 tch = { git = "https://github.com/LaurentMazare/tch-rs.git", rev = "bbf49e6", features = ["python-extension"] }
 torch-sys = { version = "0.25.0" }
 time = "0.3.36"
 tokio = { version = "1.47.0", features = ["full"] }
 uuid = { version = "1.11.0", features = ["v4"] }
+zip = { version = "0.6.6", default-features = false, features = ["deflate"] }
 
 [features]
 default = ["debug_training"]

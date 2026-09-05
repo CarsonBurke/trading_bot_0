@@ -2,7 +2,7 @@ use tch::{Device, Kind, Tensor};
 
 pub const SIGREG_PROJECTIONS: i64 = 1_024;
 pub const SIGREG_KNOTS: i64 = 17;
-pub const SIGREG_MAX_VIEWS: i64 = 256;
+pub const SIGREG_MAX_VIEWS: i64 = 16;
 pub const SIGREG_MAX_T: f64 = 3.0;
 pub const DEFAULT_SIGREG_LAMBDA: f64 = 0.09;
 
@@ -30,6 +30,16 @@ pub(crate) fn sigreg_loss_with_directions(embeddings: &Tensor, directions: &Tens
         embeddings.size()[2],
         "SIGReg direction dimension mismatch"
     );
+    assert_eq!(
+        directions.device(),
+        embeddings.device(),
+        "SIGReg directions must share the embedding device"
+    );
+    assert_eq!(
+        directions.kind(),
+        Kind::Float,
+        "SIGReg directions must be fp32"
+    );
     let samples = embeddings.size()[1];
     let knots = Tensor::linspace(
         0.0,
@@ -43,11 +53,7 @@ pub(crate) fn sigreg_loss_with_directions(embeddings: &Tensor, directions: &Tens
     let _ = coefficients.narrow(0, SIGREG_KNOTS - 1, 1).fill_(dt);
     let normal_ecf = (-knots.square() * 0.5).exp();
     let coefficients = coefficients * &normal_ecf;
-    let projected = embeddings.to_kind(Kind::Float).matmul(
-        &directions
-            .to_device(embeddings.device())
-            .to_kind(Kind::Float),
-    );
+    let projected = embeddings.to_kind(Kind::Float).matmul(directions);
     let phases = projected.unsqueeze(-1) * knots.view([1, 1, 1, SIGREG_KNOTS]);
     let cos_error = phases.cos().mean_dim([1i64].as_slice(), false, Kind::Float)
         - normal_ecf.view([1, 1, SIGREG_KNOTS]);
@@ -58,7 +64,9 @@ pub(crate) fn sigreg_loss_with_directions(embeddings: &Tensor, directions: &Tens
     integrated.mean(Kind::Float) * samples as f64
 }
 
-/// Select temporal positions as semantic views while preserving batch rows as samples.
+/// Select a bounded set of temporal positions as semantic views while preserving batch rows as
+/// independent samples. Sixteen views keep the LeWM kernel footprint fixed when N grows from
+/// eight to 128; more correlated positions add cost, not independent evidence.
 pub fn sample_temporal_views(tokens: &Tensor, train: bool) -> Tensor {
     assert_eq!(
         tokens.dim(),
@@ -66,19 +74,18 @@ pub fn sample_temporal_views(tokens: &Tensor, train: bool) -> Tensor {
         "temporal SIGReg input must be [batch,tickers,time,dim]"
     );
     let total_positions = tokens.size()[2];
-    let indices = temporal_view_indices(
-        total_positions,
-        SIGREG_MAX_VIEWS.min(total_positions),
-        train,
-        tokens.device(),
-    );
-    let selected = tokens.index_select(2, &indices);
+    let views = SIGREG_MAX_VIEWS.min(total_positions);
+    let selected = if !train && views == total_positions {
+        tokens.shallow_clone()
+    } else {
+        let indices = temporal_view_indices(total_positions, views, train, tokens.device());
+        tokens.index_select(2, &indices)
+    };
     let samples = selected.size()[0] * selected.size()[1];
-    selected.permute([2, 0, 1, 3]).contiguous().reshape([
-        indices.size()[0],
-        samples,
-        selected.size()[3],
-    ])
+    selected
+        .permute([2, 0, 1, 3])
+        .contiguous()
+        .reshape([views, samples, selected.size()[3]])
 }
 
 pub(crate) fn temporal_view_indices(
@@ -118,7 +125,10 @@ fn validate_embeddings(embeddings: &Tensor) {
 
 #[cfg(test)]
 mod tests {
-    use super::{sigreg_loss_with_directions, temporal_view_indices, SIGREG_KNOTS, SIGREG_MAX_T};
+    use super::{
+        sample_temporal_views, sigreg_loss_with_directions, temporal_view_indices, SIGREG_KNOTS,
+        SIGREG_MAX_T, SIGREG_MAX_VIEWS,
+    };
     use crate::torch::test_rng;
     use tch::{Device, Kind, Tensor};
 
@@ -215,6 +225,15 @@ mod tests {
             assert_eq!(values.iter().filter(|&&index| index == 18).count(), 1);
             assert_eq!(values.len(), 8);
         }
+    }
+
+    #[test]
+    fn production_view_layout_has_128_independent_samples() {
+        let tokens = Tensor::zeros([128, 1, SIGREG_MAX_VIEWS, 4], (Kind::Float, Device::Cpu));
+        assert_eq!(
+            sample_temporal_views(&tokens, false).size(),
+            [SIGREG_MAX_VIEWS, 128, 4]
+        );
     }
 
     #[test]

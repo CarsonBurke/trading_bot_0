@@ -216,7 +216,9 @@ fn install_backward_probe(py: Python<'_>) -> Result<()> {
         |arguments: &Bound<'_, PyTuple>, _keywords: Option<&Bound<'_, PyDict>>| -> PyResult<()> {
             let phase = arguments.get_item(0)?.extract::<u8>()?;
             let now = Instant::now();
-            let mut entered = ENTERED.lock().expect("the FA4 probe cursor is not poisoned");
+            let mut entered = ENTERED
+                .lock()
+                .expect("the FA4 probe cursor is not poisoned");
             match (phase, entered.replace(now)) {
                 (1, Some(previous)) => {
                     profile::record(profile::FA4_BACKWARD_LOCK, (now - previous).as_secs_f64());

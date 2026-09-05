@@ -40,7 +40,7 @@ pub fn render(f: &mut Frame, app: &mut App) {
             match app.training_kind {
                 crate::state::TrainingKind::Rl => "rl",
                 crate::state::TrainingKind::Genetic => "genetic",
-                crate::state::TrainingKind::Pretrain => "pretrain",
+                crate::state::TrainingKind::Pretrain => "TimeXer",
             }
         ),
         Style::default().fg(theme::TEAL),
@@ -68,7 +68,7 @@ pub fn render(f: &mut Frame, app: &mut App) {
         }
         crate::state::TrainingKind::Pretrain => {
             title_spans.push(Span::styled(
-                "objective: bar-nll + dyn + kl",
+                "objective: cumulative-return NLL",
                 Style::default().fg(theme::BLUE),
             ));
         }

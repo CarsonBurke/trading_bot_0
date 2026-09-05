@@ -177,6 +177,10 @@ impl ProcessManagerState {
             return Ok(());
         }
 
+        if kind == TrainingKind::Pretrain {
+            anyhow::ensure!(weights.is_none(), "TimeXer starts from a fresh initialization; use its evaluation command to load a checkpoint");
+        }
+
         let run_dir = match (kind, &weights) {
             (TrainingKind::Pretrain, _) => RunDir::create_fresh(RUNS_PATH, None)?,
             (_, Some(w)) => {
@@ -210,14 +214,7 @@ impl ProcessManagerState {
                     .arg(genetic_family.as_cli_str());
             }
             TrainingKind::Pretrain => {
-                // Every knob of the bar-distribution pretrainer has a default derived
-                // from the corpus, so the launcher passes nothing but the weights and
-                // the run name.
-                cmd.arg("pretrain");
-
-                if let Some(w) = weights {
-                    cmd.arg("--weights").arg(w);
-                }
+                cmd.arg("train-timexer-segment");
             }
         }
 
@@ -452,7 +449,7 @@ fn is_training_invocation(
     match argv_executable {
         "trading_bot_0" => {
             actual_executable == "trading_bot_0"
-                && args.get(1).is_some_and(|arg| is_training_subcommand(arg))
+                && (args.len() == 1 || args.get(1).is_some_and(|arg| is_training_subcommand(arg)))
         }
         "cargo" => {
             if !matches!(actual_executable, "cargo" | "rustup") {
@@ -464,10 +461,14 @@ fn is_training_invocation(
             if cwd == workspace_root && !cargo_selects_trading_bot(args) {
                 return false;
             }
-            args.iter()
-                .position(|arg| arg == "--")
-                .and_then(|separator| args.get(separator + 1))
-                .is_some_and(|arg| is_training_subcommand(arg))
+            match args.iter().position(|arg| arg == "--") {
+                Some(separator) => args
+                    .get(separator + 1)
+                    .is_none_or(|arg| is_training_subcommand(arg)),
+                None => !args
+                    .iter()
+                    .any(|arg| matches!(arg.as_str(), "--help" | "-h" | "--version" | "-V")),
+            }
         }
         _ => false,
     }
@@ -484,7 +485,17 @@ fn cargo_selects_trading_bot(args: &[String]) -> bool {
 fn is_training_subcommand(arg: &str) -> bool {
     matches!(
         arg,
-        "train" | "train-planner" | "genetic" | "pretrain" | "pretrain-mse-jepa"
+        "train"
+            | "train-planner"
+            | "genetic"
+            | "pretrain"
+            | "pretrain-mse-jepa"
+            | "train-timexer-segment"
+            | "evaluate-timexer-segment"
+            | "train-timexer"
+            | "evaluate-timexer"
+            | "forecast-timexer"
+            | "fit-mse-jepa-readouts"
     )
 }
 
@@ -740,6 +751,16 @@ mod tests {
             workspace,
             bots,
         ));
+        assert!(is_training_invocation(
+            bots,
+            Path::new("/repo/target/release/trading_bot_0"),
+            &strings(&[
+                "/repo/target/release/trading_bot_0",
+                "fit-mse-jepa-readouts",
+            ]),
+            workspace,
+            bots,
+        ));
 
         assert!(!is_training_invocation(
             Path::new("/other"),
@@ -776,6 +797,43 @@ mod tests {
             workspace,
             bots,
         ));
+    }
+
+    #[test]
+    fn default_forecaster_invocations_are_detected_without_claiming_help() {
+        let workspace = Path::new("/repo");
+        let bots = Path::new("/repo/trading_bots");
+        assert!(is_training_invocation(
+            workspace,
+            Path::new("/repo/target/release/trading_bot_0"),
+            &strings(&["trading_bot_0"]),
+            workspace,
+            bots,
+        ));
+        for arguments in [
+            vec!["cargo", "run", "-p", "trading_bot_0"],
+            vec!["cargo", "run", "-p", "trading_bot_0", "--"],
+        ] {
+            assert!(is_training_invocation(
+                workspace,
+                Path::new("/usr/bin/cargo"),
+                &strings(&arguments),
+                workspace,
+                bots
+            ));
+        }
+        for arguments in [
+            vec!["cargo", "run", "-p", "trading_bot_0", "--help"],
+            vec!["cargo", "run", "-p", "trading_bot_0", "--", "--help"],
+        ] {
+            assert!(!is_training_invocation(
+                workspace,
+                Path::new("/usr/bin/cargo"),
+                &strings(&arguments),
+                workspace,
+                bots
+            ));
+        }
     }
 
     #[test]

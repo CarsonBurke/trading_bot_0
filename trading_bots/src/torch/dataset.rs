@@ -1672,6 +1672,13 @@ impl BarCorpus {
     pub fn dof_scaling(&self) -> DofScaling {
         self.inner.dof_scaling
     }
+    /// Tune the mmap policy for shuffled sparse-window workloads.
+    pub fn advise_random_access(&self) -> Result<()> {
+        self.inner
+            .files
+            .par_iter()
+            .try_for_each(BarFile::advise_random_access)
+    }
 
     /// This corpus's [`TIME_RESOLUTION`] id.
     pub fn resolution_class(&self) -> i64 {
@@ -7675,7 +7682,10 @@ mod tests {
         let table = &*TRADING_DATES;
         let first = NaiveDate::from_ymd_opt(1990, 1, 1).expect("span start");
         let last = first + Duration::days(table.days as i64 - 1);
-        assert_eq!(last, NaiveDate::from_ymd_opt(2099, 12, 31).expect("span end"));
+        assert_eq!(
+            last,
+            NaiveDate::from_ymd_opt(2099, 12, 31).expect("span end")
+        );
         for date in [
             first - Duration::days(1),
             first,
@@ -7745,9 +7755,8 @@ mod tests {
             }
             // Non-vacuity: the wall clock really jumps an hour here, so the equality above is
             // comparing two answers that a table off by one entry would get different.
-            let jump = (et_naive_local(start * 1_000)
-                - et_naive_local((start - 1) * 1_000))
-            .num_seconds();
+            let jump =
+                (et_naive_local(start * 1_000) - et_naive_local((start - 1) * 1_000)).num_seconds();
             assert_eq!(
                 (jump - 1).abs(),
                 3_600,
@@ -7799,7 +7808,10 @@ mod tests {
     /// Every [`BatchScratch`] field is therefore live.
     fn scratch_fixture(label: &str) -> (Fixture, BarCorpus) {
         let (fixture, corpus, _) = market_fixture(label);
-        (fixture, corpus.with_dof_scaling(DofScaling::VolStandardized))
+        (
+            fixture,
+            corpus.with_dof_scaling(DofScaling::VolStandardized),
+        )
     }
 
     /// A long draw and a SHORT one that is not a prefix of it, both straddling the proxy hole
@@ -7853,9 +7865,12 @@ mod tests {
         );
         assert!(fresh[0].raw_dof.is_some() && fresh[0].direct_valid.is_some());
         assert!(
-            !fresh[1]
-                .dof
-                .equal(&fresh[0].dof.narrow(0, 0, short.len() as i64).narrow(1, 0, 65)),
+            !fresh[1].dof.equal(
+                &fresh[0]
+                    .dof
+                    .narrow(0, 0, short.len() as i64)
+                    .narrow(1, 0, 65)
+            ),
             "the draws stage the same values, so a leak between them would be invisible here"
         );
 
@@ -7870,7 +7885,11 @@ mod tests {
         .enumerate()
         {
             let reused = sampler.batch_of_into(refs, Device::Cpu, &mut scratch);
-            assert_batch_eq(&reused, &fresh[step], &format!("draw {step} through one scratch"));
+            assert_batch_eq(
+                &reused,
+                &fresh[step],
+                &format!("draw {step} through one scratch"),
+            );
         }
     }
 
@@ -7982,8 +8001,7 @@ mod tests {
         {
             let (ids, next) = channel.ids_at_from(early, 500);
             assert_eq!(
-                ids,
-                [MARKET_MISSING; MARKET_FEATURES],
+                ids, [MARKET_MISSING; MARKET_FEATURES],
                 "a backwards cursor cannot recover the bar it skipped past"
             );
             assert_eq!(next, 500, "the scan has no way to rewind");

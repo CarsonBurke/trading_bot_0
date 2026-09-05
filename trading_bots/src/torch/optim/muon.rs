@@ -2076,6 +2076,13 @@ impl Muon {
     pub fn lr(&self) -> f64 {
         self.cfg.lr
     }
+
+    /// Whether the primary optimizer body including AdamW has finished capture.
+    pub(crate) fn with_adamw_step_graph_captured(&self) -> bool {
+        matches!(&self.step_graphs, StepGraphState::Armed(graphs)
+            if matches!(graphs.with_adamw.state, GraphSlotState::Captured))
+    }
+
     /// Device-resident packed diagnostics from the latest primary step, in
     /// [`RowLearnedLrMetrics`] field order. `None` when disabled or when no routed
     /// matrix had a gradient.
@@ -4535,7 +4542,11 @@ mod tests {
 
         // The handles a capture would have baked into its kernel arguments.
         let captured = optimizer.publish_step_scalars(&mut pack);
-        assert_slot(slot_value(&captured.normuon_lerp), 1.0 - 0.9, "1 - momentum");
+        assert_slot(
+            slot_value(&captured.normuon_lerp),
+            1.0 - 0.9,
+            "1 - momentum",
+        );
         assert_slot(slot_value(&captured.nesterov), 0.9, "momentum");
 
         optimizer.set_lr(0.05);
@@ -4973,10 +4984,7 @@ mod tests {
         for step in 0..2 * PHASE {
             // The second phase brings the idle parameter into the loss for the first time.
             let excluded = (step < PHASE).then_some(IDLE);
-            for (optimizer, named) in [
-                (&mut graphed, &graphed_named),
-                (&mut eager, &eager_named),
-            ] {
+            for (optimizer, named) in [(&mut graphed, &graphed_named), (&mut eager, &eager_named)] {
                 apply_schedule(optimizer, step);
                 backward_schedule_loss(named, step, excluded);
                 optimizer.step(StepKind::Primary);
@@ -5015,7 +5023,10 @@ mod tests {
         );
         match &graphed.step_graphs {
             StepGraphState::Armed(graphs) => {
-                assert!(matches!(graphs.normuon_only.state, GraphSlotState::Captured));
+                assert!(matches!(
+                    graphs.normuon_only.state,
+                    GraphSlotState::Captured
+                ));
                 assert!(matches!(graphs.with_adamw.state, GraphSlotState::Captured));
             }
             _ => panic!("the graph path did not recapture after the parameter set changed"),

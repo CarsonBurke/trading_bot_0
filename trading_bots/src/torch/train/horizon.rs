@@ -1930,13 +1930,12 @@ impl MomentEmaState {
             "moment-EMA state and output vectors must have identical symbol counts"
         );
         let innovation = 1.0 - self.retention;
-        for ((&id, &elapsed), raw) in present_symbols
-            .iter()
-            .zip(elapsed_steps)
-            .zip(raw_moments)
-        {
+        for ((&id, &elapsed), raw) in present_symbols.iter().zip(elapsed_steps).zip(raw_moments) {
             let index = id as usize;
-            ensure!(index < self.means.len(), "moment-EMA symbol id is out of range");
+            ensure!(
+                index < self.means.len(),
+                "moment-EMA symbol id is out of range"
+            );
             let raw_second = Self::repair_second(raw.mean_simple, raw.second_simple)?;
             if !self.initialized[index] || elapsed > 1 {
                 self.means[index] = raw.mean_simple;
@@ -1948,8 +1947,7 @@ impl MomentEmaState {
                 self.seconds[index] =
                     self.retention * self.seconds[index] + innovation * raw_second;
             }
-            self.seconds[index] =
-                Self::repair_second(self.means[index], self.seconds[index])?;
+            self.seconds[index] = Self::repair_second(self.means[index], self.seconds[index])?;
             means[index] = self.means[index];
             seconds[index] = self.seconds[index];
         }
@@ -2411,9 +2409,7 @@ where
         if policy == RecedingPolicy::Model {
             match signal_rule {
                 RecedingSignalRule::Raw => {}
-                RecedingSignalRule::MeanSignHysteresis { margin_simple }
-                    if margin_simple > 0.0 =>
-                {
+                RecedingSignalRule::MeanSignHysteresis { margin_simple } if margin_simple > 0.0 => {
                     let (retained, flips) = apply_mean_sign_hysteresis(
                         &mut means,
                         &slice.symbols,
@@ -4266,8 +4262,7 @@ fn receding_persistence_result(
         ((gross.mean - net.mean) - cost_drag.mean).abs() <= tolerance
             && ((paired_gross.mean - paired_net.mean) - paired_cost.mean).abs() <= tolerance
             && ((gross_annual - net_annual) - cost_annual).abs() <= tolerance
-            && ((paired_gross_annual - paired_net_annual) - paired_cost_annual).abs()
-                <= tolerance,
+            && ((paired_gross_annual - paired_net_annual) - paired_cost_annual).abs() <= tolerance,
         "receding persistence gross/net/cost accounting identity failed at half-life \
          {half_life_bars}"
     );
@@ -4459,8 +4454,7 @@ fn write_receding_persistence_report(
                 .eq(RECEDING_PERSISTENCE_HALF_LIVES),
         "persistence report requires raw then the fixed half-life frontier"
     );
-    let values =
-        |f: fn(&RecedingPersistenceResult) -> f64| rows.iter().map(f).collect::<Vec<_>>();
+    let values = |f: fn(&RecedingPersistenceResult) -> f64| rows.iter().map(f).collect::<Vec<_>>();
     let dispersion = |f: fn(&RecedingPersistenceResult) -> Dispersion,
                       field: fn(Dispersion) -> f64| {
         rows.iter().map(|row| field(f(row))).collect::<Vec<_>>()
@@ -8386,8 +8380,7 @@ mod tests {
         let tiny_decline = 1.0e-20;
         let tiny_drawdown = maximum_drawdown_from_log_equity(&[-tiny_decline]);
         assert!(
-            tiny_drawdown > 0.0
-                && ((tiny_drawdown - tiny_decline) / tiny_decline).abs() < 1.0e-12,
+            tiny_drawdown > 0.0 && ((tiny_drawdown - tiny_decline) / tiny_decline).abs() < 1.0e-12,
             "a tiny representable log-equity decline must not round away: {tiny_drawdown}"
         );
 
@@ -8873,8 +8866,7 @@ mod tests {
         assert_eq!(rows[1].max_abs_net, config.constraints.net_max.abs() + 0.04);
         assert_eq!(rows[1].max_name, config.constraints.per_name_cap + 0.03);
         assert!(rows.iter().all(|row| {
-            row.net_maximum_drawdown.is_finite()
-                && (0.0..=1.0).contains(&row.net_maximum_drawdown)
+            row.net_maximum_drawdown.is_finite() && (0.0..=1.0).contains(&row.net_maximum_drawdown)
         }));
         for dispersion in [
             rows[0].paired_net_gain_bps_per_decision_bar,
@@ -8983,8 +8975,7 @@ mod tests {
         }));
         for row in &rows {
             assert!(
-                ((row.gross_bps_per_decision_bar.mean
-                    - row.net_bps_per_decision_bar.mean)
+                ((row.gross_bps_per_decision_bar.mean - row.net_bps_per_decision_bar.mean)
                     - row.cost_drag_bps_per_decision_bar.mean)
                     .abs()
                     <= 1.0e-9
@@ -9019,7 +9010,9 @@ mod tests {
         let ReportKind::MultiLine { series } = report.kind else {
             panic!("persistence evidence must be a multiline report")
         };
-        assert!(series.iter().all(|series| series.values.len() == rows.len()));
+        assert!(series
+            .iter()
+            .all(|series| series.values.len() == rows.len()));
         let half_lives = series
             .iter()
             .find(|series| series.label == "moment EMA half-life (bars; raw=0)")

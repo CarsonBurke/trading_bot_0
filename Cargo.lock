@@ -4161,6 +4161,7 @@ name = "trading_bot_0"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "bytemuck",
  "candle-core",
  "candle-nn",
  "chrono",
@@ -4194,6 +4195,7 @@ dependencies = [
  "tokio",
  "torch-sys",
  "uuid",
+ "zip 0.6.6",
 ]
 
 [[package]]
