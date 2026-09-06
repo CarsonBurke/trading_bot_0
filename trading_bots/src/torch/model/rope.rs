@@ -2,17 +2,22 @@ use tch::{Kind, Tensor};
 
 pub(in crate::torch::model) const ROPE_DIMS: i64 = 16;
 
-fn rotate_half(x: &Tensor) -> Tensor {
-    let last_dim = *x.size().last().unwrap();
-    let half = last_dim / 2;
-    let x1 = x.narrow(-1, 0, half);
-    let x2 = x.narrow(-1, half, half);
-    Tensor::cat(&[&(-&x2), &x1], -1)
+/// `x·cos + rotate_half(x)·sin` written as the two half-width products it is.
+///
+/// Bit-identical to the `cat([-x2, x1])` form it replaces (`(-x2)·sin == -(x2·sin)` and
+/// `a + (-b) == a - b` are exact in IEEE), and strictly cheaper on both passes: one `split`
+/// node instead of two `narrow`s, so backward builds ONE zero-padded full-width gradient
+/// instead of two plus the add that reduced them, and the negation and the full-width
+/// concatenation of the rotated copy disappear from forward.
+fn rotate(x: &Tensor, cos: &Tensor, sin: &Tensor) -> Tensor {
+    let parts = x.split(*x.size().last().unwrap() / 2, -1);
+    let (x1, x2) = (&parts[0], &parts[1]);
+    Tensor::cat(&[x1 * cos - x2 * sin, x2 * cos + x1 * sin], -1)
 }
 
 pub(crate) struct RotaryEmbedding {
-    cos_cached: Tensor, // [max_seq_len, rope_dims]
-    sin_cached: Tensor, // [max_seq_len, rope_dims]
+    cos_cached: Tensor, // [max_seq_len, rope_dims / 2]
+    sin_cached: Tensor, // [max_seq_len, rope_dims / 2]
     rope_dims: i64,
 }
 
@@ -32,34 +37,37 @@ impl RotaryEmbedding {
         let cos_half = angles.cos();
         let sin_half = angles.sin();
         Self {
-            cos_cached: Tensor::cat(&[&cos_half, &cos_half], -1).set_requires_grad(false),
-            sin_cached: Tensor::cat(&[&sin_half, &sin_half], -1).set_requires_grad(false),
+            cos_cached: cos_half.set_requires_grad(false),
+            sin_cached: sin_half.set_requires_grad(false),
             rope_dims: rd,
         }
     }
 
     pub(crate) fn apply_positions(&self, x: &Tensor, positions: &Tensor) -> Tensor {
-        let head_dim = *x.size().last().unwrap();
-        let positions = positions.to_kind(Kind::Int64).to_device(x.device());
-        let cos = self
-            .cos_cached
-            .index_select(0, &positions)
-            .to_kind(x.kind());
-        let sin = self
-            .sin_cached
-            .index_select(0, &positions)
-            .to_kind(x.kind());
-        self.apply_with_cached(x, &cos, &sin, head_dim)
+        let (cos, sin) = self.cached_rotation(positions, x.kind());
+        self.apply_cached(x, &cos, &sin)
     }
 
-    fn apply_with_cached(&self, x: &Tensor, cos: &Tensor, sin: &Tensor, head_dim: i64) -> Tensor {
+    /// Half-width `cos`/`sin` rows for `positions`, broadcastable over `[.., seq, rope_dims/2]`.
+    /// Callers whose positions never change hoist this out of the step: it is four small kernels
+    /// per attention tensor per layer otherwise.
+    pub(crate) fn cached_rotation(&self, positions: &Tensor, kind: Kind) -> (Tensor, Tensor) {
+        let positions = positions
+            .to_kind(Kind::Int64)
+            .to_device(self.cos_cached.device());
+        (
+            self.cos_cached.index_select(0, &positions).to_kind(kind),
+            self.sin_cached.index_select(0, &positions).to_kind(kind),
+        )
+    }
+
+    pub(crate) fn apply_cached(&self, x: &Tensor, cos: &Tensor, sin: &Tensor) -> Tensor {
+        let head_dim = *x.size().last().unwrap();
         if self.rope_dims < head_dim {
-            let x_rope = x.narrow(-1, 0, self.rope_dims);
-            let x_pass = x.narrow(-1, self.rope_dims, head_dim - self.rope_dims);
-            let rotated = &x_rope * cos + rotate_half(&x_rope) * sin;
-            Tensor::cat(&[&rotated, &x_pass], -1)
+            let parts = x.split_with_sizes([self.rope_dims, head_dim - self.rope_dims], -1);
+            Tensor::cat(&[rotate(&parts[0], cos, sin), parts[1].shallow_clone()], -1)
         } else {
-            x * cos + rotate_half(x) * sin
+            rotate(x, cos, sin)
         }
     }
 }

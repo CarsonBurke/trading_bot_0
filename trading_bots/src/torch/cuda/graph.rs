@@ -1,9 +1,10 @@
-use std::ffi::CStr;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::ptr::NonNull;
 
 use tch::Device;
 use torch_sys::C_cuda_graph;
+
+use super::read_torch_error;
 
 pub(crate) struct CudaGraph {
     raw: NonNull<C_cuda_graph>,
@@ -143,18 +144,6 @@ impl Drop for CudaGraph {
         unsafe { torch_sys::at_cuda_graph_free(self.raw.as_ptr()) };
         let _ = read_torch_error();
     }
-}
-
-fn read_torch_error() -> Result<(), String> {
-    let ptr = unsafe { torch_sys::get_and_reset_last_err() };
-    if ptr.is_null() {
-        return Ok(());
-    }
-    let message = unsafe { CStr::from_ptr(ptr) }
-        .to_string_lossy()
-        .into_owned();
-    unsafe { libc::free(ptr.cast()) };
-    Err(message)
 }
 
 fn panic_message(panic: Box<dyn std::any::Any + Send>) -> String {

@@ -408,6 +408,17 @@ char *at_to_string(tensor t, int line_size) {
 
 void at_copy_(tensor dst, tensor src) { PROTECT(dst->copy_(*src);) }
 
+// Copy into an EXISTING destination without draining the stream.
+//
+// ATen's `copy_` defaults to non_blocking=false, and for a host-to-device copy that
+// means cudaMemcpyAsync followed by cudaStreamSynchronize: a full host wait on every
+// kernel already queued. A per-step upload into a fixed address (a captured graph's
+// static input, a schedule mirror) needs the fixed address AND the asynchrony, which
+// `to` cannot give (it allocates) and `copy_` refuses. The caller owes the usual
+// non-blocking contract: pinned host memory, so the source block is not reused before
+// the copy retires.
+void at_copy_nonblocking(tensor dst, tensor src) { PROTECT(dst->copy_(*src, true);) }
+
 cuda_graph at_cuda_graph_new() {
 #ifdef TCH_CUDA_GRAPHS
   PROTECT(return new TchCudaGraph();)
