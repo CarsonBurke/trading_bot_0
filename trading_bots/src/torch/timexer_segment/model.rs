@@ -372,11 +372,17 @@ fn scaled_linear(input: &Tensor, layer: &nn::Linear, scale: &Tensor) -> Tensor {
 /// residual lambdas instead (see [`BlockLambdas`]).
 ///
 /// `eps` is passed explicitly, at the in-repo value: `world_model.rs:109-110`
-/// (`BAR_NORM_EPS = 1e-6`, "The norm carries no learnable gain anywhere in this model").
-/// `F.rms_norm(x, shape)` leaves `eps=None`, which ATen resolves to `finfo(x.dtype).eps` -
-/// 7.8e-3 for bf16, a 0.4% systematic shrink of every normalized activation that would not
-/// appear in an fp32 CPU test of the same code; 1e-6 is also what the reference passes where
-/// it passes one at all (`train_gpt.py:1079`).
+/// (`BAR_NORM_EPS = 1e-6`, "The norm carries no learnable gain anywhere in this model"), which
+/// is also what the reference passes where it passes one at all (`train_gpt.py:1079`).
+///
+/// What `eps=None` actually resolves to was MEASURED, not read off `finfo`: on a bf16 CUDA
+/// input, `_fused_rms_norm(x, shape, None, None)` is bit-identical to `eps = 1.1920929e-7`
+/// (max difference exactly 0.0) and nowhere near `finfo(bfloat16).eps = 7.8e-3`, which would
+/// have shrunk the sample by 95%. The kernel resolves the default from the fp32 ACCUMULATE
+/// type, not from the input dtype, so at unit RMS `None` and 1e-6 are indistinguishable.
+/// Passing 1e-6 is still the right call and is not cosmetic: on a head block whose RMS has
+/// collapsed - 4.2e-3 in the same probe, where eps is 5.6% of the mean square - the two
+/// choices differ by 2.5%, and 1e-6 is the floor the rest of the repo normalizes against.
 ///
 /// `_fused_rms_norm`, NOT `rms_norm`: `rms_norm`'s composite body dispatches to
 /// `_fused_rms_norm`, but `rms_norm` itself registers as a math kernel on CUDA, so calling it
