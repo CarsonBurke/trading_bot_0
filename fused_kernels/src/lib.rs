@@ -84,7 +84,15 @@ fn finish(raw: *mut C_tensor, operation: &str) -> Tensor {
 /// own output, so `x` is what the composition frees). The mask `NOT (relu(x) <= 0)` equals
 /// `NOT (x <= 0)` and `relu(x) == x` wherever that mask holds, so the input recovers both
 /// factors of `2·relu(x)·grad` exactly.
+///
+/// Off CUDA this IS [`reference::relu_square`]: there is no kernel to run, the reference
+/// is bit-identical by the tests below, and it lives here rather than at the call site so
+/// the backbone has exactly one spelling of the op. Training asserts CUDA long before it
+/// reaches this; the CPU path exists for the model's own equality tests.
 pub fn relu_square(input: &Tensor) -> Tensor {
+    if !input.device().is_cuda() {
+        return reference::relu_square(input);
+    }
     finish(unsafe { fk_relu_square(input.as_ptr()) }, "relu_square")
 }
 
@@ -101,7 +109,12 @@ pub fn relu_square(input: &Tensor) -> Tensor {
 ///
 /// The rotation is treated as a constant, so backward saves no activation whatsoever -
 /// the transpose of a rotation needs only the rotation.
+///
+/// Off CUDA this is [`reference::rope`], for the reason given on [`relu_square`].
 pub fn rope(input: &Tensor, cosine: &Tensor, sine: &Tensor, heads: i64) -> Tensor {
+    if !input.device().is_cuda() {
+        return reference::rope(input, cosine, sine, heads);
+    }
     finish(
         unsafe { fk_rope(input.as_ptr(), cosine.as_ptr(), sine.as_ptr(), heads) },
         "rope",
