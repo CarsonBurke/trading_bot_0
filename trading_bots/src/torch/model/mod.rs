@@ -4,7 +4,7 @@ mod forward;
 mod head;
 mod init;
 mod rmsnorm;
-mod rope;
+pub(crate) mod rope;
 mod stream;
 mod trading_model;
 

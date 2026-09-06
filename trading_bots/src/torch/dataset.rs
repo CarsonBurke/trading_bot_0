@@ -1404,7 +1404,7 @@ fn build_et_transitions() -> (Vec<i64>, Vec<i32>) {
     (starts, offsets)
 }
 
-fn et_offset_secs(utc_secs: i64) -> i32 {
+pub(crate) fn et_offset_secs(utc_secs: i64) -> i32 {
     let (starts, offsets) = &*ET_TRANSITIONS;
     let index = starts.partition_point(|&start| start <= utc_secs);
     offsets[index.saturating_sub(1)]

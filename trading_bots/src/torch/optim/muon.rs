@@ -5,6 +5,7 @@
 use std::collections::{HashMap, HashSet};
 use std::env;
 use std::path::Path;
+use std::sync::Arc;
 
 use anyhow::{ensure, Context, Result};
 use tch::{Device, Kind, Tensor};
@@ -514,14 +515,26 @@ impl StepScalarPack {
     /// Publish this step's schedule. Issued on the default stream, which the graph's
     /// stream scope then orders itself after, so the replay reads what was just written.
     ///
-    /// ATen makes a copy out of pageable host memory stream-synchronizing, so this is
-    /// also a host wait on the outstanding backward. That is why the pack exists only on
-    /// the graph path: it buys the elimination of every launch in the step, and the
-    /// fallback step keeps issuing `Scalar` arguments with no host-to-device traffic at
-    /// all.
+    /// PINNED and asynchronous, deliberately. A `copy_` out of pageable host memory is
+    /// stream-synchronizing, so the obvious spelling of this made every graphed step wait
+    /// for the whole outstanding backward before the host could issue anything else -
+    /// which is exactly the launch pipeline the capture exists to keep full. The staging
+    /// block comes from libtorch's caching host allocator, which retains it until the
+    /// recorded copy retires, so dropping it here cannot race the copy.
+    ///
+    /// The narrowing to the parameter dtype happens on the host, on a couple of kilobytes,
+    /// and is the same round-to-nearest ATen applies to a `Scalar` argument - so the
+    /// graphed and the eager step still cannot drift apart.
     fn upload(&self) {
+        let device = self.values.device();
+        let staged = Tensor::from_slice(&self.host).to_kind(self.values.kind());
         let mut values = self.values.shallow_clone();
-        values.copy_(&Tensor::from_slice(&self.host));
+        if device.is_cuda() {
+            crate::torch::cuda::copy_nonblocking(&mut values, &staged.pin_memory(device))
+                .expect("publishing the step schedule is a fixed-shape copy");
+        } else {
+            values.copy_(&staged);
+        }
     }
 }
 
@@ -665,6 +678,10 @@ pub struct Muon {
     step_graphs: StepGraphState,
     /// Arms performed, against [`MAX_STEP_GRAPH_ARMS`]. Counts the retained mempools.
     step_graph_arms: usize,
+    /// The private mempool every capture of this optimizer allocates into. Minted on the
+    /// first arm, or installed by a caller that captures a body of its own
+    /// ([`Self::install_graph_pool`]) so the process holds exactly one.
+    step_graph_pool: Option<Arc<CudaGraphPool>>,
 }
 
 /// Single-matrix quintic orthogonalization.
@@ -1371,6 +1388,7 @@ impl Muon {
             row_lr_metrics: None,
             step_graphs: StepGraphState::Unarmed,
             step_graph_arms: 0,
+            step_graph_pool: None,
             names,
         }
     }
@@ -1695,13 +1713,19 @@ impl Muon {
         // therefore sit at the same addresses, so both capture into one private mempool
         // rather than each retaining a copy of the working set for the process's life.
         // `with_adamw` is a superset of `normuon_only`, so that is close to halving it.
-        let pool = match CudaGraphPool::new() {
-            Ok(pool) => pool,
-            Err(err) => {
-                println!("pretrain CUDA graphs disabled: init failed ({err})");
-                return None;
-            }
+        // A caller that also captures its own body installs its pool here, so the whole
+        // process holds exactly one; otherwise this mints its own.
+        let pool = match self.step_graph_pool.clone() {
+            Some(pool) => pool,
+            None => match CudaGraphPool::new() {
+                Ok(pool) => Arc::new(pool),
+                Err(err) => {
+                    println!("pretrain CUDA graphs disabled: init failed ({err})");
+                    return None;
+                }
+            },
         };
+        self.step_graph_pool = Some(Arc::clone(&pool));
         let graphs = match (
             CudaGraph::new_in_pool(device, &pool),
             CudaGraph::new_in_pool(device, &pool),
@@ -2045,6 +2069,19 @@ impl Muon {
             .iter()
             .find(|(needle, _)| name.contains(needle.as_str()))
             .map_or(self.cfg.adamw_betas, |(_, betas)| *betas)
+    }
+
+    /// Install the private mempool this optimizer's captures allocate into, so a caller
+    /// that captures a body of its own shares one pool with them instead of retaining a
+    /// second copy of a transient working set for the process's life. Must be called
+    /// before the first primary step; a later call cannot move blocks that are already
+    /// baked into a captured kernel's arguments.
+    pub(crate) fn install_graph_pool(&mut self, pool: Arc<CudaGraphPool>) {
+        assert!(
+            matches!(self.step_graphs, StepGraphState::Unarmed),
+            "the optimizer's captures are already placed"
+        );
+        self.step_graph_pool = Some(pool);
     }
 
     /// Zero the gradients the next backward accumulates into.

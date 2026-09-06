@@ -4,15 +4,22 @@ use anyhow::{ensure, Context, Result};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use shared::{
-    bars::{parse_bar_file_name, BarFile, PackedBar},
+    bars::{bar_file_path, parse_bar_file_name, BarFile, PackedBar},
     report::CandleBar,
 };
 use tch::{Device, Kind, Tensor};
 
-use super::data::{retained_partition_end, valid_ohlc, DataContract, Dataset};
+use super::{
+    data::{filtered_contract, retained_partition_end, valid_ohlc, DataContract},
+    features::{
+        market_steps, single_series, AuxiliaryCursor, Exogenous, FeatureSet, Grid, MarketSummary,
+        SPY,
+    },
+};
+use crate::torch::hashing::file_sha256;
 
-const RESOLUTION_MS: i64 = 300_000;
-const SCHEMA: &str = "timexer-pooled-mmap-v1;independent-ticker-rows;all-valid-source-unique-utc-grid-quantiles70:10:10:10;purge-only-at-observed-partition-boundaries;train-only-per-ticker-scaler;next-valid-observed-bars;invalid-ohlc-rows-quarantined-without-repair;disjoint-target-epoch-with-masked-remainder;validation-disjoint-complete-targets;terminal-test-locked";
+pub(super) const RESOLUTION_MS: i64 = 300_000;
+const SCHEMA: &str = "timexer-pooled-mmap-v5;independent-ticker-rows;all-valid-source-unique-utc-grid-quantiles70:10:10:10;purge-only-at-observed-partition-boundaries;centered-log-prices-with-bar-validity;covariates-over-context-and-horizon;next-valid-observed-bars;invalid-ohlc-rows-quarantined-without-repair;disjoint-target-epoch-with-masked-remainder;validation-disjoint-complete-targets;terminal-test-locked;exogenous-variates-on-shared-utc-grid;market-cumulative-log-return-over-steps-defined-by-min-cross-section-slots-spanning-sparse-slots-centered-at-origin";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct WindowRef {
@@ -35,7 +42,15 @@ pub struct CorpusContract {
     pub pred_len: usize,
     pub common_context: usize,
     pub purge: usize,
-    pub volume_features: bool,
+    pub features: FeatureSet,
+    pub auxiliary_schema: String,
+    pub spy_fingerprint: Option<String>,
+    /// SHA-256 over the ordered universe fingerprints, partition boundaries, and the market step
+    /// construction (threshold included) that define the cumulative market path every row's
+    /// targets are demeaned by.
+    pub market_fingerprint: String,
+    /// Sources that must hold a valid bar at a grid slot for it to define a market step.
+    pub market_min_cross_section: usize,
     pub minimum_source_bars: usize,
     pub minimum_training_bars: usize,
     pub train_target_bars: usize,
@@ -99,8 +114,8 @@ impl CorpusTicker {
         if origin < c.common_context.max(c.context) - 1 {
             return None;
         }
-        if origin < c.scaler_fit_bars - 1 {
-            return Some(c.pred_len.min(c.scaler_fit_bars - origin - 1));
+        if origin < c.train_end - 1 {
+            return Some(c.pred_len.min(c.train_end - origin - 1));
         }
         let start = c.boundaries[1].saturating_sub(1);
         let end = retained_partition_end(c.boundaries[2], c.valid_bars, c.purge)
@@ -114,74 +129,77 @@ pub struct Corpus {
     pub train_refs: Vec<WindowRef>,
     pub validation_refs: Vec<WindowRef>,
     pub excluded_tickers: Vec<ExcludedTicker>,
+    pub market: MarketSummary,
     tickers: Vec<CorpusTicker>,
+    exogenous: Exogenous,
     gather_pool: rayon::ThreadPool,
     device: Device,
 }
 
+/// One row is `seq_len + pred_len` bars: `log_prices[b, t, c] = ln(price) - ln(anchor)` where
+/// `anchor` is the row's last context close, `valid[b, t]` marks observed bars (context bars are
+/// always valid; horizon bars are valid up to the ticker's owned targets), `aux[b, t, :]`
+/// carries the covariates for every bar with history-only channels zeroed beyond the context,
+/// and `market_cum[b, t]` is the cumulative market log return at the bar's timestamp minus its
+/// value at the row's last context bar.
 pub struct Batch {
-    pub inputs: Tensor,
-    pub targets: Tensor,
-    pub target_mask: Tensor,
-    pub price_scaling: Tensor,
-    pub geometry_context: Tensor,
-    pub auxiliary: Option<Tensor>,
+    pub log_prices: Tensor,
+    pub valid: Tensor,
+    pub aux: Tensor,
+    pub market_cum: Tensor,
+    pub anchor: Tensor,
     pub valid_target_bars: usize,
     packed: Tensor,
     context: usize,
     pred_len: usize,
-    volume_features: bool,
+    aux_channels: usize,
 }
 
 impl Batch {
-    fn from_packed(
+    pub(super) fn row_width(context: usize, pred_len: usize, aux_channels: usize) -> usize {
+        (context + pred_len) * (6 + aux_channels) + 1
+    }
+
+    pub(super) fn from_packed(
         packed: Tensor,
         context: usize,
         pred_len: usize,
-        volume_features: bool,
+        aux_channels: usize,
         valid_target_bars: usize,
     ) -> Self {
         let b = packed.size()[0];
-        let input_len = context as i64 * 4;
-        let target_len = pred_len as i64 * 4;
-        let aux_len = if volume_features {
-            context as i64 * 2
-        } else {
-            0
-        };
-        let inputs = packed
-            .narrow(1, 0, input_len)
-            .reshape([b, context as i64, 4]);
-        let targets = packed
-            .narrow(1, input_len, target_len)
-            .reshape([b, pred_len as i64, 4]);
-        let auxiliary = volume_features.then(|| {
-            packed
-                .narrow(1, input_len + target_len, aux_len)
-                .reshape([b, context as i64, 2])
-        });
-        let target_mask = packed
-            .narrow(1, input_len + target_len + aux_len, pred_len as i64)
-            .reshape([b, pred_len as i64]);
-        let price_scaling = packed
-            .narrow(1, input_len + target_len + aux_len + pred_len as i64, 8)
-            .reshape([b, 2, 4]);
-        let geometry_context = packed
-            .narrow(1, input_len + target_len + aux_len + pred_len as i64 + 8, 3)
-            .reshape([b, 3]);
+        let length = (context + pred_len) as i64;
+        assert_eq!(
+            packed.size()[1] as usize,
+            Self::row_width(context, pred_len, aux_channels)
+        );
+        let log_prices = packed.narrow(1, 0, length * 4).reshape([b, length, 4]);
+        let valid = packed.narrow(1, length * 4, length);
+        let aux = packed
+            .narrow(1, length * 5, length * aux_channels as i64)
+            .reshape([b, length, aux_channels as i64]);
+        let market_cum = packed.narrow(1, length * (5 + aux_channels as i64), length);
+        let anchor = packed
+            .narrow(1, length * (6 + aux_channels as i64), 1)
+            .reshape([b]);
         Self {
-            inputs,
-            targets,
-            target_mask,
-            price_scaling,
-            geometry_context,
-            auxiliary,
+            log_prices,
+            valid,
+            aux,
+            market_cum,
+            anchor,
             valid_target_bars,
             packed,
             context,
             pred_len,
-            volume_features,
+            aux_channels,
         }
+    }
+
+    /// Rows in the packed block: the batch dimension a captured graph or a resident buffer
+    /// is fixed to.
+    pub fn rows(&self) -> i64 {
+        self.packed.size()[0]
     }
 
     pub fn to_device(self, device: Device) -> Self {
@@ -189,9 +207,62 @@ impl Batch {
             self.packed.to_device_(device, Kind::Float, true, false),
             self.context,
             self.pred_len,
-            self.volume_features,
+            self.aux_channels,
             self.valid_target_bars,
         )
+    }
+
+    /// A device-resident batch of this batch's exact shape whose packed storage NEVER
+    /// moves, so [`Self::upload`] can refill it in place.
+    ///
+    /// Two things need that. A captured CUDA graph records addresses, so its input has to
+    /// be one fixed buffer rather than whatever [`Self::to_device`] allocated this step.
+    /// And even eagerly, `to_device` allocates and frees the whole packed row block every
+    /// step - 114 MB at batch 256 - which the caching allocator has to keep re-serving.
+    pub fn resident(&self, device: Device) -> Self {
+        Self::from_packed(
+            Tensor::zeros(self.packed.size(), (Kind::Float, device)),
+            self.context,
+            self.pred_len,
+            self.aux_channels,
+            self.valid_target_bars,
+        )
+    }
+
+    /// A host copy of this batch, in pinned memory when a device is given.
+    ///
+    /// The capture audit builds both to measure what the loader's `pin_memory` buys: a
+    /// pageable source makes the H2D copy blocking whatever `non_blocking` says, because the
+    /// driver has to stage it, so the host waits for the outstanding step to drain.
+    pub fn host_copy(&self, pinned: Option<Device>) -> Self {
+        let packed = self.packed.to_device_(Device::Cpu, Kind::Float, true, false);
+        Self::from_packed(
+            match pinned {
+                Some(device) => packed.pin_memory(device),
+                None => packed,
+            },
+            self.context,
+            self.pred_len,
+            self.aux_channels,
+            self.valid_target_bars,
+        )
+    }
+
+    /// Refill `resident` from this host batch, asynchronously.
+    ///
+    /// `Corpus::host_batch` pins the packed block whenever the corpus is prepared for a
+    /// CUDA device, which is what makes the non-blocking copy safe: libtorch's caching
+    /// host allocator holds the block until the copy retires, so the host batch may drop
+    /// the moment this returns.
+    pub fn upload(&self, resident: &mut Self) -> Result<()> {
+        ensure!(
+            self.packed.size() == resident.packed.size(),
+            "resident batch shape does not match the host batch"
+        );
+        crate::torch::cuda::copy_nonblocking(&mut resident.packed, &self.packed)
+            .map_err(|err| anyhow::anyhow!("uploading the packed batch: {err}"))?;
+        resident.valid_target_bars = self.valid_target_bars;
+        Ok(())
     }
 }
 
@@ -202,11 +273,16 @@ impl Corpus {
         context: usize,
         pred_len: usize,
         common_context: usize,
-        volume_features: bool,
+        features: &FeatureSet,
+        market_min_cross_section: usize,
     ) -> Result<Self> {
         ensure!(
             context > 0 && pred_len > 0 && common_context >= context,
             "invalid context or forecast length"
+        );
+        ensure!(
+            market_min_cross_section > 0,
+            "market steps need a positive minimum cross-section"
         );
         let purge = pred_len.max(100);
         let minimum_source_bars = common_context + 1;
@@ -289,12 +365,12 @@ impl Corpus {
             files
                 .into_par_iter()
                 .map(|file| {
-                    let contract = Dataset::contract_with_bounds(
-                        &file,
+                    let contract = filtered_contract(
+                        file.symbol(),
+                        file.bars(),
                         context,
                         pred_len,
                         common_context,
-                        volume_features,
                         bounds,
                     )
                     .with_context(|| {
@@ -310,7 +386,7 @@ impl Corpus {
                 .collect::<Result<_>>()
         })?;
         tickers.retain(|ticker| {
-            let eligible = ticker.contract.scaler_fit_bars >= minimum_training_bars;
+            let eligible = ticker.contract.train_end >= minimum_training_bars;
             if !eligible {
                 excluded_tickers.push(ExcludedTicker {
                     ticker: ticker.contract.ticker.clone(),
@@ -333,6 +409,9 @@ impl Corpus {
             !tickers.is_empty(),
             "no ticker has sufficient valid purged training history"
         );
+        let (exogenous, market) = gather_pool.install(|| {
+            exogenous_series(directory, features, &tickers, market_min_cross_section)
+        })?;
         let mut train_refs = Vec::new();
         let mut validation_refs = Vec::new();
         let mut train_target_bars = 0;
@@ -341,11 +420,11 @@ impl Corpus {
         for (ticker, data) in tickers.iter().enumerate() {
             let c = &data.contract;
             train_refs.extend(
-                (common_context - 1..c.scaler_fit_bars - 1)
+                (common_context - 1..c.train_end - 1)
                     .step_by(pred_len)
                     .map(|origin| WindowRef { ticker, origin }),
             );
-            train_target_bars += c.scaler_fit_bars - common_context;
+            train_target_bars += c.train_end - common_context;
             let start = c.boundaries[1].max(common_context);
             let available =
                 retained_partition_end(c.boundaries[2], c.valid_bars, purge).saturating_sub(start);
@@ -369,7 +448,14 @@ impl Corpus {
                 pred_len,
                 common_context,
                 purge,
-                volume_features,
+                features: *features,
+                auxiliary_schema: features.schema(),
+                market_fingerprint: market_fingerprint(&tickers, bounds, market_min_cross_section),
+                market_min_cross_section,
+                spy_fingerprint: features
+                    .spy
+                    .then(|| file_sha256(bar_file_path(directory, SPY, 300)))
+                    .transpose()?,
                 minimum_source_bars,
                 minimum_training_bars,
                 train_target_bars,
@@ -380,7 +466,9 @@ impl Corpus {
             train_refs,
             validation_refs,
             excluded_tickers,
+            market,
             tickers,
+            exogenous,
             gather_pool,
             device: Device::Cpu,
         })
@@ -397,12 +485,8 @@ impl Corpus {
         ensure!(!refs.is_empty(), "cannot construct an empty batch");
         let context = self.contract.context;
         let pred_len = self.contract.pred_len;
-        let auxiliary_len = if self.contract.volume_features {
-            context * 2
-        } else {
-            0
-        };
-        let width = (context + pred_len) * 4 + auxiliary_len + pred_len + 11;
+        let features = &self.contract.features;
+        let width = Batch::row_width(context, pred_len, features.channels());
         let sources = refs
             .iter()
             .map(|reference| {
@@ -432,14 +516,22 @@ impl Corpus {
                 .par_chunks_mut(width)
                 .zip(sources.par_iter())
                 .for_each(|(row, &(ticker, origin, targets))| {
-                    fill_row(row, ticker.file.bars(), &ticker.contract, origin, targets);
+                    fill_row(
+                        row,
+                        ticker.file.bars(),
+                        &ticker.contract,
+                        features,
+                        &self.exogenous,
+                        origin,
+                        targets,
+                    );
                 })
         });
         Ok(Batch::from_packed(
             packed,
             context,
             pred_len,
-            self.contract.volume_features,
+            features.channels(),
             sources.iter().map(|(_, _, targets)| *targets).sum(),
         ))
     }
@@ -447,119 +539,134 @@ impl Corpus {
     pub fn batch(&self, refs: &[WindowRef], device: Device) -> Result<Batch> {
         Ok(self.host_batch(refs)?.to_device(device))
     }
+}
 
-    fn scales(&self, refs: &[WindowRef], device: Device) -> (Tensor, Tensor) {
-        let means: Vec<f32> = refs
+fn market_fingerprint(tickers: &[CorpusTicker], bounds: [i64; 3], min_cross_section: usize) -> String {
+    let mut digest = ring::digest::Context::new(&ring::digest::SHA256);
+    for ticker in tickers {
+        digest.update(ticker.contract.ticker.as_bytes());
+        digest.update(b":");
+        digest.update(ticker.contract.fingerprint.as_bytes());
+        digest.update(b";");
+    }
+    for bound in bounds {
+        digest.update(&bound.to_le_bytes());
+    }
+    digest.update(b"market-steps-min-cross-section:");
+    digest.update(&(min_cross_section as u64).to_le_bytes());
+    digest
+        .finish()
+        .as_ref()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+fn exogenous_series(
+    directory: &Path,
+    features: &FeatureSet,
+    tickers: &[CorpusTicker],
+    market_min_cross_section: usize,
+) -> Result<(Exogenous, MarketSummary)> {
+    let first = tickers
+        .iter()
+        .filter_map(|ticker| ticker.file.first_ts_ms())
+        .min()
+        .context("empty exogenous timestamp universe")?;
+    let last = tickers
+        .iter()
+        .filter_map(|ticker| ticker.file.last_ts_ms())
+        .max()
+        .context("empty exogenous timestamp universe")?;
+    let grid = Grid::new(first, last)?;
+    let sources: Vec<_> = tickers
+        .iter()
+        .map(|ticker| {
+            (
+                ticker.file.bars(),
+                ticker.contract.invalid_ohlc_indices.as_slice(),
+            )
+        })
+        .collect();
+    let steps = market_steps(&sources, grid, market_min_cross_section);
+    let mut exogenous = Exogenous {
+        market: features.market.then(|| steps.series()),
+        spy: None,
+        market_cum: steps.path(),
+    };
+    if features.spy {
+        let file = BarFile::open(&bar_file_path(directory, SPY, 300))
+            .with_context(|| format!("loading the {SPY} exogenous variate"))?;
+        ensure!(
+            file.symbol() == SPY && file.res_secs() == 300 && !file.is_empty(),
+            "{SPY} exogenous corpus header mismatch or empty"
+        );
+        let bars = file.bars();
+        for (index, bar) in bars.iter().enumerate() {
+            ensure!(
+                (index == 0 || bars[index - 1].ts() < bar.ts())
+                    && bar.ts().rem_euclid(RESOLUTION_MS) == 0,
+                "{SPY}: timestamps must be strictly increasing on the five-minute grid at raw bar {index}"
+            );
+        }
+        let invalid: Vec<usize> = bars
             .iter()
-            .flat_map(|r| self.ticker(*r).contract.means.map(|v| v as f32))
+            .enumerate()
+            .filter_map(|(index, bar)| (!valid_ohlc(bar)).then_some(index))
             .collect();
-        let stds: Vec<f32> = refs
-            .iter()
-            .flat_map(|r| self.ticker(*r).contract.stds.map(|v| v as f32))
-            .collect();
-        (
-            Tensor::from_slice(&means)
-                .reshape([refs.len() as i64, 1, 4])
-                .to_device(device),
-            Tensor::from_slice(&stds)
-                .reshape([refs.len() as i64, 1, 4])
-                .to_device(device),
-        )
+        exogenous.spy = Some(single_series(bars, &invalid, grid));
     }
-
-    pub fn denormalize(&self, refs: &[WindowRef], prediction: &Tensor) -> Tensor {
-        let (means, stds) = self.scales(refs, prediction.device());
-        prediction.to_kind(Kind::Float) * stds + means
-    }
-
-    pub fn price_errors(&self, refs: &[WindowRef], errors: &Tensor) -> Tensor {
-        let (_, stds) = self.scales(refs, errors.device());
-        errors.to_kind(Kind::Float) * stds
-    }
+    Ok((exogenous, steps.summary()))
 }
 
 fn fill_row(
     row: &mut [f32],
     bars: &[PackedBar],
     contract: &DataContract,
+    features: &FeatureSet,
+    exogenous: &Exogenous,
     origin: usize,
     targets: usize,
 ) {
     let context = contract.context;
-    let pred_len = contract.pred_len;
+    let length = context + contract.pred_len;
     let start = origin + 1 - context;
-    let values_len = (context + pred_len) * 4;
-    let aux_len = if contract.volume_features {
-        context * 2
-    } else {
-        0
-    };
+    let aux_channels = features.channels();
+    let invalid = &contract.invalid_ohlc_indices;
     row.fill(0.0);
-    let mut close_mean = 0.0f64;
-    let mut close_m2 = 0.0f64;
-    let mut relative_range_sum = 0.0f64;
-    let mut previous_volume = start.checked_sub(1).map_or(0.0, |i| {
-        bars[raw_index(i, &contract.invalid_ohlc_indices)].volume
-    });
-    for (position, bar) in ValidBars::new(
-        bars,
-        &contract.invalid_ohlc_indices,
-        start,
-        context + targets,
-    )
-    .enumerate()
-    {
+    let (prices, rest) = row.split_at_mut(length * 4);
+    let (valid, rest) = rest.split_at_mut(length);
+    let (aux, rest) = rest.split_at_mut(length * aux_channels);
+    let (market_cum, anchor) = rest.split_at_mut(length);
+    let market_anchor = exogenous.market_cum.at(bars[raw_index(origin, invalid)].ts());
+    let c_last = f64::from(bars[raw_index(origin, invalid)].close);
+    let ln_anchor = c_last.ln();
+    let mut auxiliary = AuxiliaryCursor::new(
+        features,
+        exogenous,
+        start
+            .checked_sub(1)
+            .map(|i| &bars[raw_index(i, invalid)]),
+    );
+    for (position, bar) in ValidBars::new(bars, invalid, start, context + targets).enumerate() {
         for (channel, value) in [bar.open, bar.high, bar.low, bar.close]
             .into_iter()
             .enumerate()
         {
-            row[position * 4 + channel] =
-                ((f64::from(value) - contract.means[channel]) / contract.stds[channel]) as f32;
+            prices[position * 4 + channel] = (f64::from(value).ln() - ln_anchor) as f32;
         }
-        if position < context {
-            let close = f64::from(bar.close);
-            let delta = close - close_mean;
-            close_mean += delta / (position + 1) as f64;
-            close_m2 += delta * (close - close_mean);
-            relative_range_sum += (f64::from(bar.high) - f64::from(bar.low)) / f64::from(bar.low);
-        }
-        if contract.volume_features && position < context {
-            let current = bar.volume;
-            let valid = current.is_finite()
-                && current > 0.0
-                && previous_volume.is_finite()
-                && previous_volume > 0.0;
-            if valid {
-                row[values_len + position * 2] =
-                    (f64::from(current).ln() - f64::from(previous_volume).ln()) as f32;
-                row[values_len + position * 2 + 1] = 1.0;
-            }
-            previous_volume = current;
+        valid[position] = 1.0;
+        market_cum[position] = (exogenous.market_cum.at(bar.ts()) - market_anchor) as f32;
+        if aux_channels > 0 {
+            let offset = position * aux_channels;
+            auxiliary.write(
+                bar,
+                &mut aux[offset..offset + aux_channels],
+                position >= context,
+            );
         }
     }
-    row[values_len + aux_len..values_len + aux_len + targets].fill(1.0);
-    let scaling_start = values_len + aux_len + pred_len;
-    row[scaling_start..scaling_start + 4]
-        .copy_from_slice(&contract.means.map(|value| value as f32));
-    row[scaling_start + 4..scaling_start + 8]
-        .copy_from_slice(&contract.stds.map(|value| value as f32));
-    let close_scale = (close_m2 / context as f64 + 1e-5 * contract.stds[3].powi(2)).sqrt();
-    let mean_range = relative_range_sum / context as f64;
-    let relative_range = if mean_range > 0.0 {
-        mean_range
-    } else {
-        let training_range = (contract.means[1] - contract.means[2]) / contract.means[2];
-        if training_range > 0.0 {
-            training_range
-        } else {
-            f64::from(f32::EPSILON)
-        }
-    };
-    row[scaling_start + 8..scaling_start + 11].copy_from_slice(&[
-        close_mean as f32,
-        close_scale as f32,
-        relative_range as f32,
-    ]);
+    anchor[0] = c_last as f32;
 }
 
 fn raw_index(logical_index: usize, invalid: &[usize]) -> usize {
@@ -742,6 +849,7 @@ mod tests {
     fn pooled_rows_preserve_ticker_values_and_mask_partial_targets() {
         let bars: Vec<_> = (0..20)
             .map(|i| PackedBar {
+                ts_ms: i * RESOLUTION_MS,
                 open: i as f32 + 1.0,
                 high: i as f32 + 3.0,
                 low: i as f32 + 0.5,
@@ -762,105 +870,95 @@ mod tests {
             context: 4,
             pred_len: 3,
             purge: 1,
-            scaler_fit_bars: 9,
-            means: [2.0; 4],
-            stds: [2.0; 4],
+            train_end: 9,
             common_context: 4,
-            volume_features: true,
-            auxiliary_schema: String::new(),
         };
-        let mut row = vec![f32::NAN; 4 * 7 + 2 * 4 + 3 + 11];
-        fill_row(&mut row, &bars, &contract, 6, 2);
-        assert_eq!(&row[..4], &[1.0, 2.0, 0.75, 1.5]);
+        let volume = FeatureSet {
+            volume: true,
+            ..FeatureSet::NONE
+        };
+        let exogenous = Exogenous {
+            market: None,
+            spy: None,
+            market_cum: market_steps(&[(&bars, &[])], Grid::new(0, 19 * RESOLUTION_MS).unwrap(), 1)
+                .path(),
+        };
+        let mut row = vec![f32::NAN; Batch::row_width(4, 3, 2)];
+        assert_eq!(row.len(), 57);
+        fill_row(&mut row, &bars, &contract, &volume, &exogenous, 6, 2);
+        assert_eq!(row[3], (5.0f64 / 8.0).ln() as f32);
+        assert_eq!(row[0], (4.0f64 / 8.0).ln() as f32);
+        assert_eq!(row[15], 0.0);
+        assert_eq!(row[19], (9.0f64 / 8.0).ln() as f32);
         assert_eq!(&row[24..28], &[0.0; 4]);
-        assert_eq!(&row[36..39], &[1.0, 1.0, 0.0]);
-        assert_eq!(&row[39..47], &[2.0; 8]);
-        assert_eq!(row[47], 6.5);
-        assert_eq!(row[48], (1.25f64 + 1e-5 * 4.0).sqrt() as f32);
+        assert_eq!(&row[28..35], &[1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.0]);
+        assert_eq!(row[35], (103.0f64.ln() - 102.0f64.ln()) as f32);
+        assert_eq!(row[36], 1.0);
+        assert_eq!(&row[41..43], &[(106.0f64.ln() - 105.0f64.ln()) as f32, 1.0]);
+        assert_eq!(&row[43..49], &[0.0; 6], "history channels leak beyond the context");
+        for position in 0..6 {
+            assert!(
+                (row[49 + position] - row[position * 4 + 3]).abs() <= 1e-6,
+                "a one-ticker universe's market path is the ticker's own close path"
+            );
+        }
+        assert_eq!(row[49 + 3], 0.0);
+        assert_eq!(row[55], 0.0, "masked horizon bars carry no market path");
+        assert_eq!(row[56], 8.0);
         let batch = Batch::from_packed(
             Tensor::from_slice(&row).reshape([1, row.len() as i64]),
             4,
             3,
-            true,
+            2,
             2,
         )
         .to_device(Device::Cpu);
-        assert_eq!(batch.inputs.size(), [1, 4, 4]);
-        assert_eq!(batch.targets.size(), [1, 3, 4]);
-        assert_eq!(batch.price_scaling.size(), [1, 2, 4]);
-        assert_eq!(batch.geometry_context.size(), [1, 3]);
+        assert_eq!(batch.log_prices.size(), [1, 7, 4]);
+        assert_eq!(batch.valid.size(), [1, 7]);
+        assert_eq!(batch.aux.size(), [1, 7, 2]);
+        assert_eq!(batch.anchor.size(), [1]);
+        assert_eq!(batch.anchor.double_value(&[0]), 8.0);
         assert_eq!(
-            Vec::<f32>::try_from(batch.price_scaling.reshape([-1])).unwrap(),
-            [2.0; 8]
+            Vec::<f32>::try_from(batch.valid.reshape([-1])).unwrap(),
+            &row[28..35]
         );
-        assert_eq!(batch.auxiliary.unwrap().size(), [1, 4, 2]);
-        assert_eq!(
-            Vec::<f32>::try_from(batch.target_mask.reshape([-1])).unwrap(),
-            [1.0, 1.0, 0.0]
-        );
-        let mut penny_contract = contract.clone();
-        penny_contract.means = [1e8; 4];
-        penny_contract.stds = [1e8; 4];
-        let mut penny_bars = bars.clone();
-        for (index, bar) in penny_bars.iter_mut().enumerate() {
-            let close = 0.0001f32 + index as f32 * 0.000001;
-            bar.open = close;
-            bar.high = close * 1.1;
-            bar.low = close * 0.9;
-            bar.close = close;
+        assert_eq!(batch.log_prices.double_value(&[0, 4, 3]), f64::from(row[19]));
+        let mut doubled_bars = bars.clone();
+        for bar in &mut doubled_bars {
+            bar.open *= 2.0;
+            bar.high *= 2.0;
+            bar.low *= 2.0;
+            bar.close *= 2.0;
         }
-        let mut penny_row = vec![0.0; row.len()];
-        fill_row(&mut penny_row, &penny_bars, &penny_contract, 6, 2);
-        let historical = &penny_bars[3..7];
-        let expected_mean = historical
-            .iter()
-            .map(|bar| f64::from(bar.close))
-            .sum::<f64>()
-            / 4.0;
-        let expected_variance = historical
-            .iter()
-            .map(|bar| (f64::from(bar.close) - expected_mean).powi(2))
-            .sum::<f64>()
-            / 4.0;
-        let expected_range = historical
-            .iter()
-            .map(|bar| (f64::from(bar.high) - f64::from(bar.low)) / f64::from(bar.low))
-            .sum::<f64>()
-            / 4.0;
-        assert_eq!(penny_row[47], expected_mean as f32);
-        assert_eq!(
-            penny_row[48],
-            (expected_variance + 1e-5 * 1e16).sqrt() as f32
-        );
-        assert_eq!(penny_row[49], expected_range as f32);
-        assert!(penny_row[47] > 0.0);
-        assert_eq!(
-            penny_row[3] * 1e8f32 + 1e8f32,
-            0.0,
-            "fixture must expose normalized-price cancellation"
-        );
-        for bar in &mut penny_bars[7..] {
+        let mut doubled = vec![0.0; row.len()];
+        fill_row(&mut doubled, &doubled_bars, &contract, &volume, &exogenous, 6, 2);
+        assert_eq!(&doubled[..56], &row[..56], "representation must be scale-free");
+        assert_eq!(doubled[56], 16.0);
+        let mut future_bars = bars.clone();
+        for bar in &mut future_bars[7..] {
             bar.open *= 1000.0;
             bar.high *= 1000.0;
             bar.low *= 1000.0;
             bar.close *= 1000.0;
         }
         let mut changed = vec![0.0; row.len()];
-        fill_row(&mut changed, &penny_bars, &penny_contract, 6, 2);
+        fill_row(&mut changed, &future_bars, &contract, &volume, &exogenous, 6, 2);
         assert_eq!(
-            &penny_row[47..50],
-            &changed[47..50],
-            "future targets changed historical geometry context"
+            &changed[..16],
+            &row[..16],
+            "future targets changed historical inputs"
         );
-        for bar in &mut penny_bars[..7] {
-            bar.high = bar.close;
-            bar.low = bar.close;
+        assert_eq!(changed[56], row[56], "future targets changed the anchor");
+        let mut flat_bars = bars.clone();
+        for bar in &mut flat_bars[..7] {
+            bar.open = 8.0;
+            bar.high = 8.0;
+            bar.low = 8.0;
+            bar.close = 8.0;
         }
-        fill_row(&mut changed, &penny_bars, &penny_contract, 6, 2);
-        assert_eq!(changed[49], f32::EPSILON);
-        penny_contract.means[1] = 1.5e8;
-        fill_row(&mut changed, &penny_bars, &penny_contract, 6, 2);
-        assert_eq!(changed[49], 0.5);
+        fill_row(&mut changed, &flat_bars, &contract, &volume, &exogenous, 6, 2);
+        assert_eq!(&changed[..16], &[0.0; 16]);
+        assert_eq!(changed[19], (9.0f64 / 8.0).ln() as f32);
     }
 
     #[test]
@@ -951,7 +1049,14 @@ mod tests {
             &ancient,
         )
         .unwrap();
-        let corpus = Corpus::load(&directory.0, &[], 16, 7, 32, true).unwrap();
+        let features = FeatureSet {
+            spy: false,
+            ..FeatureSet::ALL
+        };
+        let corpus = Corpus::load(&directory.0, &[], 16, 7, 32, &features, 1).unwrap();
+        assert_eq!(corpus.contract.market_min_cross_section, 1);
+        assert_eq!(corpus.contract.features, features);
+        assert!(corpus.contract.spy_fingerprint.is_none());
         assert_eq!(
             corpus
                 .contract
@@ -964,14 +1069,14 @@ mod tests {
         assert!(corpus.excluded_tickers.iter().any(|t| t.ticker == "NEW"));
         assert!(corpus.validation_refs.iter().all(|r| r.ticker == 0));
         assert_eq!(corpus.contract.boundary_timestamps[0], bars[6999].ts());
-        assert_eq!(corpus.contract.tickers[0].scaler_fit_bars, 6999 - 100);
-        assert_eq!(corpus.contract.tickers[1].scaler_fit_bars, 4994);
+        assert_eq!(corpus.contract.tickers[0].train_end, 6999 - 100);
+        assert_eq!(corpus.contract.tickers[1].train_end, 4994);
         assert_eq!(
             corpus.contract.tickers[1].invalid_ohlc_indices,
             [0, 1, 47, 48, 49, 4000]
         );
-        assert_eq!(corpus.contract.tickers[2].scaler_fit_bars, 5000);
-        assert_eq!(corpus.contract.tickers[3].scaler_fit_bars, 33);
+        assert_eq!(corpus.contract.tickers[2].train_end, 5000);
+        assert_eq!(corpus.contract.tickers[3].train_end, 33);
         assert!(corpus
             .excluded_tickers
             .iter()
@@ -991,11 +1096,41 @@ mod tests {
             assert_eq!(candle.close, bars[raw].close);
         }
         let selected = corpus.host_batch(&[reference]).unwrap();
-        let normalized: Vec<f32> = Vec::try_from(selected.inputs.reshape([-1])).unwrap();
-        for (position, &raw) in valid_raw[31..47].iter().enumerate() {
-            let expected = ((f64::from(bars[raw].close) - source.contract.means[3])
-                / source.contract.stds[3]) as f32;
-            assert_eq!(normalized[position * 4 + 3], expected);
+        let log_prices: Vec<f32> = Vec::try_from(selected.log_prices.reshape([-1])).unwrap();
+        let valid: Vec<f32> = Vec::try_from(selected.valid.reshape([-1])).unwrap();
+        assert_eq!(log_prices.len(), 23 * 4);
+        assert_eq!(valid, vec![1.0; 23]);
+        let closes: Vec<f64> = valid_raw[31..54]
+            .iter()
+            .map(|&raw| f64::from(bars[raw].close))
+            .collect();
+        let c_last = closes[15];
+        assert_eq!(selected.anchor.double_value(&[0]), c_last);
+        let market_cum: Vec<f32> = Vec::try_from(selected.market_cum.reshape([-1])).unwrap();
+        assert_eq!(market_cum.len(), 23);
+        assert_eq!(market_cum[15], 0.0);
+        assert!(market_cum[..23].iter().all(|v| v.is_finite()));
+        assert_eq!(corpus.contract.market_fingerprint.len(), 64);
+        assert_eq!(log_prices[15 * 4 + 3], 0.0);
+        for (position, close) in closes.iter().enumerate() {
+            let expected = (close / c_last).ln();
+            assert!((f64::from(log_prices[position * 4 + 3]) - expected).abs() <= 1e-7);
+        }
+        let auxiliary: Vec<f32> = Vec::try_from(selected.aux.reshape([-1])).unwrap();
+        assert_eq!(auxiliary.len(), 23 * 10);
+        for (position, &raw) in valid_raw[31..54].iter().enumerate() {
+            let channels = &auxiliary[position * 10..position * 10 + 10];
+            assert!(channels[..4].iter().all(|value| value.abs() <= 1.0));
+            let gap = if raw == 50 { [1.0, 4.0f32.ln()] } else { [0.0, 0.0] };
+            assert_eq!(&channels[4..6], &gap);
+            if position < 16 {
+                assert_eq!(&channels[6..8], &[0.0, 1.0]);
+                let market =
+                    (f64::from(bars[raw].close) / f64::from(bars[raw - 1].close)).ln() as f32;
+                assert!((channels[8] - market).abs() < 1e-7 && channels[9] == 1.0);
+            } else {
+                assert_eq!(&channels[6..10], &[0.0; 4], "future history channels must be blank");
+            }
         }
         let minimal = corpus
             .train_refs
@@ -1026,31 +1161,22 @@ mod tests {
                 total += count;
             }
             assert!(coverage[..32].iter().all(|&v| v == 0));
-            assert!(coverage[32..metadata.scaler_fit_bars]
-                .iter()
-                .all(|&v| v == 1));
-            assert!(coverage[metadata.scaler_fit_bars..].iter().all(|&v| v == 0));
+            assert!(coverage[32..metadata.train_end].iter().all(|&v| v == 1));
+            assert!(coverage[metadata.train_end..].iter().all(|&v| v == 0));
         }
         assert_eq!(total, corpus.contract.train_target_bars);
         let refs = [corpus.train_refs[0], *corpus.train_refs.last().unwrap()];
         let batch = corpus.host_batch(&refs).unwrap();
-        assert_eq!(batch.target_mask.size(), [2, 7]);
-        assert_eq!(batch.price_scaling.size(), [2, 2, 4]);
-        assert_eq!(batch.geometry_context.size(), [2, 3]);
-        let expected_scaling = refs
-            .iter()
-            .flat_map(|reference| {
-                let contract = &corpus.ticker(*reference).contract;
-                contract
-                    .means
-                    .into_iter()
-                    .chain(contract.stds)
-                    .map(|value| value as f32)
-            })
-            .collect::<Vec<_>>();
+        assert_eq!(batch.valid.size(), [2, 23]);
+        assert_eq!(batch.anchor.size(), [2]);
+        assert!(batch.anchor.gt(0.0).all().int64_value(&[]) == 1);
         assert_eq!(
-            Vec::<f32>::try_from(batch.price_scaling.reshape([-1])).unwrap(),
-            expected_scaling
+            batch
+                .valid
+                .narrow(1, 16, 7)
+                .sum(Kind::Float)
+                .int64_value(&[]) as usize,
+            batch.valid_target_bars
         );
         assert_eq!(
             batch.valid_target_bars,
@@ -1058,6 +1184,58 @@ mod tests {
                 .map(|r| corpus.ticker(*r).target_count(r.origin).unwrap())
                 .sum::<usize>()
         );
+    }
+
+    /// Every accessor on a `Batch` is a VIEW of one packed block. That is what lets a
+    /// resident batch be refilled by a single copy into a fixed address - which is what a
+    /// captured CUDA graph reads and what keeps a 114 MB allocate-and-free off every step.
+    /// If `from_packed` ever returned copies instead, `upload` would refresh nothing and the
+    /// model would train on whatever the resident batch held at construction.
+    #[test]
+    fn uploading_a_host_batch_refreshes_every_view_of_the_resident_batch() {
+        let (context, pred_len, aux_channels) = (4, 3, 2);
+        let width = Batch::row_width(context, pred_len, aux_channels);
+        let batch_of = |rows: usize, offset: f32| {
+            let values: Vec<f32> = (0..rows * width)
+                .map(|index| offset + index as f32)
+                .collect();
+            Batch::from_packed(
+                Tensor::from_slice(&values).reshape([rows as i64, width as i64]),
+                context,
+                pred_len,
+                aux_channels,
+                rows,
+            )
+        };
+        let first = batch_of(2, 1.0);
+        let second = batch_of(2, 1000.0);
+        let mut resident = first.resident(Device::Cpu);
+        first.upload(&mut resident).unwrap();
+        for (mine, theirs) in [
+            (&resident.log_prices, &first.log_prices),
+            (&resident.valid, &first.valid),
+            (&resident.aux, &first.aux),
+            (&resident.market_cum, &first.market_cum),
+            (&resident.anchor, &first.anchor),
+        ] {
+            assert!(mine.equal(theirs), "the first upload did not land in a view");
+        }
+        second.upload(&mut resident).unwrap();
+        for (mine, theirs) in [
+            (&resident.log_prices, &second.log_prices),
+            (&resident.valid, &second.valid),
+            (&resident.aux, &second.aux),
+            (&resident.market_cum, &second.market_cum),
+            (&resident.anchor, &second.anchor),
+        ] {
+            assert!(
+                mine.equal(theirs),
+                "a refill left a view reading the previous batch"
+            );
+        }
+        assert_eq!(resident.valid_target_bars, second.valid_target_bars);
+        // A shape the capture never recorded must be refused, not silently truncated.
+        assert!(batch_of(1, 0.0).upload(&mut resident).is_err());
     }
 
     #[test]
