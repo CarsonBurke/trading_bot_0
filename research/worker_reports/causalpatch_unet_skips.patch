@@ -1,0 +1,434 @@
+--- a/trading_bots/src/torch/timexer_segment/model.rs
++++ b/trading_bots/src/torch/timexer_segment/model.rs
+@@ -25,6 +25,16 @@
+ const HEAD_OUTPUT_SCALE: f64 = 1.0 / 32.0;
+ /// tanh soft cap on the log predictive scale around the `½·ln h` prior: `s/σ√h ∈ [e⁻⁴, e⁴]`.
+ const LOG_SCALE_CAP: f64 = 4.0;
++/// Logit initialising every U-net skip gate, from modded-nanogpt: the skips entered the
++/// reference at raw weight 1.0 (`records/track_1_short/2024-11-10_UNetDoubleLr/
++/// c87bb826-797b-4f37-98c7-d3a5dad2de74.txt:244`) and were re-parameterised to
++/// `σ(logit)` with this init in `records/track_1_short/2025-11-18_RefineSkip/
++/// 00f4e1e6-0044-4a08-b88a-3b7ec0624081.txt:953-954`, which the current
++/// `train_gpt.py:1346` still carries verbatim (`-1.5 * torch.ones(1),  # skip_lambda ->
++/// σ(-1.5) ≈ 0.18`). σ(-1.5) = 0.18243: eight layers whose decoder half adds an encoder
++/// output at weight 1 would double the early residual stream before a single gradient step,
++/// and the sigmoid keeps the gate in (0, 1) however far the logit travels.
++const SKIP_LOGIT_INIT: f64 = -1.5;
+ 
+ #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, clap::Args)]
+ #[serde(deny_unknown_fields)]
+@@ -105,6 +115,10 @@
+             "layer count and feedforward width must be positive"
+         );
+         ensure!(
++            self.layers % 2 == 0,
++            "the U-net skip stack pairs each encoder layer with one decoder layer, so the layer count must be even"
++        );
++        ensure!(
+             self.dropout.is_finite() && (0.0..1.0).contains(&self.dropout),
+             "dropout must be in [0, 1)"
+         );
+@@ -119,6 +133,17 @@
+         self.seq_len / self.patch_len
+     }
+ 
++    /// `(encoder source, decoder destination)` for every U-net skip, deepest encoder layer
++    /// first: at eight layers this is `3->4, 2->5, 1->6, 0->7`. The order IS the stack
++    /// discipline - encoder layers push in index order, decoder layers pop - and the `k`-th
++    /// pair is gated by `skip_weights[k]`, matching the reference's `skip_weights[i - n]`
++    /// indexing (`records/track_1_short/2024-11-10_UNetDoubleLr/
++    /// c87bb826-797b-4f37-98c7-d3a5dad2de74.txt:266-270`).
++    pub fn skip_pairs(&self) -> impl Iterator<Item = (usize, usize)> + '_ {
++        let encoder = self.layers / 2;
++        (0..self.layers - encoder).map(move |k| (encoder - 1 - k, encoder + k))
++    }
++
+     /// Arithmetic and traffic cost of one training step at `batch`, from shapes alone.
+     pub fn step_cost(&self, batch: usize) -> StepCost {
+         let (rows, origins, horizon) = (batch as f64, self.origins() as f64, self.pred_len as f64);
+@@ -164,6 +189,11 @@
+         // materializes, so the bound it produced was 40% low.
+         bytes += self.layers as f64
+             * bf16(tokens * (2. * width + 3. * width + 8. * width + 6. * width + 2. * ffn));
++        // The U-net skip: ONE fused `addcmul` per decoder layer (see `unet_stack`), so each
++        // pair materializes a single `width` activation, not the two a separate `gate * skip`
++        // product and add would. The encoder half's outputs are free - they are the very
++        // tensors the next layer's norm already retains, so the stack itself adds no bytes.
++        bytes += (self.layers / 2) as f64 * bf16(tokens * width);
+         bytes += bf16(tokens * (width + horizon * known + covariate_width + head_input))
+             + bf16(tokens * 2. * HEAD_HIDDEN as f64)
+             + bf16(tokens * head_outputs);
+@@ -349,6 +379,57 @@
+     }
+ }
+ 
++/// The U-net encoder/decoder layer loop: the first half of the layers push their output onto a
++/// stack, the second half pop one and fold it into the residual stream BEFORE their own compute,
++/// which pairs the deepest unconsumed encoder layer with the shallowest decoder layer -
++/// `3->4, 2->5, 1->6, 0->7` at eight layers.
++///
++/// Straight from modded-nanogpt, `records/track_1_short/2024-11-10_UNetDoubleLr/
++/// c87bb826-797b-4f37-98c7-d3a5dad2de74.txt:257-270` (@brendanh0gan): encoder outputs are
++/// appended, then `self.transformer.h[encoder_layers + i](x + skip_weights[i] * pop(), ...)`.
++/// The current `train_gpt.py:1591-1595` keeps the same shape - `x = x + gate * cache[3]` ahead
++/// of layer 6's compute - having pruned the twelve-layer U down to the single pair that paid
++/// for itself there; we keep the full U because eight layers is not twelve and because the
++/// pruning was a wall-clock decision on a 3-minute run, not a loss result.
++///
++/// `gates` are the POST-sigmoid gates, one per decoder layer, already in the residual stream's
++/// dtype: the reference casts its residual scalars to bf16 for exactly this multiply
++/// (`train_gpt.py:1509-1512`), and an fp32 gate would promote a 94 MB bf16 activation to fp32.
++///
++/// The fold is one `addcmul`, not a `gate * skip` product followed by an add: `addcmul`'s
++/// backward saves only the two factors - both already retained - so the fused form materializes
++/// one `[tokens, width]` tensor per pair instead of two and never keeps the product alive.
++///
++/// `layer` is the per-index compute so this loop can be exercised with distinguishable stub
++/// layers; the model's forward passes the real blocks.
++fn unet_stack<F>(mut state: Tensor, layers: usize, gates: &[Tensor], mut layer: F) -> Tensor
++where
++    F: FnMut(usize, &Tensor) -> Tensor,
++{
++    let encoder = layers / 2;
++    assert_eq!(
++        gates.len(),
++        layers - encoder,
++        "one skip gate per decoder layer"
++    );
++    let mut skips: Vec<Tensor> = Vec::with_capacity(encoder);
++    for index in 0..layers {
++        if index >= encoder {
++            let skip = skips
++                .pop()
++                .expect("every decoder layer consumes one encoder output");
++            state = state.addcmul(&skip, &gates[index - encoder]);
++        }
++        state = layer(index, &state);
++        if index < encoder {
++            // A reference, not a copy: this tensor is the next layer's input either way, so the
++            // stack costs four pointers and no bytes.
++            skips.push(state.shallow_clone());
++        }
++    }
++    state
++}
++
+ /// Causal per-origin statistics, `[batch, origins]` in fp32. Origin `k` is the last bar of
+ /// patch `k`; every value uses only bars at or before it.
+ pub struct Statistics {
+@@ -445,6 +526,11 @@
+     /// two full-width products - see [`Block::rotate`].
+     rotation: (Tensor, Tensor),
+     blocks: Vec<Block>,
++    /// LOGITS of the U-net skip gates, `[layers/2]` fp32, one per decoder layer in
++    /// [`ModelConfig::skip_pairs`] order. The gate the residual stream sees is `σ(logit)`, so
++    /// it can never leave `(0, 1)` and starts at σ([`SKIP_LOGIT_INIT`]) = 0.18243. Stored on the
++    /// root path, 1-D and outside the `block_*` allowlist, which is what routes it to AdamW.
++    skip_weights: Tensor,
+     final_norm: LayerNorm,
+     covariates: Option<nn::Linear>,
+     head_hidden: nn::Linear,
+@@ -516,6 +602,11 @@
+             blocks: (0..config.layers)
+                 .map(|index| Block::new(path / format!("block_{index}"), config))
+                 .collect(),
++            skip_weights: path.var(
++                "skip_weights",
++                &[(config.layers / 2) as i64],
++                nn::Init::Const(SKIP_LOGIT_INIT),
++            ),
+             final_norm: LayerNorm::new(path / "final_norm", config.d_model),
+             covariates,
+             head_hidden: projection(path / "head" / "hidden", head_input, HEAD_HIDDEN, true),
+@@ -556,6 +647,35 @@
+         &self.half_log_horizon
+     }
+ 
++    /// Every learnable recipe scalar as `(name, post-parameterization value)`, for the
++    /// `timexer_segment_recipe_scalars` report base.
++    ///
++    /// Values are what the residual stream actually sees - `σ(logit)` for the skip gates, not
++    /// the stored logit - because the question a reader asks of this panel is whether a skip
++    /// moved off its 0.18 init, and a logit does not answer it.
++    ///
++    /// ONE host transfer for the whole set: the parts are concatenated on device and copied
++    /// once. Call this per report interval, never per step - it synchronizes.
++    pub fn recipe_scalars(&self) -> Vec<(String, f64)> {
++        let (names, values) = self.recipe_scalar_parts();
++        let flat = Tensor::cat(&values, 0).to_kind(Kind::Double);
++        names.into_iter().zip(Vec::<f64>::try_from(flat).unwrap()).collect()
++    }
++
++    /// The contributions to [`Self::recipe_scalars`], names and device-side values kept apart so
++    /// that adding a family of scalars costs one `push` here and no host round-trip of its own.
++    fn recipe_scalar_parts(&self) -> (Vec<String>, Vec<Tensor>) {
++        let mut names = Vec::new();
++        let mut values = Vec::new();
++        names.extend(
++            self.config
++                .skip_pairs()
++                .map(|(source, destination)| format!("skip weight {source}->{destination}")),
++        );
++        values.push(self.skip_weights.sigmoid());
++        (names, values)
++    }
++
+     pub fn statistics(&self, batch: &Batch) -> Statistics {
+         let c = &self.config;
+         let (context, patch, origins) = (c.seq_len, c.patch_len, c.origins());
+@@ -668,11 +788,19 @@
+         last_only: bool,
+     ) -> Tensor {
+         let origins = self.config.origins();
+-        let mut state = linear(&self.tokens(batch, stats), &self.patch)
++        let state = linear(&self.tokens(batch, stats), &self.patch)
+             .dropout(self.config.dropout, train);
+-        for block in &self.blocks {
+-            state = block.forward(&state, (&self.rotation.0, &self.rotation.1), train);
+-        }
++        // One `unbind`, not four `select`s: `select`'s backward is `zeros_like` plus a copy, and
++        // `unbind`'s is a single `stack` over the four gates. The bf16 cast is the reference's
++        // (`train_gpt.py:1509-1512`) and keeps the fold from promoting a 94 MB activation.
++        let gates = self
++            .skip_weights
++            .sigmoid()
++            .to_kind(Kind::BFloat16)
++            .unbind(0);
++        let state = unet_stack(state, self.blocks.len(), &gates, |index, state| {
++            self.blocks[index].forward(state, (&self.rotation.0, &self.rotation.1), train)
++        });
+         let state = self.final_norm.forward(&state);
+         if last_only {
+             state.narrow(1, origins - 1, 1)
+@@ -1762,7 +1877,7 @@
+             seq_len: 96,
+             pred_len: 8,
+             patch_len: 8,
+-            layers: 1,
++            layers: 2,
+             d_model: 32,
+             heads: 4,
+             ffn: 64,
+@@ -1916,4 +2031,139 @@
+             "casting before the concatenation changed the tokens"
+         );
+     }
++
++    fn eight_layer_config() -> ModelConfig {
++        ModelConfig {
++            layers: 8,
++            ..small_config()
++        }
++    }
++
++    #[test]
++    fn skip_gates_start_at_the_reference_sigmoid_of_minus_three_halves() {
++        let config = eight_layer_config();
++        let store = nn::VarStore::new(Device::Cpu);
++        let model = CausalPatchModel::new(&store.root(), &config);
++        let stored = store
++            .variables()
++            .remove("skip_weights")
++            .expect("the skip gate logits must be a named varstore parameter");
++        assert_eq!(stored.size(), [4]);
++        assert!(stored.requires_grad());
++        assert_eq!(
++            (&stored - SKIP_LOGIT_INIT).abs().max().double_value(&[]),
++            0.0,
++            "the stored parameter is the LOGIT, so it must start at -1.5, not at 0.18"
++        );
++        // σ(-1.5), the reference's own annotation of this init.
++        let expected = 1.0 / (1.0 + 1.5f64.exp());
++        assert!((expected - 0.182_425_523_806_356_35).abs() < 1e-15);
++        let reported = model.recipe_scalars();
++        assert_eq!(
++            reported.iter().map(|(name, _)| name.as_str()).collect::<Vec<_>>(),
++            [
++                "skip weight 3->4",
++                "skip weight 2->5",
++                "skip weight 1->6",
++                "skip weight 0->7"
++            ]
++        );
++        for (name, value) in &reported {
++            assert!(
++                (value - expected).abs() < 1e-6,
++                "{name} reported {value}, not the post-sigmoid init {expected}"
++            );
++        }
++    }
++
++    #[test]
++    fn closed_skip_gates_leave_the_backbone_bit_identical_to_a_plain_stack() {
++        let config = eight_layer_config();
++        let store = nn::VarStore::new(Device::Cpu);
++        let mut model = CausalPatchModel::new(&store.root(), &config);
++        // σ(-∞) = 0 exactly: the only way to close a sigmoid gate, and the only setting under
++        // which the U-net stack is required to vanish.
++        tch::no_grad(|| {
++            let _ = model.skip_weights.fill_(f64::NEG_INFINITY);
++        });
++        let batch = synthetic(&config, &[8, 8, 8]);
++        let stats = model.statistics(&batch);
++        let actual = model.backbone(&batch, &stats, false, false);
++        // The plain stack, spelled out: the loop this change replaced.
++        let mut state = linear(&model.tokens(&batch, &stats), &model.patch);
++        for block in &model.blocks {
++            state = block.forward(&state, (&model.rotation.0, &model.rotation.1), false);
++        }
++        let expected = model.final_norm.forward(&state);
++        assert_eq!(actual.size(), expected.size());
++        assert!(
++            expected.abs().max().double_value(&[]) > 0.0,
++            "a zero backbone output would make this comparison vacuous"
++        );
++        assert!(
++            actual.equal(&expected),
++            "closed skip gates must not perturb a single bit of the backbone"
++        );
++    }
++
++    #[test]
++    fn the_skip_stack_pairs_the_deepest_encoder_layer_with_the_shallowest_decoder_layer() {
++        let layers = 8usize;
++        let options = (Kind::Double, Device::Cpu);
++        let width = layers as i64;
++        // Layer `i` adds a one-hot tag, so channel `i` of the result is exactly the coefficient
++        // with which layer `i`'s output reached the output - which is what a pairing IS. The
++        // gates are distinct primes so no two pairings can coincide by commutativity.
++        let tag = |index: usize| {
++            let value = Tensor::zeros([width], options);
++            let _ = value.narrow(0, index as i64, 1).fill_(1.0);
++            value
++        };
++        let gates: Vec<Tensor> = [2.0, 3.0, 5.0, 7.0]
++            .into_iter()
++            .map(|gate| Tensor::scalar_tensor(gate, options))
++            .collect();
++        let actual = unet_stack(
++            Tensor::zeros([width], options),
++            layers,
++            &gates,
++            |index, state| state + tag(index),
++        );
++
++        // The four encoder outputs, straight-line.
++        let encoder_0 = Tensor::zeros([width], options) + tag(0);
++        let encoder_1 = &encoder_0 + tag(1);
++        let encoder_2 = &encoder_1 + tag(2);
++        let encoder_3 = &encoder_2 + tag(3);
++        // Straight-line, no loop: the pairing the reference specifies, one line per skip.
++        let layer_4 = encoder_3.addcmul(&encoder_3, &gates[0]) + tag(4); // 3 -> 4
++        let layer_5 = layer_4.addcmul(&encoder_2, &gates[1]) + tag(5); // 2 -> 5
++        let layer_6 = layer_5.addcmul(&encoder_1, &gates[2]) + tag(6); // 1 -> 6
++        let expected = layer_6.addcmul(&encoder_0, &gates[3]) + tag(7); // 0 -> 7
++        assert!(
++            actual.equal(&expected),
++            "expected 3->4, 2->5, 1->6, 0->7; got {actual:?} against {expected:?}"
++        );
++
++        // Negative control: the queue order a `remove(0)` instead of a `pop` would produce. If
++        // this matched, the assertion above would be proving nothing.
++        let queue_4 = encoder_3.addcmul(&encoder_0, &gates[0]) + tag(4); // 0 -> 4
++        let queue_5 = queue_4.addcmul(&encoder_1, &gates[1]) + tag(5); // 1 -> 5
++        let queue_6 = queue_5.addcmul(&encoder_2, &gates[2]) + tag(6); // 2 -> 6
++        let queue_7 = queue_6.addcmul(&encoder_3, &gates[3]) + tag(7); // 3 -> 7
++        assert!(
++            !actual.equal(&queue_7),
++            "the tags and gates cannot distinguish stack order from queue order"
++        );
++    }
++
++    #[test]
++    fn an_odd_layer_count_cannot_split_into_encoder_and_decoder_halves() {
++        let config = ModelConfig {
++            layers: 7,
++            ..small_config()
++        };
++        let error = config.validate().expect_err("7 layers must be rejected");
++        assert!(error.to_string().contains("even"), "{error}");
++    }
+ }
+--- a/trading_bots/src/torch/timexer_segment/compute.rs
++++ b/trading_bots/src/torch/timexer_segment/compute.rs
+@@ -26,6 +26,9 @@
+ /// modded-nanogpt `train_gpt.py` Adam / NorMuon bases (`:2065-2076`).
+ const NANOGPT_ADAMW_LR: f64 = 0.008;
+ const NANOGPT_MUON_LR: f64 = 0.023;
++/// AdamW learning-rate multiplier for the learnable recipe scalars, from modded-nanogpt's
++/// `"scalars"` group (`train_gpt.py:2030`, `lr_mul: 5.0`).
++const NANOGPT_SCALAR_LR_MULTIPLIER: f64 = 5.0;
+ const NANOGPT_COOLDOWN_FRAC: f64 = 0.60;
+ const NANOGPT_COOLDOWN_FLOOR: f64 = 0.15;
+ const NANOGPT_MUON_WARMUP_STEPS: usize = 300;
+@@ -91,7 +94,7 @@
+ }
+ 
+ fn polar_express(named: &[(String, Tensor)], learning_rate: f64) -> Muon {
+-    let optimizer = Muon::new_named(
++    let mut optimizer = Muon::new_named(
+         named,
+         MuonConfig {
+             lr: OptimizerKind::PolarExpress
+@@ -106,7 +109,14 @@
+             adamw_betas: (0.9, 0.95),
+             adamw_eps: 1e-10,
+             adamw_wd: 0.005,
+-            adamw_no_weight_decay_name_substrings: vec!["norm".into(), ".bias".into()],
++            // `skip_weights` joins the norms and biases here: the reference's scalar group is
++            // `wd_mul: 0.0` (`train_gpt.py:2030`), and decaying a gate logit toward 0 would
++            // pull every skip gate toward 0.5, which is not a neutral prior.
++            adamw_no_weight_decay_name_substrings: vec![
++                "norm".into(),
++                ".bias".into(),
++                "skip_weights".into(),
++            ],
+             adamw_weight_decay_multipliers: vec![
+                 ("head.".into(), 150.),
+                 ("patch.".into(), 150.),
+@@ -129,6 +139,14 @@
+             ..MuonConfig::default()
+         },
+     );
++    // The reference runs its scalar group at 5x the base Adam rate
++    // (`train_gpt.py:2030`, `lr_mul: 5.0`); a gate logit has to travel ~1.5 to close or open,
++    // which it cannot do at the rate a 512x2048 matrix wants.
++    assert_eq!(
++        optimizer.set_named_lr_scale(&["skip_weights"], NANOGPT_SCALAR_LR_MULTIPLIER),
++        1,
++        "the U-net skip gate logits must be present exactly once"
++    );
+     let muon: HashSet<_> = optimizer.muon_param_names().into_iter().collect();
+     let adamw: HashSet<_> = optimizer.adamw_param_names().into_iter().collect();
+     assert!(muon.is_disjoint(&adamw));
+@@ -1079,10 +1053,19 @@
+             let path = path.split('.').fold(store.root(), |path, part| path / part);
+             let _ = path.var(name, &shape, nn::Init::Const(0.));
+         }
++        // Root-level, 1-D: the U-net skip gate logits, whose whole routing story is that they
++        // are outside the `block_*` allowlist and so cannot reach NorMuon.
++        let _ = store.root().var("skip_weights", &[4], nn::Init::Const(-1.5));
+         let named = named_trainable_variables(&store);
+         let optimizer = polar_express(&named, NANOGPT_ADAMW_LR);
+         assert_eq!(optimizer.muon_param_names().len(), 4);
+-        assert_eq!(optimizer.adamw_param_names().len(), 7);
++        assert_eq!(optimizer.adamw_param_names().len(), 8);
++        let (lr_scale, betas, wd_multiplier) = optimizer
++            .adamw_group_settings("skip_weights")
++            .expect("the skip gate logits must be an AdamW parameter");
++        assert!((lr_scale - NANOGPT_SCALAR_LR_MULTIPLIER).abs() < 1e-12);
++        assert_eq!(betas, (0.9, 0.95));
++        assert_eq!(wd_multiplier, 0.0);
+         for name in [
+             "head.hidden.weight",
+             "head.output.weight",
+--- a/docs/timexer_segment.md
++++ b/docs/timexer_segment.md
+@@ -14,6 +14,7 @@
+ 
+ - Tokens: patch `k` covers context bars `[16k, 16k+16)`, one stream per row (no channel independence). Token input is the flatten over the 16 bars of the four log-price channels made origin-relative (`(ln p - ln c_k) / σ_k`) plus all `n_aux` covariates (the market and SPY return values divided by `σ_k`; their validity flags and every other channel unscaled), through `Linear(16*(4+n_aux) -> d_model)`. 375 tokens with rotary positions.
+ - Backbone: pre-norm transformer, defaults 8 layers, `d_model` 512, 8 heads, FFN 2048, GELU, dropout 0, flash SDPA with `is_causal=true`, final norm. No autocast: activations are cast to bf16 once, at the patch embedding, and every fp32 master parameter is cast to the activation dtype at its point of use, so LayerNorm and every GEMM see matching dtypes and reach their fused kernels instead of ATen's mixed-dtype fallback. σ, the causal statistics, the candle geometry, the NLL elements and both loss reductions are fp32; nothing else is.
++- U-net skips over the backbone (modded-nanogpt record 11, `records/track_1_short/2024-11-10_UNetDoubleLr/c87bb826-797b-4f37-98c7-d3a5dad2de74.txt:239-244,257-270`): the encoder half of the layers pushes its output onto a stack, the decoder half pops one and folds it into the residual stream before its own compute, pairing `3->4, 2->5, 1->6, 0->7` at eight layers. The gate is `σ(logit)` with the logit initialised to `-1.5`, so each skip starts at `0.182` and is confined to `(0, 1)` however far the logit travels — record 11's raw init of `1.0` would nearly double the residual stream entering layer 4 before a single gradient step, and the current `train_gpt.py:1346` carries exactly this logit init (`-1.5 * torch.ones(1),  # skip_lambda -> σ(-1.5) ≈ 0.18`). The four logits are one root-level `skip_weights` parameter, AdamW at 5× the base rate and no weight decay, matching the reference's `"scalars"` group (`train_gpt.py:2030`); their post-sigmoid values are reported per interval as `skip weight <src>-><dst>`. Cost: the stack itself is four references to tensors the next layer's norm already retains, so it adds no bytes; the fold is one `addcmul` per pair, which materializes one `[rows·375, 512]` bf16 activation each — 375 MiB at batch 256 and +2.36 GB of the ~144 GB a step moves (+1.6%).
+ - Causal statistics per origin `t_k = 16(k+1)-1` from `log_prices`/`valid`: `σ_k` = expanding std of valid close-to-close log returns over `[0, t_k]` (variance floor 1e-8), `ρ_k` = expanding mean relative range `exp(lh-ll)-1`, `c_k` = close at `t_k`, `β_k = (Σ r_i m_i + λ_k)/(Σ m_i² + λ_k)` over the valid consecutive-bar pairs in `[0, t_k]` with `r` the ticker's log close return and `m` the `market_cum` step over the same pair, `λ_k = 256 · max(mean(m²) so far, 1e-8)`: a ridge slope shrunk toward `β = 1` with the weight of 256 average market-step squares, so origins with little history sit near 1 (the old unit-β demeaning) and β converges to the OLS slope as history accumulates (half-way at 256 pairs, ~4% prior weight at 6,000). Equal-weight demeaning with β = 1 added variance for low-β tickers: over 61,901 validation windows the σ-scaled h=192 persistence MSE was 285 absolute vs 408 unit-β relative, and 953 vs 1,652 in the lowest-σ quintile (median β 0.30); the causal β gives 255 overall and 908 / 96 / 94 / 90 / 88 against 953 / 133 / 126 / 112 / 101 absolute per σ quintile (validation β quantiles p10 0.17, p50 0.66, p90 1.25). Origins with fewer than `--min-history` (256) valid bars are masked out of the loss.
+ - Head per token: future-known covariates for bars `t_k+1..t_k+192` (`known_future` channels only) -> `Linear(192*n_known -> 256)`, concatenated with the token state -> MLP (hidden 1024, GELU) -> `8×192` channel-major: four candle coordinates then four log-scales, each contiguous over the 192 future bars. The layout is load-bearing — every consumer slices one channel, and in the `192×8` layout each such slice is a stride-8 gather over a 147 M-element space, one 32-byte sector per two useful bytes. The output layer is zero-initialised and its `1/√1024` μP multiplier rides on the weight copy the GEMM already needs (scaling a 1024×1536 weight, not a 147 M-element output), so Adam's first steps move each output by O(lr) rather than O(lr·fan_in); the log-scale is soft-capped to `±4` around the `½·ln h` prior (`4·tanh(x/4)`), which bounds the NLL for any target.
+ - Decoder: the persistence-anchored joint OHLC decoder per (origin, bar): `close = c_k·exp(σ_k·√h·c0)`, range a softplus multiple of `ρ_k`, open/close positions sigmoids inside it. Predictions in loss units are `ŷ = ln(p̂ / c_k)/σ_k`; the scale is `s = √h·exp(logscale)`. Zero coordinates therefore give the persistence candle with the random-walk `σ√h` prior.

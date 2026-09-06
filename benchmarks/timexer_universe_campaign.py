@@ -16,7 +16,12 @@ SEED = 20260905
 COMMON_CONTEXT = 6000
 BATCH_SIZE = 256
 PRED_LEN = 192
-VARIANTS = (("c2048", 2048, False), ("c6000", 6000, False), ("c6000-volume", 6000, True))
+FEATURE_NAMES = ("time_of_day", "day_of_week", "session_gap", "volume", "market", "spy")
+VARIANTS = (("c2048", 2048, False), ("c6000", 6000, False), ("c6000-features", 6000, True))
+
+
+def feature_set(enabled):
+    return {name: enabled for name in FEATURE_NAMES}
 
 
 def run_name(value):
@@ -25,13 +30,12 @@ def run_name(value):
     return value
 
 
-def training_command(name, context, volume, epochs, data_dir):
+def training_command(name, context, features, epochs, data_dir):
     command = [str(ROOT / "trading_bots/run-release-cuda.sh"), "train-timexer-segment",
                "--run", name, "--seq-len", str(context), "--common-context", str(COMMON_CONTEXT),
                "--pred-len", str(PRED_LEN), "--patch-len", "16", "--batch-size", str(BATCH_SIZE),
-               "--seed", str(SEED), "--epochs", str(epochs), "--patience", "3", "--fused", "true", "--optimizer", "polar-express"]
-    if volume:
-        command.append("--volume-features")
+               "--seed", str(SEED), "--epochs", str(epochs), "--patience", "3", "--fused", "true", "--optimizer", "polar-express",
+               "--features", "all" if features else "none"]
     if data_dir:
         command += ["--data-dir", str(data_dir.resolve())]
     return command
@@ -57,9 +61,9 @@ def submit(args):
     if "--run" not in command or command[command.index("--run") + 1] != args.reference_run:
         raise ValueError("reference job does not produce the configured reference run")
     predecessor = args.reference_job
-    for suffix, context, volume in VARIANTS:
+    for suffix, context, features in VARIANTS:
         name = f"{args.campaign}-{suffix}"
-        predecessor = submit_job(name, predecessor, "3h", training_command(name, context, volume, 1, args.data_dir))
+        predecessor = submit_job(name, predecessor, "3h", training_command(name, context, features, 1, args.data_dir))
     launch = [sys.executable, str(Path(__file__).resolve()), "--launch-final",
               "--campaign", args.campaign, "--reference-run", args.reference_run]
     if args.data_dir:
@@ -70,7 +74,7 @@ def submit(args):
 
 def contract_identity(contract):
     identity = copy.deepcopy(contract)
-    for key in ("context", "volume_features"):
+    for key in ("context", "features", "auxiliary_schema", "spy_fingerprint"):
         identity.pop(key)
     identity["excluded_tickers"].sort(key=lambda ticker: (ticker["ticker"], ticker["reason"]))
     tickers = identity["tickers"]
@@ -79,12 +83,11 @@ def contract_identity(contract):
     for ticker in tickers:
         if not re.fullmatch(r"[0-9a-f]{64}", ticker["fingerprint"]):
             raise ValueError("invalid authenticated source fingerprint")
-        for key in ("context", "volume_features", "auxiliary_schema"):
-            ticker.pop(key)
+        ticker.pop("context")
     return identity
 
 
-def read_evidence(name, context, volume):
+def read_evidence(name, context, features):
     directory = ROOT / "training/runs" / name
     contract = json.loads((directory / "timexer-segment-data-contract.json").read_text())
     checkpoint = directory / "weights/epoch-0001"
@@ -97,13 +100,13 @@ def read_evidence(name, context, volume):
         raise ValueError(f"{name}: not a completed matched one-epoch comparison")
     if manifest["completed_target_bars"] != contract["train_target_bars"]:
         raise ValueError(f"{name}: incomplete training target coverage")
-    if (contract["context"], contract["common_context"], contract["pred_len"], contract["volume_features"]) != (
-            context, COMMON_CONTEXT, PRED_LEN, volume):
-        raise ValueError(f"{name}: unexpected context, horizons, or auxiliary features")
+    if (contract["context"], contract["common_context"], contract["pred_len"], contract["features"]) != (
+            context, COMMON_CONTEXT, PRED_LEN, feature_set(features)):
+        raise ValueError(f"{name}: unexpected context, horizons, or exogenous features")
     if contract["purge"] < PRED_LEN:
         raise ValueError(f"{name}: insufficient chronological purge")
     model = manifest["model"].copy()
-    if model.pop("seq_len") != context or model.pop("volume_features") != volume:
+    if model.pop("seq_len") != context or model.pop("features") != feature_set(features):
         raise ValueError(f"{name}: model and data feature contracts differ")
     if model["pred_len"] != PRED_LEN or model["patch_len"] != 16:
         raise ValueError(f"{name}: unexpected forecast or patch layout")
@@ -135,17 +138,17 @@ def read_evidence(name, context, volume):
 
 def launch_final(args):
     specifications = [(args.reference_run, 96, False)] + [
-        (f"{args.campaign}-{suffix}", context, volume) for suffix, context, volume in VARIANTS]
+        (f"{args.campaign}-{suffix}", context, features) for suffix, context, features in VARIANTS]
     evidence = [read_evidence(*specification) for specification in specifications]
     for candidate in evidence[1:]:
         for key in ("identity", "model", "validation_origins", "completed_origins", "persistence", "protocol"):
             if candidate[key] != evidence[0][key]:
                 raise ValueError(f"comparison {key} differs; refusing unmatched selection")
-    volume = evidence[3]["mse"] < evidence[2]["mse"]
+    features = evidence[3]["mse"] < evidence[2]["mse"]
     print(f"Authenticated four complete-corpus comparisons. Final context remains 6000; "
-          f"same-ticker volume {'enabled' if volume else 'disabled'} by matched full-validation MSE. "
+          f"exogenous variates {'enabled' if features else 'disabled'} by matched full-validation MSE. "
           "Comparison values remain in each run's timexer_segment_validation.report.bin.", flush=True)
-    status = subprocess.run(training_command(f"{args.campaign}-final", COMMON_CONTEXT, volume, 10, args.data_dir),
+    status = subprocess.run(training_command(f"{args.campaign}-final", COMMON_CONTEXT, features, 10, args.data_dir),
                             cwd=ROOT).returncode
     return status if status >= 0 else 128 - status
 

@@ -1,0 +1,192 @@
+--- a/trading_bots/src/torch/timexer_segment/compute.rs
++++ b/trading_bots/src/torch/timexer_segment/compute.rs
+@@ -48,7 +48,7 @@
+     pub fn recipe(self) -> &'static str {
+         match self {
+             Self::PolarExpress => {
+-                "normuon-pe5-block-hidden2D-only;patch-covariates-norm-bias-head-AdamW;muonLR=.023;adamwLR=.008;muonWD=1.2;adamwWD=.005;head-embed-wd_mul=150;quadraticWD;cautiousWD;b2=.9;nesterov;momentum=.85-to-.95-over300-cd50;AdamWbetas=.9,.95;eps=1e-10;AdamWevery=1;stepgraphs;nanogpt-cooldown-frac=.60-floor=.15-v1"
++                "normuon-pe5-block-hidden2D-only;patch-covariates-norm-bias-lambda-head-AdamW;lambda-noWD;muonLR=.023;adamwLR=.008;muonWD=1.2;adamwWD=.005;head-embed-wd_mul=150;quadraticWD;cautiousWD;b2=.9;nesterov;momentum=.85-to-.95-over300-cd50;AdamWbetas=.9,.95;eps=1e-10;AdamWevery=1;stepgraphs;nanogpt-cooldown-frac=.60-floor=.15-v1"
+             }
+             Self::Adam => {
+                 "Adam-fp32-masters;betas=.9,.999;eps=1e-8;WD=0;nanogpt-cooldown-frac=.60-floor=.15-v1"
+@@ -91,7 +91,7 @@
+ }
+ 
+ fn polar_express(named: &[(String, Tensor)], learning_rate: f64) -> Muon {
+-    let optimizer = Muon::new_named(
++    let mut optimizer = Muon::new_named(
+         named,
+         MuonConfig {
+             lr: OptimizerKind::PolarExpress
+@@ -106,7 +106,15 @@
+             adamw_betas: (0.9, 0.95),
+             adamw_eps: 1e-10,
+             adamw_wd: 0.005,
+-            adamw_no_weight_decay_name_substrings: vec!["norm".into(), ".bias".into()],
++            // `lambda`: the residual/post/x0 recipe scalars. modded-nanogpt gives every one of
++            // them `wd_mul = 0` (`train_gpt.py:2035-2036`, `train_gpt_medium.py:1081`), and
++            // with `quadratic_lr_weight_decay` a decay on a scalar whose useful value is ~1.05
++            // is a pure bias toward zero - i.e. toward deleting the residual stream.
++            adamw_no_weight_decay_name_substrings: vec![
++                "norm".into(),
++                ".bias".into(),
++                "lambda".into(),
++            ],
+             adamw_weight_decay_multipliers: vec![
+                 ("head.".into(), 150.),
+                 ("patch.".into(), 150.),
+@@ -129,6 +137,22 @@
+             ..MuonConfig::default()
+         },
+     );
++    // The reference runs the residual and x0 lambdas at 5x the Adam base learning rate and the
++    // post lambdas at 1x: `train_gpt.py:2035-2036`
++    // (`"post_lambdas": {..., "lr_mul": 1.0, "wd_mul": 0.0}`,
++    // `"resid_lambdas": {..., "lr_mul": 5.0, "wd_mul": 0.0}`) and
++    // `train_gpt_medium.py:1078-1081` (`self.x0_lambdas.lr_mul = 5.0`). Five scalars per layer
++    // move the whole residual stream, so they need to move faster than a 512x512 matrix's
++    // per-coordinate step.
++    // The count is asserted here, not only in
++    // `every_causal_patch_parameter_lands_in_its_intended_optimizer_group`: a silent zero-match
++    // leaves the banks at 1x, and a rename should fail loudly at construction rather than train
++    // a differently-tuned model. Same reason the disjointness below is an assert.
++    assert_eq!(
++        optimizer.set_named_lr_scale(&["lambdas.resid", "lambdas.x0"], 5.0),
++        2,
++        "the residual and x0 lambda banks must both take the 5x Adam learning rate"
++    );
+     let muon: HashSet<_> = optimizer.muon_param_names().into_iter().collect();
+     let adamw: HashSet<_> = optimizer.adamw_param_names().into_iter().collect();
+     assert!(muon.is_disjoint(&adamw));
+@@ -1068,8 +1092,12 @@
+             ("block_0.output", "weight", vec![8, 8]),
+             ("block_0.first", "weight", vec![32, 8]),
+             ("block_0.second", "weight", vec![8, 32]),
+-            ("block_0.first", "bias", vec![32]),
+-            ("block_0.norm_0", "weight", vec![8]),
++            // The recipe leaves the blocks with no bias and no norm gain, so the 1-D negative
++            // control - "a non-matrix must not reach NorMuon" - is now the lambda banks, which
++            // are also what `set_named_lr_scale` below must match.
++            ("lambdas", "resid", vec![4]),
++            ("lambdas", "post", vec![4]),
++            ("lambdas", "x0", vec![2]),
+             ("patch", "weight", vec![8, 4]),
+             ("covariates", "weight", vec![8, 64]),
+             ("head.hidden", "weight", vec![16, 16]),
+@@ -1082,7 +1110,7 @@
+         let named = named_trainable_variables(&store);
+         let optimizer = polar_express(&named, NANOGPT_ADAMW_LR);
+         assert_eq!(optimizer.muon_param_names().len(), 4);
+-        assert_eq!(optimizer.adamw_param_names().len(), 7);
++        assert_eq!(optimizer.adamw_param_names().len(), 8);
+         for name in [
+             "head.hidden.weight",
+             "head.output.weight",
+@@ -1112,6 +1140,107 @@
+         assert!(!optimizer.adamw_accumulation_pending());
+     }
+ 
++    /// Every parameter of a real model, enumerated with the optimizer group it lands in.
++    ///
++    /// Misrouting is silent: a recipe scalar in NorMuon's 2-D group would be orthogonalized as
++    /// if it were a weight matrix, and a lambda left in AdamW's decaying group would be pulled
++    /// toward zero - i.e. toward deleting the residual stream - by a decay that is quadratic in
++    /// the learning rate. Neither shows up as an error, only as a worse run, so the whole
++    /// parameter list is pinned here rather than spot-checked.
++    #[test]
++    fn every_causal_patch_parameter_lands_in_its_intended_optimizer_group() {
++        let store = nn::VarStore::new(Device::Cpu);
++        let config = ModelConfig {
++            seq_len: 96,
++            pred_len: 8,
++            patch_len: 8,
++            layers: 2,
++            d_model: 32,
++            heads: 4,
++            ffn: 64,
++            min_history: 8,
++            ..Default::default()
++        };
++        let _model = CausalPatchModel::new(&store.root(), &config);
++        let named = named_trainable_variables(&store);
++        let optimizer = polar_express(&named, NANOGPT_ADAMW_LR);
++        let muon = optimizer.muon_param_names();
++        let mut expected_muon: Vec<String> = (0..config.layers)
++            .flat_map(|layer| {
++                ["qkv", "output", "first", "second"]
++                    .into_iter()
++                    .map(move |projection| format!("block_{layer}.{projection}.weight"))
++            })
++            .collect();
++        expected_muon.sort();
++        let mut sorted_muon = muon.clone();
++        sorted_muon.sort();
++        assert_eq!(
++            sorted_muon, expected_muon,
++            "NorMuon must hold exactly the four hidden matrices per block - no norm gains \
++             (the RMSNorm is gainless), no biases (the block projections have none), and no \
++             recipe scalars"
++        );
++        // Every remaining parameter, with the group settings the reference prescribes:
++        // `(lr scale, betas, weight-decay multiplier)`.
++        for (name, lr_scale, wd_mul) in [
++            ("lambdas.resid", 5.0, 0.0),
++            ("lambdas.post", 1.0, 0.0),
++            ("lambdas.x0", 5.0, 0.0),
++            ("patch.weight", 1.0, 150.0),
++            ("patch.bias", 1.0, 0.0),
++            ("head.hidden.weight", 1.0, 150.0),
++            ("head.hidden.bias", 1.0, 0.0),
++            ("head.output.weight", 1.0, 150.0),
++            ("head.output.bias", 1.0, 0.0),
++        ] {
++            let (scale, betas, decay) = optimizer
++                .adamw_group_settings(name)
++                .unwrap_or_else(|| panic!("{name} is not an AdamW parameter"));
++            assert!(
++                (scale - lr_scale).abs() < 1e-12,
++                "{name} learning-rate scale is {scale}, expected {lr_scale}"
++            );
++            assert!(
++                (decay - wd_mul).abs() < 1e-12,
++                "{name} weight-decay multiplier is {decay}, expected {wd_mul}"
++            );
++            assert_eq!(betas, (0.9, 0.95), "{name} betas");
++        }
++        // And nothing outside those two lists exists: the union is the whole store, which
++        // `polar_express` already asserts, so it is enough to pin the AdamW count.
++        let lambda_banks = 3;
++        let per_block = 4;
++        assert_eq!(
++            muon.len(),
++            per_block * config.layers,
++            "one hidden matrix group per block projection"
++        );
++        assert_eq!(
++            optimizer.adamw_param_names().len(),
++            named.len() - per_block * config.layers,
++            "every non-hidden parameter is AdamW"
++        );
++        assert!(
++            optimizer
++                .adamw_param_names()
++                .iter()
++                .filter(|name| name.starts_with("lambdas."))
++                .count()
++                == lambda_banks,
++            "all three lambda banks are AdamW-routed"
++        );
++        for (name, tensor) in &named {
++            if name.starts_with("lambdas.") {
++                assert_eq!(
++                    tensor.dim(),
++                    1,
++                    "{name} must stay 1-D: a 2-D lambda bank is what NorMuon's router looks \
++                     for (optim/muon.rs:1316)"
++                );
++            }
++        }
++    }
+     #[test]
+     fn nanogpt_lr_scale_holds_then_cools_to_the_floor() {
+         let scheduled = 1270;

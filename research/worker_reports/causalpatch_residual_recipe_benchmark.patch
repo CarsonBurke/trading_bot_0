@@ -1,0 +1,42 @@
+--- a/trading_bots/src/torch/timexer_segment/benchmark.rs
++++ b/trading_bots/src/torch/timexer_segment/benchmark.rs
+@@ -707,9 +707,11 @@
+         let scaled = |row: &KernelRow| {
+             let name: &str = row.name;
+             let repeats = match name {
+-                // Two norms and two residual adds per layer; the embedding and the two
++                // Two pre-norms per layer and three residual `addcmul`s (the residual scale
++                // on both sub-blocks plus the x0 injection); the embedding and the two
+                 // pre-change reference forms run once for the whole step.
+-                "LayerNorm" | "residual add" => 2. * layers,
++                "RMSNorm" => 2. * layers,
++                "residual addcmul" => 3. * layers,
+                 "patch embedding tokens" | "reference embedding (cast after cat)" => 1.,
+                 _ => layers,
+             };
+@@ -753,8 +755,8 @@
+             );
+         }
+         // Sum of the parts against the whole. The composed layer, the once-per-step embedding
+-        // and the two pre-change reference forms are not parts of a layer; the norm and the
+-        // residual add are, twice each.
++        // and the two pre-change reference forms are not parts of a layer; the pre-norm runs
++        // twice per layer and the residual `addcmul` three times.
+         let parts: f64 = kernels
+             .iter()
+             .filter(|row| {
+@@ -764,10 +766,10 @@
+             })
+             .map(|row| {
+                 let each = row.forward_ms + row.backward_ms;
+-                if row.name == "LayerNorm" || row.name == "residual add" {
+-                    2. * each
+-                } else {
+-                    each
++                match row.name {
++                    "RMSNorm" => 2. * each,
++                    "residual addcmul" => 3. * each,
++                    _ => each,
+                 }
+             })
+             .sum();
