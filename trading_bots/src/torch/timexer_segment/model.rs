@@ -1,4 +1,5 @@
 use anyhow::{ensure, Result};
+use fused_kernels::{relu_square, rope as fused_rope};
 use serde::{Deserialize, Serialize};
 use tch::{nn, Device, Kind, Tensor};
 
@@ -204,25 +205,27 @@ impl ModelConfig {
         let fp32 = |elements: f64| 4. * elements;
         let mut bytes = bf16(tokens * self.patch_len as f64 * (CHANNELS as f64 + aux));
         // Per layer: two pre-norms (2·width), the packed projection (3·width), the QK norm over
-        // the packed `q‖k` block (2·width), the rotation's own intermediates (8·width - two
+        // the packed `q‖k` block (2·width), the rotation's OUTPUT (2·width - the only tensor
+        // `fused_kernels::rope` materializes, where the composed form charged 8·width for two
         // full-width products over that block, the two half-crossing sums and the buffer that
-        // interleaves them, see `Block::rotate`), the attention output, its projection and the
-        // two residual `addcmul`s (6·width), the x0 injection's second `addcmul` (1·width), and
-        // the feedforward triple (3·ffn - the up projection, `relu`, and `square`; GELU
-        // materialized only two). The rotation term was missing before this accounting was
-        // measured per kernel class: at `d_model` 512 it is 8 of the 22 width-units a layer
-        // materializes, so the bound it produced was 40% low.
+        // interleaved them), the attention output, its projection and the two residual
+        // `addcmul`s (6·width), the x0 injection's second `addcmul` (1·width), and the
+        // feedforward PAIR (2·ffn - the up projection and `fused_kernels::relu_square`'s single
+        // output; the `relu`-then-`square` composition materialized three, GELU two). The
+        // rotation term was missing entirely before this accounting was measured per kernel
+        // class, and at 8·width of 22 the bound it produced was 40% low.
         //
-        // The residual recipe added 3·width + 1·ffn per layer over the LayerNorm/GELU form
-        // (19·width + 2·ffn): the QK norm, the x0 `addcmul`, and the unfused `square`. The
-        // post-lambdas cost nothing here because they ride the projection weights
-        // ([`scaled_linear`]), and the residual scales cost nothing because `addcmul` folds
-        // them into the add that was already there.
+        // Against the LayerNorm/GELU form (19·width + 2·ffn) the residual recipe now adds
+        // 3·width per layer - the QK norm and the x0 `addcmul` - and nothing at all in the
+        // feedforward: with both fusions on the path, `square`'s extra `[tokens, ffn]` tensor
+        // and six of the rotation's eight width-units are gone. The post-lambdas cost nothing
+        // here because they ride the projection weights ([`scaled_linear`]), and the residual
+        // scales cost nothing because `addcmul` folds them into the add that was already there.
         bytes += self.layers as f64
             * bf16(
                 tokens
-                    * (2. * width + 3. * width + 2. * width + 8. * width + 6. * width + width
-                        + 3. * ffn),
+                    * (2. * width + 3. * width + 2. * width + 2. * width + 6. * width + width
+                        + 2. * ffn),
             );
         // The patch embedding's own norm: `x0 = rms_norm(patch(tokens))`, once per step.
         bytes += bf16(tokens * width);
@@ -405,21 +408,6 @@ struct BlockLambdas<'a> {
     x0: &'a Tensor,
 }
 
-/// Half-width rotary rows broadcast to the packed `q‖k` block: `[origins, head_dim/2]` ->
-/// `[1, origins, 2·heads·head_dim]`, where column `t·heads·head_dim + h·head_dim + s·half + r`
-/// carries row `r`. Built once, so the per-step cost is two reads of 384 KiB.
-fn rotation_tiles(cosine: &Tensor, sine: &Tensor, heads: i64) -> (Tensor, Tensor) {
-    let (length, half) = cosine
-        .size2()
-        .expect("rotary rows are [origins, head_dim/2]");
-    let tile = |rows: &Tensor| {
-        rows.reshape([1, length, 1, 1, 1, half])
-            .expand([1, length, 2, heads, 2, half], false)
-            .reshape([1, length, 4 * heads * half])
-    };
-    (tile(cosine), tile(sine))
-}
-
 struct Block {
     qkv: nn::Linear,
     output: nn::Linear,
@@ -456,41 +444,6 @@ impl Block {
             width,
             dropout: config.dropout,
         }
-    }
-
-    /// Rotary-embedded queries and keys as ONE contiguous `[batch, length, 2, heads, head_dim]`
-    /// buffer, from the packed `q‖k` block of the QKV projection.
-    ///
-    /// The per-tensor half-width form this replaces issued fourteen kernels a layer - two
-    /// `split_with_sizes`, eight 32-wide products and four 32-wide sums over strided
-    /// half-views, each touching 64-byte runs - to move exactly the same bytes as these five.
-    /// Here `cosine` and `sine` are single full-width products over the packed block (2 KiB of
-    /// contiguous columns per token), and the rotation is their half-crossing combination.
-    ///
-    /// Bit-identical to the half-width form: every element still gets one bf16-rounded product
-    /// and one bf16-rounded sum of the same two operands, and column
-    /// `t·width + h·head_dim + s·half + r` still carries tensor `t`, head `h`, half `s`,
-    /// rotary pair `r` - the same mapping `split(width, -1)` then `reshape([.., heads, head_dim])`
-    /// produced.
-    fn rotate(&self, packed: &Tensor, rotation: (&Tensor, &Tensor)) -> Tensor {
-        let (batch, length) = (packed.size()[0], packed.size()[1]);
-        let head_dim = self.width / self.heads;
-        let half = head_dim / 2;
-        let cosine = packed * rotation.0;
-        let sine = packed * rotation.1;
-        // `split`, not two `select`s: ATen's backward for `select` is `zeros_like(input)` plus a
-        // copy into the slice, so selecting the two halves of each product would zero-fill four
-        // 197 MB gradients a layer at batch 256 and then reduce them pairwise.
-        let halves = |product: &Tensor| {
-            let parts = product
-                .reshape([batch, length, 2, self.heads, 2, half])
-                .split(1, 4);
-            (parts[0].squeeze_dim(4), parts[1].squeeze_dim(4))
-        };
-        let (cos_low, cos_high) = halves(&cosine);
-        let (sin_low, sin_high) = halves(&sine);
-        Tensor::stack(&[&cos_low - &sin_high, &cos_high + &sin_low], 4)
-            .reshape([batch, length, 2, self.heads, head_dim])
     }
 
     /// One pre-norm block: `x = λr·x + λp·O(attn(rms(x))) + λ0·x0`, then
@@ -556,11 +509,18 @@ impl Block {
         //
         // `[batch, length, 2·heads, head_dim]` is a free reshape of the packed `q‖k` block -
         // column `t·heads·head_dim + h·head_dim + d` already carries tensor `t`, head `h`,
-        // dim `d` (see `Self::rotate`) - so one RMSNorm over the last axis is exactly
-        // per-head, per-token normalization of both q and k in a single kernel.
+        // dim `d` - so one RMSNorm over the last axis is exactly per-head, per-token
+        // normalization of both q and k in a single kernel.
         let normed = rms_norm(&packed[0].reshape([batch, length, 2 * self.heads, head_dim]))
             .reshape([batch, length, 2 * self.width]);
-        let rotated = self.rotate(&normed, rotation).split(1, 2);
+        // ONE kernel in each direction: `fused_kernels::rope` reads the normalized `q‖k`
+        // block, indexes the untiled `[origins, head_dim/2]` rotation rows directly and
+        // writes the `[batch, length, 2, heads, head_dim]` buffer. The composed form
+        // materialized two full-width products, two half-crossing sums and the buffer that
+        // interleaved them - eighteen `state`-units of traffic against this four - and needed
+        // 768 KiB of broadcast tiles that are no longer built at all. Bit-identical in both
+        // directions, so nothing downstream moves.
+        let rotated = fused_rope(&normed, rotation.0, rotation.1, self.heads).split(1, 2);
         // Value residual. `packed[1]` is the layer's own value, head-shaped by a VIEW (splitting
         // the last dimension is always expressible as a stride, so this costs nothing); the mix
         // is one `lerp` - a single read of each operand and one write - rather than the
@@ -606,12 +566,12 @@ impl Block {
         // RMS-normalized, so the activation's second moment is absorbed rather than
         // compensated. Its hidden width is `4 * model_dim` (`train_gpt.py:1299`), which is
         // exactly our fixed 2048 at `d_model` 512, so there is no width mismatch to correct
-        // either.
+        // either. ONE kernel in each direction: `fused_kernels::relu_square` is the same
+        // fusion the reference has as a Triton kernel, bit-identical to `relu().square()`
+        // down to the NaN conventions, and it removes the second full-width pass over the
+        // `[tokens, ffn]` hidden activation - the largest single traffic cost of this recipe.
         let ff = scaled_linear(
-            &linear(&rms_norm(&state), &self.first)
-                .relu()
-                .square()
-                .dropout(self.dropout, train),
+            &relu_square(&linear(&rms_norm(&state), &self.first)).dropout(self.dropout, train),
             &self.second,
             lambdas.post[1],
         )
@@ -776,10 +736,11 @@ pub struct KernelClass<'a> {
 pub struct CausalPatchModel {
     config: ModelConfig,
     patch: nn::Linear,
-    /// Rotary `cos`/`sin` tiled across the packed `q‖k` block, `[1, origins, 2·d_model]` bf16:
-    /// column `t·d_model + h·head_dim + s·(head_dim/2) + r` carries the pair-`r` row for both
-    /// tensors, every head and both halves. 768 KiB of constants that turn the rotation into
-    /// two full-width products - see [`Block::rotate`].
+    /// Rotary `cos`/`sin` for the fixed position grid, `[origins, head_dim/2]` bf16 and
+    /// UNTILED: row `t`, column `r` is the pair-`r` angle at origin `t`. 24 KiB apiece that the
+    /// whole stack reads out of L2, because `fused_kernels::rope` indexes these rows directly -
+    /// the composed rotation needed them broadcast to a `[1, origins, 2·d_model]` pair of
+    /// 768 KiB tiles.
     rotation: (Tensor, Tensor),
     blocks: Vec<Block>,
     /// Per-sub-block residual-stream scale, `[2·layers]` fp32, laid out `[attn_0, ffn_0,
@@ -850,14 +811,14 @@ impl CausalPatchModel {
         let sigma_scale = Tensor::from_slice(&sigma_scale).to_device(device);
         // The dense causal-patch model attends over a FIXED position grid, so the rotation rows
         // are constant: building them once removes four small kernels per attention tensor per
-        // layer (64 launches per forward), and tiling them across the packed `q‖k` block removes
-        // nine more per layer (see [`Block::rotate`]).
+        // layer (64 launches per forward), and `fused_kernels::rope` consumes them in exactly
+        // this untiled form, so the broadcast tiles the composed rotation needed are never
+        // built at all.
         let rope = RotaryEmbedding::new(config.origins(), head_dim, head_dim, device);
-        let (cosine, sine) = rope.cached_rotation(
+        let rotation = rope.cached_rotation(
             &Tensor::arange(config.origins(), (Kind::Int64, device)),
             Kind::BFloat16,
         );
-        let rotation = rotation_tiles(&cosine, &sine, config.heads);
         Self {
             patch: projection(
                 path / "patch",
@@ -1255,12 +1216,16 @@ impl CausalPatchModel {
             KernelClass {
                 name: "rotary rotation",
                 inputs: vec![activation(2 * width)],
-                // Two full-width products (4·state each), two half-crossing sums (3·state
-                // each) and the stack that interleaves them back (4·state).
-                forward_bytes: 18. * state,
+                // ONE kernel: `fused_kernels::rope` reads the packed `q‖k` block and writes the
+                // rotated buffer, so this charges `4·state`. The composition charged `18·state`
+                // - two full-width products (4·state each), two half-crossing sums (3·state
+                // each) and the stack that interleaved them back (4·state) - and the 768 KiB of
+                // broadcast tiles it needed are not built either: the kernel indexes the
+                // untiled `[origins, head_dim/2]` rows directly, which round to nothing here.
+                forward_bytes: 4. * state,
                 forward_flops: 6. * tokens * width as f64,
                 parameters: Vec::new(),
-                run: Box::new(move |input| block.rotate(&input[0], rotation)),
+                run: Box::new(move |input| fused_rope(&input[0], rotation.0, rotation.1, heads)),
             },
             KernelClass {
                 name: "causal SDPA",
@@ -1345,17 +1310,17 @@ impl CausalPatchModel {
             KernelClass {
                 name: "ReLU^2",
                 inputs: vec![activation(ffn)],
-                // TWO kernels, not one: `relu` writes a `[tokens, ffn]` tensor that `square`
-                // reads back. GELU charged `2·hidden` for its single pass; this charges
-                // `4·hidden`, and the extra materialized `[tokens, ffn]` tensor is the single
-                // largest traffic cost of the residual recipe. The reference pays it once, in
-                // a fused Triton kernel (`train_gpt.py:46-48`,
-                // `relu(x @ W1.T)^2 @ W2.T`); ATen has no fused ReLU², so until one exists
-                // this is the honest number.
-                forward_bytes: 4. * hidden,
+                // ONE kernel: `fused_kernels::relu_square` writes its result in a single pass,
+                // so this charges `2·hidden` - what GELU charged - instead of the `4·hidden`
+                // the `relu`-then-`square` composition charged, and the extra materialized
+                // `[tokens, ffn]` tensor that was the single largest traffic cost of the
+                // residual recipe does not exist. Same fusion the reference has as a Triton
+                // kernel (`train_gpt.py:46-48`, `relu(x @ W1.T)^2 @ W2.T`), and ours is
+                // bit-identical to the composition it replaces in both directions.
+                forward_bytes: 2. * hidden,
                 forward_flops: 2. * tokens * ffn as f64,
                 parameters: Vec::new(),
-                run: Box::new(move |input| input[0].relu().square()),
+                run: Box::new(move |input| relu_square(&input[0])),
             },
             KernelClass {
                 name: "FFN down projection",
@@ -2387,7 +2352,6 @@ mod tests {
             &Tensor::arange(length, (Kind::Int64, Device::Cpu)),
             Kind::BFloat16,
         );
-        let tiles = rotation_tiles(&cosine, &sine, heads);
         let input = (Tensor::randn([rows, length, width], (Kind::Float, Device::Cpu)) * 0.5)
             .to_kind(Kind::BFloat16)
             .set_requires_grad(true);
@@ -2444,9 +2408,7 @@ mod tests {
         let packed = projection.split_with_sizes([2 * width, width], -1);
         let normed_packed = rms_norm(&packed[0].reshape([rows, length, 2 * heads, head_dim]))
             .reshape([rows, length, 2 * width]);
-        let rotated = block
-            .rotate(&normed_packed, (&tiles.0, &tiles.1))
-            .split(1, 2);
+        let rotated = fused_rope(&normed_packed, &cosine, &sine, heads).split(1, 2);
         let query_key = |tensor: &Tensor| tensor.squeeze_dim(2).transpose(1, 2);
         let fused = [
             query_key(&rotated[0]),
@@ -2468,11 +2430,11 @@ mod tests {
                 "{name} is not bit-identical to the per-tensor rotation"
             );
         }
-        // Rotation is not the identity: the tiles must actually rotate, or the test above would
-        // pass on a pair of untouched projections.
+        // Rotation is not the identity: the kernel must actually rotate, or the test above
+        // would pass on a pair of untouched projections.
         assert!(
             (&reference[0] - per_head(&parts[0])).abs().max().double_value(&[]) > 0.0,
-            "the rotary tiles left the query unchanged"
+            "the rotary rows left the query unchanged"
         );
         let attended = Tensor::scaled_dot_product_attention(
             &reference[0],
@@ -2496,7 +2458,7 @@ mod tests {
         )
         .addcmul(&state, block_lambdas.resid[1]);
         let (actual, published) =
-            block.forward(&input, &x0, None, &block_lambdas, (&tiles.0, &tiles.1), false);
+            block.forward(&input, &x0, None, &block_lambdas, (&cosine, &sine), false);
         // The SOURCE layer publishes exactly its own value, and mixes nothing into it.
         assert!(block.value_lambda.is_none(), "layer 0 owns no lambda");
         assert_eq!(
@@ -2702,24 +2664,22 @@ mod tests {
             min_history: 4,
             ..Default::default()
         };
-        let store = nn::VarStore::new(Device::Cpu);
-        let block = Block::new(store.root() / "block", &config, 0);
         let length = config.origins();
         let rope = RotaryEmbedding::new(length, head_dim, head_dim, Device::Cpu);
         let (cosine, sine) = rope.cached_rotation(
             &Tensor::arange(length, (Kind::Int64, Device::Cpu)),
             Kind::Float,
         );
-        let tiles = rotation_tiles(&cosine, &sine, heads);
         let projection = Tensor::randn([1, length, 2 * width], (Kind::Float, Device::Cpu));
-        let norm_then_rotate = block.rotate(
+        let norm_then_rotate = fused_rope(
             &rms_norm(&projection.reshape([1, length, 2 * heads, head_dim]))
                 .reshape([1, length, 2 * width]),
-            (&tiles.0, &tiles.1),
+            &cosine,
+            &sine,
+            heads,
         );
         let rotate_then_norm = rms_norm(
-            &block
-                .rotate(&projection, (&tiles.0, &tiles.1))
+            &fused_rope(&projection, &cosine, &sine, heads)
                 .reshape([1, length, 2 * heads, head_dim]),
         )
         .reshape([1, length, 2, heads, head_dim]);
@@ -3163,7 +3123,6 @@ mod tests {
             &Tensor::arange(length, (Kind::Int64, Device::Cpu)),
             Kind::BFloat16,
         );
-        let tiles = rotation_tiles(&cosine, &sine, heads);
         let input = (Tensor::randn([rows, length, width], (Kind::Float, Device::Cpu)) * 0.5)
             .to_kind(Kind::BFloat16)
             .set_requires_grad(true);
@@ -3197,7 +3156,7 @@ mod tests {
             let packed = projection.split_with_sizes([2 * width, width], -1);
             let normed = rms_norm(&packed[0].reshape([rows, length, 2 * heads, head_dim]))
                 .reshape([rows, length, 2 * width]);
-            let rotated = block.rotate(&normed, (&tiles.0, &tiles.1)).split(1, 2);
+            let rotated = fused_rope(&normed, &cosine, &sine, heads).split(1, 2);
             let query_key = |tensor: &Tensor| tensor.squeeze_dim(2).transpose(1, 2);
             let value = replacement
                 .map(Tensor::shallow_clone)
@@ -3254,7 +3213,7 @@ mod tests {
                 &x0,
                 Some(&first),
                 &block_lambdas,
-                (&tiles.0, &tiles.1),
+                (&cosine, &sine),
                 false,
             );
             assert!(
@@ -3298,7 +3257,7 @@ mod tests {
             &x0,
             Some(&first),
             &block_lambdas,
-            (&tiles.0, &tiles.1),
+            (&cosine, &sine),
             false,
         );
         let grad = Tensor::run_backward(&[&output], &[lambda.shallow_clone()], false, false);
