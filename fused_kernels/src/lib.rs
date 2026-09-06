@@ -456,6 +456,7 @@ pub mod reference {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Mutex, MutexGuard};
     use tch::{Device, Kind};
 
     /// Rotary rows at the real geometry, built the way the model builds them: half-width
@@ -731,15 +732,56 @@ mod tests {
         );
     }
 
+    /// The device a CUDA test runs on, together with the process-wide claim on it that lets
+    /// `cargo test -p fused_kernels` be green without a `--test-threads=1` incantation.
+    ///
+    /// WHY A LOCK, and why not a private stream. `CUDAGraph::capture_begin` captures in
+    /// `cudaStreamCaptureModeGlobal`, the only mode libtorch's C++ API exposes, and that
+    /// mode rejects any "unsafe" CUDA action anywhere in the PROCESS for as long as the
+    /// capture is open. Cargo runs tests on one thread each, so a sibling CUDA test doing a
+    /// host-to-device copy dies inside `CachingHostAllocator` with
+    /// `cudaErrorStreamCaptureUnsupported` and takes the capture down with it
+    /// (`cudaErrorStreamCaptureInvalidated`). Capturing on a side stream does NOT help: the
+    /// restriction is on the process, not on the stream. The capture test passing under
+    /// `--test-threads=1` was a scheduling accident, and `WireKernels` caught it on the
+    /// merged tip (job 5185: 6 of 14 failed).
+    ///
+    /// So the device is handed out under a mutex, and it is handed out ONLY under the mutex:
+    /// [`CudaClaim`] is the sole way for a test in this module to name a CUDA device, which
+    /// is what stops the next CUDA test anyone adds from forgetting to serialize. Bind the
+    /// claim to a `let` for the whole test body - `*cuda()?` in a temporary would release it
+    /// at the end of that statement.
+    struct CudaClaim {
+        /// Never read: its Drop is the whole point.
+        _claim: MutexGuard<'static, ()>,
+        device: Device,
+    }
+
+    impl std::ops::Deref for CudaClaim {
+        type Target = Device;
+
+        fn deref(&self) -> &Device {
+            &self.device
+        }
+    }
+
+    static CUDA_DEVICE: Mutex<()> = Mutex::new(());
+
     /// Skipped, not failed, without a device - the same gate the repository's other CUDA
     /// tests use, so `cargo test` runs off the training box.
-    fn cuda() -> Option<Device> {
-        tch::Cuda::is_available().then_some(Device::Cuda(0))
+    fn cuda() -> Option<CudaClaim> {
+        tch::Cuda::is_available().then(|| CudaClaim {
+            // A failing CUDA test poisons this mutex. The tests after it should report their
+            // own result rather than a poison error about someone else's failure.
+            _claim: CUDA_DEVICE.lock().unwrap_or_else(|error| error.into_inner()),
+            device: Device::Cuda(0),
+        })
     }
 
     #[test]
     fn fused_relu_square_is_bit_identical_including_gradients() {
-        let Some(device) = cuda() else { return };
+        let Some(claim) = cuda() else { return };
+        let device = *claim;
         // The second shape is deliberately not a multiple of eight, so the vectorized body
         // and the scalar path are both covered by the same assertion.
         for shape in [vec![4096i64, 2048i64], vec![1023i64]] {
@@ -784,7 +826,8 @@ mod tests {
 
     #[test]
     fn fused_rope_is_bit_identical_including_gradients() {
-        let Some(device) = cuda() else { return };
+        let Some(claim) = cuda() else { return };
+        let device = *claim;
         let (heads, head_dim, length, batch) = (8i64, 64i64, 375i64, 3i64);
         let half = head_dim / 2;
         let width = heads * head_dim;
@@ -844,7 +887,8 @@ mod tests {
     /// suite gets exactly one capture window.
     #[test]
     fn every_kernel_captures_and_replays_inside_a_cuda_graph() {
-        let Some(device) = cuda() else { return };
+        let Some(claim) = cuda() else { return };
+        let device = *claim;
         if !unsafe { torch_sys::at_cuda_graph_is_available() } {
             return;
         }
@@ -983,7 +1027,8 @@ mod tests {
     /// land in the right columns of a wider one.
     #[test]
     fn fused_qk_norm_rope_is_bit_identical_including_gradients() {
-        let Some(device) = cuda() else { return };
+        let Some(claim) = cuda() else { return };
+        let device = *claim;
         let (heads, head_dim, length, batch) = (8i64, 64i64, 375i64, 3i64);
         let half = head_dim / 2;
         let width = heads * head_dim;
@@ -1040,7 +1085,8 @@ mod tests {
     /// the baseline this op actually replaces once the packed rotary has landed.
     #[test]
     fn fused_qk_norm_rope_matches_the_norm_plus_fused_rotary_pair() {
-        let Some(device) = cuda() else { return };
+        let Some(claim) = cuda() else { return };
+        let device = *claim;
         let (heads, head_dim, length, batch) = (8i64, 64i64, 375i64, 2i64);
         let (cosine, sine) = rotation(length, head_dim / 2, device);
         let packed = qk_sample(&[batch, length, 2 * heads * head_dim], device);
@@ -1057,7 +1103,8 @@ mod tests {
     /// dead, unproven code the moment a head dimension changed.
     #[test]
     fn fused_qk_norm_rope_is_bit_identical_on_the_emulated_reduction_path() {
-        let Some(device) = cuda() else { return };
+        let Some(claim) = cuda() else { return };
+        let device = *claim;
         let (heads, head_dim, length, batch) = (3i64, 12i64, 17i64, 2i64);
         let (cosine, sine) = rotation(length, head_dim / 2, device);
         let packed = qk_sample(&[batch, length, 2 * heads * head_dim], device);
@@ -1106,7 +1153,8 @@ mod tests {
     /// kernel quietly drifting off the reference.
     #[test]
     fn qk_norm_rope_rounding_is_the_measured_pair() {
-        let Some(device) = cuda() else { return };
+        let Some(claim) = cuda() else { return };
+        let device = *claim;
         let (heads, head_dim, length, batch) = (8i64, 64i64, 375i64, 2i64);
         let (cosine, sine) = rotation(length, head_dim / 2, device);
         let width = heads * head_dim;
@@ -1162,7 +1210,8 @@ mod tests {
     /// whether it was the tree or the arithmetic that was wrong.
     #[test]
     fn atens_rms_statistic_is_the_reduction_tree_the_kernel_reproduces() {
-        let Some(device) = cuda() else { return };
+        let Some(claim) = cuda() else { return };
+        let device = *claim;
         let (rows, head_dim) = (4096i64, 64i64);
         let values = bf16_randn(&[rows, head_dim], device);
         let statistic = values

@@ -314,7 +314,37 @@ the ownership line, handed to `WireKernels`:
 - `model.rs:376-377` (and the `NORM_EPS` doc) state the `finfo(bf16).eps = 7.8e-3` default.
   That claim is not true of this torch; see the eps bullet in section 3.
 
-## 7. What is NOT claimed
+## 7. The test suite was racy, and why a side stream is not the fix
+
+`WireKernels` ran `cargo test -p fused_kernels` on the merged tip (job 5185) and got **8
+passed, 6 FAILED**: five CUDA tests died in `CachingHostAllocator` / `memcpy_and_sync` with
+`cudaErrorStreamCaptureUnsupported`, and `every_kernel_captures_and_replays_inside_a_cuda_graph`
+then died with `cudaErrorStreamCaptureInvalidated`. My own 14/14 runs (jobs 5180, 5182) used
+`--test-threads=1` and were therefore not evidence of anything. Recorded here because the
+diagnosis is a property of libtorch that any future capture test in this repository will hit.
+
+`CUDAGraph::capture_begin` captures in `cudaStreamCaptureModeGlobal` - the only mode libtorch's
+C++ API exposes, and `torch-sys` binds no mode argument at all
+(`at_cuda_graph_capture_begin(graph, device_index)`). Global mode rejects any "unsafe" CUDA
+action **anywhere in the process** while a capture is open, and a host-to-device copy in a
+sibling test thread is exactly such an action. **Capturing on a private stream does not fix
+this**, which is the tempting wrong answer: the restriction is scoped to the process, not to the
+stream, so the sibling still dies and still invalidates the capture.
+
+The fix is therefore serialization, and the thing worth designing is making it unforgettable
+rather than a `--test-threads=1` incantation. `cuda()` now returns a `CudaClaim`: a
+`MutexGuard<'static, ()>` plus the `Device`, `Deref`ing to the `Device`. It is the only way for
+a test in this module to name a CUDA device, so a new CUDA test cannot fail to serialize - the
+type system hands out the device only under the lock. The mutex is drained of poison
+(`unwrap_or_else(|e| e.into_inner())`) so a failing CUDA test reports its own assertion rather
+than poisoning every test after it. The CPU tests are unaffected and still run concurrently:
+they touch no CUDA.
+
+Verified as the harness actually runs it - job 5187, `cargo test --release -p fused_kernels`
+with cargo's default thread count (24 on this box), **five consecutive runs, 14/14 each**.
+Total CUDA test time is 0.3 s, so the serialization costs nothing worth measuring.
+
+## 8. What is NOT claimed
 
 - No capture-budget relief. 234 MiB is 0.9% of a 25.9 GiB usable budget and 1.4% of the
   ~17.0 GiB a forward+backward private mempool needs. The op is a 16.4 ms/step win that also
