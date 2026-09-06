@@ -210,6 +210,408 @@ __global__ void rope_scalar(const __nv_bfloat16 *__restrict__ input,
     }
 }
 
+// ---------------------------------------------------------------------------------------
+// Fused per-head QK-normalization + packed rotary.
+//
+// The composition this replaces is `_fused_rms_norm(q‖k viewed as [.., 2*heads, head_dim])`
+// followed by the packed rotation, so the normalized `q‖k` is a materialized bf16 tensor
+// that only the rotation ever reads. Here it never exists: the kernel takes the RAW packed
+// block, normalizes each head block of `head_dim` over itself, rotates, and writes only the
+// rotated result. The backward recomputes the per-head RMS from the raw block it is already
+// streaming for the `x·rstd·stats` term, so no `rstd` tensor is retained either.
+//
+// BIT-IDENTITY IS A REDUCTION-ORDER PROBLEM. `rstd` is fp32 and a bf16 output has an 8-bit
+// mantissa, so a 1-ulp fp32 difference in `rstd` flips roughly one output element in 10^5 -
+// about 1500 elements per layer at the training shape. Matching ATen therefore means
+// reproducing its summation TREE, not merely summing the same numbers. ATen's forward for
+// bf16 with `N % 4 == 0` is `vectorized_layer_norm_kernel<..., rms_norm=true>` launched with
+// `dim3(32, num_threads()/32) = (32, 4)`; `compute_stats` gives thread `thrx` the vectors
+// `i ≡ thrx (mod 128)` of four elements each, accumulates each vector's squares serially
+// from `0.f`, reduces across the warp with `WARP_SHFL_DOWN` at offsets 16..1, then across
+// the four warps, and finally divides by `N`. The backward is
+// `layer_norm_grad_input_kernel_vectorized` with 128 threads, whose `BlockReduceSum` is the
+// same 32-lane tree over the same four-element partials. So for `head_dim <= 128` both
+// directions are: partials over four CONSECUTIVE elements, then a 32-slot binary tree.
+//
+// This kernel keeps the rotary kernel's thread mapping - one thread per `(row, head block,
+// vector)` with `V = half/8` threads per head block, each holding one 128-bit vector of the
+// low half and one of the high half - and reproduces that tree exactly on it. Thread `j`
+// owns partials `2j, 2j+1` (low) and `2V+2j, 2V+2j+1` (high), so ATen's `offset == 2V` level
+// is thread-local, every offset above it adds a structural zero, and the levels below it are
+// `log2(V)` XOR butterflies over the head block's own lanes. Nothing is approximated and
+// nothing is reassociated.
+
+// `Fma` selects whether a squared/product accumulation contracts into one `fma`. It is a
+// template parameter and not a taste question: which one ATen's own build emitted is a
+// property of ITS compiler, it changes the last bit of the reduction, and the answer was
+// measured (see `qk_norm_rope_rounding_is_the_measured_one`). `__fmul_rn`/`__fadd_rn` are
+// used for the non-fused form because plain `*`/`+` would let nvcc contract them anyway.
+template <bool Fma>
+__device__ __forceinline__ float accumulate_square(float accumulator, float value) {
+    return Fma ? __fmaf_rn(value, value, accumulator)
+               : __fadd_rn(accumulator, __fmul_rn(value, value));
+}
+
+template <bool Fma>
+__device__ __forceinline__ float accumulate_product(float accumulator, float left,
+                                                    float right) {
+    return Fma ? __fmaf_rn(left, right, accumulator)
+               : __fadd_rn(accumulator, __fmul_rn(left, right));
+}
+
+// One of ATen's four-element partials over a strided run of a thread's own vector.
+template <bool Fma>
+__device__ __forceinline__ float square_partial(const float *values) {
+    float accumulator = 0.0f;
+#pragma unroll
+    for (int lane = 0; lane < 4; ++lane) {
+        accumulator = accumulate_square<Fma>(accumulator, values[lane]);
+    }
+    return accumulator;
+}
+
+// The `log2(V)` XOR butterflies plus the final local add: ATen's offsets `V, V/2, .., 1`
+// over the `2V` values left after the thread-local `offset == 2V` level. Every lane of the
+// head block ends with the identical total, which is what lets each lane normalize its own
+// elements without a broadcast.
+//
+// The mask is the head block's own lanes, never `0xffffffff`: `items` is always a multiple
+// of `V` and the grid stride is too, so a head block is never split across the loop's tail,
+// but the WARP can be - and a full-mask shuffle against exited threads is undefined.
+__device__ __forceinline__ float head_block_total(float first, float second,
+                                                  int64_t half_vectors, unsigned lane) {
+    const unsigned block_lanes = static_cast<unsigned>(half_vectors);
+    const unsigned mask = ((1u << block_lanes) - 1u) << (lane & ~(block_lanes - 1u));
+    for (int64_t offset = half_vectors / 2; offset >= 1; offset >>= 1) {
+        first += __shfl_xor_sync(mask, first, static_cast<int>(offset));
+        second += __shfl_xor_sync(mask, second, static_cast<int>(offset));
+    }
+    return first + second;
+}
+
+// `rsqrtf`, not `1.0f / sqrtf`: `c10::cuda::compat::rsqrt` is `rsqrtf`, which is a different
+// instruction with a different result, and this is the one place where a two-ulp intrinsic
+// has to be reproduced rather than improved on.
+__device__ __forceinline__ float inverse_rms(float sum_of_squares, float width, float eps) {
+    return rsqrtf(sum_of_squares / width + eps);
+}
+
+// The normalized value AS THE COMPOSITION MATERIALIZES IT: one fp32 multiply, rounded to
+// bf16 exactly once, then widened again for the rotation. Keeping `rstd * x` in fp32 through
+// the rotation would be strictly more accurate and would not be the reference.
+__device__ __forceinline__ float normalized(float value, float rstd) {
+    return __bfloat162float(__float2bfloat16(rstd * value));
+}
+
+template <bool Fma>
+__global__ void qk_norm_rope_forward_vec(const Vec8 *__restrict__ input,
+                                         const Vec8 *__restrict__ cosine,
+                                         const Vec8 *__restrict__ sine,
+                                         Vec8 *__restrict__ output, int64_t rows,
+                                         int64_t length, int64_t blocks,
+                                         int64_t half_vectors, int64_t input_row_vectors,
+                                         int64_t output_row_vectors, float width,
+                                         float eps) {
+    const int64_t per_row = blocks * half_vectors;
+    const int64_t items = rows * per_row;
+    const int64_t stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
+    const unsigned lane = threadIdx.x & 31u;
+    for (int64_t index = blockIdx.x * static_cast<int64_t>(blockDim.x) + threadIdx.x;
+         index < items; index += stride) {
+        const int64_t row = index / per_row;
+        const int64_t within = index - row * per_row;
+        const int64_t block = within / half_vectors;
+        const int64_t vector = within - block * half_vectors;
+        const int64_t position = row % length;
+
+        const int64_t in_low = row * input_row_vectors + block * 2 * half_vectors + vector;
+        const int64_t out_low = row * output_row_vectors + block * 2 * half_vectors + vector;
+        const int64_t rotation = position * half_vectors + vector;
+
+        const Vec8 low = input[in_low];
+        const Vec8 high = input[in_low + half_vectors];
+        float raw_low[8];
+        float raw_high[8];
+#pragma unroll
+        for (int slot = 0; slot < 8; ++slot) {
+            raw_low[slot] = __bfloat162float(low.lane[slot]);
+            raw_high[slot] = __bfloat162float(high.lane[slot]);
+        }
+        // ATen's `offset == 2V` level, thread-local: partial `2j` pairs with `2j+2V`, which
+        // is this thread's own high vector, and `2j+1` with `2j+1+2V`.
+        const float first = square_partial<Fma>(raw_low) + square_partial<Fma>(raw_high);
+        const float second =
+            square_partial<Fma>(raw_low + 4) + square_partial<Fma>(raw_high + 4);
+        const float rstd =
+            inverse_rms(head_block_total(first, second, half_vectors, lane), width, eps);
+
+        const Vec8 cos = cosine[rotation];
+        const Vec8 sin = sine[rotation];
+        Vec8 out_a;
+        Vec8 out_b;
+#pragma unroll
+        for (int slot = 0; slot < 8; ++slot) {
+            const float y_low = normalized(raw_low[slot], rstd);
+            const float y_high = normalized(raw_high[slot], rstd);
+            const float c = __bfloat162float(cos.lane[slot]);
+            const float s = __bfloat162float(sin.lane[slot]);
+            out_a.lane[slot] =
+                __float2bfloat16(rounded_product(y_low, c) - rounded_product(y_high, s));
+            out_b.lane[slot] =
+                __float2bfloat16(rounded_product(y_high, c) + rounded_product(y_low, s));
+        }
+        output[out_low] = out_a;
+        output[out_low + half_vectors] = out_b;
+    }
+}
+
+// `dx = ((width·gy) - (x·rstd)·stats) · ((1/width)·rstd)`, where `gy` is the gradient the
+// composition would have MATERIALIZED between the two ops - the transposed rotation of
+// `grad_output`, rounded to bf16 - and `stats = Σ (gy·x)·rstd` over the head block in ATen's
+// tree. Written in ATen's operation order, term by term, because that order is the answer.
+template <bool Fma, bool FmaStats, bool FmaGrad>
+__global__ void qk_norm_rope_backward_vec(
+    const Vec8 *__restrict__ grad, const Vec8 *__restrict__ input,
+    const Vec8 *__restrict__ cosine, const Vec8 *__restrict__ sine, Vec8 *__restrict__ dx,
+    int64_t rows, int64_t length, int64_t blocks, int64_t half_vectors,
+    int64_t grad_row_vectors, int64_t input_row_vectors, int64_t dx_row_vectors, float width,
+    float eps) {
+    const int64_t per_row = blocks * half_vectors;
+    const int64_t items = rows * per_row;
+    const int64_t stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
+    const unsigned lane = threadIdx.x & 31u;
+    for (int64_t index = blockIdx.x * static_cast<int64_t>(blockDim.x) + threadIdx.x;
+         index < items; index += stride) {
+        const int64_t row = index / per_row;
+        const int64_t within = index - row * per_row;
+        const int64_t block = within / half_vectors;
+        const int64_t vector = within - block * half_vectors;
+        const int64_t position = row % length;
+
+        const int64_t offset = block * 2 * half_vectors + vector;
+        const int64_t rotation = position * half_vectors + vector;
+        const Vec8 grad_low = grad[row * grad_row_vectors + offset];
+        const Vec8 grad_high = grad[row * grad_row_vectors + offset + half_vectors];
+        const Vec8 low = input[row * input_row_vectors + offset];
+        const Vec8 high = input[row * input_row_vectors + offset + half_vectors];
+        const Vec8 cos = cosine[rotation];
+        const Vec8 sin = sine[rotation];
+
+        float raw_low[8];
+        float raw_high[8];
+        float gy_low[8];
+        float gy_high[8];
+#pragma unroll
+        for (int slot = 0; slot < 8; ++slot) {
+            raw_low[slot] = __bfloat162float(low.lane[slot]);
+            raw_high[slot] = __bfloat162float(high.lane[slot]);
+            const float g_low = __bfloat162float(grad_low.lane[slot]);
+            const float g_high = __bfloat162float(grad_high.lane[slot]);
+            const float c = __bfloat162float(cos.lane[slot]);
+            const float s = __bfloat162float(sin.lane[slot]);
+            // The transpose of the rotation, rounded to bf16 where the composition wrote a
+            // bf16 tensor. This is the QK-norm backward's `dY`.
+            gy_low[slot] = __bfloat162float(
+                __float2bfloat16(rounded_product(g_low, c) + rounded_product(g_high, s)));
+            gy_high[slot] = __bfloat162float(
+                __float2bfloat16(rounded_product(g_high, c) - rounded_product(g_low, s)));
+        }
+
+        const float rstd = inverse_rms(
+            head_block_total(square_partial<Fma>(raw_low) + square_partial<Fma>(raw_high),
+                             square_partial<Fma>(raw_low + 4) + square_partial<Fma>(raw_high + 4),
+                             half_vectors, lane),
+            width, eps);
+
+        float stats_first = 0.0f;
+        float stats_second = 0.0f;
+#pragma unroll
+        for (int slot = 0; slot < 4; ++slot) {
+            stats_first = accumulate_product<FmaStats>(
+                stats_first, __fmul_rn(gy_low[slot], raw_low[slot]), rstd);
+            stats_second = accumulate_product<FmaStats>(
+                stats_second, __fmul_rn(gy_low[slot + 4], raw_low[slot + 4]), rstd);
+        }
+        float stats_high_first = 0.0f;
+        float stats_high_second = 0.0f;
+#pragma unroll
+        for (int slot = 0; slot < 4; ++slot) {
+            stats_high_first = accumulate_product<FmaStats>(
+                stats_high_first, __fmul_rn(gy_high[slot], raw_high[slot]), rstd);
+            stats_high_second = accumulate_product<FmaStats>(
+                stats_high_second, __fmul_rn(gy_high[slot + 4], raw_high[slot + 4]), rstd);
+        }
+        const float stats = head_block_total(stats_first + stats_high_first,
+                                             stats_second + stats_high_second, half_vectors,
+                                             lane);
+
+        const float term = __fmul_rn(1.0f / width, rstd);
+        Vec8 out_a;
+        Vec8 out_b;
+#pragma unroll
+        for (int slot = 0; slot < 8; ++slot) {
+            float grad_input_low = __fmul_rn(width, gy_low[slot]);
+            float grad_input_high = __fmul_rn(width, gy_high[slot]);
+            const float scaled_low = __fmul_rn(raw_low[slot], rstd);
+            const float scaled_high = __fmul_rn(raw_high[slot], rstd);
+            if (FmaGrad) {
+                grad_input_low = __fmaf_rn(-scaled_low, stats, grad_input_low);
+                grad_input_high = __fmaf_rn(-scaled_high, stats, grad_input_high);
+            } else {
+                grad_input_low = __fsub_rn(grad_input_low, __fmul_rn(scaled_low, stats));
+                grad_input_high = __fsub_rn(grad_input_high, __fmul_rn(scaled_high, stats));
+            }
+            out_a.lane[slot] = __float2bfloat16(__fmul_rn(grad_input_low, term));
+            out_b.lane[slot] = __float2bfloat16(__fmul_rn(grad_input_high, term));
+        }
+        dx[row * dx_row_vectors + offset] = out_a;
+        dx[row * dx_row_vectors + offset + half_vectors] = out_b;
+    }
+}
+
+// The same reduction tree, emulated by ONE thread over a whole head block, for geometries
+// the 128-bit path cannot take (`half` not a multiple of eight, or unaligned buffers). ATen
+// still runs its vectorized kernel there - the choice is made on ITS contiguous copy, which
+// is always aligned - so this path has to reproduce the same tree rather than a convenient
+// one. `slot[i]` is ATen lane `i`'s partial; every partial lands in the first warp because
+// `head_dim <= 128`, and the in-place ascending sweep is safe because level `offset` only
+// reads slots above the one it writes.
+struct AtenTree {
+    float slot[32];
+
+    __device__ __forceinline__ void clear() {
+#pragma unroll
+        for (int index = 0; index < 32; ++index) {
+            slot[index] = 0.0f;
+        }
+    }
+
+    __device__ __forceinline__ float total() {
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            for (int index = 0; index + offset < 32; ++index) {
+                slot[index] += slot[index + offset];
+            }
+        }
+        return slot[0];
+    }
+};
+
+template <bool Fma>
+__global__ void qk_norm_rope_forward_scalar(const __nv_bfloat16 *__restrict__ input,
+                                            const __nv_bfloat16 *__restrict__ cosine,
+                                            const __nv_bfloat16 *__restrict__ sine,
+                                            __nv_bfloat16 *__restrict__ output, int64_t rows,
+                                            int64_t length, int64_t blocks, int64_t half,
+                                            int64_t input_row_stride,
+                                            int64_t output_row_stride, float width,
+                                            float eps) {
+    const int64_t items = rows * blocks;
+    const int64_t count = 2 * half;
+    const int64_t stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
+    for (int64_t index = blockIdx.x * static_cast<int64_t>(blockDim.x) + threadIdx.x;
+         index < items; index += stride) {
+        const int64_t row = index / blocks;
+        const int64_t block = index - row * blocks;
+        const int64_t position = row % length;
+        const __nv_bfloat16 *source = input + row * input_row_stride + block * count;
+        __nv_bfloat16 *target = output + row * output_row_stride + block * count;
+
+        AtenTree tree;
+        tree.clear();
+        for (int64_t partial = 0; partial < count / 4; ++partial) {
+            float accumulator = 0.0f;
+            for (int64_t element = 0; element < 4; ++element) {
+                accumulator = accumulate_square<Fma>(
+                    accumulator, __bfloat162float(source[partial * 4 + element]));
+            }
+            tree.slot[partial] = accumulator;
+        }
+        const float rstd = inverse_rms(tree.total(), width, eps);
+
+        for (int64_t pair = 0; pair < half; ++pair) {
+            const float y_low = normalized(__bfloat162float(source[pair]), rstd);
+            const float y_high = normalized(__bfloat162float(source[half + pair]), rstd);
+            const float c = __bfloat162float(cosine[position * half + pair]);
+            const float s = __bfloat162float(sine[position * half + pair]);
+            target[pair] =
+                __float2bfloat16(rounded_product(y_low, c) - rounded_product(y_high, s));
+            target[half + pair] =
+                __float2bfloat16(rounded_product(y_high, c) + rounded_product(y_low, s));
+        }
+    }
+}
+
+template <bool Fma, bool FmaStats, bool FmaGrad>
+__global__ void qk_norm_rope_backward_scalar(
+    const __nv_bfloat16 *__restrict__ grad, const __nv_bfloat16 *__restrict__ input,
+    const __nv_bfloat16 *__restrict__ cosine, const __nv_bfloat16 *__restrict__ sine,
+    __nv_bfloat16 *__restrict__ dx, int64_t rows, int64_t length, int64_t blocks,
+    int64_t half, int64_t grad_row_stride, int64_t input_row_stride, int64_t dx_row_stride,
+    float width, float eps) {
+    const int64_t items = rows * blocks;
+    const int64_t count = 2 * half;
+    const int64_t stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
+    for (int64_t index = blockIdx.x * static_cast<int64_t>(blockDim.x) + threadIdx.x;
+         index < items; index += stride) {
+        const int64_t row = index / blocks;
+        const int64_t block = index - row * blocks;
+        const int64_t position = row % length;
+        const __nv_bfloat16 *upstream = grad + row * grad_row_stride + block * count;
+        const __nv_bfloat16 *source = input + row * input_row_stride + block * count;
+        __nv_bfloat16 *target = dx + row * dx_row_stride + block * count;
+
+        AtenTree squares;
+        squares.clear();
+        for (int64_t partial = 0; partial < count / 4; ++partial) {
+            float accumulator = 0.0f;
+            for (int64_t element = 0; element < 4; ++element) {
+                accumulator = accumulate_square<Fma>(
+                    accumulator, __bfloat162float(source[partial * 4 + element]));
+            }
+            squares.slot[partial] = accumulator;
+        }
+        const float rstd = inverse_rms(squares.total(), width, eps);
+
+        // `gy` recovered per element, twice: once for the statistic and once for the
+        // gradient. Two evaluations of four multiplies beat a `2*half` scratch array in a
+        // path that exists for correctness rather than throughput.
+        const auto grad_normalized = [&](int64_t element) {
+            const bool is_low = element < half;
+            const int64_t pair = is_low ? element : element - half;
+            const float g_low = __bfloat162float(upstream[pair]);
+            const float g_high = __bfloat162float(upstream[half + pair]);
+            const float c = __bfloat162float(cosine[position * half + pair]);
+            const float s = __bfloat162float(sine[position * half + pair]);
+            return __bfloat162float(__float2bfloat16(
+                is_low ? rounded_product(g_low, c) + rounded_product(g_high, s)
+                       : rounded_product(g_high, c) - rounded_product(g_low, s)));
+        };
+
+        AtenTree stats;
+        stats.clear();
+        for (int64_t partial = 0; partial < count / 4; ++partial) {
+            float accumulator = 0.0f;
+            for (int64_t element = 0; element < 4; ++element) {
+                const int64_t at = partial * 4 + element;
+                accumulator = accumulate_product<FmaStats>(
+                    accumulator,
+                    __fmul_rn(grad_normalized(at), __bfloat162float(source[at])), rstd);
+            }
+            stats.slot[partial] = accumulator;
+        }
+        const float statistic = stats.total();
+
+        const float term = __fmul_rn(1.0f / width, rstd);
+        for (int64_t element = 0; element < count; ++element) {
+            float grad_input = __fmul_rn(width, grad_normalized(element));
+            const float scaled = __fmul_rn(__bfloat162float(source[element]), rstd);
+            grad_input = FmaGrad ? __fmaf_rn(-scaled, statistic, grad_input)
+                                 : __fsub_rn(grad_input, __fmul_rn(scaled, statistic));
+            target[element] = __float2bfloat16(__fmul_rn(grad_input, term));
+        }
+    }
+}
+
 __global__ void stream_copy_vec(const Vec8 *__restrict__ input, Vec8 *__restrict__ output,
                                 int64_t vectors) {
     const int64_t stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
@@ -246,6 +648,78 @@ int launch_rope(const void *input, const void *cosine, const void *sine, void *o
             static_cast<const __nv_bfloat16 *>(sine),
             static_cast<__nv_bfloat16 *>(output), rows, length, blocks, half,
             input_row_stride, output_row_stride);
+    }
+    return static_cast<int>(cudaGetLastError());
+}
+
+// The 128-bit path additionally needs `V = half/8` to be a POWER OF TWO. ATen's tree has
+// offsets 16..1 only, so the level that pairs a thread's low vector with its own high
+// vector exists exactly when `2V` is one of them; at `head_dim = 48` (`V = 3`) there is no
+// such level and the butterfly would reassociate the sum. Those geometries take the
+// emulated path, which reproduces the tree for any `head_dim`.
+bool power_of_two(int64_t value) { return value > 0 && (value & (value - 1)) == 0; }
+
+template <bool Fma>
+int launch_qk_norm_rope_forward(const void *input, const void *cosine, const void *sine,
+                                void *output, int64_t rows, int64_t length, int64_t blocks,
+                                int64_t half, int64_t input_row_stride,
+                                int64_t output_row_stride, float width, float eps,
+                                void *stream) {
+    cudaStream_t handle = static_cast<cudaStream_t>(stream);
+    const bool vectorizable = half % 8 == 0 && power_of_two(half / 8) &&
+                              input_row_stride % 8 == 0 && output_row_stride % 8 == 0 &&
+                              aligned16(input) && aligned16(output) && aligned16(cosine) &&
+                              aligned16(sine);
+    if (vectorizable) {
+        const int64_t half_vectors = half / 8;
+        const int64_t items = rows * blocks * half_vectors;
+        qk_norm_rope_forward_vec<Fma><<<grid_for(items), kThreads, 0, handle>>>(
+            static_cast<const Vec8 *>(input), static_cast<const Vec8 *>(cosine),
+            static_cast<const Vec8 *>(sine), static_cast<Vec8 *>(output), rows, length,
+            blocks, half_vectors, input_row_stride / 8, output_row_stride / 8, width, eps);
+    } else {
+        const int64_t items = rows * blocks;
+        qk_norm_rope_forward_scalar<Fma><<<grid_for(items), kThreads, 0, handle>>>(
+            static_cast<const __nv_bfloat16 *>(input),
+            static_cast<const __nv_bfloat16 *>(cosine),
+            static_cast<const __nv_bfloat16 *>(sine),
+            static_cast<__nv_bfloat16 *>(output), rows, length, blocks, half,
+            input_row_stride, output_row_stride, width, eps);
+    }
+    return static_cast<int>(cudaGetLastError());
+}
+
+template <bool Fma, bool FmaStats, bool FmaGrad>
+int launch_qk_norm_rope_backward(const void *grad, const void *input, const void *cosine,
+                                 const void *sine, void *dx, int64_t rows, int64_t length,
+                                 int64_t blocks, int64_t half, int64_t grad_row_stride,
+                                 int64_t input_row_stride, int64_t dx_row_stride,
+                                 float width, float eps, void *stream) {
+    cudaStream_t handle = static_cast<cudaStream_t>(stream);
+    const bool vectorizable = half % 8 == 0 && power_of_two(half / 8) &&
+                              grad_row_stride % 8 == 0 && input_row_stride % 8 == 0 &&
+                              dx_row_stride % 8 == 0 && aligned16(grad) &&
+                              aligned16(input) && aligned16(dx) && aligned16(cosine) &&
+                              aligned16(sine);
+    if (vectorizable) {
+        const int64_t half_vectors = half / 8;
+        const int64_t items = rows * blocks * half_vectors;
+        qk_norm_rope_backward_vec<Fma, FmaStats, FmaGrad>
+            <<<grid_for(items), kThreads, 0, handle>>>(
+                static_cast<const Vec8 *>(grad), static_cast<const Vec8 *>(input),
+                static_cast<const Vec8 *>(cosine), static_cast<const Vec8 *>(sine),
+                static_cast<Vec8 *>(dx), rows, length, blocks, half_vectors,
+                grad_row_stride / 8, input_row_stride / 8, dx_row_stride / 8, width, eps);
+    } else {
+        const int64_t items = rows * blocks;
+        qk_norm_rope_backward_scalar<Fma, FmaStats, FmaGrad>
+            <<<grid_for(items), kThreads, 0, handle>>>(
+                static_cast<const __nv_bfloat16 *>(grad),
+                static_cast<const __nv_bfloat16 *>(input),
+                static_cast<const __nv_bfloat16 *>(cosine),
+                static_cast<const __nv_bfloat16 *>(sine),
+                static_cast<__nv_bfloat16 *>(dx), rows, length, blocks, half,
+                grad_row_stride, input_row_stride, dx_row_stride, width, eps);
     }
     return static_cast<int>(cudaGetLastError());
 }
@@ -298,6 +772,57 @@ extern "C" int fk_rope_backward(const void *grad, const void *cosine, const void
                                 int64_t dx_row_stride, void *stream) {
     return launch_rope<false>(grad, cosine, sine, dx, rows, length, blocks, half,
                               grad_row_stride, dx_row_stride, stream);
+}
+
+// `rounding` selects the fp32 contraction forms, bit 0 for the squared accumulation, bit 1
+// for the gradient statistic and bit 2 for the gradient's subtraction. It is a parameter
+// only so that the discovery test can prove which one ATen's build emitted and that the
+// other seven disagree; the model path passes `FK_QK_NORM_ROPE_ROUNDING`.
+extern "C" int fk_qk_norm_rope_forward(const void *input, const void *cosine,
+                                       const void *sine, void *output, int64_t rows,
+                                       int64_t length, int64_t blocks, int64_t half,
+                                       int64_t input_row_stride, int64_t output_row_stride,
+                                       float width, float eps, int rounding, void *stream) {
+    if ((rounding & 1) != 0) {
+        return launch_qk_norm_rope_forward<true>(input, cosine, sine, output, rows, length,
+                                                 blocks, half, input_row_stride,
+                                                 output_row_stride, width, eps, stream);
+    }
+    return launch_qk_norm_rope_forward<false>(input, cosine, sine, output, rows, length,
+                                              blocks, half, input_row_stride,
+                                              output_row_stride, width, eps, stream);
+}
+
+extern "C" int fk_qk_norm_rope_backward(const void *grad, const void *input,
+                                        const void *cosine, const void *sine, void *dx,
+                                        int64_t rows, int64_t length, int64_t blocks,
+                                        int64_t half, int64_t grad_row_stride,
+                                        int64_t input_row_stride, int64_t dx_row_stride,
+                                        float width, float eps, int rounding,
+                                        void *stream) {
+#define FK_LAUNCH(squares, stats, gradient)                                                \
+    launch_qk_norm_rope_backward<squares, stats, gradient>(                                \
+        grad, input, cosine, sine, dx, rows, length, blocks, half, grad_row_stride,        \
+        input_row_stride, dx_row_stride, width, eps, stream)
+    switch (rounding & 7) {
+    case 0:
+        return FK_LAUNCH(false, false, false);
+    case 1:
+        return FK_LAUNCH(true, false, false);
+    case 2:
+        return FK_LAUNCH(false, true, false);
+    case 3:
+        return FK_LAUNCH(true, true, false);
+    case 4:
+        return FK_LAUNCH(false, false, true);
+    case 5:
+        return FK_LAUNCH(true, false, true);
+    case 6:
+        return FK_LAUNCH(false, true, true);
+    default:
+        return FK_LAUNCH(true, true, true);
+    }
+#undef FK_LAUNCH
 }
 
 extern "C" int fk_stream_copy(const void *input, void *output, int64_t count, void *stream) {

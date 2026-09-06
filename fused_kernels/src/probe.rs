@@ -22,7 +22,7 @@
 
 use tch::{Cuda, Device, Kind, Tensor};
 
-use crate::{raw, reference, relu_square, rope, stream_copy, Timer};
+use crate::{qk_norm_rope, raw, reference, relu_square, rope, stream_copy, Timer};
 
 /// Timed executions per batch, batches per measurement, untimed warm-up rounds.
 const ROUNDS: usize = 20;
@@ -30,6 +30,11 @@ const BATCHES: usize = 6;
 const WARMUP: usize = 3;
 
 /// One kernel measured both ways. Times are one layer's worth of work per execution.
+///
+/// Two rows may share a `fused_*` side against different baselines: the QK-norm fusion is
+/// measured both against the whole composed-ATen sequence and against `_fused_rms_norm`
+/// plus the already-landed rotary kernel, because the second is what the call site actually
+/// looks like by the time this op lands and is therefore the honest marginal saving.
 pub struct Comparison {
     pub name: &'static str,
     /// Forward alone, autograd off: the kernels and nothing else, both forms.
@@ -49,6 +54,11 @@ pub struct Comparison {
     pub fused_backward_bytes: f64,
     /// Invocations per step, so a per-execution saving becomes a step saving.
     pub layers: f64,
+    /// Whether this row's saving belongs in the step total. `QK norm + rotary` measures the
+    /// fused op against the WHOLE composed sequence, so its saving already contains the
+    /// `packed rotary` row's; only the marginal row is additive on top of it, and double
+    /// counting a 26 ms kernel is exactly the sort of arithmetic a table invites.
+    pub additive: bool,
 }
 
 impl Comparison {
@@ -77,6 +87,29 @@ pub struct Measurement {
     pub streaming_roof_gbs: f64,
 }
 
+/// What the composition retains per layer and this fusion does not, measured from the
+/// caching allocator rather than counted from shapes.
+pub struct ActivationSaving {
+    pub layers: i64,
+    /// Allocator peak across a `layers`-deep chain, with every layer's rotated output kept
+    /// alive exactly as attention keeps it.
+    pub composed_peak_mib: f64,
+    pub fused_peak_mib: f64,
+    /// Bytes still live at the end of the chain: what autograd retains for its backward.
+    pub composed_live_mib: f64,
+    pub fused_live_mib: f64,
+}
+
+impl ActivationSaving {
+    pub fn peak_saved_mib(&self) -> f64 {
+        self.composed_peak_mib - self.fused_peak_mib
+    }
+
+    pub fn retained_saved_mib(&self) -> f64 {
+        self.composed_live_mib - self.fused_live_mib
+    }
+}
+
 /// Best per-task batch mean over [`BATCHES`] interleaved passes, CUDA-event timed.
 fn interleaved(tasks: &mut [Box<dyn FnMut() + '_>]) -> Vec<f64> {
     let mut timer = Timer::new();
@@ -99,7 +132,7 @@ fn interleaved(tasks: &mut [Box<dyn FnMut() + '_>]) -> Vec<f64> {
     best
 }
 
-/// Both kernels at the real training geometry: `rows * origins` tokens, `d_model` wide,
+/// Every kernel at the real training geometry: `rows * origins` tokens, `d_model` wide,
 /// `heads` heads, `ffn` hidden, over `layers` backbone layers.
 pub fn measure(
     device: Device,
@@ -198,6 +231,73 @@ pub fn measure(
             )
         }),
         Box::new(|| drop(raw::rope_backward(&rotated_grad, &cosine, &sine, heads))),
+        // QK-norm + rotary. `packed(&projection)` is the RAW block: the whole point is that
+        // the normalized one is never built.
+        Box::new(|| {
+            drop(tch::no_grad(|| {
+                reference::qk_norm_rope(&packed(&projection_detached), &cosine, &sine, heads)
+            }))
+        }),
+        Box::new(|| {
+            drop(tch::no_grad(|| {
+                reference::qk_norm_fused_rope(
+                    &packed(&projection_detached),
+                    &cosine,
+                    &sine,
+                    heads,
+                )
+            }))
+        }),
+        Box::new(|| {
+            drop(tch::no_grad(|| {
+                qk_norm_rope(&packed(&projection_detached), &cosine, &sine, heads)
+            }))
+        }),
+        Box::new(|| {
+            drop(reference::qk_norm_rope(
+                &packed(&projection),
+                &cosine,
+                &sine,
+                heads,
+            ))
+        }),
+        Box::new(|| {
+            objective(
+                reference::qk_norm_rope(&packed(&projection), &cosine, &sine, heads),
+                &projection,
+            )
+        }),
+        Box::new(|| {
+            drop(reference::qk_norm_fused_rope(
+                &packed(&projection),
+                &cosine,
+                &sine,
+                heads,
+            ))
+        }),
+        Box::new(|| {
+            objective(
+                reference::qk_norm_fused_rope(&packed(&projection), &cosine, &sine, heads),
+                &projection,
+            )
+        }),
+        Box::new(|| drop(qk_norm_rope(&packed(&projection), &cosine, &sine, heads))),
+        Box::new(|| {
+            objective(
+                qk_norm_rope(&packed(&projection), &cosine, &sine, heads),
+                &projection,
+            )
+        }),
+        Box::new(|| {
+            drop(raw::qk_norm_rope_backward(
+                &rotated_grad,
+                &packed(&projection_detached),
+                &cosine,
+                &sine,
+                heads,
+                crate::QK_NORM_ROUNDING,
+            ))
+        }),
     ];
     let timings = interleaved(&mut tasks);
 
@@ -217,6 +317,7 @@ pub fn measure(
                 // Read x, read grad, write dx.
                 fused_backward_bytes: 3.0 * hidden_elements * element,
                 layers: layers as f64,
+                additive: true,
             },
             Comparison {
                 name: "packed rotary",
@@ -230,8 +331,138 @@ pub fn measure(
                 fused_forward_bytes: 2.0 * rope_elements * element + rotation_bytes,
                 fused_backward_bytes: 2.0 * rope_elements * element + rotation_bytes,
                 layers: layers as f64,
+                additive: true,
+            },
+            Comparison {
+                name: "QK norm + rotary",
+                composed_forward_ms: timings[15],
+                fused_forward_ms: timings[17],
+                composed_backward_ms: timings[19] - timings[18],
+                fused_backward_ms: timings[23] - timings[22],
+                fused_backward_kernel_ms: timings[24],
+                // Read the raw q‖k, write the rotated buffer. `rstd` is neither written nor
+                // read back, and the normalized block never exists.
+                fused_forward_bytes: 2.0 * rope_elements * element + rotation_bytes,
+                // Read the upstream gradient, read the raw q‖k, write the gradient. The
+                // third pass is what buys the retained `rstd` and the normalized block.
+                fused_backward_bytes: 3.0 * rope_elements * element + rotation_bytes,
+                layers: layers as f64,
+                additive: false,
+            },
+            Comparison {
+                name: "QK norm marginal",
+                composed_forward_ms: timings[16],
+                fused_forward_ms: timings[17],
+                composed_backward_ms: timings[21] - timings[20],
+                fused_backward_ms: timings[23] - timings[22],
+                fused_backward_kernel_ms: timings[24],
+                fused_forward_bytes: 2.0 * rope_elements * element + rotation_bytes,
+                fused_backward_bytes: 3.0 * rope_elements * element + rotation_bytes,
+                layers: layers as f64,
+                additive: true,
             },
         ],
         streaming_roof_gbs: 2.0 * hidden_elements * element / (timings[0] / 1000.0) / 1e9,
+    }
+}
+
+/// Allocator bytes, from the same torch that runs the kernels. `max_memory_allocated` is
+/// the peak of the LIVE set, which is what a graph capture's private mempool has to fit on
+/// top of; `memory_allocated` is what is still live, i.e. what autograd retained.
+fn allocator_mib(reset: bool) -> (f64, f64) {
+    use pyo3::types::PyAnyMethods;
+    pyo3::Python::attach(|python| {
+        let cuda = python
+            .import("torch")
+            .expect("torch")
+            .getattr("cuda")
+            .expect("torch.cuda");
+        cuda.call_method0("init").expect("cuda init");
+        if reset {
+            cuda.call_method0("empty_cache").expect("empty_cache");
+            cuda.call_method1("reset_peak_memory_stats", (0,))
+                .expect("reset_peak_memory_stats");
+        }
+        let read = |name: &str| {
+            cuda.call_method1(name, (0,))
+                .expect("allocator statistic")
+                .extract::<u64>()
+                .expect("allocator statistic is an integer") as f64
+                / 1048576.0
+        };
+        (read("max_memory_allocated"), read("memory_allocated"))
+    })
+}
+
+/// The activation cost of the composition that this fusion does not pay, MEASURED: build a
+/// `layers`-deep chain of the QK-norm-then-rotate step, keep every layer's rotated output
+/// and its projection alive exactly as attention and the QKV backward keep them, and read
+/// the allocator.
+///
+/// Both arms are identical apart from the op, and each starts from an emptied cache with the
+/// peak counter reset, so the difference is the composition's own footprint: per layer, the
+/// contiguous copy ATen makes of the STRIDED `q‖k` view, the normalized block that copy
+/// feeds, and the fp32 `[tokens, 2·heads]` `rstd` that `_fused_rms_norm` retains for its
+/// backward. The first two are transient and bound the PEAK; the third is retained for the
+/// whole step and is what the `layers`-fold difference in live bytes is made of.
+///
+/// The projection is drawn DIRECTLY in bf16. Drawing it in fp32 and casting made the first
+/// version of this measurement useless: an fp32 `[rows, origins, 3·d_model]` scratch is
+/// 562.5 MiB at batch 256, three times the transient the measurement is trying to see, so
+/// both peaks landed on the scratch and reported only the retained difference.
+pub fn activation_saving(
+    device: Device,
+    rows: i64,
+    origins: i64,
+    d_model: i64,
+    heads: i64,
+    layers: i64,
+) -> ActivationSaving {
+    let half = d_model / heads / 2;
+    let inverse = (Tensor::arange(half, (Kind::Float, device)) * (1.0 / half as f64)
+        * -(10000.0_f64.ln()))
+    .exp();
+    let angles =
+        Tensor::arange(origins, (Kind::Float, device)).unsqueeze(1) * inverse.unsqueeze(0);
+    let cosine = angles.cos().to_kind(Kind::BFloat16);
+    let sine = angles.sin().to_kind(Kind::BFloat16);
+
+    let chain = |fused: bool| {
+        let (_, before) = allocator_mib(true);
+        // Held to the end of the arm: the rotated buffer is what SDPA saves for its
+        // backward, and the projection is what the QKV linear's backward and the value path
+        // hold. Everything else a layer allocates is the op's own business.
+        let mut retained: Vec<Tensor> = Vec::new();
+        for _ in 0..layers {
+            let projection = Tensor::randn(
+                [rows, origins, 3 * d_model],
+                (Kind::BFloat16, device),
+            )
+            .set_requires_grad(true);
+            let packed = projection.split_with_sizes([2 * d_model, d_model], -1);
+            let rotated = if fused {
+                qk_norm_rope(&packed[0], &cosine, &sine, heads)
+            } else {
+                reference::qk_norm_fused_rope(&packed[0], &cosine, &sine, heads)
+            };
+            retained.push(rotated);
+            retained.push(projection);
+        }
+        Cuda::synchronize(0);
+        let (peak, live) = allocator_mib(false);
+        drop(retained);
+        (peak - before, live - before)
+    };
+
+    // The composed arm first, then the fused one, each behind its own `empty_cache`, so
+    // neither inherits the other's fragmentation.
+    let (composed_peak_mib, composed_live_mib) = chain(false);
+    let (fused_peak_mib, fused_live_mib) = chain(true);
+    ActivationSaving {
+        layers,
+        composed_peak_mib,
+        fused_peak_mib,
+        composed_live_mib,
+        fused_live_mib,
     }
 }

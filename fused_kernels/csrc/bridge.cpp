@@ -227,6 +227,135 @@ struct Rope : public torch::autograd::Function<Rope> {
     }
 };
 
+// The RMSNorm epsilon is BAKED IN rather than passed. `_fused_rms_norm` with `eps=None`
+// resolves to `finfo(bf16).eps = 7.8e-3`, a 0.4% systematic shrink of every normalized
+// activation, and the backbone deliberately passes 1e-6 (`world_model.rs`'s `BAR_NORM_EPS`,
+// and the reference's own `train_gpt.py:1079`). A call site that could pass its own epsilon
+// is a call site that can silently stop matching the composition it replaced, and this op
+// exists for exactly one call site.
+constexpr float kNormEps = 1e-6f;
+
+// Geometry shared by the QK-norm rotary's forward and backward: one head block is
+// simultaneously the normalization group and the rotary block.
+struct HeadGeometry {
+    int64_t blocks;
+    int64_t head_dim;
+    int64_t half;
+    int64_t columns;
+};
+
+HeadGeometry head_geometry(int64_t columns, int64_t heads, int64_t rotary_half,
+                           const char *name) {
+    TORCH_CHECK(heads > 0, name, " needs a positive head count, found ", heads);
+    const int64_t blocks = 2 * heads;
+    TORCH_CHECK(columns % blocks == 0, name, " has ", columns,
+                " columns, not a multiple of ", blocks);
+    const int64_t head_dim = columns / blocks;
+    TORCH_CHECK(head_dim == 2 * rotary_half, name, " has head dimension ", head_dim,
+                " but the rotation carries ", rotary_half, " pairs");
+    // ATen's own bf16 RMSNorm forward is `vectorized_layer_norm_kernel` only while
+    // `head_dim % 4 == 0`; below that it switches to a Welford reduction with a different
+    // summation order, and at more than 128 elements its partials stop fitting the first
+    // warp of the tree this kernel reproduces. Both would break bit-identity silently, so
+    // they are refused loudly.
+    TORCH_CHECK(head_dim % 4 == 0 && head_dim <= 128, name, " needs a head dimension that "
+                "is a multiple of four and at most 128 for the reduction order to match "
+                "ATen's, found ", head_dim);
+    return {blocks, head_dim, rotary_half, columns};
+}
+
+void check_rotation(const torch::Tensor &cosine, const torch::Tensor &sine, int64_t length,
+                    const char *name) {
+    check_bf16_cuda(cosine, "qk_norm_rope cosine");
+    check_bf16_cuda(sine, "qk_norm_rope sine");
+    TORCH_CHECK(cosine.dim() == 2 && cosine.size(0) == length, name,
+                " cosine must be [", length, ", head_dim/2], found ", cosine.sizes());
+    TORCH_CHECK(sine.sizes() == cosine.sizes(),
+                "qk_norm_rope sine and cosine must have the same shape");
+    TORCH_CHECK(cosine.is_contiguous() && sine.is_contiguous(),
+                "qk_norm_rope cosine and sine must be contiguous");
+    TORCH_CHECK(!cosine.requires_grad() && !sine.requires_grad(),
+                "qk_norm_rope treats the rotation as a constant; cosine and sine must not "
+                "require gradients");
+}
+
+// The fused backward launch, shared by the autograd node and by the raw entry point the
+// microbenchmark times. `grad_output` is `[batch, length, 2, heads, head_dim]` and `input`
+// is the RAW packed block the forward received, possibly a strided view; the result is the
+// dense `[batch, length, 2*heads*head_dim]` gradient of that block.
+torch::Tensor qk_norm_rope_backward(const torch::Tensor &grad_output,
+                                    const torch::Tensor &input,
+                                    const torch::Tensor &cosine, const torch::Tensor &sine,
+                                    int64_t heads, int rounding) {
+    const torch::Tensor grad = grad_output.contiguous();
+    check_bf16_cuda(grad, "qk_norm_rope gradient");
+    check_bf16_cuda(input, "qk_norm_rope backward input");
+    const RowLayout layout = row_layout(input, "qk_norm_rope backward input");
+    check_rotation(cosine, sine, layout.length, "qk_norm_rope");
+    const HeadGeometry geometry =
+        head_geometry(input.size(2), heads, cosine.size(1), "qk_norm_rope gradient");
+    TORCH_CHECK(grad.numel() == layout.rows * geometry.columns, "qk_norm_rope gradient has ",
+                grad.numel(), " elements but the input block had ",
+                layout.rows * geometry.columns);
+    torch::Tensor dx =
+        at::empty({input.size(0), layout.length, geometry.columns}, input.options());
+    check_launch(fk_qk_norm_rope_backward(
+                     grad.const_data_ptr(), input.const_data_ptr(),
+                     cosine.const_data_ptr(), sine.const_data_ptr(), dx.mutable_data_ptr(),
+                     layout.rows, layout.length, geometry.blocks, geometry.half,
+                     geometry.columns, layout.stride, geometry.columns,
+                     static_cast<float>(geometry.head_dim), kNormEps, rounding,
+                     current_stream(input)),
+                 "qk_norm_rope backward");
+    return dx;
+}
+
+struct QkNormRope : public torch::autograd::Function<QkNormRope> {
+    static torch::Tensor forward(torch::autograd::AutogradContext *ctx,
+                                 torch::Tensor input, torch::Tensor cosine,
+                                 torch::Tensor sine, int64_t heads, int64_t rounding) {
+        check_bf16_cuda(input, "qk_norm_rope input");
+        TORCH_CHECK(input.dim() == 3,
+                    "qk_norm_rope input must be [batch, length, 2*d_model]");
+        const RowLayout layout = row_layout(input, "qk_norm_rope input");
+        check_rotation(cosine, sine, layout.length, "qk_norm_rope");
+        const HeadGeometry geometry =
+            head_geometry(input.size(2), heads, cosine.size(1), "qk_norm_rope input");
+
+        torch::Tensor output =
+            at::empty({input.size(0), layout.length, 2, heads, geometry.head_dim},
+                      input.options());
+        // The RAW block is saved and `rstd` is NOT. The composition retains an fp32
+        // `[tokens, 2*heads]` statistic per layer and, in the forward, a contiguous copy of
+        // this very block plus the normalized block itself; here the backward re-derives
+        // the statistic from `input`, which it has to stream anyway for the `x*rstd*stats`
+        // term, so the recompute is a reduction over `head_dim` values already in registers.
+        ctx->save_for_backward({input, cosine, sine});
+        ctx->saved_data["heads"] = heads;
+        ctx->saved_data["rounding"] = rounding;
+        check_launch(fk_qk_norm_rope_forward(
+                         input.const_data_ptr(), cosine.const_data_ptr(),
+                         sine.const_data_ptr(), output.mutable_data_ptr(), layout.rows,
+                         layout.length, geometry.blocks, geometry.half, layout.stride,
+                         geometry.columns, static_cast<float>(geometry.head_dim), kNormEps,
+                         static_cast<int>(rounding), current_stream(input)),
+                     "qk_norm_rope forward");
+        return output;
+    }
+
+    static torch::autograd::variable_list
+    backward(torch::autograd::AutogradContext *ctx,
+             torch::autograd::variable_list grad_outputs) {
+        reject_double_backward(grad_outputs, "qk_norm_rope");
+        const torch::autograd::variable_list saved = ctx->get_saved_variables();
+        return {qk_norm_rope_backward(grad_outputs[0], saved[0], saved[1], saved[2],
+                                      ctx->saved_data["heads"].toInt(),
+                                      static_cast<int>(
+                                          ctx->saved_data["rounding"].toInt())),
+                torch::Tensor(), torch::Tensor(), torch::Tensor(), torch::Tensor()};
+    }
+};
+
 // A CUDA-event timer, exposed because the composed-versus-fused comparison has to be
 // measured with events rather than a host clock. The repository's own profiler learned this
 // the expensive way: a host-timed mean over ten rounds reported this card's copy peak at
@@ -272,7 +401,15 @@ void *fk_rope(const void *input, const void *cosine, const void *sine, int64_t h
     });
 }
 
-// The two backward kernels called directly, with no autograd node around them. NOT
+void *fk_qk_norm_rope(const void *input, const void *cosine, const void *sine,
+                      int64_t heads, int64_t rounding) {
+    return protect([&] {
+        return QkNormRope::apply(borrow(input), borrow(cosine), borrow(sine), heads,
+                                 rounding);
+    });
+}
+
+// The backward kernels called directly, with no autograd node around them. NOT
 // differentiable and not for the model path: they exist so the microbenchmark can time the
 // kernel rather than the kernel plus whatever objective the harness needed to reach it.
 void *fk_relu_square_backward_raw(const void *input, const void *grad) {
@@ -283,6 +420,14 @@ void *fk_rope_backward_raw(const void *grad, const void *cosine, const void *sin
                            int64_t heads) {
     return protect(
         [&] { return rope_backward(borrow(grad), borrow(cosine), borrow(sine), heads); });
+}
+
+void *fk_qk_norm_rope_backward_raw(const void *grad, const void *input, const void *cosine,
+                                   const void *sine, int64_t heads, int64_t rounding) {
+    return protect([&] {
+        return qk_norm_rope_backward(borrow(grad), borrow(input), borrow(cosine),
+                                     borrow(sine), heads, static_cast<int>(rounding));
+    });
 }
 
 // A bf16 clone through the vectorized copy kernel: the streaming roof, measured the same

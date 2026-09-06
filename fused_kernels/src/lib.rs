@@ -44,6 +44,21 @@ extern "C" {
         sine: *const C_tensor,
         heads: i64,
     ) -> *mut C_tensor;
+    fn fk_qk_norm_rope(
+        input: *const C_tensor,
+        cosine: *const C_tensor,
+        sine: *const C_tensor,
+        heads: i64,
+        rounding: i64,
+    ) -> *mut C_tensor;
+    fn fk_qk_norm_rope_backward_raw(
+        grad: *const C_tensor,
+        input: *const C_tensor,
+        cosine: *const C_tensor,
+        sine: *const C_tensor,
+        heads: i64,
+        rounding: i64,
+    ) -> *mut C_tensor;
     fn fk_stream_copy_tensor(input: *const C_tensor) -> *mut C_tensor;
     fn fk_timer_new() -> *mut std::ffi::c_void;
     fn fk_timer_start(timer: *mut std::ffi::c_void) -> i32;
@@ -121,6 +136,73 @@ pub fn rope(input: &Tensor, cosine: &Tensor, sine: &Tensor, heads: i64) -> Tenso
     )
 }
 
+/// The RMSNorm epsilon the QK-norm fusion is defined at, matching the backbone's `NORM_EPS`
+/// and `world_model.rs`'s `BAR_NORM_EPS`. It is a constant and not an argument for the same
+/// reason the kernel bakes it in: `_fused_rms_norm` resolves `eps = None` to the accumulate
+/// type's epsilon, `FLT_EPSILON = 1.19e-7` for a bf16 input, so a call site that chooses its
+/// own epsilon is a call site that can silently stop matching the composition. At unit scale
+/// that default is bit-indistinguishable from this one; on a collapsed head block it is not,
+/// which `the_norm_epsilon_is_observable_where_it_is_load_bearing` shows.
+pub const NORM_EPS: f64 = 1e-6;
+
+/// The fp32 contraction forms ATen's own build emitted, as a three-bit selector: bit 0 the
+/// squared accumulation of the RMS reduction, bit 1 the gradient statistic's accumulation,
+/// bit 2 the gradient's `f -= (x·rstd)·stats`. A set bit means that operation contracts
+/// into a single `fma`.
+///
+/// This is MEASURED, not chosen: `nvcc` contracts `a*b + c` by default, so which form a
+/// kernel implements is a property of the compiler that built it, it changes the last bit of
+/// a reduction over 64 values, and one flipped bit in `rstd` moves roughly one output
+/// element in 10^5. The measurement
+/// (`qk_norm_rope_rounding_is_the_measured_pair`) found that bit 1 must be SET and bit 2
+/// must be CLEAR, and that bit 0 cannot be measured at all because it is provably inert: the
+/// accumulated value is a product of two bf16 mantissas, which is exact in fp32, so
+/// `fmaf(v, v, a)` and `a + v*v` round identically. This ships the form with no gratuitous
+/// contraction in the two places where contraction is observable and where ATen has one.
+pub const QK_NORM_ROUNDING: i64 = 2;
+
+/// Per-head QK-normalization AND the packed `q‖k` rotary in one pass, with a one-pass
+/// backward.
+///
+/// `input` is the RAW, UN-normalized `q‖k` block: `[batch, length, 2·heads·head_dim]` bf16
+/// on CUDA, exactly what `split_with_sizes` hands back from the QKV projection, strided
+/// view included. `cosine` and `sine` are the untiled `[length, head_dim/2]` rotation rows,
+/// the same tensors [`rope`] takes. The output is the contiguous
+/// `[batch, length, 2, heads, head_dim]` buffer, so the call site keeps its `.split(1, 2)`.
+///
+/// Each head block of `head_dim` columns is simultaneously one gainless, biasless RMS
+/// normalization group (epsilon [`NORM_EPS`]) and one rotary block, which is what makes the
+/// fusion exact rather than approximate. `V` is neither normalized nor rotated and is not
+/// part of this block: the packed layout is `q‖k` only, `[2·heads, head_dim]` per token with
+/// column `t·heads·head_dim + h·head_dim + d`, and the value block is the SECOND output of
+/// the same split.
+///
+/// Bit-identical to [`reference::qk_norm_rope`] in both directions. The normalized block -
+/// one `[tokens, 2·d_model]` bf16 tensor, plus ATen's contiguous copy of the raw block, plus
+/// the fp32 `rstd` the composition retains for its backward - is never materialized: the
+/// backward recomputes `rstd` from the raw block it already has to stream.
+///
+/// Off CUDA this is [`reference::qk_norm_rope`], for the reason given on [`relu_square`],
+/// and it is dtype-agnostic there: the model's CPU tests reach this in fp32 as well as
+/// bf16, so nothing on the reference path assumes bf16.
+pub fn qk_norm_rope(input: &Tensor, cosine: &Tensor, sine: &Tensor, heads: i64) -> Tensor {
+    if !input.device().is_cuda() {
+        return reference::qk_norm_rope(input, cosine, sine, heads);
+    }
+    finish(
+        unsafe {
+            fk_qk_norm_rope(
+                input.as_ptr(),
+                cosine.as_ptr(),
+                sine.as_ptr(),
+                heads,
+                QK_NORM_ROUNDING,
+            )
+        },
+        "qk_norm_rope",
+    )
+}
+
 /// The gradient kernels called directly, with no autograd node around them.
 ///
 /// These are NOT differentiable and are not the model path - [`relu_square`] and [`rope`]
@@ -130,7 +212,8 @@ pub fn rope(input: &Tensor, cosine: &Tensor, sine: &Tensor, heads: i64) -> Tenso
 /// traffic that says nothing about the kernel.
 pub mod raw {
     use super::{
-        fk_relu_square_backward_raw, fk_rope_backward_raw, finish, Tensor,
+        fk_qk_norm_rope, fk_qk_norm_rope_backward_raw, fk_relu_square_backward_raw,
+        fk_rope_backward_raw, finish, Tensor,
     };
 
     /// `x <= 0 ? 0 : 2·grad·x`, from the saved forward input.
@@ -147,6 +230,59 @@ pub mod raw {
         finish(
             unsafe { fk_rope_backward_raw(grad.as_ptr(), cosine.as_ptr(), sine.as_ptr(), heads) },
             "rope backward",
+        )
+    }
+
+    /// The fused QK-norm rotary backward, with the rounding selector exposed: `grad` is
+    /// `[batch, length, 2, heads, head_dim]`, `input` the RAW packed block the forward saw,
+    /// and the result is the dense `[batch, length, 2·heads·head_dim]` gradient.
+    ///
+    /// `rounding` is a parameter here and nowhere else. The model path is
+    /// [`super::qk_norm_rope`], which passes [`super::QK_NORM_ROUNDING`]; this entry point
+    /// exists so the discovery test can prove that constant is the only bit-identical one.
+    pub fn qk_norm_rope_backward(
+        grad: &Tensor,
+        input: &Tensor,
+        cosine: &Tensor,
+        sine: &Tensor,
+        heads: i64,
+        rounding: i64,
+    ) -> Tensor {
+        finish(
+            unsafe {
+                fk_qk_norm_rope_backward_raw(
+                    grad.as_ptr(),
+                    input.as_ptr(),
+                    cosine.as_ptr(),
+                    sine.as_ptr(),
+                    heads,
+                    rounding,
+                )
+            },
+            "qk_norm_rope backward",
+        )
+    }
+
+    /// The fused QK-norm rotary forward with the rounding selector exposed, differentiable
+    /// like [`super::qk_norm_rope`] but not the model path, for the same reason.
+    pub fn qk_norm_rope(
+        input: &Tensor,
+        cosine: &Tensor,
+        sine: &Tensor,
+        heads: i64,
+        rounding: i64,
+    ) -> Tensor {
+        finish(
+            unsafe {
+                fk_qk_norm_rope(
+                    input.as_ptr(),
+                    cosine.as_ptr(),
+                    sine.as_ptr(),
+                    heads,
+                    rounding,
+                )
+            },
+            "qk_norm_rope",
         )
     }
 }
@@ -275,6 +411,46 @@ pub mod reference {
         let (cosine_tile, sine_tile) = rotation_tiles(cosine, sine, heads);
         rope_tiled(input, &cosine_tile, &sine_tile, heads)
     }
+
+    /// The gainless, biasless per-head RMS normalization the recipe applies to the packed
+    /// `q‖k` block BEFORE the rotation, transcribed from `Block::forward`:
+    /// `rms_norm(packed.reshape([b, t, 2·heads, head_dim])).reshape([b, t, 2·width])`.
+    ///
+    /// `_fused_rms_norm`, not `rms_norm`: the latter registers as a math composite on CUDA
+    /// and hides the kernel this has to be bit-identical to. Both reshapes are views even
+    /// when `input` is a strided slice of the projection, so the only tensor this
+    /// materializes is the normalized block itself - plus the contiguous copy ATen makes of
+    /// the strided input, and the fp32 `[tokens, 2·heads]` `rstd` it retains for backward.
+    pub fn qk_norm(input: &Tensor, heads: i64) -> Tensor {
+        let (batch, length, columns) = input
+            .size3()
+            .expect("packed q‖k is [batch, length, 2·d_model]");
+        let head_dim = columns / (2 * heads);
+        input
+            .reshape([batch, length, 2 * heads, head_dim])
+            .internal_fused_rms_norm([head_dim], None::<&Tensor>, Some(super::NORM_EPS))
+            .0
+            .reshape([batch, length, columns])
+    }
+
+    /// The whole composed form the fused QK-norm rotary replaces: normalize per head, then
+    /// rotate the packed block. This is the sequence `Block::forward` runs today.
+    pub fn qk_norm_rope(input: &Tensor, cosine: &Tensor, sine: &Tensor, heads: i64) -> Tensor {
+        rope(&qk_norm(input, heads), cosine, sine, heads)
+    }
+
+    /// The same composition with the rotation already fused: `_fused_rms_norm` followed by
+    /// [`super::rope`]. This is the state of the call site AFTER the packed rotary lands and
+    /// BEFORE this fusion does, so it is the honest baseline for what fusing the norm buys
+    /// on top of it. Bit-identical to [`qk_norm_rope`], since the rotary kernel is.
+    pub fn qk_norm_fused_rope(
+        input: &Tensor,
+        cosine: &Tensor,
+        sine: &Tensor,
+        heads: i64,
+    ) -> Tensor {
+        super::rope(&qk_norm(input, heads), cosine, sine, heads)
+    }
 }
 
 #[cfg(test)]
@@ -307,6 +483,14 @@ mod tests {
     /// whole point of these kernels is that a call site can adopt them without moving a
     /// training curve by one ulp.
     fn identical(left: &Tensor, right: &Tensor) -> bool {
+        differing(left, right) == 0
+    }
+
+    /// How many elements of two bf16 tensors are not bit-for-bit equal. This, not
+    /// `max |delta|`, is the diagnostic that survives a NaN in the input: `NaN - NaN` is
+    /// NaN, so a subtraction-based summary of a tensor that legitimately contains NaN
+    /// reports NaN whether the kernel is right or wrong.
+    fn differing(left: &Tensor, right: &Tensor) -> i64 {
         assert_eq!(left.size(), right.size(), "shapes differ");
         let left = left.reshape(-1).to_kind(Kind::Float);
         let right = right.reshape(-1).to_kind(Kind::Float);
@@ -318,9 +502,9 @@ mod tests {
             .logical_or(&left.isnan());
         value
             .logical_and(&sign)
-            .all()
+            .logical_not()
+            .sum(Kind::Int64)
             .int64_value(&[])
-            == 1
     }
 
     fn max_absolute(left: &Tensor, right: &Tensor) -> f64 {
@@ -421,6 +605,129 @@ mod tests {
         assert!(
             identical(&fused, &expected),
             "the packed rotation does not agree with the per-tensor rotation it replaced"
+        );
+    }
+
+    /// The layout claim the fused kernel's normalization groups depend on: normalizing the
+    /// packed block viewed as `[.., 2·heads, head_dim]` IS normalizing q and k separately,
+    /// per head, per token. Without this an equality test against the packed reference
+    /// would pass while both forms normalized across head boundaries.
+    #[test]
+    fn packed_qk_norm_equals_the_per_tensor_per_head_norm() {
+        let (heads, head_dim, length, batch) = (4i64, 16i64, 7i64, 2i64);
+        let width = heads * head_dim;
+        let packed = bf16_randn(&[batch, length, 2 * width], Device::Cpu);
+        let fused = reference::qk_norm(&packed, heads);
+
+        let per_tensor = |tensor: &Tensor| {
+            tensor
+                .reshape([batch, length, heads, head_dim])
+                .internal_fused_rms_norm([head_dim], None::<&Tensor>, Some(NORM_EPS))
+                .0
+                .reshape([batch, length, width])
+        };
+        let split = packed.split(width, -1);
+        let expected = Tensor::cat(&[per_tensor(&split[0]), per_tensor(&split[1])], -1);
+        assert!(
+            identical(&fused, &expected),
+            "the packed QK norm does not agree with per-head norms of q and k"
+        );
+    }
+
+    /// The OFF-CUDA path of the public op, in fp32, forward and backward. This is the path
+    /// ten of the model's CPU tests take through `Block::forward`, two of them in fp32, so
+    /// it is a real contract and not a courtesy: if `qk_norm_rope` raised off CUDA, or
+    /// assumed bf16, or returned the wrong axis order, those tests would be what discovered
+    /// it. The comparison is against an INDEPENDENT per-tensor composition - split `q‖k`,
+    /// normalize each per head, rotate each pair - so it pins the layout too, and it runs
+    /// the gradient because the model's CPU tests differentiate through here.
+    #[test]
+    fn the_off_cuda_path_is_the_per_tensor_composition_in_fp32() {
+        let (heads, head_dim, length, batch) = (4i64, 16i64, 7i64, 2i64);
+        let (half, width) = (head_dim / 2, heads * head_dim);
+        let (cosine, sine) = rotation(length, half, Device::Cpu);
+        let (cosine, sine) = (cosine.to_kind(Kind::Float), sine.to_kind(Kind::Float));
+
+        let sample = Tensor::randn([batch, length, 2 * width], (Kind::Float, Device::Cpu));
+        let dispatched_input = sample.detach().copy().set_requires_grad(true);
+        let dispatched = qk_norm_rope(&dispatched_input, &cosine, &sine, heads);
+        assert_eq!(
+            dispatched.size(),
+            vec![batch, length, 2, heads, head_dim],
+            "the off-CUDA path must produce the same axis order the kernel does"
+        );
+        assert_eq!(dispatched.kind(), Kind::Float, "fp32 in, fp32 out");
+
+        let expected_input = sample.detach().copy().set_requires_grad(true);
+        let per_tensor = |tensor: Tensor| {
+            let normed = tensor
+                .reshape([batch, length, heads, head_dim])
+                .internal_fused_rms_norm([head_dim], None::<&Tensor>, Some(NORM_EPS))
+                .0;
+            let parts = normed.split(half, -1);
+            let rows = |r: &Tensor| r.reshape([1, length, 1, half]);
+            Tensor::cat(
+                &[
+                    &parts[0] * rows(&cosine) - &parts[1] * rows(&sine),
+                    &parts[1] * rows(&cosine) + &parts[0] * rows(&sine),
+                ],
+                -1,
+            )
+        };
+        let split = expected_input.split(width, -1);
+        let expected = Tensor::stack(
+            &[
+                per_tensor(split[0].shallow_clone()),
+                per_tensor(split[1].shallow_clone()),
+            ],
+            2,
+        );
+        assert!(
+            max_absolute(&dispatched, &expected) < 1e-5,
+            "the off-CUDA path disagrees with the per-tensor composition, max |delta| {}",
+            max_absolute(&dispatched, &expected)
+        );
+
+        let upstream = Tensor::randn(dispatched.size(), (Kind::Float, Device::Cpu));
+        let gradient = Tensor::run_backward(
+            &[(&dispatched * &upstream).sum(Kind::Float)],
+            &[&dispatched_input],
+            false,
+            false,
+        );
+        let reference_gradient = Tensor::run_backward(
+            &[(&expected * &upstream).sum(Kind::Float)],
+            &[&expected_input],
+            false,
+            false,
+        );
+        assert!(
+            max_absolute(&gradient[0], &reference_gradient[0]) < 1e-5,
+            "the off-CUDA gradient disagrees with the per-tensor composition's, max |delta| {}",
+            max_absolute(&gradient[0], &reference_gradient[0])
+        );
+    }
+
+    /// The epsilon is 1e-6 and it MATTERS - but not for the reason the recipe report gives.
+    /// `_fused_rms_norm_cuda` resolves `eps = None` to the ACCUMULATE type's epsilon, which
+    /// for a bf16 input is `FLT_EPSILON = 1.19e-7` and not `finfo(bf16).eps = 7.8e-3`; at
+    /// unit scale that default and 1e-6 produce bit-identical bf16 output, which is why the
+    /// first version of this test failed. The difference appears where the epsilon is
+    /// load-bearing: a head block whose RMS is near the epsilon itself, which is exactly the
+    /// state QK-norm has to survive (a dead head, or a token whose projection collapsed).
+    /// The kernel bakes 1e-6 in, so this pins that the choice is observable rather than
+    /// letting a default silently stand in for the backbone's.
+    #[test]
+    fn the_norm_epsilon_is_observable_where_it_is_load_bearing() {
+        let values = bf16_randn(&[4, 6, 64], Device::Cpu) * 1e-4;
+        let chosen = values
+            .internal_fused_rms_norm([64], None::<&Tensor>, Some(NORM_EPS))
+            .0;
+        let defaulted = values.internal_fused_rms_norm([64], None::<&Tensor>, None).0;
+        assert!(
+            !identical(&chosen, &defaulted),
+            "eps=1e-6 and the resolved default agree even on a near-zero block, so this \
+             convention is untested"
         );
     }
 
@@ -526,13 +833,17 @@ mod tests {
     }
 
     /// Graph-capture compatibility, proven rather than argued: capture a forward AND a
-    /// backward through both kernels, overwrite the input buffers in place, replay, and
+    /// backward through every kernel, overwrite the input buffers in place, replay, and
     /// require the replayed gradients to be what a fresh eager evaluation produces on the
     /// new bytes. A host synchronization inside a kernel, an allocation outside the
     /// capture's private pool, or a launch geometry that depended on anything but the
     /// arguments would fail the capture or produce a stale replay.
+    ///
+    /// ONE capture test for all three kernels, not one each: `cargo test` runs tests in
+    /// parallel threads and two concurrent captures on one device fail each other, so the
+    /// suite gets exactly one capture window.
     #[test]
-    fn both_kernels_capture_and_replay_inside_a_cuda_graph() {
+    fn every_kernel_captures_and_replays_inside_a_cuda_graph() {
         let Some(device) = cuda() else { return };
         if !unsafe { torch_sys::at_cuda_graph_is_available() } {
             return;
@@ -543,15 +854,24 @@ mod tests {
         let (cosine, sine) = rotation(length, half, device);
         let hidden = bf16_randn(&[batch * length, 512], device).set_requires_grad(true);
         let packed = bf16_randn(&[batch, length, 2 * width], device).set_requires_grad(true);
+        let raw_packed = bf16_randn(&[batch, length, 2 * width], device).set_requires_grad(true);
 
         let step = || {
             let activation = relu_square(&hidden);
             let rotated = rope(&packed, &cosine, &sine, heads);
-            let objective = activation.sum(Kind::Float) + rotated.sum(Kind::Float);
-            let gradients = Tensor::run_backward(&[&objective], &[&hidden, &packed], false, false);
+            let normed = qk_norm_rope(&raw_packed, &cosine, &sine, heads);
+            let objective =
+                activation.sum(Kind::Float) + rotated.sum(Kind::Float) + normed.sum(Kind::Float);
+            let gradients = Tensor::run_backward(
+                &[&objective],
+                &[&hidden, &packed, &raw_packed],
+                false,
+                false,
+            );
             (
                 gradients[0].shallow_clone(),
                 gradients[1].shallow_clone(),
+                gradients[2].shallow_clone(),
                 objective,
             )
         };
@@ -579,9 +899,11 @@ mod tests {
         // New data into the SAME buffers: that is the only way a replay sees new inputs.
         let fresh_hidden = bf16_randn(&hidden.size(), device);
         let fresh_packed = bf16_randn(&packed.size(), device);
+        let fresh_raw = bf16_randn(&raw_packed.size(), device);
         tch::no_grad(|| {
             hidden.detach().copy_(&fresh_hidden);
             packed.detach().copy_(&fresh_packed);
+            raw_packed.detach().copy_(&fresh_raw);
         });
         unsafe {
             torch_sys::at_cuda_graph_stream_begin(graph, 0);
@@ -598,15 +920,23 @@ mod tests {
         // and neither can a replay that reproduced the kernels' own bug.
         let hidden_leaf = fresh_hidden.detach().copy().set_requires_grad(true);
         let packed_leaf = fresh_packed.detach().copy().set_requires_grad(true);
+        let raw_leaf = fresh_raw.detach().copy().set_requires_grad(true);
         let eager = {
             let activation = reference::relu_square(&hidden_leaf);
             let rotated = reference::rope(&packed_leaf, &cosine, &sine, heads);
-            let objective = activation.sum(Kind::Float) + rotated.sum(Kind::Float);
-            let gradients =
-                Tensor::run_backward(&[&objective], &[&hidden_leaf, &packed_leaf], false, false);
+            let normed = reference::qk_norm_rope(&raw_leaf, &cosine, &sine, heads);
+            let objective =
+                activation.sum(Kind::Float) + rotated.sum(Kind::Float) + normed.sum(Kind::Float);
+            let gradients = Tensor::run_backward(
+                &[&objective],
+                &[&hidden_leaf, &packed_leaf, &raw_leaf],
+                false,
+                false,
+            );
             (
                 gradients[0].shallow_clone(),
                 gradients[1].shallow_clone(),
+                gradients[2].shallow_clone(),
                 objective,
             )
         };
@@ -618,11 +948,248 @@ mod tests {
             identical(&captured.1, &eager.1),
             "the replayed rope gradient is not the composition's gradient of the new input"
         );
+        assert!(
+            identical(&captured.2, &eager.2),
+            "the replayed qk_norm_rope gradient is not the composition's gradient of the new input"
+        );
         assert_eq!(
-            captured.2.double_value(&[]),
-            eager.2.double_value(&[]),
+            captured.3.double_value(&[]),
+            eager.3.double_value(&[]),
             "the replayed objective does not match an eager evaluation on the same bytes"
         );
         unsafe { torch_sys::at_cuda_graph_free(graph) };
+    }
+
+    /// A packed input with the interesting values forced in rather than hoped for. The
+    /// special tokens go along the LENGTH axis, not the batch axis, because the batch here
+    /// is two or three rows and every one of them has to stay a normal sample.
+    ///
+    /// Token 0 is exactly zero, so `rstd` is `rsqrt(eps)` for every head block of it and a
+    /// naive `1/rms` would divide by zero; token 1 is all NaN; token 2 is all negative; and
+    /// token 3 carries a SINGLE NaN element, which has to poison exactly its own head block
+    /// through the reduction and no other.
+    fn qk_sample(shape: &[i64], device: Device) -> Tensor {
+        let values = bf16_randn(shape, device);
+        let _ = values.narrow(1, 0, 1).fill_(0.0);
+        let _ = values.narrow(1, 1, 1).fill_(f64::NAN);
+        let _ = values.narrow(1, 2, 1).fill_(-3.5);
+        let _ = values.narrow(1, 3, 1).narrow(-1, 5, 1).fill_(f64::NAN);
+        values
+    }
+
+    /// Forward and backward of the fused op against the composition, on the REAL call
+    /// site's input: a `split_with_sizes` view of the `[.., 3·d_model]` QKV projection, so
+    /// the kernel normalizes and rotates out of a strided buffer and the gradient has to
+    /// land in the right columns of a wider one.
+    #[test]
+    fn fused_qk_norm_rope_is_bit_identical_including_gradients() {
+        let Some(device) = cuda() else { return };
+        let (heads, head_dim, length, batch) = (8i64, 64i64, 375i64, 3i64);
+        let half = head_dim / 2;
+        let width = heads * head_dim;
+        let (cosine, sine) = rotation(length, half, device);
+
+        let source = qk_sample(&[batch, length, 3 * width], device);
+        let projection = source.detach().copy().set_requires_grad(true);
+        let composed_projection = source.detach().copy().set_requires_grad(true);
+        let packed = projection.split_with_sizes([2 * width, width], -1);
+        let composed_packed = composed_projection.split_with_sizes([2 * width, width], -1);
+        assert!(
+            !packed[0].is_contiguous(),
+            "the q‖k block should be a strided view of the projection"
+        );
+
+        let fused = qk_norm_rope(&packed[0], &cosine, &sine, heads);
+        let composed = reference::qk_norm_rope(&composed_packed[0], &cosine, &sine, heads);
+        assert_eq!(fused.size(), composed.size());
+        assert!(
+            identical(&fused, &composed),
+            "fused qk_norm_rope forward differs from the composition, {} elements differ",
+            differing(&fused, &composed)
+        );
+
+        let upstream = bf16_randn(&fused.size(), device);
+        let fused_grad = Tensor::run_backward(
+            &[(&fused * &upstream).sum(Kind::Float)],
+            &[&projection],
+            false,
+            false,
+        );
+        let composed_grad = Tensor::run_backward(
+            &[(&composed * &upstream).sum(Kind::Float)],
+            &[&composed_projection],
+            false,
+            false,
+        );
+        assert!(
+            identical(&fused_grad[0], &composed_grad[0]),
+            "fused qk_norm_rope backward differs from the composition, {} elements differ",
+            differing(&fused_grad[0], &composed_grad[0])
+        );
+        // The V block is neither normalized nor rotated, so its gradient columns must be
+        // untouched zeros - the op must not have written outside the q‖k half.
+        let value_gradient = fused_grad[0].narrow(-1, 2 * width, width);
+        assert_eq!(
+            value_gradient.abs().sum(Kind::Float).double_value(&[]),
+            0.0,
+            "the fused op wrote into the value block's gradient columns"
+        );
+    }
+
+    /// The composition and the fusion agree with the ALREADY-FUSED rotation too, which is
+    /// the baseline this op actually replaces once the packed rotary has landed.
+    #[test]
+    fn fused_qk_norm_rope_matches_the_norm_plus_fused_rotary_pair() {
+        let Some(device) = cuda() else { return };
+        let (heads, head_dim, length, batch) = (8i64, 64i64, 375i64, 2i64);
+        let (cosine, sine) = rotation(length, head_dim / 2, device);
+        let packed = qk_sample(&[batch, length, 2 * heads * head_dim], device);
+        assert!(identical(
+            &qk_norm_rope(&packed, &cosine, &sine, heads),
+            &reference::qk_norm_fused_rope(&packed, &cosine, &sine, heads)
+        ));
+    }
+
+    /// The geometry the 128-bit path refuses. `head_dim = 12` gives `half = 6`, so the
+    /// vector path cannot be taken and the single-thread emulation of ATen's reduction tree
+    /// runs instead - while ATen itself still runs its VECTORIZED kernel, because it makes
+    /// that choice on its own contiguous copy. Without this the emulated tree would be
+    /// dead, unproven code the moment a head dimension changed.
+    #[test]
+    fn fused_qk_norm_rope_is_bit_identical_on_the_emulated_reduction_path() {
+        let Some(device) = cuda() else { return };
+        let (heads, head_dim, length, batch) = (3i64, 12i64, 17i64, 2i64);
+        let (cosine, sine) = rotation(length, head_dim / 2, device);
+        let packed = qk_sample(&[batch, length, 2 * heads * head_dim], device);
+        let input = packed.detach().copy().set_requires_grad(true);
+        let composed_input = packed.detach().copy().set_requires_grad(true);
+
+        let fused = qk_norm_rope(&input, &cosine, &sine, heads);
+        let composed = reference::qk_norm_rope(&composed_input, &cosine, &sine, heads);
+        assert!(
+            identical(&fused, &composed),
+            "the emulated reduction path is not bit-identical, {} elements differ",
+            differing(&fused, &composed)
+        );
+
+        let upstream = bf16_randn(&fused.size(), device);
+        let fused_grad = Tensor::run_backward(
+            &[(&fused * &upstream).sum(Kind::Float)],
+            &[&input],
+            false,
+            false,
+        );
+        let composed_grad = Tensor::run_backward(
+            &[(&composed * &upstream).sum(Kind::Float)],
+            &[&composed_input],
+            false,
+            false,
+        );
+        assert!(
+            identical(&fused_grad[0], &composed_grad[0]),
+            "the emulated reduction path's gradient is not bit-identical, {} elements differ",
+            differing(&fused_grad[0], &composed_grad[0])
+        );
+    }
+
+    /// [`QK_NORM_ROUNDING`] is the MEASURED contraction form, and this is the measurement:
+    /// all eight forms run against the composition, and the set that reproduces it bit for
+    /// bit is asserted whole. It is `{2, 3}`, a pair and not a singleton, because bit 0 is
+    /// inert - the value it accumulates is a product of two bf16 mantissas and is therefore
+    /// exact in fp32, so contracting that multiply-add changes nothing. Bits 1 and 2 are not
+    /// inert and only one of their four combinations is ATen's.
+    ///
+    /// The forms differ only in whether an fp32 multiply-accumulate contracts into an `fma`,
+    /// which is invisible in any tolerance-based comparison and moves roughly one output
+    /// element in 10^5 - about 1500 per layer at the training shape. If a toolchain change
+    /// ever moves the answer, this fails with the new set in the message instead of the
+    /// kernel quietly drifting off the reference.
+    #[test]
+    fn qk_norm_rope_rounding_is_the_measured_pair() {
+        let Some(device) = cuda() else { return };
+        let (heads, head_dim, length, batch) = (8i64, 64i64, 375i64, 2i64);
+        let (cosine, sine) = rotation(length, head_dim / 2, device);
+        let width = heads * head_dim;
+        let sample = qk_sample(&[batch, length, 2 * width], device);
+        let upstream = bf16_randn(&[batch, length, 2, heads, head_dim], device);
+
+        let composed_input = sample.detach().copy().set_requires_grad(true);
+        let composed = reference::qk_norm_rope(&composed_input, &cosine, &sine, heads);
+        let composed_grad = Tensor::run_backward(
+            &[(&composed * &upstream).sum(Kind::Float)],
+            &[&composed_input],
+            false,
+            false,
+        );
+
+        let mut matching = Vec::new();
+        let mut diagnostic = String::new();
+        for rounding in 0..8 {
+            let input = sample.detach().copy().set_requires_grad(true);
+            let fused = raw::qk_norm_rope(&input, &cosine, &sine, heads, rounding);
+            let gradient = Tensor::run_backward(
+                &[(&fused * &upstream).sum(Kind::Float)],
+                &[&input],
+                false,
+                false,
+            );
+            let forward_ok = identical(&fused, &composed);
+            let backward_ok = identical(&gradient[0], &composed_grad[0]);
+            if forward_ok && backward_ok {
+                matching.push(rounding);
+            }
+            diagnostic.push_str(&format!(
+                "\n  rounding {rounding}: forward {forward_ok} ({} elements differ), backward {backward_ok} ({} elements differ)",
+                differing(&fused, &composed),
+                differing(&gradient[0], &composed_grad[0])
+            ));
+        }
+        assert_eq!(
+            matching,
+            vec![QK_NORM_ROUNDING, QK_NORM_ROUNDING | 1],
+            "exactly the measured contraction pair should reproduce ATen's reduction:{diagnostic}"
+        );
+    }
+
+    /// ATen's `rstd` is the reduction TREE the kernel reproduces, proven without the kernel:
+    /// squares summed four at a time in order, then halved pairwise - `p[i] + p[i+8]`, then
+    /// `+4`, `+2`, `+1`, which is `WARP_SHFL_DOWN` at offsets 16..1 with the top level
+    /// landing on structural zeros - then divided by `head_dim` and `rsqrt`-ed.
+    ///
+    /// This is the claim the kernel's whole addressing scheme is built on, and it is worth
+    /// pinning separately from the kernel: a naive `sum(-1)` reference would disagree with
+    /// ATen here, and a test that only compared kernel against composition could not say
+    /// whether it was the tree or the arithmetic that was wrong.
+    #[test]
+    fn atens_rms_statistic_is_the_reduction_tree_the_kernel_reproduces() {
+        let Some(device) = cuda() else { return };
+        let (rows, head_dim) = (4096i64, 64i64);
+        let values = bf16_randn(&[rows, head_dim], device);
+        let statistic = values
+            .internal_fused_rms_norm([head_dim], None::<&Tensor>, Some(NORM_EPS))
+            .1
+            .reshape(-1);
+
+        // bf16 widens to fp32 losslessly and a product of two 8-bit mantissas is exact, so
+        // `square()` here is ATen's `val * val` to the bit.
+        let chunks = values
+            .to_kind(Kind::Float)
+            .square()
+            .reshape([rows, head_dim / 4, 4]);
+        // `((a+b)+c)+d`, not `(a+b)+(c+d)`: the partial is accumulated one element at a
+        // time from zero.
+        let mut tree = &(&chunks.select(2, 0) + &chunks.select(2, 1)) + &chunks.select(2, 2);
+        tree = &tree + &chunks.select(2, 3);
+        let mut width = head_dim / 4;
+        while width > 1 {
+            width /= 2;
+            tree = &tree.narrow(1, 0, width) + &tree.narrow(1, width, width);
+        }
+        let expected = (&tree.reshape(-1) / head_dim as f64 + NORM_EPS).rsqrt();
+        assert!(
+            identical(&statistic, &expected),
+            "ATen's rstd is not the four-element-partial binary tree the kernel implements, max |delta| {}",
+            max_absolute(&statistic, &expected)
+        );
     }
 }

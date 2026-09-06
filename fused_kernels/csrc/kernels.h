@@ -46,6 +46,39 @@ int fk_rope_backward(const void *grad, const void *cosine, const void *sine,
                      int64_t half, int64_t grad_row_stride,
                      int64_t dx_row_stride, void *stream);
 
+// Fused per-head QK-normalization + the same packed rotary. `width` is `head_dim` as a
+// float (ATen's `fH`), `eps` the RMSNorm epsilon, and `rounding` the fp32 contraction
+// selector documented at the definition. Each head block of `2*half` elements is one
+// gainless, biasless RMS normalization group AND one rotary block, which is why the two
+// ops fuse without changing either one's addressing:
+//
+//   y        = bf16(rstd * x),  rstd = rsqrt(Σ x² / width + eps)
+//   out_low  = y_low * cos - y_high * sin
+//   out_high = y_high * cos + y_low * sin
+//
+// The normalized `y` is never written anywhere. `head_dim` must be a multiple of four and
+// at most 128: outside that range ATen's own forward switches to a Welford kernel with a
+// different summation order and bit-identity is no longer defined.
+int fk_qk_norm_rope_forward(const void *input, const void *cosine, const void *sine,
+                            void *output, int64_t rows, int64_t length, int64_t blocks,
+                            int64_t half, int64_t input_row_stride,
+                            int64_t output_row_stride, float width, float eps,
+                            int rounding, void *stream);
+
+// The composition's backward in one pass: the transposed rotation recovers the gradient of
+// the normalized block, the per-head RMS is RECOMPUTED from `input` (a reduction over
+// `head_dim` elements already in flight, so no `rstd` tensor is retained by the forward),
+// and the RMSNorm gradient follows:
+//
+//   gy    = g_low * cos + g_high * sin  (low),  g_high * cos - g_low * sin  (high)
+//   stats = Σ (gy * x) * rstd
+//   dx    = (width * gy - x * rstd * stats) * (rstd / width)
+int fk_qk_norm_rope_backward(const void *grad, const void *input, const void *cosine,
+                             const void *sine, void *dx, int64_t rows, int64_t length,
+                             int64_t blocks, int64_t half, int64_t grad_row_stride,
+                             int64_t input_row_stride, int64_t dx_row_stride, float width,
+                             float eps, int rounding, void *stream);
+
 // A 128-bit vectorized bf16 copy: `out[i] = in[i]`. Not used by the model. It exists to
 // measure this device's streaming roof with the SAME launch geometry and access width as
 // the kernels above, so a percentage against it is an efficiency statement rather than a

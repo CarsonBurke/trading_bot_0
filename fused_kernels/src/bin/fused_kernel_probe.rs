@@ -8,7 +8,7 @@
 
 use anyhow::{ensure, Result};
 use clap::Parser;
-use fused_kernels::probe::measure;
+use fused_kernels::probe::{activation_saving, measure};
 use shared::report::{write_report, Report, ReportKind, ReportSeries, ScaleKind};
 use std::path::PathBuf;
 use tch::{Cuda, Device};
@@ -66,9 +66,13 @@ fn main() -> Result<()> {
         "% bwd",
         "step ms cut"
     );
+    // Only the additive rows: `QK norm + rotary` measures against the whole composed
+    // sequence and already contains the rotary row's saving.
     let mut total_saved = 0.0;
     for row in rows {
-        total_saved += row.step_ms_saved();
+        if row.additive {
+            total_saved += row.step_ms_saved();
+        }
         println!(
             "{:<16} {:>10.3} {:>10.3} {:>10.3} {:>10.3} {:>10.3} {:>9.0} {:>9.0} {:>7.1} {:>7.1} {:>11.1}",
             row.name,
@@ -85,10 +89,30 @@ fn main() -> Result<()> {
         );
     }
     println!(
-        "streaming roof {peak_gbs:.0} GB/s (128-bit vectorized copy kernel, interleaved with every measurement above) | both kernels together cut {total_saved:.1} ms from a {} row step",
+        "streaming roof {peak_gbs:.0} GB/s (128-bit vectorized copy kernel, interleaved with every measurement above) | the kernels together cut {total_saved:.1} ms from a {} row step",
         args.rows
     );
 
+    // Measured after the timings, behind its own `empty_cache`: allocating a `layers`-deep
+    // retained chain would otherwise sit under every millisecond above.
+    let memory = activation_saving(
+        device,
+        args.rows,
+        args.origins,
+        args.d_model,
+        args.heads,
+        args.layers,
+    );
+    println!(
+        "QK-norm activation footprint over {} layers: composed peak {:.1} MiB, fused peak {:.1} MiB, saved {:.1} MiB | retained composed {:.1} MiB, fused {:.1} MiB, saved {:.1} MiB",
+        memory.layers,
+        memory.composed_peak_mib,
+        memory.fused_peak_mib,
+        memory.peak_saved_mib(),
+        memory.composed_live_mib,
+        memory.fused_live_mib,
+        memory.retained_saved_mib()
+    );
     let series: Vec<ReportSeries> = rows
         .iter()
         .flat_map(|row| {
@@ -145,10 +169,42 @@ fn main() -> Result<()> {
                 label: "measured streaming roof GB/s (128-bit vectorized copy kernel)".to_owned(),
                 values: vec![peak_gbs as f32],
             },
-
             ReportSeries {
-                label: "both kernels: step milliseconds saved".to_owned(),
+                label: "every kernel: step milliseconds saved".to_owned(),
                 values: vec![total_saved as f32],
+            },
+            ReportSeries {
+                label: format!(
+                    "QK norm: composed allocator peak MiB over {} layers",
+                    memory.layers
+                ),
+                values: vec![memory.composed_peak_mib as f32],
+            },
+            ReportSeries {
+                label: format!(
+                    "QK norm: fused allocator peak MiB over {} layers",
+                    memory.layers
+                ),
+                values: vec![memory.fused_peak_mib as f32],
+            },
+            ReportSeries {
+                label: "QK norm: allocator peak MiB saved".to_owned(),
+                values: vec![memory.peak_saved_mib() as f32],
+            },
+            ReportSeries {
+                label: format!(
+                    "QK norm: composed retained MiB over {} layers",
+                    memory.layers
+                ),
+                values: vec![memory.composed_live_mib as f32],
+            },
+            ReportSeries {
+                label: format!("QK norm: fused retained MiB over {} layers", memory.layers),
+                values: vec![memory.fused_live_mib as f32],
+            },
+            ReportSeries {
+                label: "QK norm: retained MiB saved".to_owned(),
+                values: vec![memory.retained_saved_mib() as f32],
             },
         ])
         .collect();
@@ -158,7 +214,7 @@ fn main() -> Result<()> {
         args.output.join("timexer_segment_fused_kernels.report.bin"),
         &Report {
             title: format!(
-                "fused ReLU^2 and packed rotary against the composed-ATen forms | {} rows, {} tokens, d_model {}, {} heads, ffn {}, {} layers | {peak_gbs:.0} GB/s measured streaming roof",
+                "fused ReLU^2, packed rotary and QK-norm+rotary against the composed-ATen forms | {} rows, {} tokens, d_model {}, {} heads, ffn {}, {} layers | {peak_gbs:.0} GB/s measured streaming roof",
                 args.rows,
                 args.rows * args.origins,
                 args.d_model,
@@ -168,7 +224,7 @@ fn main() -> Result<()> {
             ),
             x_label: Some("batch rows".to_owned()),
             y_label: Some(
-                "named units (each label states its own; lower is better in milliseconds, higher in GB/s and in percent of the streaming roof)"
+                "named units (each label states its own; lower is better in milliseconds and MiB, higher in GB/s and in percent of the streaming roof)"
                     .to_owned(),
             ),
             scale: ScaleKind::Linear,
