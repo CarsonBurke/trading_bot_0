@@ -2,7 +2,7 @@
 
 Main tree: `6b28bad9` (off-CUDA dispatch), `2d99f2df` (ReLU² + packed rotary), `1a8f2a31`
 (FusedNorm's fused QK-norm+RoPE, merged fast-forward), `7b0ec789` (that op wired, two classes
-collapsed into one), plus one docs-and-report commit on top. Jobs: **5145**/**5185**/**5186**
+collapsed into one), plus one docs-and-report commit on top. Jobs: **5145**/**5185**/**5186**/**5189**
 (`cargo test -p fused_kernels`), **5177** (pre-wiring A/B), **5147** + **5148** (first wiring,
 plain and capture-audit), **5183** + **5184** (second wiring, plain and capture-audit), **5181**
 (the `eps=None` resolution probe). All six benchmark probes ran on an idle device: their in-run
@@ -149,17 +149,23 @@ host objective read per step 167.15 ms, pinned upload 174.86 ms, pageable 174.80
   that possible. The composed `rms_norm`-then-`rope` pair now lives in `mod tests` as the
   independent reference (`use fused_kernels::rope as fused_rope` inside the test module), so no
   composed spelling remains reachable from the model.
-- `cargo test -p fused_kernels`: 6/6 at `dee5ebc5` (job 5145). At the merged tip it is **RACY**:
-  job 5185 got **8 passed, 6 failed**, and job 5186 with `--test-threads=1` got **14/14**.
-  `every_kernel_captures_and_replays_inside_a_cuda_graph` captures on the current stream while
-  cargo's other test threads issue CUDA work on it, so siblings die with
-  `cudaErrorStreamCaptureUnsupported` (from `memcpy_and_sync` / `CachingHostAllocator`) and the
-  capture test then dies with `cudaErrorStreamCaptureInvalidated`. FusedNorm's 14/14 on job 5182
-  was a scheduling accident. Reported to them with the diagnosis and two candidate fixes (a
-  process-wide mutex every CUDA test takes, or capturing on a private stream no sibling can be
-  on); it is their crate and the hazard predates the merge. **Nothing about the model path is
-  affected** - the ops themselves are proven bit-identical and capturable, including inside the
-  full forward+backward capture of jobs 5148/5184.
+- `cargo test -p fused_kernels`: 6/6 at `dee5ebc5` (job 5145). At the first merged tip it was
+  **racy**: job 5185 got **8 passed, 6 failed** and job 5186 with `--test-threads=1` got 14/14.
+  `every_kernel_captures_and_replays_inside_a_cuda_graph` captures while cargo's other test
+  threads issue CUDA work, so siblings died with `cudaErrorStreamCaptureUnsupported` (from
+  `memcpy_and_sync` / `CachingHostAllocator`) and the capture test then died with
+  `cudaErrorStreamCaptureInvalidated`; FusedNorm's earlier 14/14 runs had used
+  `--test-threads=1` and were not evidence. **Fixed by them in `a9d49064`, merged
+  fast-forward: job 5189 runs `cargo test -p fused_kernels` at cargo's default thread count on
+  this tip and passes 14/14.** The fix is a process-wide claim: `cuda()` hands out a
+  `CudaClaim` (a static `MutexGuard` that `Deref`s to the `Device`), so a CUDA test in that
+  module cannot name a device without holding the lock, and poison is drained so one failing
+  test does not cascade. Worth keeping from the diagnosis: a private capture stream would NOT
+  have helped - `CUDAGraph::capture_begin` uses `cudaStreamCaptureModeGlobal`, the only mode
+  libtorch's C++ API exposes and the only one `torch-sys` binds, and it rejects unsafe CUDA
+  actions process-wide for the duration of the capture. Nothing about the model path was ever
+  affected: the ops are bit-identical and capturable, including inside the full
+  forward+backward capture of jobs 5148/5184.
 - Job 5181 settled `eps=None` by measurement: on a bf16 CUDA input,
   `_fused_rms_norm(x, shape, None, None)` is bit-identical to `eps = 1.1920929e-7` (max
   difference exactly 0.0) and differs from `finfo(bf16).eps = 7.8e-3` by 21× in RMS - the kernel
@@ -174,8 +180,8 @@ host objective read per step 167.15 ms, pinned upload 174.86 ms, pageable 174.80
    provably correct against the eager null, but returns +0.25%. Arming it in training buys
    nothing measurable today; the audit's value is that it is the only instrument reporting the
    memory-stage table.
-2. **`fused_kernels`' test suite needs the stream-capture race fixed** (above). Until FusedNorm
-   lands it, `cargo test -p fused_kernels` is only trustworthy with `--test-threads=1`.
+2. **`fused_kernels`' test race is fixed and verified in main** (`a9d49064`, merged
+   fast-forward): nothing left to do, recorded here only because the diagnosis is reusable.
 3. **`device_peaks` is still measured sequentially**, not interleaved with the classes it is a
    denominator for. Every probe here ran on an idle device and the roofs agree across all six, so
    no fraction in this report is contention-dependent - but the defect that produced job 5136's
