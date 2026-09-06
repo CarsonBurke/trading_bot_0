@@ -1,5 +1,5 @@
 use anyhow::{ensure, Result};
-use fused_kernels::{relu_square, rope as fused_rope};
+use fused_kernels::{qk_norm_rope, relu_square};
 use serde::{Deserialize, Serialize};
 use tch::{nn, Device, Kind, Tensor};
 
@@ -204,29 +204,29 @@ impl ModelConfig {
         let bf16 = |elements: f64| 2. * elements;
         let fp32 = |elements: f64| 4. * elements;
         let mut bytes = bf16(tokens * self.patch_len as f64 * (CHANNELS as f64 + aux));
-        // Per layer: two pre-norms (2·width), the packed projection (3·width), the QK norm over
-        // the packed `q‖k` block (2·width), the rotation's OUTPUT (2·width - the only tensor
-        // `fused_kernels::rope` materializes, where the composed form charged 8·width for two
-        // full-width products over that block, the two half-crossing sums and the buffer that
-        // interleaved them), the attention output, its projection and the two residual
-        // `addcmul`s (6·width), the x0 injection's second `addcmul` (1·width), and the
-        // feedforward PAIR (2·ffn - the up projection and `fused_kernels::relu_square`'s single
-        // output; the `relu`-then-`square` composition materialized three, GELU two). The
-        // rotation term was missing entirely before this accounting was measured per kernel
-        // class, and at 8·width of 22 the bound it produced was 40% low.
+        // Per layer: two pre-norms (2·width), the packed projection (3·width), the OUTPUT of the
+        // fused QK-norm-plus-rotation (2·width - the only tensor `fused_kernels::qk_norm_rope`
+        // materializes; the composed form charged 2·width for the normalized `q‖k` block it had
+        // to hand on and 8·width for the rotation's two full-width products, its two
+        // half-crossing sums and the buffer that interleaved them), the attention output, its
+        // projection and the two residual `addcmul`s (6·width), the x0 injection's second
+        // `addcmul` (1·width), and the feedforward PAIR (2·ffn - the up projection and
+        // `fused_kernels::relu_square`'s single output; the `relu`-then-`square` composition
+        // materialized three, GELU two). The rotation term was missing entirely before this
+        // accounting was measured per kernel class, and at 8·width of 22 the bound it produced
+        // was 40% low.
         //
-        // Against the LayerNorm/GELU form (19·width + 2·ffn) the residual recipe now adds
-        // 3·width per layer - the QK norm and the x0 `addcmul` - and nothing at all in the
-        // feedforward: with both fusions on the path, `square`'s extra `[tokens, ffn]` tensor
-        // and six of the rotation's eight width-units are gone. The post-lambdas cost nothing
-        // here because they ride the projection weights ([`scaled_linear`]), and the residual
-        // scales cost nothing because `addcmul` folds them into the add that was already there.
+        // Against the LayerNorm/GELU form (19·width + 2·ffn) the residual recipe now adds ONE
+        // width-unit per layer, the x0 `addcmul`, and nothing else: the QK norm it introduced no
+        // longer materializes anything, `square`'s extra `[tokens, ffn]` tensor is gone, and so
+        // are six of the rotation's eight width-units. The post-lambdas cost nothing here
+        // because they ride the projection weights ([`scaled_linear`]), and the residual scales
+        // cost nothing because `addcmul` folds them into the add that was already there.
+        //
+        // The fp32 `rstd` a materializing RMSNorm writes is not charged here and never was;
+        // the fused kernel writes none at all, recomputing the normalization in its backward.
         bytes += self.layers as f64
-            * bf16(
-                tokens
-                    * (2. * width + 3. * width + 2. * width + 2. * width + 6. * width + width
-                        + 2. * ffn),
-            );
+            * bf16(tokens * (2. * width + 3. * width + 2. * width + 6. * width + width + 2. * ffn));
         // The patch embedding's own norm: `x0 = rms_norm(patch(tokens))`, once per step.
         bytes += bf16(tokens * width);
         // The U-net skip: ONE fused `addcmul` per decoder layer (see `unet_stack`), so each
@@ -507,20 +507,17 @@ impl Block {
         // matching the reference, where `norm` touches only `q, k` - so both operands of the
         // value-residual mix below are unnormalized, as they are upstream.
         //
-        // `[batch, length, 2·heads, head_dim]` is a free reshape of the packed `q‖k` block -
-        // column `t·heads·head_dim + h·head_dim + d` already carries tensor `t`, head `h`,
-        // dim `d` - so one RMSNorm over the last axis is exactly per-head, per-token
-        // normalization of both q and k in a single kernel.
-        let normed = rms_norm(&packed[0].reshape([batch, length, 2 * self.heads, head_dim]))
-            .reshape([batch, length, 2 * self.width]);
-        // ONE kernel in each direction: `fused_kernels::rope` reads the normalized `q‖k`
-        // block, indexes the untiled `[origins, head_dim/2]` rotation rows directly and
-        // writes the `[batch, length, 2, heads, head_dim]` buffer. The composed form
-        // materialized two full-width products, two half-crossing sums and the buffer that
-        // interleaved them - eighteen `state`-units of traffic against this four - and needed
-        // 768 KiB of broadcast tiles that are no longer built at all. Bit-identical in both
-        // directions, so nothing downstream moves.
-        let rotated = fused_rope(&normed, rotation.0, rotation.1, self.heads).split(1, 2);
+        // ONE kernel in each direction for the whole normalize-then-rotate pair:
+        // `fused_kernels::qk_norm_rope` reads the RAW packed `q‖k` block, normalizes each
+        // `head_dim` row of the free `[batch, length, 2·heads, head_dim]` view (column
+        // `t·heads·head_dim + h·head_dim + d` already carries tensor `t`, head `h`, dim `d`),
+        // rotates it against the untiled `[origins, head_dim/2]` rows and writes the
+        // `[batch, length, 2, heads, head_dim]` buffer. The normalized block is never
+        // materialized and no `rstd` is written or read back - the backward recomputes the
+        // normalization from the raw block, which is the cheap half of a memory-bound kernel.
+        // Bit-identical to `_fused_rms_norm`-then-`fused_kernels::rope` in both directions.
+        let rotated =
+            qk_norm_rope(&packed[0], rotation.0, rotation.1, self.heads).split(1, 2);
         // Value residual. `packed[1]` is the layer's own value, head-shaped by a VIEW (splitting
         // the last dimension is always expressible as a stride, so this costs nothing); the mix
         // is one `lerp` - a single read of each operand and one write - rather than the
@@ -1191,19 +1188,22 @@ impl CausalPatchModel {
                 run: Box::new(move |input| rms_norm(&input[0])),
             },
             KernelClass {
-                name: "QK RMSNorm",
-                // The packed `q‖k` block, normalized per head over `head_dim` before the
-                // rotation - `2·heads` rows of `head_dim` per token.
+                name: "QK norm + rotary",
+                // The RAW packed `q‖k` block: ONE kernel normalizes each of its `2·heads` rows
+                // of `head_dim` per token AND rotates them, so this charges `4·state` - read the
+                // block, write the rotated buffer. Nothing else crosses HBM: the normalized
+                // block is never materialized, no `rstd` is written (the backward recomputes the
+                // normalization from the raw block), and the untiled `[origins, head_dim/2]`
+                // rotation rows are 24 KiB of L2. The composition charged `4·state +
+                // fp32(2·heads·tokens)` for the norm and another `4·state` for the rotation, on
+                // top of the `18·state` the pre-kernel composed rotation cost.
                 inputs: vec![activation(2 * width)],
-                forward_bytes: 4. * state + rstd(2. * heads as f64 * tokens),
-                forward_flops: 3. * tokens * 2. * width as f64,
+                forward_bytes: 4. * state,
+                // The norm's three per element over `2·width` plus the rotation's six per
+                // `width`: one product and one sum for each of the two half-crossing terms.
+                forward_flops: 3. * tokens * 2. * width as f64 + 6. * tokens * width as f64,
                 parameters: Vec::new(),
-                run: Box::new(move |input| {
-                    rms_norm(
-                        &input[0].reshape([rows, origins, 2 * heads, head_dim]),
-                    )
-                    .reshape([rows, origins, 2 * width])
-                }),
+                run: Box::new(move |input| qk_norm_rope(&input[0], rotation.0, rotation.1, heads)),
             },
             KernelClass {
                 name: "QKV projection",
@@ -1212,20 +1212,6 @@ impl CausalPatchModel {
                 forward_flops: gemm(width, 3 * width),
                 parameters: projected(&block.qkv),
                 run: Box::new(move |input| linear(&input[0], &block.qkv)),
-            },
-            KernelClass {
-                name: "rotary rotation",
-                inputs: vec![activation(2 * width)],
-                // ONE kernel: `fused_kernels::rope` reads the packed `q‖k` block and writes the
-                // rotated buffer, so this charges `4·state`. The composition charged `18·state`
-                // - two full-width products (4·state each), two half-crossing sums (3·state
-                // each) and the stack that interleaved them back (4·state) - and the 768 KiB of
-                // broadcast tiles it needed are not built either: the kernel indexes the
-                // untiled `[origins, head_dim/2]` rows directly, which round to nothing here.
-                forward_bytes: 4. * state,
-                forward_flops: 6. * tokens * width as f64,
-                parameters: Vec::new(),
-                run: Box::new(move |input| fused_rope(&input[0], rotation.0, rotation.1, heads)),
             },
             KernelClass {
                 name: "causal SDPA",
@@ -1723,6 +1709,10 @@ pub fn gaussian_nll(prediction: &Tensor, log_scale: &Tensor, target: &Tensor, ma
 #[cfg(test)]
 mod tests {
     use super::*;
+    // The composed reference the fused kernels are checked against: normalize the packed
+    // block, then rotate it. `Block::forward` runs ONE kernel for the pair, and these tests
+    // are what pins the two to the same bytes.
+    use fused_kernels::rope as fused_rope;
     use tch::Device;
 
     fn small_config() -> ModelConfig {
