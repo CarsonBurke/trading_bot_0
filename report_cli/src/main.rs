@@ -9,7 +9,7 @@ use std::path::{Component, Path, PathBuf};
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 3 {
-        bail!("usage: report_cli <generation> <report_name> [ticker|inference_set/episode] [--run NAME|--run-root PATH] [--runs-root PATH] [--sample N] [--min N] [--max N] [--var NAME]");
+        bail!("usage: report_cli <generation> <report_base> [ticker|inference_set/episode] [--run NAME|--run-root PATH] [--runs-root PATH] [--sample N] [--min N] [--max N] [--var NAME]\n<report_base> is a chart base name without the .report.bin suffix; a miss lists the bases the generation directory holds");
     }
 
     let generation = args[1]
@@ -116,8 +116,15 @@ fn main() -> Result<()> {
     let run = resolve_run(&runs_root, run_name.as_deref(), run_root.as_deref())?;
     let report_path = build_report_path(&run.gens, generation, &report_name, ticker)?;
 
-    let bytes = fs::read(&report_path)
-        .with_context(|| format!("failed to read report {}", report_path.display()))?;
+    let bytes = fs::read(&report_path).with_context(|| {
+        let directory = report_path.parent().unwrap_or(Path::new("."));
+        format!(
+            "failed to read report {}; bases in {}: {}",
+            report_path.display(),
+            directory.display(),
+            available_bases(directory)
+        )
+    })?;
     let report: Report = postcard::from_bytes(&bytes).context("failed to decode report")?;
 
     let mut lines = report.kind.to_lines();
@@ -319,6 +326,28 @@ fn normalize_report_name(raw: &str) -> String {
         name = stripped.to_string();
     }
     name.to_ascii_lowercase().replace(' ', "_")
+}
+
+/// Chart bases sitting beside a requested report. A miss names the alternatives instead of
+/// leaving the caller to guess which of the writers' base names this run actually produced,
+/// which is the whole failure mode after a base is renamed or split.
+fn available_bases(directory: &Path) -> String {
+    let mut bases: Vec<&str> = Vec::new();
+    let entries: Vec<_> = fs::read_dir(directory)
+        .into_iter()
+        .flatten()
+        .filter_map(Result::ok)
+        .map(|entry| entry.file_name())
+        .collect();
+    bases.extend(entries.iter().filter_map(|name| {
+        name.to_str()
+            .and_then(|name| name.strip_suffix(".report.bin"))
+    }));
+    if bases.is_empty() {
+        return "none".to_owned();
+    }
+    bases.sort_unstable();
+    bases.join(", ")
 }
 
 fn build_report_path(

@@ -429,6 +429,23 @@ fn meta_chart_bases() -> Vec<&'static str> {
     bases
 }
 
+/// Panels that must be reached before any alphabetically sorted one, most important first.
+const HEADLINE_CHART_BASES: &[&str] = &["timexer_segment_skill"];
+
+/// Position of `path`'s base in [`HEADLINE_CHART_BASES`], or one past the end for every
+/// other panel, so a plain path comparison orders the remainder.
+fn headline_rank(path: &Path) -> usize {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .and_then(|name| name.strip_suffix(".report.bin"))
+        .and_then(|base| {
+            HEADLINE_CHART_BASES
+                .iter()
+                .position(|headline| *headline == base)
+        })
+        .unwrap_or(HEADLINE_CHART_BASES.len())
+}
+
 fn planner_committed_updates(gens: &Path) -> std::collections::HashMap<String, u64> {
     let Some(weights) = gens.parent().map(|root| root.join("weights")) else {
         return std::collections::HashMap::new();
@@ -773,8 +790,11 @@ impl App {
             }
         }
 
-        // Sort by filename for consistent ordering
-        self.latest_meta_charts.sort();
+        // Sort by filename for consistent ordering, with the headline panels pulled to the
+        // front: alphabetical order would bury the one chart that answers "is this run
+        // beating its baseline at all" in the middle of its own family.
+        self.latest_meta_charts
+            .sort_by(|a, b| headline_rank(a).cmp(&headline_rank(b)).then_with(|| a.cmp(b)));
 
         Ok(())
     }
@@ -1178,13 +1198,46 @@ mod planner_inference_discovery_tests {
     #[test]
     fn the_meta_chart_list_looks_for_every_registered_writer_base() {
         let bases = meta_chart_bases();
-        for registered in PRETRAIN_REPORT_BASES.iter().chain(RL_META_REPORT_BASES) {
+        for registered in PRETRAIN_REPORT_BASES
+            .iter()
+            .chain(RL_META_REPORT_BASES)
+            .chain(shared::report::TIMEXER_SEGMENT_REPORT_BASES)
+        {
             assert!(
                 bases.contains(registered),
                 "{registered} is written but the TUI never scans for it, so the chart is \
                  invisible"
             );
         }
+        // Both directions for the segment family. The forward sweep above catches a base the
+        // writer produces and the TUI never scans; this catches the reverse, a name the TUI
+        // still scans after the writer retired it, which renders as a permanently blank
+        // panel that a reader cannot distinguish from a metric that stopped moving.
+        let mut registered: Vec<_> = shared::report::TIMEXER_SEGMENT_REPORT_BASES.to_vec();
+        registered.sort_unstable();
+        let scanned: Vec<_> = bases
+            .iter()
+            .copied()
+            .filter(|base| base.starts_with("timexer_segment_"))
+            .collect();
+        assert_eq!(
+            scanned, registered,
+            "every timexer_segment_* base the TUI scans must be registered and vice versa"
+        );
+        assert_eq!(
+            HEADLINE_CHART_BASES.first(),
+            Some(&"timexer_segment_skill"),
+            "the dimensionless persistence-ratio panel is the chart a reader checks first"
+        );
+        assert_eq!(
+            headline_rank(Path::new("gens/3/timexer_segment_skill.report.bin")),
+            0
+        );
+        assert!(
+            headline_rank(Path::new("gens/3/timexer_segment_loss.report.bin"))
+                > headline_rank(Path::new("gens/3/timexer_segment_skill.report.bin")),
+            "an ordinary panel must sort after every headline panel"
+        );
         assert!(
             bases.contains(&"pretrain_independent_marginal_nll"),
             "the independent-marginal diagnostic must be registered under its honest base"

@@ -6,14 +6,37 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 static TEMP_FILE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
+/// The CausalPatch segment forecaster's chart bases, headline first. Each base answers one
+/// question in one unit; the split into `_skill` / `_loss` / `_error` and the four-way
+/// per-horizon family exists because a shared axis carrying a dimensionless ratio near 1
+/// beside a σ-scaled level beside a rate near 0.5 renders all but one of them as flat lines.
 pub const TIMEXER_SEGMENT_REPORT_BASES: &[&str] = &[
-    "timexer_segment_validation",
+    "timexer_segment_skill",
+    "timexer_segment_loss",
+    "timexer_segment_error",
+    "timexer_segment_calibration",
+    "timexer_segment_horizon",
+    "timexer_segment_horizon_error",
+    "timexer_segment_horizon_robust",
+    "timexer_segment_horizon_rates",
+    "timexer_segment_decomposition",
+    "timexer_segment_signal",
+    "timexer_segment_offset",
+    "timexer_segment_tradable",
+    "timexer_segment_tradable_rates",
+    "timexer_segment_portfolio",
+    "timexer_segment_portfolio_sharpe",
     "timexer_segment_progress",
+    "timexer_segment_recipe_scalars",
     "timexer_segment_timing",
+    "timexer_segment_capture",
     "timexer_segment_candles",
     "timexer_segment_hardware",
     "timexer_segment_benchmark",
     "timexer_segment_benchmark_phases",
+    "timexer_segment_benchmark_kernels",
+    "timexer_segment_benchmark_kernel_roofline",
+    "timexer_segment_benchmark_kernel_activations",
 ];
 
 pub const RL_META_REPORT_BASES: &[&str] = &[

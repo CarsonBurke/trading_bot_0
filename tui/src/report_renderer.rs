@@ -916,11 +916,18 @@ fn render_candle_segment(
     );
     let solo = solo_series.filter(|&index| index < 2);
     let active = |index| solo.is_none() || solo == Some(index);
-    let visible_predictions = || {
-        predicted
-            .iter()
-            .enumerate()
-            .filter(|(i, _)| origin + 1 + i >= skip)
+    let prediction_skip = skip.saturating_sub(origin + 1);
+    let predicted_visible = if active(1) {
+        let anchor = match prediction_skip {
+            0 => actual[origin].close,
+            n => predicted
+                .get(n - 1)
+                .map(|candle| candle.close)
+                .unwrap_or(actual[origin].close),
+        };
+        chain_forecast_candles(anchor, skip_slice(predicted, prediction_skip))
+    } else {
+        Vec::new()
     };
     let mut values = Vec::new();
     if active(0) {
@@ -931,7 +938,11 @@ fn render_candle_segment(
         );
     }
     if active(1) {
-        values.extend(visible_predictions().flat_map(|(_, c)| [c.open, c.high, c.low, c.close]));
+        values.extend(
+            predicted_visible
+                .iter()
+                .flat_map(|c| [c.open, c.high, c.low, c.close]),
+        );
     }
     if !values.iter().any(|v| v.is_finite()) {
         return Ok(());
@@ -977,10 +988,9 @@ fn render_candle_segment(
         )?;
     }
     if active(1) {
-        let prediction_skip = skip.saturating_sub(origin + 1);
         draw_candles(
             &mut chart,
-            skip_slice(predicted, prediction_skip),
+            &predicted_visible,
             (origin + 1 + prediction_skip) as f64,
             0.45,
             "predicted OHLC (transparent)",
@@ -1147,6 +1157,24 @@ fn render_candle_forecast(
             .draw()?;
     }
     Ok(())
+}
+
+fn chain_forecast_candles(anchor_close: f32, candles: &[CandleBar]) -> Vec<CandleBar> {
+    let mut prev = anchor_close;
+    candles
+        .iter()
+        .map(|candle| {
+            let open = prev;
+            let close = candle.close;
+            prev = close;
+            CandleBar {
+                open,
+                high: candle.high.max(open).max(close),
+                low: candle.low.min(open).min(close),
+                close,
+            }
+        })
+        .collect()
 }
 
 fn draw_candles(
@@ -1405,10 +1433,10 @@ mod tests {
             3
         ];
         let predicted = vec![CandleBar {
-            open: 10.0,
-            high: 8.0,
-            low: 13.0,
-            close: 11.0,
+            open: 14.0,
+            high: 13.0,
+            low: 10.0,
+            close: 12.0,
         }];
         let report = Report {
             title: "deterministic segment".to_owned(),
@@ -1445,6 +1473,47 @@ mod tests {
             .enumerate_pixels()
             .any(|(_, y, p)| y > 100 && p.0 == [theme::RED.0, theme::RED.1, theme::RED.2]));
         assert!(render_report_with_options(&report, 2, true, None).is_ok());
+    }
+
+    #[test]
+    fn forecast_candles_are_chained_to_the_close_path() {
+        let chained = chain_forecast_candles(
+            10.0,
+            &[
+                CandleBar {
+                    open: 12.0,
+                    high: 13.0,
+                    low: 9.0,
+                    close: 11.0,
+                },
+                CandleBar {
+                    open: 8.0,
+                    high: 12.0,
+                    low: 7.0,
+                    close: 9.5,
+                },
+                CandleBar {
+                    open: 9.0,
+                    high: 9.2,
+                    low: 8.8,
+                    close: 10.5,
+                },
+            ],
+        );
+        assert_eq!(chained[0].open, 10.0);
+        assert_eq!(chained[0].close, 11.0);
+        assert!(chained[0].close > chained[0].open);
+        assert_eq!(chained[0].high, 13.0);
+        assert_eq!(chained[0].low, 9.0);
+        assert_eq!(chained[1].open, 11.0);
+        assert_eq!(chained[1].close, 9.5);
+        assert!(chained[1].close < chained[1].open);
+        assert_eq!(chained[1].high, 12.0);
+        assert_eq!(chained[1].low, 7.0);
+        assert_eq!(chained[2].open, 9.5);
+        assert_eq!(chained[2].close, 10.5);
+        assert_eq!(chained[2].high, 10.5);
+        assert_eq!(chained[2].low, 8.8);
     }
 
     #[test]
