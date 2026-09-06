@@ -43,6 +43,7 @@ rust_neural_network = "0.18.0"
 serde = "1.0.228"
 serde_json = { version = "1.0", features = ["float_roundtrip"] }
 tch = { git = "https://github.com/LaurentMazare/tch-rs.git", rev = "bbf49e6", features = ["python-extension"] }
+fused_kernels = { path = "../fused_kernels" }
 torch-sys = { version = "0.25.0" }
 time = "0.3.36"
 tokio = { version = "1.47.0", features = ["full"] }

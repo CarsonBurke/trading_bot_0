@@ -1,0 +1,346 @@
+// libtorch side of the fused kernels: shape and dtype contract, output allocation,
+// current-stream discovery, and the autograd registration.
+//
+// AUTOGRAD MECHANISM. Each fusion is a `torch::autograd::Function` subclass whose
+// `apply` is what the C ABI calls. That is the mechanism libtorch itself uses for ops
+// written outside the dispatcher, and it is the only one that works here: the alternative
+// (a dispatcher op plus a `derivatives.yaml` entry) needs codegen we do not run, and the
+// third option people reach for - composing the forward out of differentiable ATen calls -
+// is precisely the cost being removed. `Function::apply` builds a real autograd node, so
+// the tensor handed back to Rust carries a `grad_fn` and `Tensor::backward` /
+// `Tensor::run_backward` from Rust drive these kernels with no further plumbing.
+//
+// Soundness: `apply` runs `forward` with grad mode off and records the node itself, so the
+// output's version counter, `requires_grad` and graph edges are libtorch's, not ours. The
+// backward is first-order only; it is written with raw kernels, so it creates no graph, and
+// a second-order call would silently see a zero. That is checked for and rejected rather
+// than tolerated - the backbone never takes a second derivative.
+
+#include "kernels.h"
+
+#include <torch/autograd.h>
+#include <torch/torch.h>
+
+#include <ATen/cuda/CUDAContext.h>
+#include <c10/cuda/CUDAStream.h>
+
+#include <exception>
+#include <string>
+#include <vector>
+
+namespace {
+
+thread_local std::string last_error;
+
+// The `[tokens, ffn]` and `[tokens, 2*d_model]` activations are far too big for anything
+// but bf16, and a silent fp32 path would be a performance bug that still passes a
+// numerical test, so the dtype is a contract rather than a dispatch.
+void check_bf16_cuda(const torch::Tensor &tensor, const char *name) {
+    TORCH_CHECK(tensor.defined(), name, " is undefined");
+    TORCH_CHECK(tensor.is_cuda(), name, " must be a CUDA tensor, found ",
+                tensor.device());
+    TORCH_CHECK(tensor.scalar_type() == torch::kBFloat16, name,
+                " must be bfloat16, found ", tensor.scalar_type());
+}
+
+void check_launch(int status, const char *name) {
+    TORCH_CHECK(status == 0, name, " launch failed: ",
+                cudaGetErrorString(static_cast<cudaError_t>(status)));
+}
+
+void *current_stream(const torch::Tensor &tensor) {
+    return static_cast<void *>(
+        at::cuda::getCurrentCUDAStream(tensor.device().index()).stream());
+}
+
+void reject_double_backward(const torch::autograd::variable_list &grads,
+                            const char *name) {
+    for (const auto &grad : grads) {
+        TORCH_CHECK(!grad.defined() || !grad.requires_grad(), name,
+                    " has no second derivative: its backward is a raw kernel and would "
+                    "report a zero double-gradient instead of failing");
+    }
+}
+
+// The backward launch, shared by the autograd node and by the raw entry point the
+// microbenchmark times. Timing the kernel through autograd would charge it the objective's
+// own reduction and cast, which at the FFN shape is several milliseconds of traffic that
+// has nothing to do with this kernel.
+torch::Tensor relu_square_backward(const torch::Tensor &input, const torch::Tensor &grad_output) {
+    const torch::Tensor grad = grad_output.contiguous();
+    check_bf16_cuda(input, "relu_square backward input");
+    check_bf16_cuda(grad, "relu_square gradient");
+    TORCH_CHECK(input.is_contiguous(), "relu_square backward input must be contiguous");
+    TORCH_CHECK(grad.numel() == input.numel(), "relu_square gradient has ", grad.numel(),
+                " elements but the input had ", input.numel());
+    torch::Tensor dx = at::empty_like(input, at::MemoryFormat::Contiguous);
+    check_launch(fk_relu_square_backward(input.const_data_ptr(), grad.const_data_ptr(),
+                                         dx.mutable_data_ptr(), input.numel(),
+                                         current_stream(input)),
+                 "relu_square backward");
+    return dx;
+}
+
+struct ReluSquare : public torch::autograd::Function<ReluSquare> {
+    static torch::Tensor forward(torch::autograd::AutogradContext *ctx,
+                                 torch::Tensor input) {
+        check_bf16_cuda(input, "relu_square input");
+        TORCH_CHECK(input.is_contiguous(), "relu_square input must be contiguous");
+        torch::Tensor output = at::empty_like(input, at::MemoryFormat::Contiguous);
+        // The INPUT is saved, not `relu(input)`. Both are one [tokens, ffn] bf16 tensor,
+        // which is what the ATen composition retains too (`square` saves `relu`'s
+        // output), so memory is unchanged - but saving `relu(input)` would force the
+        // forward to write a second full-width tensor, +393 MiB of traffic per layer at
+        // batch 256, for nothing: `threshold_backward`'s mask `NOT (relu(x) <= 0)` and the
+        // factor `relu(x)` are both recoverable from `x` exactly, because that mask equals
+        // `NOT (x <= 0)` and `relu(x) == x` wherever it holds.
+        ctx->save_for_backward({input});
+        check_launch(fk_relu_square_forward(input.const_data_ptr(),
+                                           output.mutable_data_ptr(), input.numel(),
+                                           current_stream(input)),
+                     "relu_square forward");
+        return output;
+    }
+
+    static torch::autograd::variable_list
+    backward(torch::autograd::AutogradContext *ctx,
+             torch::autograd::variable_list grad_outputs) {
+        reject_double_backward(grad_outputs, "relu_square");
+        return {relu_square_backward(ctx->get_saved_variables()[0], grad_outputs[0])};
+    }
+};
+
+// Row addressing shared by the rotary forward and backward: `[batch, length, columns]`
+// with the last dimension contiguous and a uniform row stride, which is what a
+// `split_with_sizes` view of the packed QKV projection is.
+struct RowLayout {
+    int64_t rows;
+    int64_t length;
+    int64_t stride;
+};
+
+RowLayout row_layout(const torch::Tensor &tensor, const char *name) {
+    TORCH_CHECK(tensor.dim() >= 3, name, " must be [batch, length, ...], found ",
+                tensor.dim(), " dimensions");
+    const int64_t batch = tensor.size(0);
+    const int64_t length = tensor.size(1);
+    // Trailing dimensions must be dense so a row is one contiguous run, and the batch
+    // stride must be exactly `length` rows so `batch*length` is a single flat row index.
+    int64_t dense = 1;
+    for (int64_t dimension = tensor.dim() - 1; dimension >= 2; --dimension) {
+        TORCH_CHECK(tensor.stride(dimension) == dense, name,
+                    " needs dense trailing dimensions; dimension ", dimension,
+                    " has stride ", tensor.stride(dimension), " not ", dense);
+        dense *= tensor.size(dimension);
+    }
+    const int64_t stride = tensor.stride(1);
+    TORCH_CHECK(stride >= dense, name, " row stride ", stride,
+                " is smaller than its ", dense, " columns");
+    TORCH_CHECK(batch == 1 || tensor.stride(0) == length * stride, name,
+                " batch stride ", tensor.stride(0), " is not ", length, " rows of ",
+                stride);
+    return {batch * length, length, stride};
+}
+
+// The rotary backward launch, shared by the autograd node and by the raw entry point the
+// microbenchmark times. `grad_output` is `[batch, length, 2, heads, head_dim]`; the result is
+// the dense `[batch, length, 2*heads*head_dim]` gradient of the packed block.
+torch::Tensor rope_backward(const torch::Tensor &grad_output, const torch::Tensor &cosine,
+                            const torch::Tensor &sine, int64_t heads) {
+    const torch::Tensor grad = grad_output.contiguous();
+    check_bf16_cuda(grad, "rope gradient");
+    check_bf16_cuda(cosine, "rope cosine");
+    check_bf16_cuda(sine, "rope sine");
+    TORCH_CHECK(heads > 0, "rope needs a positive head count, found ", heads);
+    const RowLayout layout = row_layout(grad, "rope gradient");
+    const int64_t blocks = 2 * heads;
+    const int64_t half = cosine.size(1);
+    const int64_t columns = blocks * 2 * half;
+    TORCH_CHECK(grad.numel() == layout.rows * columns, "rope gradient has ", grad.numel(),
+                " elements but ", heads, " heads of ", 2 * half, " imply ",
+                layout.rows * columns);
+    torch::Tensor dx = at::empty({grad.size(0), layout.length, columns}, grad.options());
+    check_launch(fk_rope_backward(grad.const_data_ptr(), cosine.const_data_ptr(),
+                                  sine.const_data_ptr(), dx.mutable_data_ptr(), layout.rows,
+                                  layout.length, blocks, half, layout.stride, columns,
+                                  current_stream(grad)),
+                 "rope backward");
+    return dx;
+}
+
+struct Rope : public torch::autograd::Function<Rope> {
+    static torch::Tensor forward(torch::autograd::AutogradContext *ctx,
+                                 torch::Tensor input, torch::Tensor cosine,
+                                 torch::Tensor sine, int64_t heads) {
+        check_bf16_cuda(input, "rope input");
+        check_bf16_cuda(cosine, "rope cosine");
+        check_bf16_cuda(sine, "rope sine");
+        TORCH_CHECK(input.dim() == 3, "rope input must be [batch, length, 2*d_model]");
+        TORCH_CHECK(heads > 0, "rope needs a positive head count, found ", heads);
+        const RowLayout layout = row_layout(input, "rope input");
+        const int64_t columns = input.size(2);
+        const int64_t blocks = 2 * heads;
+        TORCH_CHECK(columns % (blocks * 2) == 0, "rope input has ", columns,
+                    " columns, not a multiple of ", blocks * 2);
+        const int64_t head_dim = columns / blocks;
+        const int64_t half = head_dim / 2;
+        TORCH_CHECK(head_dim % 2 == 0, "rope needs an even head dimension, found ",
+                    head_dim);
+        TORCH_CHECK(cosine.dim() == 2 && cosine.size(0) == layout.length &&
+                        cosine.size(1) == half,
+                    "rope cosine must be [", layout.length, ", ", half, "], found ",
+                    cosine.sizes());
+        TORCH_CHECK(sine.sizes() == cosine.sizes(),
+                    "rope sine and cosine must have the same shape");
+        TORCH_CHECK(cosine.is_contiguous() && sine.is_contiguous(),
+                    "rope cosine and sine must be contiguous");
+        TORCH_CHECK(!cosine.requires_grad() && !sine.requires_grad(),
+                    "rope treats the rotation as a constant; cosine and sine must not "
+                    "require gradients");
+
+        torch::Tensor output =
+            at::empty({input.size(0), layout.length, 2, heads, head_dim},
+                      input.options());
+        // Nothing about the INPUT is saved: the rotation is orthogonal, so its transpose
+        // needs only the rotation itself. `cosine`/`sine` are the model's resident
+        // [length, head_dim/2] constants - 24 KiB each at the real geometry - so the
+        // backward of this op retains no activation at all.
+        ctx->save_for_backward({cosine, sine});
+        ctx->saved_data["heads"] = heads;
+        ctx->saved_data["columns"] = columns;
+        check_launch(fk_rope_forward(input.const_data_ptr(), cosine.const_data_ptr(),
+                                     sine.const_data_ptr(), output.mutable_data_ptr(),
+                                     layout.rows, layout.length, blocks, half,
+                                     layout.stride, columns, current_stream(input)),
+                     "rope forward");
+        return output;
+    }
+
+    static torch::autograd::variable_list
+    backward(torch::autograd::AutogradContext *ctx,
+             torch::autograd::variable_list grad_outputs) {
+        reject_double_backward(grad_outputs, "rope");
+        const torch::autograd::variable_list saved = ctx->get_saved_variables();
+        return {rope_backward(grad_outputs[0], saved[0], saved[1],
+                              ctx->saved_data["heads"].toInt()),
+                torch::Tensor(), torch::Tensor(), torch::Tensor()};
+    }
+};
+
+// A CUDA-event timer, exposed because the composed-versus-fused comparison has to be
+// measured with events rather than a host clock. The repository's own profiler learned this
+// the expensive way: a host-timed mean over ten rounds reported this card's copy peak at
+// 630 GB/s while its own kernels measured 1569 GB/s, so every roofline fraction in that
+// profile was halved by contention landing in the denominator. Events plus a best-of-N
+// reduction fix it. `stop` synchronizes, which is exactly why these are probe-only entry
+// points and are never reachable from the model path.
+struct Timer {
+    cudaEvent_t start;
+    cudaEvent_t stop;
+};
+
+template <typename Body> void *protect(Body body) {
+    last_error.clear();
+    try {
+        return static_cast<void *>(new torch::Tensor(body()));
+    } catch (const std::exception &error) {
+        last_error = error.what();
+    } catch (...) {
+        last_error = "unknown C++ exception";
+    }
+    return nullptr;
+}
+
+const torch::Tensor &borrow(const void *handle) {
+    return *static_cast<const torch::Tensor *>(handle);
+}
+
+} // namespace
+
+extern "C" {
+
+// Non-null on failure, and cleared by the next call on this thread.
+const char *fk_last_error() { return last_error.empty() ? nullptr : last_error.c_str(); }
+
+void *fk_relu_square(const void *input) {
+    return protect([&] { return ReluSquare::apply(borrow(input)); });
+}
+
+void *fk_rope(const void *input, const void *cosine, const void *sine, int64_t heads) {
+    return protect([&] {
+        return Rope::apply(borrow(input), borrow(cosine), borrow(sine), heads);
+    });
+}
+
+// The two backward kernels called directly, with no autograd node around them. NOT
+// differentiable and not for the model path: they exist so the microbenchmark can time the
+// kernel rather than the kernel plus whatever objective the harness needed to reach it.
+void *fk_relu_square_backward_raw(const void *input, const void *grad) {
+    return protect([&] { return relu_square_backward(borrow(input), borrow(grad)); });
+}
+
+void *fk_rope_backward_raw(const void *grad, const void *cosine, const void *sine,
+                           int64_t heads) {
+    return protect(
+        [&] { return rope_backward(borrow(grad), borrow(cosine), borrow(sine), heads); });
+}
+
+// A bf16 clone through the vectorized copy kernel: the streaming roof, measured the same
+// way as the kernels measured against it.
+void *fk_stream_copy_tensor(const void *input) {
+    return protect([&] {
+        const torch::Tensor &source = borrow(input);
+        check_bf16_cuda(source, "stream_copy input");
+        TORCH_CHECK(source.is_contiguous(), "stream_copy input must be contiguous");
+        torch::Tensor output = at::empty_like(source, at::MemoryFormat::Contiguous);
+        check_launch(fk_stream_copy(source.const_data_ptr(), output.mutable_data_ptr(),
+                                      source.numel(), current_stream(source)),
+                     "stream_copy");
+        return output;
+    });
+}
+
+void *fk_timer_new() {
+    last_error.clear();
+    auto *timer = new Timer{};
+    if (cudaEventCreate(&timer->start) != cudaSuccess ||
+        cudaEventCreate(&timer->stop) != cudaSuccess) {
+        last_error = "could not create CUDA events";
+        delete timer;
+        return nullptr;
+    }
+    return static_cast<void *>(timer);
+}
+
+// Records on the stream the kernels launch on, so the interval brackets exactly their work.
+int fk_timer_start(void *handle) {
+    auto *timer = static_cast<Timer *>(handle);
+    return static_cast<int>(
+        cudaEventRecord(timer->start, at::cuda::getCurrentCUDAStream().stream()));
+}
+
+// Milliseconds since `fk_timer_start`, or a negative value on failure.
+double fk_timer_stop(void *handle) {
+    auto *timer = static_cast<Timer *>(handle);
+    if (cudaEventRecord(timer->stop, at::cuda::getCurrentCUDAStream().stream()) !=
+            cudaSuccess ||
+        cudaEventSynchronize(timer->stop) != cudaSuccess) {
+        return -1.0;
+    }
+    float milliseconds = 0.0f;
+    if (cudaEventElapsedTime(&milliseconds, timer->start, timer->stop) != cudaSuccess) {
+        return -1.0;
+    }
+    return static_cast<double>(milliseconds);
+}
+
+void fk_timer_free(void *handle) {
+    auto *timer = static_cast<Timer *>(handle);
+    if (timer == nullptr) {
+        return;
+    }
+    cudaEventDestroy(timer->start);
+    cudaEventDestroy(timer->stop);
+    delete timer;
+}
+}

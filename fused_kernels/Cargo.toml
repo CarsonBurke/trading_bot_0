@@ -1,0 +1,21 @@
+[package]
+name = "fused_kernels"
+version = "0.1.0"
+edition = "2021"
+publish = false
+build = "build.rs"
+# The kernels are compiled into a static archive of their own. Declaring a `links` key
+# keeps two copies of this crate from ever landing in one binary, which would duplicate
+# every `__global__` symbol.
+links = "fused_kernels"
+
+[dependencies]
+tch = { git = "https://github.com/LaurentMazare/tch-rs.git", rev = "bbf49e6", features = ["python-extension"] }
+torch-sys = "0.25.0"
+shared = { path = "../shared" }
+anyhow = "1.0.98"
+clap = { version = "4.5.21", features = ["derive"] }
+
+[build-dependencies]
+anyhow = "1.0.98"
+cc = "1.2"

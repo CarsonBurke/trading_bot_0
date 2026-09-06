@@ -1143,6 +1143,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "fused_kernels"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "cc",
+ "clap",
+ "shared",
+ "tch",
+ "torch-sys",
+]
+
+[[package]]
 name = "futures-channel"
 version = "0.3.31"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4169,6 +4181,7 @@ dependencies = [
  "clap",
  "colored",
  "enum-map",
+ "fused_kernels",
  "hashbrown 0.15.5",
  "ibapi",
  "image 0.25.9",

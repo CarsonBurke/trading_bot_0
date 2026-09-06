@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "trading_bots",
+    "fused_kernels",
     "tui",
     "shared",
     "report_cli",

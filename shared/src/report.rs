@@ -37,6 +37,7 @@ pub const TIMEXER_SEGMENT_REPORT_BASES: &[&str] = &[
     "timexer_segment_benchmark_kernels",
     "timexer_segment_benchmark_kernel_roofline",
     "timexer_segment_benchmark_kernel_activations",
+    "timexer_segment_fused_kernels",
 ];
 
 pub const RL_META_REPORT_BASES: &[&str] = &[
