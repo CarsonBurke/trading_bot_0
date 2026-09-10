@@ -3892,7 +3892,7 @@ mod lr_trajectory_tests {
         MlpDownLr, OptimizerKind, RecipeKnobs, NANOGPT_COOLDOWN_FLOOR, NANOGPT_COOLDOWN_FRAC,
     };
     use crate::torch::timexer_segment::model::{CausalPatchModel, ModelConfig};
-    use shared::report::read_report;
+    use shared::report::{read_report, TIMEXER_SEGMENT_REPORT_BASES};
     use std::fs;
     use tch::{nn, Device};
 
