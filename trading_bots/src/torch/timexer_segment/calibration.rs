@@ -695,7 +695,12 @@ impl MeanCalibration {
             blocks: self.blocks.clone(),
             anchor: self.anchor.gain.clone(),
             offset: self.offset.gain.clone(),
-            measured_anchor: self.anchor.measured_gain.clone(),
+            measured_anchor: self
+                .anchor
+                .measured_gain
+                .iter()
+                .map(|gain| gain.is_finite().then_some(*gain))
+                .collect(),
         }
     }
 }
@@ -714,8 +719,9 @@ pub struct FrozenGain {
     /// Multiplies the three intrabar offsets. Positive, so candle ordering survives.
     pub offset: Vec<f64>,
     /// The calibration block's OWN least-squares anchor gain per horizon, signed and
-    /// unsmoothed: the measurement, not the applied curve. `NaN` where the block identified no
-    /// amplitude at all.
+    /// unsmoothed: the measurement, not the applied curve. `None` where the block identified no
+    /// amplitude at all, which is a different fact from a measured zero and is why this is an
+    /// option rather than a sentinel - the manifest is JSON, and JSON has no NaN.
     ///
     /// Carried because the applied curve cannot answer the one question a position-sizing
     /// consumer has to ask. The fit runs on `ln g`, so every applied gain is positive by
@@ -724,7 +730,7 @@ pub struct FrozenGain {
     /// smooth curve and the wrong thing to trade, because it sizes a horizon on evidence that
     /// is not its own. [`Self::tradable`] is the gate; this vector is why it can exist without
     /// a second fit, and it is reported signed and unmodified so a gated horizon is legible.
-    pub measured_anchor: Vec<f64>,
+    pub measured_anchor: Vec<Option<f64>>,
 }
 
 impl FrozenGain {
@@ -757,8 +763,10 @@ impl FrozenGain {
         ensure!(
             self.measured_anchor
                 .iter()
-                .all(|gain| gain.is_finite() || gain.is_nan()),
-            "an infinite measured anchor gain is a broken reduction, not a measurement"
+                .flatten()
+                .all(|gain| gain.is_finite()),
+            "a nonfinite measured anchor gain is a broken reduction, not a measurement; an \
+             unmeasured horizon is null, which is a different statement from a measured zero"
         );
         Ok(())
     }
@@ -773,12 +781,14 @@ impl FrozenGain {
     pub fn tradable(&self, horizon: usize) -> bool {
         self.measured_anchor
             .get(horizon - 1)
-            .is_some_and(|gain| gain.is_finite() && *gain > 0.)
+            .and_then(|gain| *gain)
+            .is_some_and(|gain| gain > 0.)
     }
 
     /// The 1-based horizons whose measurement gates them out of sizing, with the value that
-    /// gated them, for the report that has to name them.
-    pub fn gated(&self) -> Vec<(usize, f64)> {
+    /// gated them - `None` where there was no measurement at all, which is its own reason - for
+    /// the report that has to name them.
+    pub fn gated(&self) -> Vec<(usize, Option<f64>)> {
         (1..=self.measured_anchor.len())
             .filter(|horizon| !self.tradable(*horizon))
             .map(|horizon| (horizon, self.measured_anchor[horizon - 1]))
