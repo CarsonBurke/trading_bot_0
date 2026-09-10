@@ -1,11 +1,14 @@
 use anyhow::{ensure, Result};
-use fused_kernels::{qk_norm_rope, relu_square};
+use fused_kernels::{loss_geometry, qk_norm_rope, relu_square};
 use serde::{Deserialize, Serialize};
+use std::{fmt, str::FromStr};
 use tch::{nn, Device, Kind, Tensor};
 
 use super::{
+    calibration::FrozenGain,
     corpus::Batch,
     features::{Feature, FeatureSet},
+    target_basis::{self, BasisTransform, BasisWeight, TargetBasis},
 };
 use crate::torch::model::rope::RotaryEmbedding;
 
@@ -60,6 +63,477 @@ const SKIP_LOGIT_INIT: f64 = -1.5;
 /// starting point.
 const VALUE_LAMBDA_INIT: f64 = 0.5;
 
+/// Whether the per-layer embedding re-injection EXISTS.
+///
+/// [`Self::Disabled`] is not a lambda pinned at zero: the `lambdas.x0` bank is never registered
+/// in the varstore, no `addcmul` against the embedding is issued, and the checkpoint carries a
+/// different FORMAT stamp because its parameter set is smaller (`runner::format_stamp`). The
+/// mode is a diagnostic: the shortcut hands every layer the patch embedding directly, which is
+/// the cheapest possible route to fitting the training period's own drift, so a run that
+/// generalizes worse WITH the shortcut than without it is evidence about the shortcut rather
+/// than about the eight layers.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
+#[serde(rename_all = "kebab-case")]
+pub enum X0Lambdas {
+    /// One learned scale per layer, init 0, as modded-nanogpt has it.
+    #[default]
+    Enabled,
+    /// No bank, no injection, `layers` fewer trained scalars.
+    Disabled,
+}
+
+impl X0Lambdas {
+    pub fn enabled(self) -> bool {
+        matches!(self, Self::Enabled)
+    }
+}
+
+/// How the training objective weights the `pred_len` forecast horizons.
+///
+/// The head emits every horizon from every causal token and the objective used to average all
+/// of them with equal weight. Jobs 5190-5193 measured what that costs: on the held-out sample
+/// between step 2k and 5k the market-neutral MSE ratio at h = 1 and h = 8 kept IMPROVING
+/// (0.9636 -> 0.9602, 0.9458 -> 0.9256) while h = 64 and h = 192 rotted (0.9886 -> 1.0688,
+/// 1.0257 -> 1.0854), calibration stayed nominal, and the mis-scaling cross term inverted along
+/// the horizon axis. One trunk plus one equal-weighted loss means the long horizons'
+/// memorization of the training period dominates both the gradient and the scalar that selects
+/// checkpoints. This knob is the dial that decides how much of the objective the unlearnable
+/// end of the horizon axis is allowed to own.
+///
+/// Every mode is normalized to mean 1 over ALL `pred_len` horizons (`Σ w = pred_len`), so
+/// [`Self::Uniform`] is the weight vector `1` exactly and reproduces the pre-knob loss
+/// bit-for-bit. The loss additionally divides by `Σ w·mask·CHANNELS` rather than by
+/// `Σ mask·CHANNELS`, which makes the reported NLL a weighted MEAN of per-element NLL - still
+/// nats per bar, still comparable across modes, and invariant to the overall scale of `w`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum HorizonLoss {
+    /// Today's objective: every horizon weighted 1. The control arm.
+    #[default]
+    Uniform,
+    /// `1/√h`, normalized. The gentler of the two decays: h = 192 still carries 1/13.9 of
+    /// h = 1's weight, so the long end contributes but cannot dominate.
+    InverseSqrt,
+    /// `1/h`, normalized. The aggressive decay: h = 192 carries 1/192 of h = 1's weight. The
+    /// correct decay rate is the open question and these two bracket it.
+    Inverse,
+    /// Train ONLY horizons `1..=K`; every horizon above `K` gets weight exactly 0, so no
+    /// gradient reaches the head rows that are exclusive to it. The forecasts are still
+    /// EMITTED for all `pred_len` horizons - the loss is masked, the head is not shrunk - so
+    /// every per-horizon diagnostic keeps reading the untrained end and the run pays the full
+    /// head cost. See [`ModelConfig::step_cost`] for what that costs.
+    Cutoff(i64),
+}
+
+impl HorizonLoss {
+    /// The effective per-horizon weight vector, index `i` being horizon `i + 1`, normalized to
+    /// mean 1 over all `pred_len` horizons. [`Self::Uniform`] returns exactly `1.0` in every
+    /// slot: `pred_len` ones sum exactly in fp64 and the division by `pred_len` is exact, so
+    /// the control arm's loss is bit-identical to the unweighted one.
+    pub fn weights(self, pred_len: i64) -> Vec<f64> {
+        assert!(pred_len > 0, "weights need a positive horizon");
+        let raw: Vec<f64> = (1..=pred_len)
+            .map(|step| match self {
+                Self::Uniform => 1.0,
+                Self::InverseSqrt => (step as f64).sqrt().recip(),
+                Self::Inverse => (step as f64).recip(),
+                Self::Cutoff(cut) => f64::from(u8::from(step <= cut)),
+            })
+            .collect();
+        let mean = raw.iter().sum::<f64>() / pred_len as f64;
+        raw.into_iter().map(|weight| weight / mean).collect()
+    }
+
+    /// The horizons that carry nonzero weight, for the cost accounting: `Cutoff` still runs the
+    /// head over all `pred_len` of them.
+    pub fn trained_horizons(self, pred_len: i64) -> i64 {
+        match self {
+            Self::Cutoff(cut) => cut.min(pred_len),
+            _ => pred_len,
+        }
+    }
+}
+
+impl fmt::Display for HorizonLoss {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Uniform => formatter.write_str("uniform"),
+            Self::InverseSqrt => formatter.write_str("inv-sqrt"),
+            Self::Inverse => formatter.write_str("inv"),
+            Self::Cutoff(cut) => write!(formatter, "cutoff:{cut}"),
+        }
+    }
+}
+
+impl FromStr for HorizonLoss {
+    type Err = anyhow::Error;
+    /// `uniform` | `inv-sqrt` | `inv` | `cutoff:K`. `K` is validated to be positive HERE and
+    /// against `pred_len` in [`ModelConfig::validate`], which runs before the corpus loads.
+    fn from_str(spec: &str) -> Result<Self> {
+        match spec {
+            "uniform" => return Ok(Self::Uniform),
+            "inv-sqrt" => return Ok(Self::InverseSqrt),
+            "inv" => return Ok(Self::Inverse),
+            _ => {}
+        }
+        let cut = spec.strip_prefix("cutoff:").ok_or_else(|| {
+            anyhow::anyhow!(
+                "unknown horizon loss {spec:?}; expected uniform, inv-sqrt, inv or cutoff:K"
+            )
+        })?;
+        let cut: i64 = cut
+            .parse()
+            .map_err(|_| anyhow::anyhow!("cutoff:K needs an integer K, got {cut:?}"))?;
+        ensure!(
+            cut >= 1,
+            "cutoff:{cut} trains no horizon at all; K must be at least 1"
+        );
+        Ok(Self::Cutoff(cut))
+    }
+}
+
+impl Serialize for HorizonLoss {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&self.to_string())
+    }
+}
+
+impl<'de> Deserialize<'de> for HorizonLoss {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let spec = String::deserialize(deserializer)?;
+        spec.parse().map_err(serde::de::Error::custom)
+    }
+}
+
+/// How the conditional MEAN is parameterized along the forecast horizon.
+///
+/// [`HorizonLoss`] changes what the objective WEIGHTS; this changes what the head can EXPRESS,
+/// and it is the only knob here that removes parameters. The measurement it answers is the one
+/// in [`HorizonLoss`]'s own doc: between step 2k and 5k the held-out market-neutral MSE ratio
+/// kept improving at h = 1 and h = 8 while h = 64 and h = 192 rotted past persistence, and the
+/// mis-scaling cross term INVERTED along the horizon axis (h = 8: -0.108 -> -0.004, h = 64:
+/// -0.007 -> -0.073) while coverage stayed nominal. A mean whose amplitude grows away from its
+/// target only at the long end, with a calibrated scale, is a mean that is fitting the training
+/// period's own realized path. The 192 free means per channel are the degrees of freedom that
+/// let it: each long horizon has its own row of head weights and nothing ties it to its
+/// neighbours.
+///
+/// # The basis
+///
+/// Under [`Self::Basis`] horizons `1..=free` keep an independent mean each - that is the band
+/// where out-of-period skill is DEMONSTRATED, so it is left alone - and the `pred_len - free`
+/// horizons above it are expressed as
+///
+/// ```text
+/// mean(channel, h) = Σ_b coefficient(channel, b) · φ_b(h - free),   h > free
+/// φ_b(u)           = exp(-u / τ_b) / rms_b,   τ_b = free · (pred_len/free)^(b/(B-1))
+/// rms_b            = √( mean_u exp(-2u / τ_b)² )      (unit RMS over the restricted band)
+/// ```
+///
+/// so `functions` coefficients per channel replace `pred_len - free` free means. The choice was
+/// fixed BEFORE any validation number was read, and it is this and not something adaptive for
+/// four reasons:
+///
+/// - **It is the shape a term structure of expected return actually has.** The close coordinate
+///   is in units of the h-step persistence deviation σ√h, so it is a signal-to-noise ratio per
+///   horizon, not a price. A predictable component with half-life `T` contributes an expected
+///   cumulative return whose σ√h-normalized profile decays like `exp(-h/T)`. A sum of `B`
+///   exponentials with geometrically spaced timescales is exactly a discretized mixture over
+///   half-lives, and by Bernstein's theorem every completely monotone decay - power laws
+///   included - is such a mixture, so the span covers the plausible term structures rather than
+///   one hand-picked curve.
+/// - **It cannot express per-horizon idiosyncrasy.** A nonzero real exponential sum
+///   `Σ_b c_b e^{-u/τ_b}` with distinct `τ_b` has at most `B - 1` zeros in `u` (the
+///   Descartes rule for exponential sums), so ANY mean this span can emit changes sign at most
+///   `functions - 1` times across the whole restricted band. A per-horizon wiggle needs one
+///   sign change per horizon. That is the entire restriction, and
+///   `the_basis_represents_a_term_structure_and_refuses_per_horizon_idiosyncrasy` is the test
+///   that holds it to it rather than the claim.
+/// - **Zero coefficients are exactly persistence.** The expansion is linear and homogeneous:
+///   no intercept function, no additive constant. `coefficient = 0` gives `mean = 0` at every
+///   restricted horizon, which [`decode_joint`] maps to the origin close - so the zero-init
+///   head still starts at the persistence forecast, bit for bit, exactly as it does under
+///   [`Self::Free`].
+/// - **The timescale grid spans the band that is left to explain.** The fastest is `free`
+///   itself: anything decaying faster than the free band's own width is already representable
+///   there. The slowest is `pred_len`, which over the restricted band decays from 0.995 to
+///   0.383 - a drift, and deliberately not a constant, since a flat level in σ√h units is a
+///   cumulative return growing like √h forever. Unit-RMS scaling makes every coefficient read
+///   in the same units (σ√h of mean at the tail) without touching the span or the monotone
+///   decay of any function.
+///
+/// The log predictive scales are NOT restricted: they stay one free parameter per horizon per
+/// channel. Coverage at 5k was 0.678/0.923 against nominal 0.683/0.950, so the distribution's
+/// shape is not the measured failure and restricting it would trade a working part of the model
+/// for nothing.
+///
+/// The one cost of insisting on monotone functions rather than an orthonormal span: the
+/// columns overlap heavily near `h = free + 1`, so the coefficient Gram matrix is
+/// ill-conditioned and reaching the last few digits of a fitted term structure needs large
+/// cancelling coefficients. Orthonormalizing would fix that and lose the per-function
+/// monotonicity, and it buys nothing here - the shipped fp32 head emits a hyperbolic term
+/// structure to 0.75% relative
+/// (`the_basis_represents_a_term_structure_and_refuses_per_horizon_idiosyncrasy`), which is
+/// three orders of magnitude below the amplitude error being diagnosed, and AdamW's per-
+/// parameter normalization makes it indifferent to the column scaling anyway.
+///
+/// The likelihood is unchanged and still consumes all `pred_len` means: the head EMITS the
+/// dense `[2·CHANNELS, pred_len]` block in both modes ([`CausalPatchModel::head`] folds the
+/// expansion onto the output weight), so no dense-target traffic disappears. See
+/// [`ModelConfig::step_cost`] for what the fold costs and what it does not save.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum HorizonMean {
+    /// One independent mean per horizon per channel: `pred_len · 2·CHANNELS` head outputs. The
+    /// control arm, and bit-for-bit the pre-knob head.
+    #[default]
+    Free,
+    /// Independent means for horizons `1..=free`; `functions` basis coefficients per channel
+    /// for everything above. The free means those coefficients replace do not exist - they are
+    /// absent from the varstore, not masked, not frozen.
+    Basis { free: i64, functions: i64 },
+    /// Per-BAR increment means - `CHANNELS · pred_len` of them, full rank, the cumulative
+    /// forecast recovered by a cumsum at the decode - plus `scales` state-dependent log-scale
+    /// coefficients per channel over a smooth basis in `ln h`.
+    ///
+    /// This is not a rank restriction on the mean: the difference operator is square and
+    /// invertible, so the emitted 192-horizon forecast keeps every degree of freedom it has
+    /// today. What changes is the SPACE THE LOSS IS COMPUTED IN. The `h = 192` cumulative
+    /// target is a 192-bar overlapping sum, so the 2.46 M rows carrying it rest on ~504
+    /// independent draws; the `j = 192` increment target is a single non-overlapping calendar
+    /// bar and rests on all of them. Supervising increments moves the long-horizon evidence
+    /// without moving what the model can represent.
+    ///
+    /// `scales` is the one real restriction, and it is in the UNCERTAINTY channel: today's head
+    /// emits 192 state-dependent log scales per channel and this emits `scales` coefficients
+    /// over [`Self::scale_basis`]. `scales = pred_len` recovers today's freedom exactly, which
+    /// is what makes the mean-side and scale-side changes separable knobs rather than one
+    /// bundled arm.
+    Increment { scales: i64 },
+}
+
+impl HorizonMean {
+    /// Horizons that keep an independent mean. All of them under [`Self::Free`], and all of
+    /// them under [`Self::Increment`] too - a difference is square and invertible, so nothing
+    /// about the mean's freedom is reduced there.
+    pub fn free_horizons(self, pred_len: i64) -> i64 {
+        match self {
+            Self::Free | Self::Increment { .. } => pred_len,
+            Self::Basis { free, .. } => free,
+        }
+    }
+
+    /// The decay timescales in bars, fastest first: `free · (pred_len/free)^(b/(B-1))`, a
+    /// geometric grid from the free band's own width to the whole forecast horizon. Empty under
+    /// [`Self::Free`]. A single function takes the SLOWEST end - one function is a drift, and
+    /// the fast decays are what the free band already covers.
+    pub fn timescales(self, pred_len: i64) -> Vec<f64> {
+        let Self::Basis { free, functions } = self else {
+            return Vec::new();
+        };
+        let (fastest, slowest) = (free as f64, pred_len as f64);
+        (0..functions)
+            .map(|index| {
+                if functions == 1 {
+                    slowest
+                } else {
+                    fastest * (slowest / fastest).powf(index as f64 / (functions - 1) as f64)
+                }
+            })
+            .collect()
+    }
+
+    /// The `[pred_len - free, functions]` row-major basis, unit RMS per column. `None` under
+    /// [`Self::Free`]. fp64 throughout: it is built once per model, and the fp32 cast is the
+    /// last thing that happens to it.
+    pub fn basis(self, pred_len: i64) -> Option<Vec<f64>> {
+        let Self::Basis { free, functions } = self else {
+            return None;
+        };
+        let restricted = pred_len - free;
+        assert!(
+            restricted > 0 && functions > 0,
+            "an unvalidated horizon mean reached the basis: {self} against pred_len {pred_len}"
+        );
+        let mut matrix = vec![0.0; (restricted * functions) as usize];
+        for (index, tau) in self.timescales(pred_len).into_iter().enumerate() {
+            let column: Vec<f64> = (1..=restricted)
+                .map(|step| (-(step as f64) / tau).exp())
+                .collect();
+            let rms = (column.iter().map(|value| value * value).sum::<f64>()
+                / restricted as f64)
+                .sqrt();
+            for (step, value) in column.into_iter().enumerate() {
+                matrix[step * functions as usize + index] = value / rms;
+            }
+        }
+        Some(matrix)
+    }
+
+    /// The head's output width: what the projection PARAMETERIZES, not what the model emits.
+    /// Under [`Self::Basis`] the means cost `CHANNELS·(free + functions)` and the untouched log
+    /// scales `CHANNELS·pred_len`. Under [`Self::Increment`] the means cost `CHANNELS·pred_len`
+    /// - unreduced - and the log scales `CHANNELS·scales`, which is where the whole width
+    /// saving is: at `scales = 8` the projection emits 800 instead of 1536.
+    pub fn head_outputs(self, pred_len: i64) -> i64 {
+        match self {
+            Self::Free => pred_len * OUTPUTS_PER_BAR,
+            Self::Basis { free, functions } => CHANNELS * (free + functions + pred_len),
+            Self::Increment { scales } => CHANNELS * (pred_len + scales),
+        }
+    }
+
+    /// The `[scales, pred_len]` row-major log-scale basis `φ_k(h) = cos(k·π·ln h / ln pred_len)`,
+    /// `None` outside [`Self::Increment`]. fp64 until the single fp32 cast at construction.
+    ///
+    /// A cosine family in `ln h` and not in `h`, because dispersion structure over a 192-bar
+    /// horizon is a phenomenon of ORDERS OF MAGNITUDE - the interesting variation between one
+    /// bar and eight is the same size as the variation between 24 and 192, and a basis linear
+    /// in `h` spends almost all of its resolution on the flat far end. `φ_0 ≡ 1` is the level,
+    /// `φ_1` is monotone in `ln h` and is exactly the slope mode a mis-strengthened aggregation
+    /// needs, and the family is a DCT-II grid on `ln h`, so `scales = pred_len` spans the full
+    /// 192-dimensional space and recovers today's per-horizon freedom rather than approximating
+    /// it.
+    pub fn scale_basis(self, pred_len: i64) -> Option<Vec<f64>> {
+        let Self::Increment { scales } = self else {
+            return None;
+        };
+        assert!(
+            scales > 0 && pred_len > 0,
+            "an unvalidated horizon mean reached the scale basis: {self} against pred_len \
+             {pred_len}"
+        );
+        let span = (pred_len as f64).ln().max(f64::MIN_POSITIVE);
+        let mut matrix = vec![0.0; (scales * pred_len) as usize];
+        for function in 0..scales as usize {
+            for step in 0..pred_len as usize {
+                let position = ((step + 1) as f64).ln() / span;
+                matrix[function * pred_len as usize + step] =
+                    (function as f64 * std::f64::consts::PI * position).cos();
+            }
+        }
+        Some(matrix)
+    }
+
+    /// The `[2·CHANNELS·pred_len, head_outputs]` row-major expansion `Ψ`, mapping the head's
+    /// parameters to the dense channel-major block the loss consumes. `None` under
+    /// [`Self::Free`], which needs no expansion at all.
+    ///
+    /// Rows are the dense block's own layout (`row = channel·pred_len + h`, channel-major, the
+    /// four coordinates then the four log scales). A free-mean row and a log-scale row are
+    /// one-hot, so the fold copies them bit-exactly; a restricted row carries that horizon's
+    /// `functions` basis values.
+    pub fn expansion(self, pred_len: i64) -> Option<Vec<f32>> {
+        let Self::Basis { free, functions } = self else {
+            return None;
+        };
+        let basis = self.basis(pred_len)?;
+        let outputs = self.head_outputs(pred_len);
+        let stride = outputs as usize;
+        let mut matrix = vec![0f32; (OUTPUTS_PER_BAR * pred_len) as usize * stride];
+        let per_channel = free + functions;
+        for channel in 0..CHANNELS {
+            let base = (channel * per_channel) as usize;
+            for step in 0..free {
+                let row = (channel * pred_len + step) as usize;
+                matrix[row * stride + base + step as usize] = 1.0;
+            }
+            for step in 0..pred_len - free {
+                let row = (channel * pred_len + free + step) as usize;
+                for function in 0..functions {
+                    matrix[row * stride + base + (free + function) as usize] =
+                        basis[(step * functions + function) as usize] as f32;
+                }
+            }
+        }
+        let scales = CHANNELS * per_channel;
+        for channel in 0..CHANNELS {
+            for step in 0..pred_len {
+                let row = ((CHANNELS + channel) * pred_len + step) as usize;
+                matrix[row * stride + (scales + channel * pred_len + step) as usize] = 1.0;
+            }
+        }
+        Some(matrix)
+    }
+
+    /// The kebab fragment the checkpoint FORMAT carries. The parameter SET differs between
+    /// modes and between `(free, functions)` pairs, so this is part of the stamp, not a note.
+    pub fn stamp(self) -> String {
+        match self {
+            Self::Free => "free".to_owned(),
+            Self::Basis { free, functions } => format!("basis-{free}-{functions}"),
+            Self::Increment { scales } => format!("increment-{scales}"),
+        }
+    }
+}
+
+impl fmt::Display for HorizonMean {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Free => formatter.write_str("free"),
+            Self::Basis { free, functions } => write!(formatter, "basis:{free}:{functions}"),
+            Self::Increment { scales } => write!(formatter, "increment:{scales}"),
+        }
+    }
+}
+
+impl FromStr for HorizonMean {
+    type Err = anyhow::Error;
+    /// `free` | `basis:S:B` | `increment:K`. Positivity is validated HERE and the bounds against
+    /// `pred_len` in [`ModelConfig::validate`], which runs before the corpus loads.
+    fn from_str(spec: &str) -> Result<Self> {
+        if spec == "free" {
+            return Ok(Self::Free);
+        }
+        if let Some(scales) = spec.strip_prefix("increment:") {
+            let scales: i64 = scales.parse().map_err(|_| {
+                anyhow::anyhow!("increment:K needs an integer K, got {scales:?}")
+            })?;
+            ensure!(
+                scales >= 1,
+                "increment:{scales} leaves the log scale no state dependence at all, not even a \
+                 level; K must be at least 1"
+            );
+            return Ok(Self::Increment { scales });
+        }
+        let restricted = spec.strip_prefix("basis:").ok_or_else(|| {
+            anyhow::anyhow!("unknown horizon mean {spec:?}; expected free, basis:S:B or increment:K")
+        })?;
+        let (free, functions) = restricted
+            .split_once(':')
+            .ok_or_else(|| anyhow::anyhow!("basis:S:B needs both S and B, got {restricted:?}"))?;
+        let parse = |name: &str, value: &str| -> Result<i64> {
+            value
+                .parse()
+                .map_err(|_| anyhow::anyhow!("basis:S:B needs an integer {name}, got {value:?}"))
+        };
+        let (free, functions) = (parse("S", free)?, parse("B", functions)?);
+        ensure!(
+            free >= 1,
+            "basis:{free}:{functions} restricts every horizon including h = 1, where skill is \
+             demonstrated; S must be at least 1"
+        );
+        ensure!(
+            functions >= 1,
+            "basis:{free}:{functions} leaves the restricted horizons no freedom at all, which \
+             is `--horizon-loss cutoff:{free}` with a dead head, not a structured mean; B must \
+             be at least 1"
+        );
+        Ok(Self::Basis { free, functions })
+    }
+}
+
+impl Serialize for HorizonMean {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&self.to_string())
+    }
+}
+
+impl<'de> Deserialize<'de> for HorizonMean {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let spec = String::deserialize(deserializer)?;
+        spec.parse().map_err(serde::de::Error::custom)
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, clap::Args)]
 #[serde(deny_unknown_fields)]
 pub struct ModelConfig {
@@ -82,9 +556,88 @@ pub struct ModelConfig {
     /// Origins with fewer valid history bars are excluded from the loss.
     #[arg(long, default_value_t = 256)]
     pub min_history: i64,
-    /// Comma-separated exogenous variates: time-of-day, day-of-week, session-gap, volume, market, spy; `all` or `none`.
+    /// Comma-separated exogenous variates: time-of-day, day-of-week, session-gap, volume,
+    /// market, spy, dispersion, cross-section-z; `all` or `none`.
     #[arg(long, default_value_t = FeatureSet::ALL)]
     pub features: FeatureSet,
+    /// Whether the per-layer embedding re-injection exists; `disabled` removes the parameters
+    /// and the kernel, and changes the checkpoint FORMAT stamp.
+    #[arg(long, value_enum, default_value_t = X0Lambdas::Enabled)]
+    pub x0_lambdas: X0Lambdas,
+    /// How the objective weights the horizon axis: `uniform`, `inv-sqrt`, `inv` or `cutoff:K`.
+    /// This is the OBJECTIVE, not the parameter set - every mode trains the same tensors and
+    /// emits the same 192 forecasts.
+    #[arg(long, default_value_t = HorizonLoss::Uniform)]
+    pub horizon_loss: HorizonLoss,
+    /// How the conditional mean is parameterized along the horizon axis: `free`,
+    /// `basis:S:B` for independent means up to `S` and `B` fixed decaying basis functions per
+    /// channel above it, or `increment:K` for full-rank per-BAR means with `K` state-dependent
+    /// log-scale coefficients per channel. This IS the parameter set - `basis` deletes mean
+    /// rows and `increment` deletes log-scale rows - so it moves the checkpoint FORMAT stamp.
+    #[arg(long, default_value_t = HorizonMean::Free)]
+    pub horizon_mean: HorizonMean,
+    /// `λ` for the training-time amplitude prior, `0` (the control) to disable it entirely.
+    ///
+    /// This penalizes the ENERGY of the predicted mean function on the σ-scaled close
+    /// coordinate the decoder already materializes - see
+    /// [`CausalPatchModel::amplitude_prior`]. It is NOT a parameter, NOT a multiplier on the
+    /// output and NOT a horizon reweighting: a fixed output multiplier is pure
+    /// reparameterization that the upstream layers undo within a few hundred steps, which is
+    /// exactly why `--horizon-mean basis:8:8` failed as an amplitude intervention. A penalty
+    /// on output VALUES cannot be undone that way, because growing an upstream weight grows
+    /// the penalty proportionally.
+    ///
+    /// Skipped from the manifest at `0`, so a control checkpoint written before this knob
+    /// existed serializes - and therefore digests - byte-identically.
+    #[arg(long, default_value_t = 0.0)]
+    #[serde(default, skip_serializing_if = "no_amplitude_prior")]
+    pub amplitude_prior: f64,
+    /// Which orthonormal map the objective measures horizon error in: `cumulative` (the
+    /// identity, and the control), `haar` or `dct`.
+    ///
+    /// This is neither the objective's WEIGHTING nor its parameter set - it is the METRIC. `W`
+    /// is full rank and orthonormal, hence a bijection, so every forecast function the head
+    /// could emit before it can emit after, at the same head shape and the same parameter
+    /// count. That is the whole difference from `--horizon-mean basis:8:8`, which restricted
+    /// the RANK of the emitted mean and destroyed the correlation gain.
+    ///
+    /// Under a non-identity basis the head's four log-scale rows are reinterpreted as
+    /// per-COEFFICIENT scales, so the Gaussian stays diagonal in the space it is modelled in
+    /// and horizon-space `σ_h` becomes DERIVED - see
+    /// [`target_basis::BasisTransform::horizon_log_scale`]. `cumulative` takes the fused loss
+    /// path untouched and is bit-for-bit the pre-knob objective.
+    #[arg(long, default_value_t = TargetBasis::Cumulative)]
+    #[serde(default, skip_serializing_if = "is_cumulative_basis")]
+    pub target_basis: TargetBasis,
+    /// How the objective weights the COEFFICIENT axis: `uniform` (equal weight per unit of
+    /// target variance once whitened) or `snr` (by measured `ρ̂²` on the [70%,80%) partition).
+    /// Mean 1 either way, so the loss stays nats per bar against the 2.3947663 anchor.
+    #[arg(long, default_value_t = BasisWeight::Uniform)]
+    #[serde(default, skip_serializing_if = "is_uniform_basis_weight")]
+    pub basis_weight: BasisWeight,
+    /// The authenticated per-coefficient statistics artifact: whitening scales fitted on
+    /// TRAINING origins and, when `--basis-weight snr`, `ρ̂` fitted on the [70%,80%) partition.
+    /// Absent means the analytic persistence prior `diag(W·C·Wᵀ)` and no measured whitening.
+    #[arg(long)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub basis_stats: Option<std::path::PathBuf>,
+}
+
+/// `--amplitude-prior 0` is the control, and a control manifest must serialize exactly as it
+/// did before the knob existed or its authenticating digest moves and every checkpoint written
+/// before today stops loading.
+fn no_amplitude_prior(lambda: &f64) -> bool {
+    *lambda == 0.
+}
+
+/// The control basis, skipped from the manifest for the same reason `--amplitude-prior 0` is:
+/// a control checkpoint must serialize, and therefore digest, exactly as it did before the knob.
+fn is_cumulative_basis(basis: &TargetBasis) -> bool {
+    basis.is_identity()
+}
+
+fn is_uniform_basis_weight(weight: &BasisWeight) -> bool {
+    *weight == BasisWeight::Uniform
 }
 
 impl Default for ModelConfig {
@@ -100,6 +653,13 @@ impl Default for ModelConfig {
             dropout: 0.0,
             min_history: 256,
             features: FeatureSet::ALL,
+            x0_lambdas: X0Lambdas::Enabled,
+            horizon_loss: HorizonLoss::Uniform,
+            horizon_mean: HorizonMean::Free,
+            amplitude_prior: 0.0,
+            target_basis: TargetBasis::Cumulative,
+            basis_weight: BasisWeight::Uniform,
+            basis_stats: None,
         }
     }
 }
@@ -147,9 +707,87 @@ impl ModelConfig {
             "dropout must be in [0, 1)"
         );
         ensure!(
+            self.amplitude_prior.is_finite() && self.amplitude_prior >= 0.,
+            "--amplitude-prior must be finite and non-negative, got {}; a negative penalty \
+             REWARDS forecast energy and diverges",
+            self.amplitude_prior
+        );
+        ensure!(
             (2..=self.seq_len).contains(&self.min_history),
             "min_history must lie in [2, seq_len]"
         );
+        if let HorizonLoss::Cutoff(cut) = self.horizon_loss {
+            ensure!(
+                (1..=self.pred_len).contains(&cut),
+                "--horizon-loss cutoff:{cut} is outside the 1..={} forecast horizon",
+                self.pred_len
+            );
+        }
+        if let HorizonMean::Basis { free, functions } = self.horizon_mean {
+            ensure!(
+                (1..self.pred_len).contains(&free),
+                "--horizon-mean basis:{free}:{functions} has no restricted horizon to structure: \
+                 S must leave at least one of the {} forecast horizons above it",
+                self.pred_len
+            );
+            ensure!(
+                (1..=self.pred_len - free).contains(&functions),
+                "--horizon-mean basis:{free}:{functions} asks for more basis functions than the \
+                 {} horizons they replace, which restricts nothing and only adds parameters",
+                self.pred_len - free
+            );
+        }
+        if let HorizonMean::Increment { scales } = self.horizon_mean {
+            ensure!(
+                (1..=self.pred_len).contains(&scales),
+                "--horizon-mean increment:{scales} asks for more log-scale coefficients than the \
+                 {} horizons they parameterize; K = {} already spans the space exactly and \
+                 recovers the per-horizon head",
+                self.pred_len,
+                self.pred_len
+            );
+        }
+        if !self.target_basis.is_identity() {
+            // A per-HORIZON weight vector is meaningless once the objective's rows are
+            // coefficients: `w_h` would multiply coefficient `h`, which is not horizon `h`.
+            // The coefficient weight is `--basis-weight`, and stacking the two would produce a
+            // loss nobody could attribute.
+            ensure!(
+                self.horizon_loss == HorizonLoss::Uniform,
+                "--target-basis {} rotates the objective's rows into coefficients, so \
+                 --horizon-loss {} would weight coefficient k by horizon k's weight, which is \
+                 not the same axis; weight the coefficient axis with --basis-weight instead",
+                self.target_basis,
+                self.horizon_loss
+            );
+            // Two different refusals wearing one `ensure!`. `basis` restricts the RANK of the
+            // emitted mean, and composing a rank restriction with a full-rank rotation makes
+            // any effect attributable to either. `increment` is not a rank restriction at all -
+            // the difference operator `D` is square and invertible - but `W·D` is neither
+            // orthonormal nor a difference, so a measurement through the composition is a
+            // measurement of neither idea. One knob per axis or neither.
+            ensure!(
+                self.horizon_mean == HorizonMean::Free,
+                "--target-basis {} is a full-rank orthonormal rotation and --horizon-mean {} \
+                 reparametrizes the same horizon axis; their composition is neither orthonormal \
+                 nor a difference, so running both makes neither attributable",
+                self.target_basis,
+                self.horizon_mean
+            );
+            ensure!(
+                self.pred_len >= 3,
+                "--target-basis {} needs at least three horizons to rotate, got {}",
+                self.target_basis,
+                self.pred_len
+            );
+        }
+        if self.basis_weight == BasisWeight::Snr {
+            ensure!(
+                self.basis_stats.is_some(),
+                "--basis-weight snr needs --basis-stats to name the artifact carrying the \
+                 measured ρ̂ per coefficient; it is fitted on the [70%,80%) partition"
+            );
+        }
         Ok(())
     }
 
@@ -182,7 +820,12 @@ impl ModelConfig {
             .count() as f64;
         let covariate_width = if known > 0. { COVARIATE_WIDTH as f64 } else { 0. };
         let head_input = width + covariate_width;
+        // What the head EMITS, in both modes: the expansion is folded onto the output weight,
+        // so the token-space GEMM and every activation below are shape-identical under
+        // `basis:S:B`. What it PARAMETERIZES is `head_parameters`, and the gap between the two
+        // is the whole restriction.
         let head_outputs = horizon * OUTPUTS_PER_BAR as f64;
+        let head_parameters = self.horizon_mean.head_outputs(self.pred_len) as f64;
         let gemm = |rows: f64, reduce: f64, out: f64| 2. * rows * reduce * out;
         let mut flops = gemm(
             tokens,
@@ -210,7 +853,8 @@ impl ModelConfig {
         // to hand on and 8·width for the rotation's two full-width products, its two
         // half-crossing sums and the buffer that interleaved them), the attention output, its
         // projection and the two residual `addcmul`s (6·width), the x0 injection's second
-        // `addcmul` (1·width), and the feedforward PAIR (2·ffn - the up projection and
+        // `addcmul` (1·width, and exactly zero when the injection does not exist), and the
+        // feedforward PAIR (2·ffn - the up projection and
         // `fused_kernels::relu_square`'s single output; the `relu`-then-`square` composition
         // materialized three, GELU two). The rotation term was missing entirely before this
         // accounting was measured per kernel class, and at 8·width of 22 the bound it produced
@@ -225,8 +869,17 @@ impl ModelConfig {
         //
         // The fp32 `rstd` a materializing RMSNorm writes is not charged here and never was;
         // the fused kernel writes none at all, recomputing the normalization in its backward.
+        let x0_injection = if self.x0_lambdas.enabled() { width } else { 0. };
         bytes += self.layers as f64
-            * bf16(tokens * (2. * width + 3. * width + 2. * width + 6. * width + width + 2. * ffn));
+            * bf16(
+                tokens
+                    * (2. * width
+                        + 3. * width
+                        + 2. * width
+                        + 6. * width
+                        + x0_injection
+                        + 2. * ffn),
+            );
         // The patch embedding's own norm: `x0 = rms_norm(patch(tokens))`, once per step.
         bytes += bf16(tokens * width);
         // The U-net skip: ONE fused `addcmul` per decoder layer (see `unet_stack`), so each
@@ -238,10 +891,36 @@ impl ModelConfig {
             + bf16(tokens * 2. * HEAD_HIDDEN as f64)
             + bf16(tokens * head_outputs);
         // The head geometry, the NLL and their backward are counted directly rather than
-        // scaled: 275 reads-or-writes of the `[rows, origins', 1, pred_len]` fp32 channel
-        // space, enumerated op by op from `CausalPatchModel::losses` (121 forward, 144
-        // backward, 10 for building the targets and the mask, which carry no gradient).
-        let head_loss = fp32(tokens * horizon) * 275.;
+        // scaled: 74 reads-or-writes of the `[rows, origins', 1, pred_len]` fp32 channel
+        // space, enumerated op by op from `CausalPatchModel::losses`.
+        //
+        // FORWARD, 51 units. The mask fold is 2 (read the mask, write `mask·w`; the
+        // `[1, 1, 1, pred_len]` weight vector rides in L2). `fused_kernels::loss_geometry`
+        // reads 9 - the whole bf16 head space is 8 half-units, the fp32 targets 4, the folded
+        // mask 1 - and writes 13, the mean coordinate plus the twelve fp32 vectors the
+        // reductions consume. The twelve `dot`s read 24. The `½·ln h` prior and the two
+        // denominators reduce the mask 3 more times.
+        //
+        // BACKWARD, 13 units. ONE kernel: 9 read (head, targets, folded mask) and 4 written
+        // (the dense bf16 head gradient). It recomputes the whole geometry from `head` instead
+        // of reading anything the forward saved, which is why the forward retains no
+        // full-size fp32 tensor and the backward is a fifth of the forward rather than double.
+        //
+        // Plus 10 for building the targets and the mask, which carry no gradient.
+        //
+        // The composition this replaced was 278 units - 121 forward and 144 backward over 65
+        // and 70 separate kernels - at 1613 and 1470 GB/s measured, already 82-90% of this
+        // card's streaming roof. The 3.8x reduction here is entirely deleted passes; not one
+        // kernel in the old chain was running slowly.
+        //
+        // `HorizonLoss::Cutoff(K)` does NOT reduce this term or any FLOP above it. The head
+        // still emits all `pred_len` horizons and the geometry still runs over all of them, so
+        // a `cutoff:K` arm pays the full head cost and trains `K/pred_len` of it: at K = 32 of
+        // 192 that is 5/6 of this term and 5/6 of the head-output GEMM spent on horizons the
+        // objective weights at zero. Masking the loss rather than narrowing the head is the
+        // deliberate trade - every per-horizon diagnostic keeps reading the untrained end,
+        // which is the entire point of the arm.
+        let head_loss = fp32(tokens * horizon) * 74.;
         // Value residual: `layers - 1` decoder layers each `lerp` their own value against layer
         // 0's. Ten passes over one `[tokens, d_model]` bf16 activation per such layer - three
         // forward (two reads and one write) and seven backward (`grad_self` and `grad_end` at a
@@ -252,9 +931,60 @@ impl ModelConfig {
         let decoders = (self.layers - 1).max(0) as f64;
         let value_residual =
             bf16(tokens * width) * (10. * decoders + 3. * (decoders - 1.).max(0.));
+        // The structured mean's own arithmetic and traffic, and the honest side of the trade.
+        //
+        // `CausalPatchModel::head` expands the parameters in WEIGHT space: one
+        // `[2·CHANNELS·pred_len, head_parameters] × [head_parameters, HEAD_HIDDEN]` GEMM per
+        // step, forward plus its weight gradient - two passes, not three, because the
+        // expansion is a constant and takes no gradient of its own. At 192/8/8 that is
+        // 5.23 GFLOP against the step's 16.98 TFLOP, and the folded weight and its gradient
+        // are 3.15 MB each, charged here at four materializations (write and read, forward and
+        // backward).
+        //
+        // What it deliberately does NOT do is shrink the token-space head GEMM, which still
+        // emits all `2·CHANNELS·pred_len` outputs from all `HEAD_HIDDEN` hidden units. Doing
+        // the expansion in ACTIVATION space instead would cut that GEMM by
+        // `3·2·tokens·HEAD_HIDDEN·704` = 0.415 TFLOP at 192/8/8, but it would have to
+        // materialize the restricted block and then concatenate it with the free band and the
+        // log scales - `+0.9 GB/step` at best, and only after `Head` stops being one tensor
+        // and the fused loss stops reading one `split` node. This model is within a factor of
+        // two of both roofs, so 2.4% of the arithmetic is not worth 0.6% of the traffic plus a
+        // second code path through the loss; more to the point, an ablation arm wants the
+        // control's cost profile, not a cheaper one.
+        let expansion = if matches!(self.horizon_mean, HorizonMean::Basis { .. }) {
+            2. * gemm(head_outputs, head_parameters, HEAD_HIDDEN as f64)
+        } else {
+            0.
+        };
+        let expansion_bytes = if matches!(self.horizon_mean, HorizonMean::Basis { .. }) {
+            4. * bf16(head_outputs * HEAD_HIDDEN as f64)
+        } else {
+            0.
+        };
+        // The training-time amplitude prior, and exactly zero when `λ = 0` - the control's
+        // cost bound must not move because a knob it does not use exists. Twenty-two passes
+        // over the same `[rows, origins', 1, pred_len]` fp32 close slice: eight forward (the
+        // masked multiply's two reads and one write, that product's reduction read, the
+        // square-multiply's two reads and one write, and its reduction read) and fourteen
+        // backward (one grad slice out of each of the two reductions at a read and a write
+        // each, the first moment's broadcast, the two accumulations into the masked product
+        // and into the close coordinate, and the mask multiply that routes one back through
+        // the other). At 256×375×192 that is 1.62 GB against the step's 143.4 GB - 1.1%, and
+        // the largest single reason this prior is not free. It is also the natural second
+        // fusion target: the two reductions read a tensor the fused loss already has in
+        // registers.
+        let amplitude_prior = if self.amplitude_prior > 0. {
+            fp32(tokens * horizon) * 22.
+        } else {
+            0.
+        };
         StepCost {
-            matmul_flops: 3. * flops,
-            traffic_bytes: 3. * 2. * bytes + head_loss + value_residual,
+            matmul_flops: 3. * flops + expansion,
+            traffic_bytes: 3. * 2. * bytes
+                + head_loss
+                + value_residual
+                + expansion_bytes
+                + amplitude_prior,
         }
     }
 }
@@ -281,12 +1011,21 @@ fn projection(path: nn::Path, input: i64, output: i64, bias: bool) -> nn::Linear
 /// A projection whose weight AND bias start at exactly zero, so the branch it terminates
 /// contributes nothing at step 0.
 ///
-/// modded-nanogpt zero-initialises every residual-branch output projection: the MLP down
-/// projection (`train_gpt_medium.py:1006` `self.c_proj.zero_()`, `train_gpt.py:1308`
-/// `self.mlp_bank[:, 1, :, :].zero_()`, both "zero init suggested by @Grad62304977") and the
-/// attention output projection, which lives in the same `vo_bank` and is zeroed for the padded
-/// groups while the real ones are folded into `CastedLinearT`, whose `reset_parameters` is
-/// `nn.init.zeros_(self.weight)` (`train_gpt.py:973-975`).
+/// modded-nanogpt zero-initialises the MLP DOWN projection (`train_gpt_medium.py:1006`
+/// `self.c_proj.zero_()`, `train_gpt.py:1308` `self.mlp_bank[:, 1, :, :].zero_()`, both "zero
+/// init suggested by @Grad62304977"). It does NOT zero-initialise the attention output
+/// projection, and this comment used to say it did: `train_gpt.py:1293` fills the whole real
+/// `vo_bank` - every V and every O - from a uniform, and only the groups padded out to
+/// `world_size` are zeroed at `:1294`; `:1161` then uses O straight from that bank.
+/// `CastedLinearT`, whose `reset_parameters` is `nn.init.zeros_(self.weight)`
+/// (`train_gpt.py:973-975`), is the LM HEAD class (`:1221`), a different module entirely.
+///
+/// So OUR attention O is a deliberate divergence, not a port: this function is what
+/// `Block::new` calls for it, so it starts at exactly zero while the reference's starts
+/// uniform. Zero O means no attention branch reaches the residual stream at step 0, which
+/// delays the QKV projections' first gradient by however long the O rows take to leave zero.
+/// It is recorded as an untried mechanistic port in
+/// `research/worker_reports/timexer_nanogpt_ledger.md` (N01) and is NOT changed here.
 ///
 /// Bias-free, like every projection in the reference (`train_gpt.py:1103` and `:1161` call
 /// `F.linear` with a weight only; `train_gpt_medium.py:995-996` stores bare weight
@@ -375,14 +1114,23 @@ fn scaled_linear(input: &Tensor, layer: &nn::Linear, scale: &Tensor) -> Tensor {
 /// (`BAR_NORM_EPS = 1e-6`, "The norm carries no learnable gain anywhere in this model"), which
 /// is also what the reference passes where it passes one at all (`train_gpt.py:1079`).
 ///
-/// What `eps=None` actually resolves to was MEASURED, not read off `finfo`: on a bf16 CUDA
-/// input, `_fused_rms_norm(x, shape, None, None)` is bit-identical to `eps = 1.1920929e-7`
-/// (max difference exactly 0.0) and nowhere near `finfo(bfloat16).eps = 7.8e-3`, which would
-/// have shrunk the sample by 95%. The kernel resolves the default from the fp32 ACCUMULATE
-/// type, not from the input dtype, so at unit RMS `None` and 1e-6 are indistinguishable.
-/// Passing 1e-6 is still the right call and is not cosmetic: on a head block whose RMS has
-/// collapsed - 4.2e-3 in the same probe, where eps is 5.6% of the mean square - the two
-/// choices differ by 2.5%, and 1e-6 is the floor the rest of the repo normalizes against.
+/// `eps=None` does NOT resolve to the input dtype's epsilon. `_fused_rms_norm` takes its
+/// default from the fp32 ACCUMULATE type, `FLT_EPSILON = 1.1920929e-7`, so
+/// `finfo(bfloat16).eps = 7.8125e-3` never reaches the kernel and no consequence of it is a
+/// consequence of the default. This comment used to quote one - a "0.4% shrink" (which is what
+/// `1 - √(1/(1 + 7.8125e-3))` is at unit RMS) - and that number described nothing this code
+/// does; the same counterfactual at a collapsed RMS reaches 95%, which is how far a
+/// dtype-epsilon story can be pushed while staying arithmetically consistent and physically
+/// vacuous.
+///
+/// What passing `1e-6` instead of the default actually changes, as `1 - √(ms/(ms + eps))`:
+/// at unit RMS, 5.0e-7 against 6.0e-8, a 4.4e-7 relative gap and far below bf16's 2^-8
+/// resolution - indistinguishable, as the reference's own omission implies. On a head block
+/// whose RMS has collapsed to 4.2e-3, mean square 1.76e-5, `1e-6` is 5.7% of the mean square:
+/// it shrinks by 2.72% where the fp32 default shrinks by 0.34%. That 2.4% is the entire
+/// behavioural content of the explicit epsilon, and it is why it is passed - `1e-6` is the
+/// floor the rest of the repo normalizes against, and it only bites where the shell has
+/// already collapsed.
 ///
 /// `_fused_rms_norm`, NOT `rms_norm`: `rms_norm`'s composite body dispatches to
 /// `_fused_rms_norm`, but `rms_norm` itself registers as a math kernel on CUDA, so calling it
@@ -400,7 +1148,7 @@ fn rms_norm(input: &Tensor) -> Tensor {
         .0
 }
 
-/// The five residual-mixing scalars one [`Block`] consumes, as 0-dim views of the model-level
+/// The residual-mixing scalars one [`Block`] consumes, as 0-dim views of the model-level
 /// lambda vectors ([`CausalPatchModel::resid_lambdas`] and friends). Borrowed rather than
 /// owned so the whole stack pays one cast and one `unbind` per step, exactly as the reference
 /// does (`train_gpt.py:1509-1512`: `self.resid_lambdas[:, 0].bfloat16().unbind(0)`).
@@ -409,9 +1157,11 @@ struct BlockLambdas<'a> {
     resid: [&'a Tensor; 2],
     /// Sub-block output scale, `[attention, feedforward]`. `train_gpt.py:1334`.
     post: [&'a Tensor; 2],
-    /// Embedding re-injection scale, applied on the attention residual only.
-    /// `train_gpt.py:1638` with the init-0 gate bias of `train_gpt.py:1389`.
-    x0: &'a Tensor,
+    /// The embedding re-injection as ONE thing: `(x0, λ0)`, the normalized patch embedding and
+    /// this layer's scale, applied on the attention residual only (`train_gpt.py:1638` with the
+    /// init-0 gate of `:1389`). `None` under [`X0Lambdas::Disabled`] - the embedding is then
+    /// simply not an input to the block, so there is no zero-multiplied tensor in the graph.
+    x0: Option<(&'a Tensor, &'a Tensor)>,
 }
 
 struct Block {
@@ -471,8 +1221,9 @@ impl Block {
     ///
     /// with the post-lambdas folded onto the projection weights ([`scaled_linear`]) and the
     /// remaining two products issued as `addcmul`, so each residual line is ONE kernel over
-    /// the residual stream instead of a multiply and an add. The attention line costs two
-    /// (the x0 term); the feedforward line costs exactly what the old bare `state + ff` cost.
+    /// the residual stream instead of a multiply and an add. The attention line costs two when
+    /// [`BlockLambdas::x0`] is present and one when it is not; the feedforward line costs
+    /// exactly what the old bare `state + ff` cost.
     ///
     /// `first_value` is the SOURCE layer's head-shaped value, `None` in the source layer itself.
     /// Returns the block output beside the value it published, which is `Some` exactly in the
@@ -480,7 +1231,6 @@ impl Block {
     fn forward(
         &self,
         input: &Tensor,
-        x0: &Tensor,
         first_value: Option<&Tensor>,
         lambdas: &BlockLambdas<'_>,
         rotation: (&Tensor, &Tensor),
@@ -557,10 +1307,13 @@ impl Block {
         // must be swapped before they can be merged, and no stride expresses that merge.
         .transpose(1, 2)
         .reshape([batch, length, self.width]);
-        let state = scaled_linear(&attended, &self.output, lambdas.post[0])
+        let residual = scaled_linear(&attended, &self.output, lambdas.post[0])
             .dropout(self.dropout, train)
-            .addcmul(input, lambdas.resid[0])
-            .addcmul(x0, lambdas.x0);
+            .addcmul(input, lambdas.resid[0]);
+        let state = match lambdas.x0 {
+            Some((x0, lambda)) => residual.addcmul(x0, lambda),
+            None => residual,
+        };
         // ReLU² instead of GELU: `train_gpt_medium.py:1010`,
         // `x = F.relu(x).square()  # https://arxiv.org/abs/2109.08668v2; ~1-2% better than
         // GELU`, and the fused `relu(x @ W1.T)^2 @ W2.T` kernel of `train_gpt.py:46`. The
@@ -688,20 +1441,17 @@ fn per_bar(statistic: &Tensor) -> Tensor {
 /// candle coordinates then the four log predictive scales, with the μP output multiplier already
 /// folded into the head weight.
 ///
-/// Channel-major is load-bearing, not cosmetic. Every consumer of this tensor slices ONE
-/// channel; in the natural `[.., pred_len, 2·CHANNELS]` layout each such slice is a stride-8
-/// gather that pulls a 32-byte sector per two useful bytes, and the dense head emits
-/// `256 · 375 · 192 · 8` = 147 M elements per step. Here a channel slice is contiguous.
+/// Channel-major is load-bearing, not cosmetic. Every consumer of this tensor addresses ONE
+/// channel at a time; in the natural `[.., pred_len, 2·CHANNELS]` layout each such access is a
+/// stride-8 gather that pulls a 32-byte sector per two useful bytes, and the dense head emits
+/// `256 · 375 · 192 · 8` = 147 M elements per step. Here a channel slice is `pred_len`
+/// contiguous elements, which is what lets the fused loss address channel `c` of bar `h` as
+/// `token·2·CHANNELS·pred_len + c·pred_len + h` and stay coalesced across a warp.
+///
+/// Nothing splits it any more: the loss reads all eight channels in one kernel and writes one
+/// dense gradient, where the `split` this type used to expose cost a `cat` over eight slices in
+/// every backward.
 pub struct Head(Tensor);
-
-impl Head {
-    /// The `2·CHANNELS` channel slices, `[rows, origins', 1, pred_len]` each, produced by ONE
-    /// `split` node: backward scatters the eight gradients into a single buffer instead of
-    /// reducing eight zero-padded 295 MB ones.
-    fn channels(&self) -> Vec<Tensor> {
-        self.0.split(1, 2)
-    }
-}
 
 /// Head outputs per (origin, future bar) in fp32, channel-major `[.., CHANNELS, pred_len]`:
 /// candle coordinates and the log predictive scale per OHLC channel in σ units, the latter
@@ -756,8 +1506,9 @@ pub struct CausalPatchModel {
     /// Per-sub-block branch-output scale, `[2·layers]` fp32, same layout. Folded onto the
     /// output projection weights rather than the activations - see [`scaled_linear`].
     post_lambdas: Tensor,
-    /// Per-layer embedding re-injection scale, `[layers]` fp32.
-    x0_lambdas: Tensor,
+    /// Per-layer embedding re-injection scale, `[layers]` fp32; `None` - unregistered, not
+    /// zeroed - under [`X0Lambdas::Disabled`].
+    x0_lambdas: Option<Tensor>,
     /// LOGITS of the U-net skip gates, `[layers/2]` fp32, one per decoder layer in
     /// [`ModelConfig::skip_pairs`] order. The gate the residual stream sees is `σ(logit)`, so
     /// it can never leave `(0, 1)` and starts at σ([`SKIP_LOGIT_INIT`]) = 0.18243. Stored on the
@@ -769,14 +1520,63 @@ pub struct CausalPatchModel {
     known_index: Tensor,
     sigma_scale: Tensor,
     unit_scale: Tensor,
+    /// `√h` per future bar, `[1, 1, 1, pred_len]` fp32: the unit the close coordinate is
+    /// measured in, and the ONE tensor a post-hoc mean calibration touches - see
+    /// [`Self::fold_mean_gain`].
     horizon_scale: Tensor,
     half_log_horizon: Tensor,
     /// `1/h` per future bar, `[1, 1, 1, pred_len]`: `exp(-2·½·ln h)` pulled out of the
     /// per-element NLL so the `½·ln h` prior never enters a full-size kernel.
     inverse_horizon: Tensor,
+    /// The objective's per-horizon weight, `[1, 1, 1, pred_len]` fp32, mean 1 over the whole
+    /// axis - see [`HorizonLoss`]. A CONSTANT buffer, never a varstore variable: it must not
+    /// be trained, and a fixed tensor is what makes it safe inside the captured CUDA graph.
+    horizon_weight: Tensor,
+    /// `Ψ`, the structured mean's expansion, `[2·CHANNELS·pred_len, head_outputs]` fp32;
+    /// `None` - and no kernel at all - under [`HorizonMean::Free`]. A CONSTANT buffer for the
+    /// same two reasons as [`Self::horizon_weight`]: the basis is fixed by construction, and a
+    /// fixed tensor at a fixed address is what makes it safe inside the captured CUDA graph.
+    /// [`Self::head`] folds it onto the output weight, so it never touches an activation.
+    mean_expansion: Option<Tensor>,
+    /// `Φ`, the log-scale basis `[scales, pred_len]` fp32, `None` outside
+    /// [`HorizonMean::Increment`]. Unlike [`Self::mean_expansion`] this canNOT be folded onto
+    /// the output weight: folding it would make the token-space GEMM emit the full
+    /// `2·CHANNELS·pred_len` again and give back the entire width saving the mode exists for.
+    /// It runs in activation space instead, where it is `[rows·origins·CHANNELS, scales] ×
+    /// [scales, pred_len]` - 1.2 GFLOP at `scales = 8`, against the 0.45 TFLOP/step the narrower
+    /// output projection saves.
+    scale_expansion: Option<Tensor>,
+    /// The three per-horizon constants the loss reads, in INCREMENT space: `√1`, `½·ln 1` and
+    /// `1/1`, i.e. ones, zeros and ones. `None` outside [`HorizonMean::Increment`].
+    ///
+    /// They are ones and zeros because a one-bar move in σ units has scale exactly 1, so the
+    /// random-walk prior that `√h`, `½·ln h` and `1/h` carry is the identity on a single bar.
+    /// Materialized as buffers rather than folded away because the fused loss takes them as
+    /// tensor operands and a captured CUDA graph needs a fixed address, not a literal.
+    increment_geometry: Option<(Tensor, Tensor, Tensor)>,
     /// `1/LOG_SCALE_CAP`, shaped `[1, 1, 1, 1]` rather than 0-dim so that multiplying a bf16
     /// log-scale channel by it promotes the result to fp32 in a single kernel.
     log_scale_gain: Tensor,
+    /// The applied amplitude calibration of the emitted mean, `None` on an uncalibrated model.
+    /// See [`Self::set_mean_gain`]; read only by [`Self::gained`], which is the last step of
+    /// [`Self::decode`] and is not on the training path.
+    mean_gain: Option<MeanGain>,
+    /// The orthonormal horizon reparametrization, `None` - and no new kernel, no new buffer and
+    /// no new branch in any hot path - under [`TargetBasis::Cumulative`]. That `None` is what
+    /// makes the control arm bit-for-bit the pre-knob objective rather than merely equal to it:
+    /// the fused loss call below is reached by exactly the code it was reached by before.
+    basis: Option<BasisTransform>,
+}
+
+/// A frozen amplitude calibration, resident: the two curves as the decode's operands, beside
+/// the manifest record they came from so a report can state what was applied without
+/// round-tripping a device tensor.
+struct MeanGain {
+    frozen: FrozenGain,
+    /// `[1, pred_len]` fp32, so it broadcasts against a `[.., 1, pred_len]` channel slice at
+    /// any rank without changing it.
+    anchor: Tensor,
+    offset: Tensor,
 }
 
 impl CausalPatchModel {
@@ -784,6 +1584,26 @@ impl CausalPatchModel {
         config
             .validate()
             .expect("invalid causal patch model configuration");
+        // Loading and authenticating the statistics artifact belongs here, beside the config
+        // validation it completes: a mispaired artifact is a different objective, and
+        // discovering that after the first optimizer step would waste the lease.
+        let basis = (!config.target_basis.is_identity())
+            .then(|| {
+                let statistics = config
+                    .basis_stats
+                    .as_deref()
+                    .map(target_basis::BasisStatistics::load)
+                    .transpose()
+                    .expect("unreadable --basis-stats artifact");
+                BasisTransform::new(
+                    config.target_basis,
+                    config.basis_weight,
+                    config.pred_len,
+                    statistics.as_ref(),
+                    path.device(),
+                )
+                .expect("invalid target basis")
+            });
         let device = path.device();
         let head_dim = config.d_model / config.heads;
         let aux_channels = config.features.channels() as i64;
@@ -850,11 +1670,13 @@ impl CausalPatchModel {
                 &[2 * config.layers as i64],
                 nn::Init::Const(POST_LAMBDA_INIT),
             ),
-            x0_lambdas: (path / "lambdas").var(
-                "x0",
-                &[config.layers as i64],
-                nn::Init::Const(X0_LAMBDA_INIT),
-            ),
+            x0_lambdas: config.x0_lambdas.enabled().then(|| {
+                (path / "lambdas").var(
+                    "x0",
+                    &[config.layers as i64],
+                    nn::Init::Const(X0_LAMBDA_INIT),
+                )
+            }),
             skip_weights: path.var(
                 "skip_weights",
                 &[(config.layers / 2) as i64],
@@ -865,7 +1687,7 @@ impl CausalPatchModel {
             head_output: nn::linear(
                 path / "head" / "output",
                 HEAD_HIDDEN,
-                config.pred_len * OUTPUTS_PER_BAR,
+                config.horizon_mean.head_outputs(config.pred_len),
                 nn::LinearConfig {
                     ws_init: nn::Init::Const(0.0),
                     bs_init: Some(nn::Init::Const(0.0)),
@@ -878,11 +1700,46 @@ impl CausalPatchModel {
             horizon_scale: horizon.sqrt(),
             half_log_horizon: horizon.log() * 0.5,
             inverse_horizon: horizon.reciprocal(),
+            horizon_weight: Tensor::from_slice(
+                &config
+                    .horizon_loss
+                    .weights(config.pred_len)
+                    .into_iter()
+                    .map(|weight| weight as f32)
+                    .collect::<Vec<f32>>(),
+            )
+            .reshape([1, 1, 1, config.pred_len])
+            .to_device(device),
+            mean_expansion: config.horizon_mean.expansion(config.pred_len).map(|values| {
+                Tensor::from_slice(&values)
+                    .reshape([
+                        OUTPUTS_PER_BAR * config.pred_len,
+                        config.horizon_mean.head_outputs(config.pred_len),
+                    ])
+                    .to_device(device)
+            }),
+            scale_expansion: config.horizon_mean.scale_basis(config.pred_len).map(|values| {
+                let values: Vec<f32> = values.into_iter().map(|value| value as f32).collect();
+                Tensor::from_slice(&values)
+                    .reshape([-1, config.pred_len])
+                    .to_device(device)
+            }),
+            increment_geometry: matches!(config.horizon_mean, HorizonMean::Increment { .. })
+                .then(|| {
+                    let shape = [1, 1, 1, config.pred_len];
+                    (
+                        Tensor::ones(shape, (Kind::Float, device)),
+                        Tensor::zeros(shape, (Kind::Float, device)),
+                        Tensor::ones(shape, (Kind::Float, device)),
+                    )
+                }),
             log_scale_gain: Tensor::full(
                 [1, 1, 1, 1],
                 1.0 / LOG_SCALE_CAP,
                 (Kind::Float, device),
             ),
+            mean_gain: None,
+            basis,
             config: config.clone(),
         }
     }
@@ -891,12 +1748,97 @@ impl CausalPatchModel {
         &self.config
     }
 
+    /// The orthonormal horizon reparametrization in force, `None` under `cumulative`.
+    pub fn basis(&self) -> Option<&BasisTransform> {
+        self.basis.as_ref()
+    }
+
     pub fn horizon_scale(&self) -> &Tensor {
         &self.horizon_scale
     }
 
     pub fn half_log_horizon(&self) -> &Tensor {
         &self.half_log_horizon
+    }
+
+    /// Apply a frozen amplitude calibration to the emitted MEAN.
+    ///
+    /// This is the ONLY thing an amplitude calibration does to the model, and it is the whole
+    /// of it. A decoded candle has exactly two amplitude degrees of freedom - see
+    /// [`decode_joint`] - so the transform is
+    ///
+    /// ```text
+    /// f_c(h) -> g_anchor(h)·close(h) + g_offset(h)·(f_c(h) - close(h))
+    /// ```
+    ///
+    /// with both gains strictly positive. Three consequences, all of them the point:
+    ///
+    /// - the close channel is rescaled exactly, `close -> g_anchor·close`, and the other three
+    ///   ride it, so the amplitude the long-horizon MSE is destroyed by is corrected in every
+    ///   channel at once;
+    /// - every intrabar offset keeps its sign and its size relative to the anchor, so
+    ///   `high ≥ max(open, close) ≥ min(open, close) ≥ low` survives for exactly the reason it
+    ///   survives uncalibrated. Independent per-CHANNEL gains would not have this property;
+    /// - the predictive scales are untouched: they come from `half_log_horizon` and the
+    ///   log-scale channels, which this does not read. The NLL is therefore the un-gained
+    ///   model's NLL, which is what keeps checkpoint selection comparable across the whole
+    ///   experiment - a mean gain with no matching σ refit makes NLL worse even where it makes
+    ///   MSE better.
+    ///
+    /// The TRAINING objective cannot see this. The loss chains read `horizon_scale`,
+    /// `inverse_horizon` and `half_log_horizon`, none of which this touches, and
+    /// [`Self::losses`] refuses to run on a calibrated model rather than relying on that
+    /// reading. The checkpoint is untouched too: the two curves are buffers derived from the
+    /// manifest, not varstore variables, so no saved tensor and no training bit moves.
+    ///
+    /// Setting REPLACES any previous curve rather than composing with it, so a re-fit at a
+    /// later step cannot silently square its own shrinkage.
+    pub fn set_mean_gain(&mut self, gain: &FrozenGain) -> Result<()> {
+        let pred_len = self.config.pred_len;
+        gain.validate(pred_len as usize)?;
+        let device = self.horizon_scale.device();
+        let curve = |values: &[f64]| {
+            Tensor::from_slice(&values.iter().map(|value| *value as f32).collect::<Vec<f32>>())
+                .reshape([1, pred_len])
+                .to_device(device)
+        };
+        self.mean_gain = Some(MeanGain {
+            anchor: curve(&gain.anchor),
+            offset: curve(&gain.offset),
+            frozen: gain.clone(),
+        });
+        Ok(())
+    }
+
+    /// The applied amplitude calibration, or `None` on an uncalibrated model.
+    pub fn mean_gain(&self) -> Option<&FrozenGain> {
+        self.mean_gain.as_ref().map(|gain| &gain.frozen)
+    }
+
+    /// The two-coordinate rescale, the identity on an uncalibrated model. Three elementwise
+    /// kernels on a `[rows, origins, CHANNELS, pred_len]` decode, which is a rounding error
+    /// beside the transformer that produced it, and none of them on the training path.
+    fn gained(&self, decoded: Tensor) -> Tensor {
+        let Some(gain) = &self.mean_gain else {
+            return decoded;
+        };
+        let anchor = decoded.narrow(-2, CHANNELS - 1, 1);
+        let offsets = &decoded - &anchor;
+        anchor * &gain.anchor + offsets * &gain.offset
+    }
+
+    /// The objective's per-horizon weight buffer, `[1, 1, 1, pred_len]` fp32, for the reference
+    /// [`gaussian_nll`] and the evaluation path.
+    pub fn horizon_weight_buffer(&self) -> &Tensor {
+        &self.horizon_weight
+    }
+
+    /// The objective's per-horizon weight vector on the host, index `i` being horizon `i + 1`.
+    /// Read back from the buffer the loss actually multiplies by, not recomputed, so the chart
+    /// and the selection scalar cannot disagree with the gradient.
+    pub fn horizon_weights(&self) -> Vec<f64> {
+        Vec::<f64>::try_from(self.horizon_weight.to_kind(Kind::Double).flatten(0, -1))
+            .expect("the horizon weight buffer is a dense fp32 vector")
     }
 
     pub fn statistics(&self, batch: &Batch) -> Statistics {
@@ -1030,7 +1972,10 @@ impl CausalPatchModel {
         let kind = x0.kind();
         let resid = self.resid_lambdas.to_kind(kind).unbind(0);
         let post = self.post_lambdas.to_kind(kind).unbind(0);
-        let x0_lambdas = self.x0_lambdas.to_kind(kind).unbind(0);
+        let x0_lambdas = self
+            .x0_lambdas
+            .as_ref()
+            .map(|bank| bank.to_kind(kind).unbind(0));
         // The U-net gates ride the same one-cast rule: POST-sigmoid, in the activation dtype.
         // One `unbind`, not `layers/2` `select`s - `select`'s backward is `zeros_like` plus a
         // copy, `unbind`'s is a single `stack`.
@@ -1046,11 +1991,12 @@ impl CausalPatchModel {
                 let lambdas = BlockLambdas {
                     resid: [&resid[2 * index], &resid[2 * index + 1]],
                     post: [&post[2 * index], &post[2 * index + 1]],
-                    x0: &x0_lambdas[index],
+                    x0: x0_lambdas
+                        .as_ref()
+                        .map(|lambdas| (&x0, &lambdas[index])),
                 };
                 let (next, published) = self.blocks[index].forward(
                     state,
-                    &x0,
                     first_value.as_ref(),
                     &lambdas,
                     (&self.rotation.0, &self.rotation.1),
@@ -1124,8 +2070,12 @@ impl CausalPatchModel {
             ]
         }));
         values.push(self.post_lambdas.shallow_clone());
-        names.extend((0..layers).map(|layer| format!("x0 lambda L{layer}")));
-        values.push(self.x0_lambdas.shallow_clone());
+        // Absent entirely under `X0Lambdas::Disabled`: the chart's series are the model's own
+        // scalars, so a mode with no injection must not report a flat zero line for one.
+        if let Some(bank) = &self.x0_lambdas {
+            names.extend((0..layers).map(|layer| format!("x0 lambda L{layer}")));
+            values.push(bank.shallow_clone());
+        }
         // POST-sigmoid, in `skip_pairs` order - the same order the gates are unbound in.
         names.extend(
             self.config
@@ -1331,8 +2281,8 @@ impl CausalPatchModel {
         ];
         // The composed layer charges every class it invokes more than once again: the pre-norm
         // runs twice (before attention, before the feedforward) and the residual `addcmul`
-        // three times (the residual scale on both sub-blocks, plus the x0 injection on the
-        // attention line). The QK norm runs once.
+        // twice for the residual scales, plus once more for the x0 injection on the attention
+        // line when that injection exists. The QK norm runs once.
         let charged = |name: &'static str| -> (f64, f64) {
             let class = classes
                 .iter()
@@ -1342,20 +2292,27 @@ impl CausalPatchModel {
         };
         let (norm_bytes, norm_flops) = charged("RMSNorm");
         let (addcmul_bytes, addcmul_flops) = charged("residual addcmul");
+        let x0_addcmuls = if self.config.x0_lambdas.enabled() { 1. } else { 0. };
         let layer_bytes: f64 = classes.iter().map(|class| class.forward_bytes).sum::<f64>()
             + norm_bytes
-            + 2. * addcmul_bytes;
+            + (1. + x0_addcmuls) * addcmul_bytes;
         let layer_flops: f64 = classes.iter().map(|class| class.forward_flops).sum::<f64>()
             + norm_flops
-            + 2. * addcmul_flops;
+            + (1. + x0_addcmuls) * addcmul_flops;
         classes.push(KernelClass {
             name: "composed layer",
-            // Entry 1 is `x0`, the normalized patch embedding the block re-injects.
-            inputs: vec![activation(width), activation(width)],
+            // Entry 1 is `x0`, the normalized patch embedding the block re-injects - present
+            // only when the injection is.
+            inputs: if self.config.x0_lambdas.enabled() {
+                vec![activation(width), activation(width)]
+            } else {
+                vec![activation(width)]
+            },
             forward_bytes: layer_bytes,
             forward_flops: layer_flops,
             // No norm parameters any more: the RMSNorm is gainless and the projections are
-            // bias-free, so a block's leaves are four matrices plus the five lambdas.
+            // bias-free, so a block's leaves are four matrices plus the residual and post
+            // lambdas, plus the x0 bank where it exists.
             parameters: projected(&block.qkv)
                 .into_iter()
                 .chain(projected(&block.output))
@@ -1364,27 +2321,27 @@ impl CausalPatchModel {
                 .chain([
                     self.resid_lambdas.shallow_clone(),
                     self.post_lambdas.shallow_clone(),
-                    self.x0_lambdas.shallow_clone(),
                 ])
+                .chain(self.x0_lambdas.iter().map(Tensor::shallow_clone))
                 .collect(),
             run: Box::new(move |input| {
                 let kind = input[0].kind();
-                let (resid, post, x0) = (
+                let (resid, post) = (
                     self.resid_lambdas.to_kind(kind),
                     self.post_lambdas.to_kind(kind),
-                    self.x0_lambdas.to_kind(kind),
                 );
+                let x0 = self
+                    .x0_lambdas
+                    .as_ref()
+                    .map(|bank| bank.to_kind(kind).get(0));
                 let (resid_attn, resid_ffn) = (resid.get(0), resid.get(1));
                 let (post_attn, post_ffn) = (post.get(0), post.get(1));
-                let x0_lambda = x0.get(0);
                 let lambdas = BlockLambdas {
                     resid: [&resid_attn, &resid_ffn],
                     post: [&post_attn, &post_ffn],
-                    x0: &x0_lambda,
+                    x0: x0.as_ref().map(|lambda| (&input[1], lambda)),
                 };
-                block
-                    .forward(&input[0], &input[1], None, &lambdas, rotation, train)
-                    .0
+                block.forward(&input[0], None, &lambdas, rotation, train).0
             }),
         });
         // The value-residual mix, at the shape a decoder layer runs it: one `lerp` over two
@@ -1485,6 +2442,129 @@ impl CausalPatchModel {
                     .to_kind(Kind::BFloat16)
             }),
         });
+        // The head and the loss, which the backbone-only list above never charged at all. The
+        // dense head emits `tokens · 2·CHANNELS · pred_len` = 147 M elements per step and the
+        // loss walks that space channel by channel, so a step-level attribution that stops at
+        // the last block cannot say where its own milliseconds went.
+        let horizon = c.pred_len;
+        let outputs = OUTPUTS_PER_BAR * horizon;
+        // One `[rows, origins', 1, pred_len]` channel slice, the unit the loss works in.
+        let slice = tokens * horizon as f64;
+        let head_space = slice * OUTPUTS_PER_BAR as f64;
+        let target_space = slice * CHANNELS as f64;
+        if let Some(covariates) = &self.covariates {
+            let known = covariates.ws.size()[1];
+            classes.push(KernelClass {
+                name: "head known-future covariate projection",
+                inputs: vec![(vec![rows, origins, known], Kind::BFloat16)],
+                forward_bytes: bf16(tokens * known as f64)
+                    + bf16(tokens * COVARIATE_WIDTH as f64)
+                    + cast(COVARIATE_WIDTH * known),
+                forward_flops: 2. * tokens * known as f64 * COVARIATE_WIDTH as f64,
+                parameters: projected(covariates),
+                run: Box::new(move |input| linear(&input[0], covariates)),
+            });
+        }
+        let head_input = self.head_hidden.ws.size()[1];
+        classes.push(KernelClass {
+            name: "head hidden projection and GELU",
+            inputs: vec![(vec![rows, origins, head_input], Kind::BFloat16)],
+            // The GEMM writes its `[tokens, 1024]` output and the GELU reads it and writes
+            // another: two materialized activations, not one.
+            forward_bytes: bf16(tokens * head_input as f64)
+                + 3. * bf16(tokens * HEAD_HIDDEN as f64)
+                + cast(HEAD_HIDDEN * head_input),
+            forward_flops: gemm(head_input, HEAD_HIDDEN) + 8. * tokens * HEAD_HIDDEN as f64,
+            parameters: projected(&self.head_hidden),
+            run: Box::new(move |input| linear(&input[0], &self.head_hidden).gelu("none")),
+        });
+        classes.push(KernelClass {
+            name: "head output projection",
+            inputs: vec![(vec![rows, origins, HEAD_HIDDEN], Kind::BFloat16)],
+            // The `[1536, 1024]` weight cast and the horizon-mean expansion's own two small
+            // matmuls are parameter-space work; the activation cost is the hidden state in and
+            // the whole 147 M-element head space out.
+            forward_bytes: bf16(tokens * HEAD_HIDDEN as f64)
+                + bf16(head_space)
+                + cast(outputs * HEAD_HIDDEN),
+            forward_flops: gemm(HEAD_HIDDEN, outputs),
+            parameters: {
+                let mut params = vec![self.head_output.ws.shallow_clone()];
+                params.extend(self.head_output.bs.iter().map(Tensor::shallow_clone));
+                params
+            },
+            run: Box::new(move |input| {
+                let (weight, bias) = self.head_output_weights(input[0].kind());
+                input[0]
+                    .linear(&weight, bias.as_ref())
+                    .reshape([rows, -1, OUTPUTS_PER_BAR, horizon])
+            }),
+        });
+        // Registered only when the prior actually runs, so an unpenalized arm's class list and
+        // its `step_cost` describe the same kernels. The mask is built outside the timed
+        // closure exactly as the fused loss class below builds its targets.
+        if c.amplitude_prior > 0. {
+            let amplitude_mask = self.targets(batch, stats, false).1;
+            classes.push(KernelClass {
+                name: "amplitude prior mean energy",
+                inputs: vec![(vec![rows, origins, 1, horizon], Kind::Float)],
+                // Eight fp32 passes over the close mean slice: the masked multiply reads two
+                // and writes one, its reduction reads one, the square-multiply reads two and
+                // writes one, and its reduction reads one. The two `[pred_len]` outputs are
+                // 768 B and do not round.
+                forward_bytes: 8. * fp32(slice),
+                // One masked multiply, one square multiply and two summations.
+                forward_flops: 4. * slice,
+                parameters: Vec::new(),
+                run: Box::new(move |input| {
+                    self.amplitude_prior(&input[0], &amplitude_mask)
+                        .expect("the amplitude prior class is registered only at nonzero λ")
+                }),
+            });
+        }
+        classes.push(KernelClass {
+            name: "targets, market drift and validity mask",
+            // No gradient: prices, the market path, the validity flags and the statistics are
+            // all data. This is pure forward traffic that the backward never revisits.
+            inputs: Vec::new(),
+            // `(future - log_close) / sigma - drift` is three fp32 passes over the target
+            // space, the drift two over the `[.., 1, pred_len]` market space, and the mask one
+            // more; each pass reads and writes.
+            forward_bytes: 6. * fp32(target_space) + 6. * fp32(slice),
+            forward_flops: 3. * target_space + 4. * slice,
+            parameters: Vec::new(),
+            run: Box::new(move |_| self.targets(batch, stats, false).0),
+        });
+        let (targets, mask) = self.targets(batch, stats, false);
+        classes.push(KernelClass {
+            name: "fused loss geometry and NLL",
+            inputs: vec![(vec![rows, origins, OUTPUTS_PER_BAR, horizon], Kind::BFloat16)],
+            // ENUMERATED, not a floor, because after the fusion there is nothing left to
+            // guess: one mask fold (read the mask, write `mask·w`), the fused kernel's reads
+            // (the whole bf16 head space, the fp32 targets, the folded mask) and writes (the
+            // mean coordinate plus the twelve fp32 vectors the reductions consume), the twelve
+            // `dot`s at two vectors each, and the three `[pred_len]`-or-scalar mask reductions
+            // the `½·ln h` prior and the two denominators need. 51 channel-slice units in all.
+            //
+            // The composition this replaced was 65 kernels and 136 such units, and the old
+            // figure here charged 43 of them - which is why it reported 783 GB/s for a chain
+            // that was actually streaming 1613 GB/s. A floor in the denominator of a roofline
+            // fraction understates the kernel and hides the fact that the win available was
+            // never bandwidth but pass count.
+            forward_bytes: 2. * fp32(slice)
+                + bf16(head_space)
+                + fp32(target_space)
+                + fp32(slice)
+                + 13. * fp32(slice)
+                + 24. * fp32(slice)
+                + 3. * fp32(slice),
+            forward_flops: 24. * slice + CHANNELS as f64 * 8. * slice,
+            parameters: Vec::new(),
+            run: Box::new(move |input| {
+                self.losses(&Head(input[0].shallow_clone()), stats, &targets, &mask)
+                    .nll
+            }),
+        });
         classes
     }
 
@@ -1514,33 +2594,116 @@ impl CausalPatchModel {
             None => state.shallow_clone(),
         };
         let hidden = linear(&head_input, &self.head_hidden).gelu("none");
-        // The μP output multiplier rides on the weight copy the GEMM already needs: scaling a
-        // 1024×1536 weight instead of a 147 M-element output is the same product and the same
-        // gradient (`HEAD_OUTPUT_SCALE` is a power of two, so the cast commutes exactly) for
-        // 1/96 000 of the traffic.
-        Head(
-            hidden
-                .linear(
-                    &(self.head_output.ws.to_kind(hidden.kind()) * HEAD_OUTPUT_SCALE),
-                    self.head_output
-                        .bs
-                        .as_ref()
-                        .map(|bias| bias.to_kind(hidden.kind()) * HEAD_OUTPUT_SCALE),
-                )
-                .reshape([rows, -1, OUTPUTS_PER_BAR, horizon]),
-        )
+        let (weight, bias) = self.head_output_weights(hidden.kind());
+        let emitted = hidden.linear(&weight, bias.as_ref());
+        let Some(expansion) = &self.scale_expansion else {
+            return Head(emitted.reshape([rows, -1, OUTPUTS_PER_BAR, horizon]));
+        };
+        // `increment`: the projection emits `CHANNELS·pred_len` increment means followed by
+        // `CHANNELS·scales` log-scale coefficients, and this is the ONE place the two are put
+        // back into the dense `[2·CHANNELS, pred_len]` block every consumer below expects. The
+        // means need no expansion at all - they are already per-bar and full rank, and the
+        // cumsum that turns them into a horizon forecast happens at the decode, not here,
+        // because the loss is computed on the increments themselves.
+        let means = horizon * CHANNELS;
+        let coefficients = emitted
+            .narrow(-1, means, emitted.size()[emitted.dim() - 1] - means)
+            .reshape([rows, -1, CHANNELS, expansion.size()[0]]);
+        Head(Tensor::cat(
+            &[
+                emitted.narrow(-1, 0, means).reshape([rows, -1, CHANNELS, horizon]),
+                coefficients
+                    .to_kind(expansion.kind())
+                    .matmul(expansion)
+                    .to_kind(emitted.kind()),
+            ],
+            2,
+        ))
+    }
+
+    /// The head's output weight and bias in `kind`.
+    ///
+    /// The μP output multiplier rides on the weight copy the GEMM already needs: scaling a
+    /// 1024×1536 weight instead of a 147 M-element output is the same product and the same
+    /// gradient (`HEAD_OUTPUT_SCALE` is a power of two, so the cast commutes exactly) for
+    /// 1/96 000 of the traffic.
+    ///
+    /// [`HorizonMean::Basis`] rides the same weight copy, for the same reason one order of
+    /// magnitude further: `Ψ · W` is `[1536, 832] × [832, 1024]`, 2.6 GFLOP against the
+    /// 0.5 TFLOP the token-space head GEMM would have to redo if the expansion happened in
+    /// activation space - and it emits the identical dense block, so [`Head`], the fused loss
+    /// and every per-horizon diagnostic are shape-identical in both modes. The one-hot rows of
+    /// `Ψ` (the free band and every log scale) sum one weight against 831 exact zeros, so they
+    /// arrive bit-identical to the parameter itself.
+    ///
+    /// `Free` takes the `None` branch and runs the pre-knob GEMM unchanged, which is what makes
+    /// the control arm bit-for-bit the old head rather than merely equal to it.
+    ///
+    /// Its own method so `kernel_classes` can time exactly this rather than a paraphrase of it.
+    fn head_output_weights(&self, kind: Kind) -> (Tensor, Option<Tensor>) {
+        let weight = self.head_output.ws.to_kind(kind) * HEAD_OUTPUT_SCALE;
+        let bias = self
+            .head_output
+            .bs
+            .as_ref()
+            .map(|bias| bias.to_kind(kind) * HEAD_OUTPUT_SCALE);
+        match &self.mean_expansion {
+            None => (weight, bias),
+            Some(expansion) => {
+                let expansion = expansion.to_kind(kind);
+                let folded_bias = bias.map(|bias| expansion.matmul(&bias));
+                (expansion.matmul(&weight), folded_bias)
+            }
+        }
     }
 
     /// fp32 channel-major coordinates and log predictive scales for the evaluation decoders.
     /// The training loss never calls this: it would materialize the whole 590 MB fp32 space.
+    ///
+    /// `log_scale` is always in HORIZON space, which under a non-identity [`TargetBasis`] means
+    /// it is DERIVED rather than emitted: the head's rows are per-coefficient scales `τ_k`, the
+    /// implied horizon covariance is `Wᵀ diag(τ²) W`, and `σ_h = √Σ_hh`. Deriving it HERE, at
+    /// the one place that materializes the evaluation output, is what keeps every existing
+    /// per-horizon report - calibration coverage, the scale charts, the trading family -
+    /// reading a per-horizon scale that still MEANS a per-horizon scale. A report that read the
+    /// raw head rows under a rotation would be charting coefficients on a horizon axis.
     pub fn output(&self, head: &Head) -> Output {
-        Output {
-            coordinates: head.0.narrow(2, 0, CHANNELS).to_kind(Kind::Float),
-            log_scale: (head.0.narrow(2, CHANNELS, CHANNELS).to_kind(Kind::Float)
+        let capped = |prior: &Tensor| {
+            (head.0.narrow(2, CHANNELS, CHANNELS).to_kind(Kind::Float) / LOG_SCALE_CAP).tanh()
+                * LOG_SCALE_CAP
+                + prior
+        };
+        if self.increment_geometry.is_some() {
+            // The head's rows are PER-BAR here, so the horizon-space scale is DERIVED, exactly
+            // as it is under a rotation and for the same reason: every per-horizon report -
+            // calibration coverage, the scale charts, the trading family - must keep reading a
+            // quantity that still MEANS a per-horizon scale.
+            //
+            // `σ_h² = Σ_{j≤h} s_j² · A_h`, and this evaluates it at `A_h ≡ 1`, the SERIAL
+            // INDEPENDENCE assumption. That assumption is MEASURED FALSE - `V_h/D_h` is ~.59 on
+            // training and swings to ~.65 on a recent window against ~.40 on held-out full - so
+            // this mode makes no calibration claim until an aggregation is supplied. It is
+            // stated here rather than hidden because the alternative is a frozen `A_h`, and a
+            // frozen first-moment-like multiplier biases every interval by an amount nobody
+            // bounded, where this one is wrong in a named direction by a measured factor.
+            let per_bar_log = (head.0.narrow(2, CHANNELS, CHANNELS).to_kind(Kind::Float)
                 / LOG_SCALE_CAP)
                 .tanh()
-                * LOG_SCALE_CAP
-                + &self.half_log_horizon,
+                * LOG_SCALE_CAP;
+            return Output {
+                coordinates: head.0.narrow(2, 0, CHANNELS).to_kind(Kind::Float),
+                log_scale: (per_bar_log * 2.).exp().cumsum(-1, Kind::Float).log() * 0.5,
+            };
+        }
+        Output {
+            coordinates: head.0.narrow(2, 0, CHANNELS).to_kind(Kind::Float),
+            log_scale: match &self.basis {
+                // Bit-for-bit the pre-knob expression. `W = I` makes the derivation the
+                // identity mathematically, but `½·ln(exp(2·ls))` is not the identity on the
+                // bits, so the control arm must not evaluate it.
+                None => capped(&self.half_log_horizon),
+                Some(basis) => basis.horizon_log_scale(&capped(basis.half_log_prior())),
+            },
         }
     }
 
@@ -1573,41 +2736,152 @@ impl CausalPatchModel {
     }
 
     /// Point forecast in σ units for `output` produced under the same `last_only` scope.
+    ///
+    /// The applied amplitude calibration ([`Self::set_mean_gain`]) is the last step, in
+    /// DECODED space, so it lands identically under both mean parameterizations: the increment
+    /// branch below accumulates its per-bar candles first and the gain then rescales the
+    /// cumulative anchor, which is the quantity the amplitude was measured on.
     pub fn decode(&self, output: &Output, stats: &Statistics) -> Tensor {
-        decode_joint(
-            &output.coordinates,
-            &per_bar(&stats.sigma),
-            &per_bar(&stats.range),
-            &self.horizon_scale,
+        let (sigma, range) = (per_bar(&stats.sigma), per_bar(&stats.range));
+        let Some((unit, _, _)) = &self.increment_geometry else {
+            return self.gained(decode_joint(
+                &output.coordinates,
+                &sigma,
+                &range,
+                &self.horizon_scale,
+            ));
+        };
+        // Per-bar candles first - `decode_joint` at unit horizon scale, since a one-bar move in
+        // σ units has scale exactly 1 - then the cumulative forecast. Only the CLOSE channel
+        // accumulates; open, high and low at bar `j` are that bar's own extremes measured from
+        // bar `j-1`'s close, so they ride the running close rather than summing. This is the
+        // exact inverse of [`Self::increment_pair`], which is what makes the emitted
+        // 192-horizon forecast identical in shape and meaning to the control's.
+        let increments = decode_joint(&output.coordinates, &sigma, &range, unit);
+        let horizon = increments.size()[increments.dim() - 1];
+        let close = increments
+            .narrow(-2, CHANNELS - 1, 1)
+            .cumsum(-1, Kind::Float);
+        let previous = Tensor::cat(
+            &[
+                close.narrow(-1, 0, 1).zeros_like(),
+                close.narrow(-1, 0, horizon - 1),
+            ],
+            -1,
+        );
+        self.gained(Tensor::cat(
+            &[
+                increments.narrow(-2, 0, CHANNELS - 1) + previous,
+                close,
+            ],
+            -2,
+        ))
+    }
+
+    /// The training-time amplitude prior: a penalty on the ENERGY of the predicted mean
+    /// FUNCTION, `None` at `λ = 0`.
+    ///
+    /// ```text
+    /// R = (λ/(2·H)) · Σ_h w_h · (1/N_h) · Σ_b mask_bh·(m_bh - m̄_h)²,  m̄_h = Σ_b mask·m / N_h
+    /// ∂R/∂m_bh = (λ/(H·N_h)) · w_h · mask_bh · (m_bh - m̄_h)
+    /// ```
+    ///
+    /// `m` is `close`, the σ-scaled close mean coordinate [`Self::losses`] already
+    /// materializes - i.e. AFTER the `√h` decode factor - and `N_h` is that horizon's valid
+    /// bar count, so with an all-valid mask this is exactly `(λ/(2·B·H))·Σ_b Σ_h w_h(m - m̄)²`
+    /// and its pre-registered gradient. `w_h` is the objective's OWN horizon weight buffer, so
+    /// the prior cannot silently re-weight the horizon axis behind the loss's back.
+    ///
+    /// # Why a penalty on values, and not a multiplier
+    ///
+    /// A fixed output multiplier is pure reparameterization: the head's last GEMM absorbs it
+    /// in a few hundred steps and the amplitude comes back. That is exactly what happened to
+    /// `--horizon-mean basis:8:8`, which restricted the horizon SHAPE to a low-rank span while
+    /// leaving its coefficients unbounded, so smooth over-amplitude survived intact (its
+    /// `C` at h=192 was `-0.0373` against the control's `-0.0385`). Penalizing the emitted
+    /// VALUES cannot be undone that way: scaling an upstream weight by `k` scales `R` by `k²`.
+    ///
+    /// The batch mean is removed so the prior attacks amplitude and not level - the whole
+    /// level opportunity at these horizons is `ȳ²/E[y²] ≤ 4.6e-5` of the persistence MSE, and
+    /// a penalty that fought over it would be spending the gradient on nothing.
+    ///
+    /// # What it does to the equilibrium, and why one λ suffices for 192 horizons
+    ///
+    /// The NLL's mean gradient carries the precision factor `1/s²` with `s ≈ σ√h`, while this
+    /// penalty carries no `h` at all. For a linear predictor `m = a·g` the stationary point of
+    /// `E[(m-y)²]/(8·B·H·s²) + R` is `a = a*/(1 + 4λs²)`, so ONE scalar λ produces the
+    /// horizon-increasing shrinkage `1/(1 + 4λh)` - flat at the short end where the measured
+    /// `β̂` is already at or above 1, and strong at the long end where it is `0.26`. That
+    /// coincidence is the reason this is a single knob rather than a curve. HYPOTHESIS: the
+    /// optimizer reaches that stationary point; the arm in the report is what tests it.
+    ///
+    /// # Cost
+    ///
+    /// At `rows = 256`, `origins = 375`, `H = 192`, one channel: 18.4 M elements, 73.7 MB per
+    /// fp32 pass. One masked multiply, one square-multiply and two `[H]` reductions forward,
+    /// their transposes in backward: ≈ 0.11 GFLOP and ≈ 1.0 GB of traffic against the step's
+    /// 16.98 TFLOP and 143.4 GB - 6e-6 of the arithmetic and 0.7% of the traffic, so a
+    /// predicted `+0.5` to `+0.9` ms on a 167 ms step. One 73.7 MB intermediate is retained
+    /// for the backward, so peak memory rises by that and not by zero.
+    pub fn amplitude_prior(&self, close: &Tensor, mask: &Tensor) -> Option<Tensor> {
+        let lambda = self.config.amplitude_prior;
+        if lambda == 0. {
+            return None;
+        }
+        // Reduce over rows, origins and the singleton channel: the surviving axis is the
+        // horizon, which is the axis the penalty is weighted and normalized along.
+        let batch = [0i64, 1, 2];
+        let counts = mask
+            .sum_dim_intlist(batch.as_slice(), false, Kind::Float)
+            .clamp_min(1.0)
+            .detach();
+        let masked = close * mask;
+        let first = masked.sum_dim_intlist(batch.as_slice(), false, Kind::Float);
+        let second = (&masked * close).sum_dim_intlist(batch.as_slice(), false, Kind::Float);
+        // `Σ mask·(m - m̄)² = Σ mask·m² - (Σ mask·m)²/N`, so the whole penalty is two `[H]`
+        // reductions and the autograd of that identity is the pre-registered gradient exactly.
+        let dispersion = (second - first.square() / &counts) / &counts;
+        Some(
+            dispersion.dot(&self.horizon_weight.reshape([-1]))
+                * (lambda / (2. * self.config.pred_len as f64)),
         )
     }
 
-    /// Masked Gaussian NLL of the dense head, fused down to the ops the algebra needs.
+    /// Masked Gaussian NLL of the dense head: ONE elementwise kernel, twelve ATen `dot`s, and
+    /// ONE backward kernel.
     ///
     /// `targets` is `[rows, origins', CHANNELS, pred_len]` and `mask` `[rows, origins', 1,
     /// pred_len]`, both from [`Self::targets`]. Mathematically this is exactly
-    /// `gaussian_nll(decode_joint(coordinates, ..), log_scale, targets, mask)`; what changes is
-    /// how many times the 147 M-element head space crosses HBM:
+    /// `gaussian_nll(decode_joint(coordinates, ..), log_scale, targets, mask)`, and
+    /// numerically it is bit-for-bit the ATen composition it replaced
+    /// ([`fused_kernels::reference::loss_geometry`]) - see
+    /// `fused_loss_geometry_is_bit_identical_at_the_production_shape`.
     ///
-    /// - the fp32 widening of the whole `[.., 2·CHANNELS, pred_len]` space is gone. Each channel
-    ///   is promoted by the first arithmetic op that needs it, which reads bf16 and writes fp32
-    ///   in one pass instead of a separate 885 MB cast whose backward is another one;
+    /// The algebra that makes the chain cheap in the first place is unchanged and still
+    /// load-bearing:
+    ///
     /// - `1/σ` is applied to the three candle offsets rather than to their three differences, so
     ///   `low` is shared by `high` and `open` instead of recomputed;
     /// - `exp(-2·ls)` is factored as `exp(-2·CAP·tanh(u))·(1/h)`, which removes the `+ ½·ln h`
     ///   add over the full space, and the `Σ mask·½·ln h` it leaves behind is a gradient-free
     ///   constant reduced over `[pred_len]`;
-    /// - the mask multiply is folded into the per-element precision weight that has to be
-    ///   materialized anyway, and the two reductions are `dot`s, so nothing writes a full-size
-    ///   masked copy of the NLL or of the squared error.
+    /// - the mask multiply is folded into the per-element precision weight, and the reductions
+    ///   are `dot`s, so nothing writes a full-size masked copy of the NLL or of the error;
+    /// - the per-horizon objective weight is folded into the mask ONCE, at
+    ///   `[rows, origins', 1, pred_len]`, so the weighting never touches the channel space.
     ///
-    /// fp32 is kept everywhere it matters: every geometry and NLL element is computed in fp32
-    /// from a bf16 read, and both reductions accumulate in fp32 exactly as the `sum` they
-    /// replace did. Against the reference chain
-    /// (`gaussian_nll(decode_joint(..), ..)`, kept for the evaluation decoders and for
-    /// `fused_loss_matches_the_reference_decode_and_nll_including_gradients`) the observed
-    /// difference is 0.0 relative on the NLL, on the MSE and on all 34 parameter gradients:
-    /// the reassociation is exact in fp32 for this algebra, not merely within tolerance.
+    /// What the fusion adds on top of that is the deletion of the intermediates. The
+    /// composition ran 65 kernels forward and 70 backward over the 18.4 M-element channel
+    /// slice - 136 fp32 slice-passes forward and 179 backward, measured at 1613 and 1470 GB/s,
+    /// i.e. already at 82-90% of this card's 1.79 TB/s streaming roof. Nothing there was slow;
+    /// there were simply 135 passes. This runs 17 forward and 1 backward, 51 and 13 slice-units
+    /// (see [`ModelConfig::step_cost`]), and retains no full-size fp32 tensor at all: the
+    /// backward recomputes the geometry from `head` rather than reading twelve saved vectors.
+    ///
+    /// The NLL is `Σ w·mask·nll / Σ w·mask·CHANNELS` - a weighted MEAN, hence still nats per
+    /// bar and invariant to the scale of `w`. The MSE keeps the UNWEIGHTED denominator and the
+    /// raw mask: it is a diagnostic that every report and every arm has to be able to compare,
+    /// so its definition does not move with the objective.
     pub fn losses(
         &self,
         head: &Head,
@@ -1615,43 +2889,262 @@ impl CausalPatchModel {
         targets: &Tensor,
         mask: &Tensor,
     ) -> Losses {
+        // The amplitude calibration is a SCORING transform on the decoded mean and no loss
+        // chain here reads its buffers, so a calibrated model would train against its own
+        // un-gained output. That state is unreachable by construction - the run fits its gain
+        // at evaluation and stamps it into the manifest instead of applying it - and this is
+        // what keeps it unreachable by accident.
+        assert!(
+            self.mean_gain.is_none(),
+            "a calibrated model must not be trained: the applied mean gain is a scoring \
+             transform and the training objective does not carry it"
+        );
+        // The ONE branch the basis knob adds to this path, above everything the fused chain
+        // does. Under `cumulative` - the control - `self.basis` is `None` and the code below is
+        // reached exactly as it was before the knob existed, so the control arm is bit-for-bit
+        // the pre-knob objective rather than merely equal to it.
+        if let Some(basis) = &self.basis {
+            return self.basis_losses(basis, head, stats, targets, mask);
+        }
+        // The increment branch, and the whole arm is in the two substitutions it makes: the
+        // targets become per-BAR differences, and the three per-horizon constants become the
+        // one-bar ones. Everything else - the fused geometry, all twelve reductions, the
+        // amplitude prior - is the same code on the same shapes, which is what makes the
+        // difference between the arms attributable to the objective's SPACE and to nothing
+        // else.
+        if let Some((scale, half_log, inverse)) = &self.increment_geometry {
+            let (targets, mask) = Self::increment_pair(targets, mask);
+            let (sigma, range, weighted_mask) = self.loss_operands(stats, &mask);
+            let geometry = loss_geometry(
+                &head.0,
+                &targets,
+                &weighted_mask,
+                &mask,
+                &sigma,
+                &range,
+                scale,
+                inverse,
+                &self.log_scale_gain,
+                LOG_SCALE_CAP,
+            );
+            return self.reduce_geometry(&geometry, &mask, &weighted_mask, half_log);
+        }
+        let (sigma, range, weighted_mask) = self.loss_operands(stats, mask);
+        let geometry = loss_geometry(
+            &head.0,
+            targets,
+            &weighted_mask,
+            mask,
+            &sigma,
+            &range,
+            &self.horizon_scale,
+            &self.inverse_horizon,
+            &self.log_scale_gain,
+            LOG_SCALE_CAP,
+        );
+        self.reduce_geometry(&geometry, mask, &weighted_mask, &self.half_log_horizon)
+    }
+
+    /// The SAME objective with the composed-ATen geometry instead of the fused kernel, for
+    /// the paired benchmark arm and for the equivalence tests.
+    ///
+    /// This is not a switch and nothing on the training path can reach it: [`Self::losses`]
+    /// carries no flag, no fallback and no branch on a kernel choice, and this function is
+    /// called only by `benchmark.rs`'s paired arm and by tests. It exists because a
+    /// cross-RUN step-time comparison is not defensible on a shared card - the 5452
+    /// measurement fell 16.3% on the machine's own measured GEMM peak, and a step that is
+    /// part arithmetic-bound, part bandwidth-bound and part launch-bound cannot be
+    /// normalized by one scalar. Running both chains in ONE process, alternated, makes
+    /// contention common to both arms so it cancels in the difference.
+    ///
+    /// The only difference from [`Self::losses`] is which geometry provider is called: the
+    /// operand preparation and all twelve reductions are literally the same code. That is
+    /// what makes the paired difference a measurement of the fusion rather than of two
+    /// separately-written objectives, and `fused_kernels`' own bit-exactness suite is what
+    /// makes the two arms' loss VALUES identical rather than merely close.
+    pub fn composed_losses(
+        &self,
+        head: &Head,
+        stats: &Statistics,
+        targets: &Tensor,
+        mask: &Tensor,
+    ) -> Losses {
+        assert!(
+            self.basis.is_none(),
+            "the composed reference arm is defined on the dense head; a target basis has its \
+             own chain in `basis_losses`"
+        );
+        let (sigma, range, weighted_mask) = self.loss_operands(stats, mask);
+        let geometry = fused_kernels::reference::loss_geometry(
+            &head.0,
+            targets,
+            &weighted_mask,
+            mask,
+            &sigma,
+            &range,
+            &self.horizon_scale,
+            &self.inverse_horizon,
+            &self.log_scale_gain,
+            LOG_SCALE_CAP,
+        );
+        self.reduce_geometry(&geometry, mask, &weighted_mask, &self.half_log_horizon)
+    }
+
+    /// σ, ρ and the once-folded per-horizon objective weight, at mask width. `uniform` is
+    /// `w = 1` exactly, so the fold is the identity on the bits.
+    fn loss_operands(&self, stats: &Statistics, mask: &Tensor) -> (Tensor, Tensor, Tensor) {
         let smallest = f64::from(f32::MIN_POSITIVE);
-        let channels = head.channels();
+        (
+            per_bar(&stats.sigma).clamp_min(smallest),
+            per_bar(&stats.range).clamp_min(smallest),
+            mask * &self.horizon_weight,
+        )
+    }
+
+    /// The twelve `dot`s and the gradient-free prior: everything the fusion deliberately did
+    /// NOT absorb, because a reduction's summation tree is cuBLAS's and reassociating it
+    /// moves the loss value.
+    fn reduce_geometry(
+        &self,
+        geometry: &fused_kernels::LossGeometry,
+        mask: &Tensor,
+        weighted_mask: &Tensor,
+        half_log: &Tensor,
+    ) -> Losses {
+        // `Some` only at nonzero λ, and the arithmetic is two `[pred_len]` reductions over the
+        // mean coordinate the fused op already had to produce - see [`Self::amplitude_prior`].
+        let amplitude = self.amplitude_prior(&geometry.close, mask);
+        // `Σ w·mask·½·ln h` over channels: gradient-free, so it never belongs in a full-size
+        // kernel. `mask` is `[rows, origins', 1, pred_len]`, so this reduces to `[pred_len]`.
+        let prior = weighted_mask
+            .sum_dim_intlist([0i64, 1, 2].as_slice(), false, Kind::Float)
+            .dot(&half_log.reshape([-1]))
+            * CHANNELS;
+        let objective_count = (weighted_mask.sum(Kind::Float) * CHANNELS).clamp_min(1.0);
+        let count = (mask.sum(Kind::Float) * CHANNELS).clamp_min(1.0);
+        // The prior is already normalized per (origin, horizon), so it is added to the
+        // NORMALIZED objective rather than folded into the numerator: λ then means the same
+        // thing whatever share of the batch's bars happened to be valid, and the reported NLL
+        // stays comparable to the control's only insofar as it genuinely includes the penalty.
+        let nll = (geometry.terms.sum(Kind::Float) + prior) / objective_count;
+        Losses {
+            nll: match amplitude {
+                Some(penalty) => nll + penalty,
+                None => nll,
+            },
+            mse: geometry.squares.sum(Kind::Float) / count,
+        }
+    }
+
+/// Per-BAR targets and their validity, from the cumulative pair. `targets` is
+/// `[rows, origins', CHANNELS, pred_len]` relative to the ORIGIN close; the increment at bar `j`
+/// is the same four coordinates relative to bar `j-1`'s CLOSE, which is `decode_joint`'s fourth
+/// channel and the only one that is a level rather than an extreme of its own bar.
+///
+/// Bar 0 needs no shift: its previous close IS the origin close, which is exactly zero in these
+/// σ-scaled targets. Its validity is `stats.mask`, already folded into `mask`.
+///
+/// A bar is valid as an increment only if it AND its predecessor were observed, so the mask is
+/// the pointwise product of the two - one bar of validity is lost at every gap, and that is a
+/// real cost of the parameterization rather than an accounting choice.
+fn increment_pair(targets: &Tensor, mask: &Tensor) -> (Tensor, Tensor) {
+    let horizon = targets.size()[targets.dim() - 1];
+    let shift = |source: &Tensor, first: Tensor| {
+        Tensor::cat(&[first, source.narrow(-1, 0, horizon - 1)], -1)
+    };
+    let close = targets.narrow(-2, CHANNELS - 1, 1);
+    let previous = shift(&close, close.narrow(-1, 0, 1).zeros_like());
+    let carried = shift(mask, mask.narrow(-1, 0, 1).ones_like());
+    (targets - previous, mask * carried)
+}
+
+    /// The objective in COEFFICIENT space: [`Self::losses`] under a non-identity
+    /// [`TargetBasis`].
+    ///
+    /// ```text
+    /// r = y - ŷ            (horizon space, ŷ from decode_joint, a valid candle)
+    /// e = W·r              (one [tokens·CHANNELS, H] × [H, H] fp32 GEMM)
+    /// ls_k = CAP·tanh(u_k/CAP) + ½·ln(prior variance of coefficient k)
+    /// NLL = Σ_k w_k·rowmask·(½·(e_k·exp(-ls_k))² + ls_k) / Σ_k w_k·rowmask·CHANNELS
+    /// ```
+    ///
+    /// Three things are load-bearing and none of them is a stylistic choice.
+    ///
+    /// **The residual is rotated, not the two moments separately.** `W(y - ŷ) = Wy - Wŷ` by
+    /// linearity, so one GEMM buys what two would, and under `W = I` the expression is
+    /// bit-for-bit [`nll_elements`] - which is what makes `cumulative` a provable identity
+    /// rather than an approximate one.
+    ///
+    /// **The mean is decoded in HORIZON space first.** The head's four mean coordinates go
+    /// through [`decode_joint`] unchanged, so `high ≥ max(open, close) ≥ min(open, close) ≥ low`
+    /// still holds bar by bar and the emitted forecast is still a valid candle. Reinterpreting
+    /// the mean rows as coefficients directly would have destroyed that invariant, and the
+    /// rotation of a valid candle is the same bijection either way.
+    ///
+    /// **The mask is the row COMPLETENESS indicator, not the per-bar mask.** A coefficient is a
+    /// weighted sum over the whole horizon window, so a row whose window is partly unobserved
+    /// has no defined coefficient vector; zero-filling its tail would inject a false zero
+    /// return into all 192 coefficients. The corpus mask is a prefix mask and held-out targets
+    /// are complete by contract, so only the training remainder is dropped -
+    /// [`super::reports::write_target_basis`] reports what share that was.
+    ///
+    /// The MSE is unchanged in definition: horizon space, raw mask, unweighted denominator. It
+    /// is the diagnostic every arm has to be comparable on, so it does not move with the metric.
+    ///
+    /// Cost, in the currency that is scarce. The rotation is 28.3 GFLOP forward at the
+    /// production shape (96,000 origins × 4 channels × 192² × 2), 0.167% of the step's
+    /// 16.98 TFLOP, and one read-write pair over the 295 MB coefficient space. What it costs is
+    /// the composed fp32 chain around it: this is `fused_kernels::reference::loss_geometry`'s
+    /// traffic profile, ~150 slice-passes forward over the 73.7 MB channel slice against the
+    /// fused path's 51, so ~+13 ms on a 168 ms step. Fusing it is worth doing only if the arm
+    /// is worth keeping.
+    pub fn basis_losses(
+        &self,
+        basis: &BasisTransform,
+        head: &Head,
+        stats: &Statistics,
+        targets: &Tensor,
+        mask: &Tensor,
+    ) -> Losses {
+        let smallest = f64::from(f32::MIN_POSITIVE);
         let sigma = per_bar(&stats.sigma).clamp_min(smallest);
         let range = per_bar(&stats.range).clamp_min(smallest);
-        // `to_kind` where the channel enters a unary fp32 op, promotion where it enters a
-        // binary one: `bf16 · [1, 1, 1, pred_len] fp32` reads bf16 and writes fp32 in one pass.
-        // A 0-dim fp32 operand would NOT promote (ATen ranks dimensioned operands first), which
-        // is why `log_scale_gain` is shaped.
-        let coordinate = |index: usize| channels[index].to_kind(Kind::Float);
-        let close = &channels[0] * &self.horizon_scale;
-        let relative_range = coordinate(1).softplus() * range / std::f64::consts::LN_2;
-        let low = &close - (coordinate(2).sigmoid() * &relative_range).log1p() / &sigma;
-        let high = &low + relative_range.log1p() / &sigma;
-        let open = &low + (coordinate(3).sigmoid() * &relative_range).log1p() / &sigma;
-        let flat = |tensor: &Tensor| tensor.reshape([-1]);
-        let mask_flat = flat(mask);
-        let precision = mask * &self.inverse_horizon;
-        let mut terms = Vec::with_capacity(2 * CHANNELS as usize);
-        let mut squares = Vec::with_capacity(CHANNELS as usize);
-        for (channel, prediction) in [open, high, low, close].into_iter().enumerate() {
-            let tanh = (&channels[CHANNELS as usize + channel] * &self.log_scale_gain).tanh();
-            let weight = (&tanh * (-2.0 * LOG_SCALE_CAP)).exp() * &precision;
-            let square = (targets.narrow(2, channel as i64, 1) - prediction).square();
-            terms.push(flat(&square).dot(&flat(&weight)) * 0.5);
-            terms.push(flat(&tanh).dot(&mask_flat) * LOG_SCALE_CAP);
-            squares.push(tch::no_grad(|| flat(&square).dot(&mask_flat)));
-        }
-        // `Σ mask·½·ln h` over channels: gradient-free, so it never belongs in a full-size
-        // kernel. `mask` is `[rows, origins', 1, pred_len]`, so this reduces to `[pred_len]`.
-        let prior = mask
-            .sum_dim_intlist([0i64, 1, 2].as_slice(), false, Kind::Float)
-            .dot(&flat(&self.half_log_horizon))
-            * CHANNELS;
+        let prediction = decode_joint(
+            &head.0.narrow(2, 0, CHANNELS).to_kind(Kind::Float),
+            &sigma,
+            &range,
+            &self.horizon_scale,
+        );
+        // The same expression [`Self::output`] uses, so the two cannot drift and the identity
+        // basis reproduces the evaluation path's log scale on the bits.
+        let log_scale = (head.0.narrow(2, CHANNELS, CHANNELS).to_kind(Kind::Float)
+            / LOG_SCALE_CAP)
+            .tanh()
+            * LOG_SCALE_CAP
+            + basis.half_log_prior();
+        let error = targets - &prediction;
+        // The mask is applied BEFORE the rotation, not only after it. On a complete window the
+        // mask is exactly 1 and this multiply is the identity on the bits, so the `cumulative`
+        // identity survives; on an incomplete one it is what makes an unobserved bar contribute
+        // exact zero rather than `0 · large`. The unobserved tail of a short row is built from
+        // zero-filled prices, so its target is a finite but arbitrary number of order
+        // `ln(anchor)/σ`; relying on the row weight alone to annihilate it after a 192-term
+        // rotation would be relying on a product that has already lost precision.
+        let residual = basis.rotate(&(&error * mask));
+        let weighted = mask.amin([-1i64].as_slice(), true) * basis.weight();
+        let objective_count = (weighted.sum(Kind::Float) * CHANNELS).clamp_min(1.0);
         let count = (mask.sum(Kind::Float) * CHANNELS).clamp_min(1.0);
+        let terms = (residual * (-&log_scale).exp()).square() * 0.5 + &log_scale;
+        let nll = (terms * weighted).sum(Kind::Float) / objective_count;
+        // The close coordinate the penalty reduces is decode_joint's fourth channel, which is
+        // the same tensor the fused path hands back as `geometry.close`.
+        let amplitude = self.amplitude_prior(&prediction.narrow(-2, CHANNELS - 1, 1), mask);
         Losses {
-            nll: (Tensor::stack(&terms, 0).sum(Kind::Float) + prior) / &count,
-            mse: Tensor::stack(&squares, 0).sum(Kind::Float) / count,
+            nll: match amplitude {
+                Some(penalty) => nll + penalty,
+                None => nll,
+            },
+            mse: tch::no_grad(|| (error.square() * mask).sum(Kind::Float) / count),
         }
     }
 }
@@ -1705,9 +3198,22 @@ pub struct Losses {
 /// Masked means over valid (origin, channel, bar) triples; `mse` carries no gradient. The
 /// reference form of [`CausalPatchModel::losses`], kept for the evaluation path and for the
 /// equivalence test that pins the fused one.
-pub fn gaussian_nll(prediction: &Tensor, log_scale: &Tensor, target: &Tensor, mask: &Tensor) -> Losses {
+///
+/// `horizon_weight` broadcasts over the last dimension - `[1, 1, 1, pred_len]`, from
+/// [`CausalPatchModel::horizon_weight_buffer`]. The NLL is the `w`-weighted mean, the MSE the
+/// unweighted one, exactly as the fused form has it.
+pub fn gaussian_nll(
+    prediction: &Tensor,
+    log_scale: &Tensor,
+    target: &Tensor,
+    mask: &Tensor,
+    horizon_weight: &Tensor,
+) -> Losses {
+    let weighted_mask = mask * horizon_weight;
+    let objective_count = (weighted_mask.sum(Kind::Float) * CHANNELS).clamp_min(1.0);
     let count = (mask.sum(Kind::Float) * CHANNELS).clamp_min(1.0);
-    let nll = (nll_elements(prediction, log_scale, target) * mask).sum(Kind::Float) / &count;
+    let nll = (nll_elements(prediction, log_scale, target) * weighted_mask).sum(Kind::Float)
+        / objective_count;
     let mse = tch::no_grad(|| ((target - prediction).square() * mask).sum(Kind::Float) / count);
     Losses { nll, mse }
 }
@@ -1733,6 +3239,13 @@ mod tests {
             dropout: 0.0,
             min_history: 16,
             features: FeatureSet::ALL,
+            x0_lambdas: X0Lambdas::Enabled,
+            horizon_loss: HorizonLoss::Uniform,
+            horizon_mean: HorizonMean::Free,
+            amplitude_prior: 0.0,
+            target_basis: TargetBasis::Cumulative,
+            basis_weight: BasisWeight::Uniform,
+            basis_stats: None,
         }
     }
 
@@ -2138,6 +3651,264 @@ mod tests {
         assert!(!changed.coordinates.equal(&reference.coordinates));
     }
 
+    /// The whole contract of an applied mean calibration, on a live head: it rescales the close
+    /// anchor exactly, rescales every intrabar offset by the second curve, keeps every candle
+    /// valid, cannot change a within-timestamp rank, and does not touch one byte of the
+    /// checkpoint.
+    #[test]
+    fn an_applied_mean_gain_rescales_anchor_and_offsets_without_touching_geometry_or_weights() {
+        let _rng = crate::torch::test_rng::exclusive();
+        tch::manual_seed(11);
+        let config = small_config();
+        let store = nn::VarStore::new(Device::Cpu);
+        let mut model = CausalPatchModel::new(&store.root(), &config);
+        live_head(&model);
+        let batch = synthetic(&config, &[8, 8, 8, 8, 8, 8]);
+        let stats = model.statistics(&batch);
+        let last = stats.last();
+        let anchored = |tensor: &Tensor| tensor.reshape([-1, 1, 1, 1]);
+        let decode = |model: &CausalPatchModel| {
+            let output = model.output(&model.forward(&batch, &stats, false, true));
+            model.decode(&output, &last)
+        };
+        let baseline = decode(&model);
+        let before = decode_prices(&baseline, &anchored(&batch.anchor), &anchored(&last.sigma));
+        assert_valid_candles(&before);
+        // The measured two-sided shape: the amplifications the short end asks for (3.662 at
+        // h=1 on the step-2000 checkpoint), then the middle band, then the hard long-end shrink
+        // and one horizon at the smallest gain a fit would ever emit. A gain above 1 is exactly
+        // as safe as one below it here. The offset curve is deliberately DIFFERENT from the
+        // anchor's at every horizon, including one horizon where the two straddle 1, because a
+        // shared curve would let a bug that ignores one of them pass.
+        let frozen = FrozenGain {
+            estimator: "test".to_owned(),
+            blocks: calibration_blocks(),
+            anchor: vec![3.662, 2.7309, 2.2125, 1.0283, 0.85, 0.41, 0.32, 0.01],
+            offset: vec![0.5, 1.4, 0.9, 2.0, 1.0, 0.25, 3.0, 1.7],
+        };
+        assert_eq!(frozen.anchor.len(), config.pred_len as usize);
+        let weights = |store: &nn::VarStore| {
+            let mut named: Vec<(String, Vec<f64>)> = store
+                .variables()
+                .into_iter()
+                .map(|(name, tensor)| {
+                    (
+                        name,
+                        Vec::<f64>::try_from(tensor.to_kind(Kind::Double).flatten(0, -1)).unwrap(),
+                    )
+                })
+                .collect();
+            named.sort_by(|a, b| a.0.cmp(&b.0));
+            named
+        };
+        let saved = weights(&store);
+        model.set_mean_gain(&frozen).unwrap();
+        assert_eq!(model.mean_gain().unwrap(), &frozen);
+        // The checkpoint is bit-identical: the two curves are derived buffers, not variables,
+        // so nothing a `VarStore::save` would write has moved.
+        assert!(saved == weights(&store), "the gain changed a saved tensor");
+        let calibrated = decode(&model);
+        let after = decode_prices(&calibrated, &anchored(&batch.anchor), &anchored(&last.sigma));
+        assert_valid_candles(&after);
+        for bar in 0..config.pred_len {
+            let (anchor, offset) = (
+                frozen.anchor[bar as usize],
+                frozen.offset[bar as usize],
+            );
+            let close = baseline.narrow(-2, CHANNELS - 1, 1).narrow(-1, bar, 1);
+            let scaled_close = calibrated.narrow(-2, CHANNELS - 1, 1).narrow(-1, bar, 1);
+            let tolerance = 1e-5 * (1. + close.abs().max().double_value(&[]));
+            assert!(
+                (&scaled_close - &close * anchor)
+                    .abs()
+                    .max()
+                    .double_value(&[])
+                    <= tolerance,
+                "the close channel at h={} is not the anchor gain times the uncalibrated close",
+                bar + 1
+            );
+            // Each channel is `anchor·close + offset·(channel - close)`, which is the whole
+            // transform: the offsets keep their sign, so the geometry above survives.
+            let expected = &close * anchor
+                + (baseline.narrow(-1, bar, 1) - &close) * offset;
+            assert!(
+                (calibrated.narrow(-1, bar, 1) - expected)
+                    .abs()
+                    .max()
+                    .double_value(&[])
+                    <= tolerance,
+                "a channel at h={} did not move by the two-coordinate rescale",
+                bar + 1
+            );
+            // The mechanism behind IC invariance: a positive gain cannot reorder the rows of
+            // one horizon, so no within-timestamp rank statistic can move.
+            let order = |tensor: &Tensor| {
+                tensor
+                    .narrow(-2, CHANNELS - 1, 1)
+                    .narrow(-1, bar, 1)
+                    .reshape([-1])
+                    .argsort(0, false)
+            };
+            assert!(
+                order(&baseline).equal(&order(&calibrated)),
+                "the row order at h={} changed under a positive gain",
+                bar + 1
+            );
+        }
+        // Setting REPLACES rather than composes, so a refit cannot square its own shrinkage.
+        model.set_mean_gain(&frozen).unwrap();
+        let again = decode(&model);
+        assert!((again - &calibrated).abs().max().double_value(&[]) == 0.);
+        // And never a wrong-length curve or a sign flip.
+        let mut fresh = CausalPatchModel::new(&nn::VarStore::new(Device::Cpu).root(), &config);
+        let mut short = frozen.clone();
+        short.anchor.truncate(4);
+        assert!(fresh.set_mean_gain(&short).is_err());
+        let mut flipped = frozen.clone();
+        flipped.offset[2] = -1.;
+        assert!(fresh.set_mean_gain(&flipped).is_err());
+        let mut nonfinite = frozen.clone();
+        nonfinite.anchor[1] = f64::NAN;
+        assert!(fresh.set_mean_gain(&nonfinite).is_err());
+        assert!(fresh.mean_gain().is_none());
+    }
+
+    /// A dated pair of blocks for the fixtures above; the numbers are provenance only - nothing
+    /// in the model reads them.
+    fn calibration_blocks() -> super::super::calibration::Blocks {
+        super::super::calibration::Blocks {
+            calibration_first_origin_ms: 1,
+            calibration_last_origin_ms: 2,
+            calibration_last_target_ms: 3,
+            calibration_origins: 4,
+            evaluation_first_origin_ms: 5,
+            evaluation_last_origin_ms: 6,
+            evaluation_origins: 7,
+            purge_gap_ms: 2,
+        }
+    }
+
+    /// The prior's VALUE and its GRADIENT against the pre-registered algebra, on a masked
+    /// population, plus the fact that `λ = 0` emits nothing at all.
+    ///
+    /// Both halves matter and neither implies the other: a penalty with the right value and
+    /// the wrong normalization would still train, just at a λ that means something else at
+    /// every batch size, and a penalty whose gradient is not `(λ/(H·N_h))·w_h·mask·(m - m̄_h)`
+    /// is a different intervention from the one that was pre-registered.
+    #[test]
+    fn the_amplitude_prior_is_the_pre_registered_mean_energy_and_its_gradient() {
+        let _rng = crate::torch::test_rng::exclusive();
+        tch::manual_seed(23);
+        let mut config = small_config();
+        // Not `uniform`: a weighting the prior silently ignored would pass under `w ≡ 1`.
+        config.horizon_loss = HorizonLoss::InverseSqrt;
+        config.amplitude_prior = 0.7;
+        let store = nn::VarStore::new(Device::Cpu);
+        let model = CausalPatchModel::new(&store.root(), &config);
+        let (rows, horizons) = (6i64, config.pred_len);
+        let cpu = (Kind::Float, Device::Cpu);
+        let close = Tensor::randn([rows, 1, 1, horizons], cpu).set_requires_grad(true);
+        // A ragged mask, including one horizon with a single valid bar - whose within-horizon
+        // dispersion is exactly zero and must contribute exactly zero rather than a NaN.
+        let mut flags = vec![1f32; (rows * horizons) as usize];
+        for row in 0..rows {
+            for bar in 0..horizons {
+                if bar == horizons - 1 && row > 0 {
+                    flags[(row * horizons + bar) as usize] = 0.;
+                }
+            }
+        }
+        flags[horizons as usize] = 0.;
+        let mask = Tensor::from_slice(&flags).reshape([rows, 1, 1, horizons]);
+        let penalty = model
+            .amplitude_prior(&close, &mask)
+            .expect("a nonzero λ must emit a penalty");
+        let host = |tensor: &Tensor| {
+            Vec::<f64>::try_from(tensor.to_kind(Kind::Double).flatten(0, -1)).unwrap()
+        };
+        let (values, flags, weights) = (host(&close), host(&mask), model.horizon_weights());
+        let width = horizons as usize;
+        let mut expected = 0.;
+        let mut expected_gradient = vec![0.; values.len()];
+        for bar in 0..width {
+            let count: f64 = (0..rows as usize).map(|row| flags[row * width + bar]).sum();
+            let scale = count.max(1.);
+            let mean: f64 = (0..rows as usize)
+                .map(|row| flags[row * width + bar] * values[row * width + bar])
+                .sum::<f64>()
+                / scale;
+            for row in 0..rows as usize {
+                let index = row * width + bar;
+                let deviation = values[index] - mean;
+                expected += config.amplitude_prior * weights[bar] * flags[index] * deviation
+                    * deviation
+                    / (2. * width as f64 * scale);
+                expected_gradient[index] = config.amplitude_prior * weights[bar] * flags[index]
+                    * deviation
+                    / (width as f64 * scale);
+            }
+        }
+        let measured = penalty.double_value(&[]);
+        // fp32 against an f64 reference. `Σ mask·m² - (Σ mask·m)²/N` is a moment form, so it
+        // would cancel if the per-horizon mean dominated the dispersion; on the measured
+        // population it does not come close - at h=192 the mean forecast is `-0.105` against a
+        // `Var(f)` of about `9`, so the subtracted term is under 0.2% of the first and fp32
+        // relative error stays at the 1e-7 level this asserts.
+        assert!(
+            (measured - expected).abs() <= 1e-6 * (1. + expected.abs()),
+            "the prior evaluated to {measured} against the pre-registered {expected}"
+        );
+        penalty.backward();
+        for (index, gradient) in host(&close.grad()).into_iter().enumerate() {
+            assert!(
+                (gradient - expected_gradient[index]).abs()
+                    <= 1e-6 * (1. + expected_gradient[index].abs()),
+                "∂R/∂m at flat index {index} is {gradient} against the pre-registered {}",
+                expected_gradient[index]
+            );
+        }
+        // The control emits no penalty at all, which is what makes an unpenalized arm's loss
+        // bit-identical to the pre-knob one rather than merely numerically close.
+        let mut control = small_config();
+        control.amplitude_prior = 0.;
+        let unpenalized = CausalPatchModel::new(&nn::VarStore::new(Device::Cpu).root(), &control);
+        assert!(unpenalized.amplitude_prior(&close, &mask).is_none());
+    }
+
+    /// A control arm's `ModelConfig` MUST serialize to the same BYTES it did before the knob
+    /// existed, because [`super::runner`]'s manifest digest is a SHA-256 over
+    /// `serde_json::to_vec` of the whole manifest: one extra key, or one reordered key, and
+    /// every checkpoint written before today fails its own authentication and stops loading.
+    /// The literal below is the real `model` object out of
+    /// `training/runs/timexer-control-4k/weights/best/manifest.json`, the checkpoint the
+    /// amplitude calibration is paired to.
+    #[test]
+    fn a_control_config_serializes_exactly_as_it_did_before_the_amplitude_prior_existed() {
+        const PRE_KNOB: &str = r#"{"seq_len":6000,"pred_len":192,"patch_len":16,"layers":8,"d_model":512,"heads":8,"ffn":2048,"dropout":0.0,"min_history":256,"features":{"time_of_day":true,"day_of_week":true,"session_gap":true,"volume":true,"market":true,"spy":true},"x0_lambdas":"disabled","horizon_loss":"uniform","horizon_mean":"free"}"#;
+        let control: ModelConfig = serde_json::from_str(PRE_KNOB).unwrap();
+        assert_eq!(control.amplitude_prior, 0.);
+        assert_eq!(serde_json::to_string(&control).unwrap(), PRE_KNOB);
+        // And a penalized arm is a DIFFERENT config that says so in its own manifest, rather
+        // than an arm that looks like the control with a hidden objective term.
+        let penalized = ModelConfig {
+            amplitude_prior: 0.0035,
+            ..control
+        };
+        let written = serde_json::to_string(&penalized).unwrap();
+        assert_eq!(
+            written,
+            PRE_KNOB.replace(
+                r#""horizon_mean":"free"}"#,
+                r#""horizon_mean":"free","amplitude_prior":0.0035}"#
+            )
+        );
+        assert_eq!(
+            serde_json::from_str::<ModelConfig>(&written)
+                .unwrap()
+                .amplitude_prior,
+            0.0035
+        );
+    }
     #[test]
     fn zero_head_forecasts_persistence_with_root_horizon_scale_at_every_origin() {
         let _rng = crate::torch::test_rng::exclusive();
@@ -2159,7 +3930,13 @@ mod tests {
         let prices = decode_prices(&scaled, &anchor, &per_bar(&stats.sigma));
         assert!((prices.narrow(2, 3, 1) - &anchor).abs().max().double_value(&[]) < 1e-3);
         let (targets, mask) = model.targets(&batch, &stats, false);
-        let losses = gaussian_nll(&scaled, &output.log_scale, &targets, &mask);
+        let losses = gaussian_nll(
+            &scaled,
+            &output.log_scale,
+            &targets,
+            &mask,
+            model.horizon_weight_buffer(),
+        );
         let nll = losses.nll.double_value(&[]);
         let mut by_hand = 0.0;
         let mut squared = 0.0;
@@ -2206,39 +3983,38 @@ mod tests {
     /// The fused training loss against the decode+NLL chain it replaced, with a NONZERO head so
     /// every branch of the candle geometry and of the log-scale cap carries signal: the loss, the
     /// no-gradient MSE, and every parameter gradient.
-    #[test]
-    fn fused_loss_matches_the_reference_decode_and_nll_including_gradients() {
+    ///
+    /// Run for EVERY [`HorizonLoss`] mode. The reference chain applies the weight to the mask
+    /// and normalizes by `Σ w·mask·CHANNELS`, so this is also the definitional pin on what the
+    /// weighted objective - and therefore the selection scalar computed the same way on the
+    /// held-out split - means.
+    fn fused_matches_reference(horizon_loss: HorizonLoss) {
         let _rng = crate::torch::test_rng::exclusive();
         tch::manual_seed(17);
-        let config = small_config();
+        let config = ModelConfig {
+            horizon_loss,
+            ..small_config()
+        };
         let store = nn::VarStore::new(Device::Cpu);
         let model = CausalPatchModel::new(&store.root(), &config);
-        tch::no_grad(|| {
-            let _ = model.head_output.ws.shallow_clone().uniform_(-0.5, 0.5);
-            let _ = model
-                .head_output
-                .bs
-                .as_ref()
-                .unwrap()
-                .shallow_clone()
-                .uniform_(-0.5, 0.5);
-            // The residual-branch output projections are zero at init (that is what makes the
-            // stack the identity, see `the_stack_is_the_identity_on_the_residual_stream_at_init`),
-            // so at init the QKV and FFN-up matrices and the post-lambdas legitimately receive
-            // no gradient. This test is about the fused loss reaching every parameter, so it
-            // needs a live network.
-            for block in &model.blocks {
-                let _ = block.output.ws.shallow_clone().uniform_(-0.1, 0.1);
-                let _ = block.second.ws.shallow_clone().uniform_(-0.1, 0.1);
-            }
-        });
+        // The residual-branch output projections are zero at init (that is what makes the
+        // stack the identity, see `the_stack_is_the_identity_on_the_residual_stream_at_init`),
+        // so at init the QKV and FFN-up matrices and the post-lambdas legitimately receive
+        // no gradient. This test is about the fused loss reaching every parameter, so it
+        // needs a live network.
+        live_head(&model);
         let batch = synthetic(&config, &[8, 5]);
         let stats = model.statistics(&batch);
         let (targets, mask) = model.targets(&batch, &stats, false);
         let head = model.forward(&batch, &stats, false, false);
         let output = model.output(&head);
-        let reference =
-            gaussian_nll(&model.decode(&output, &stats), &output.log_scale, &targets, &mask);
+        let reference = gaussian_nll(
+            &model.decode(&output, &stats),
+            &output.log_scale,
+            &targets,
+            &mask,
+            model.horizon_weight_buffer(),
+        );
         let fused = model.losses(&head, &stats, &targets, &mask);
         let expected = reference.nll.double_value(&[]);
         assert!(expected.is_finite() && expected.abs() > 1e-3, "{expected}");
@@ -2267,10 +4043,1240 @@ mod tests {
         }
         assert_eq!(touched, parameters.len(), "a parameter received no gradient");
         println!(
-            "fused vs reference: NLL {relative:.3e} relative, MSE {:.3e} relative, worst \
-             parameter gradient {worst:.3e} relative over {touched} parameters",
+            "fused vs reference at {horizon_loss}: NLL {relative:.3e} relative, MSE {:.3e} \
+             relative, worst parameter gradient {worst:.3e} relative over {touched} parameters",
             (fused.mse.double_value(&[]) - expected_mse).abs() / expected_mse.abs()
         );
+    }
+
+    /// The paired benchmark arm's composed chain is THE objective, not a paraphrase of it.
+    ///
+    /// This is the test that keeps `benchmark.rs`'s paired measurement meaningful. The two
+    /// functions differ in exactly one line - which geometry provider they call - and share
+    /// their operand preparation and all twelve reductions, so a paired difference between
+    /// them is a measurement of the fusion. If someone later changes `losses`'s σ clamp, its
+    /// horizon-weight fold or its denominators without changing `composed_losses`, the
+    /// difference would silently become a measurement of two different objectives, and this
+    /// fails the moment that happens: off CUDA both providers ARE the reference chain, so
+    /// any inequality here is prep or tail drift and nothing else.
+    #[test]
+    fn the_composed_benchmark_arm_is_the_same_objective_as_the_fused_one() {
+        // A concurrent `manual_seed` rewinds the global stream this test reads - see
+        // `torch::test_rng` - and a rewind here would compare two DIFFERENT batches.
+        let _rng = crate::torch::test_rng::exclusive();
+        tch::manual_seed(19);
+        let config = small_config();
+        let store = nn::VarStore::new(Device::Cpu);
+        let model = CausalPatchModel::new(&store.root(), &config);
+        live_head(&model);
+        let batch = synthetic(&config, &[8, 5]);
+        let stats = model.statistics(&batch);
+        let (targets, mask) = model.targets(&batch, &stats, false);
+        let head = model.forward(&batch, &stats, false, false);
+        let fused = model.losses(&head, &stats, &targets, &mask);
+        let composed = model.composed_losses(&head, &stats, &targets, &mask);
+        let value = fused.nll.double_value(&[]);
+        assert!(value.is_finite() && value.abs() > 1e-3, "{value}");
+        assert_eq!(
+            value.to_bits(),
+            composed.nll.double_value(&[]).to_bits(),
+            "the composed arm's NLL is {} against the fused {value}",
+            composed.nll.double_value(&[])
+        );
+        assert_eq!(
+            fused.mse.double_value(&[]).to_bits(),
+            composed.mse.double_value(&[]).to_bits(),
+            "the composed arm's diagnostic MSE is {} against the fused {}",
+            composed.mse.double_value(&[]),
+            fused.mse.double_value(&[])
+        );
+        // And the gradient, because the benchmark times a backward: the paired arms must
+        // drive the same one.
+        let parameters = store.trainable_variables();
+        let left = Tensor::run_backward(&[&fused.nll], &parameters, true, false);
+        let right = Tensor::run_backward(&[&composed.nll], &parameters, false, false);
+        for (index, (fused_grad, composed_grad)) in left.iter().zip(&right).enumerate() {
+            assert!(
+                fused_grad.equal(composed_grad),
+                "parameter {index} receives a different gradient from the two arms"
+            );
+        }
+    }
+
+    #[test]
+    fn fused_loss_matches_the_reference_decode_and_nll_including_gradients() {
+        let _rng = crate::torch::test_rng::exclusive();
+        for horizon_loss in [
+            HorizonLoss::Uniform,
+            HorizonLoss::InverseSqrt,
+            HorizonLoss::Inverse,
+            HorizonLoss::Cutoff(3),
+            HorizonLoss::Cutoff(small_config().pred_len),
+        ] {
+            fused_matches_reference(horizon_loss);
+        }
+    }
+
+    /// Every profiled kernel class runs at the input shape it declares, and the classes that
+    /// stand in for a piece of the real forward produce that piece's exact shape.
+    ///
+    /// The profile chart's rows are worth reading only if each one is the op it names. A class
+    /// that declared the wrong width - `d_model` instead of `d_model + COVARIATE_WIDTH` for the
+    /// head's hidden projection, say - would still time a GEMM, just not the one the step runs,
+    /// and the chart would report a fiction with nothing anywhere raising an error.
+    #[test]
+    fn every_kernel_class_runs_at_the_shape_it_declares() {
+        let _rng = crate::torch::test_rng::exclusive();
+        tch::manual_seed(7);
+        let config = small_config();
+        let batch = synthetic(&config, &[6, 8]);
+        let store = nn::VarStore::new(Device::Cpu);
+        let model = CausalPatchModel::new(&store.root(), &config);
+        let stats = model.statistics(&batch);
+        let head = model.forward(&batch, &stats, false, false);
+        let targets = model.targets(&batch, &stats, false).0;
+        for class in model.kernel_classes(&batch, &stats, false) {
+            let inputs: Vec<Tensor> = class
+                .inputs
+                .iter()
+                .map(|(shape, kind)| {
+                    Tensor::randn(shape.as_slice(), (Kind::Float, Device::Cpu)).to_kind(*kind)
+                })
+                .collect();
+            let output = (class.run)(&inputs);
+            assert!(
+                output.isfinite().all().int64_value(&[]) != 0,
+                "class {} produced a nonfinite output",
+                class.name
+            );
+            match class.name {
+                "head output projection" => assert_eq!(output.size(), head.0.size()),
+                "targets, market drift and validity mask" => {
+                    assert_eq!(output.size(), targets.size());
+                }
+                // One masked mean over the whole space: a class that reduced per channel or
+                // per row would time a different amount of reduction traffic.
+                "fused loss geometry and NLL" => assert_eq!(output.size(), Vec::<i64>::new()),
+                _ => {}
+            }
+        }
+    }
+
+    /// A live head, so the loss value and the gradients are nontrivial.
+    fn live_head(model: &CausalPatchModel) {
+        tch::no_grad(|| {
+            let _ = model.head_output.ws.shallow_clone().uniform_(-0.5, 0.5);
+            let _ = model
+                .head_output
+                .bs
+                .as_ref()
+                .unwrap()
+                .shallow_clone()
+                .uniform_(-0.5, 0.5);
+            for block in &model.blocks {
+                let _ = block.output.ws.shallow_clone().uniform_(-0.1, 0.1);
+                let _ = block.second.ws.shallow_clone().uniform_(-0.1, 0.1);
+            }
+        });
+    }
+
+    /// Every mode's normalization: mean 1 over ALL `pred_len` horizons, so `Σ w = pred_len`.
+    /// That is what keeps the reported NLL a weighted MEAN in nats per bar rather than a sum
+    /// whose scale moves with the mode, and it is why `uniform` is the vector `1` exactly.
+    #[test]
+    fn every_horizon_loss_mode_normalizes_to_mean_one_over_the_whole_axis() {
+        for pred_len in [8i64, 192] {
+            for mode in [
+                HorizonLoss::Uniform,
+                HorizonLoss::InverseSqrt,
+                HorizonLoss::Inverse,
+                HorizonLoss::Cutoff(1),
+                HorizonLoss::Cutoff(pred_len / 6),
+                HorizonLoss::Cutoff(pred_len),
+            ] {
+                let weights = mode.weights(pred_len);
+                assert_eq!(weights.len(), pred_len as usize, "{mode}");
+                let sum: f64 = weights.iter().sum();
+                assert!(
+                    (sum - pred_len as f64).abs() <= 1e-9 * pred_len as f64,
+                    "{mode} at pred_len {pred_len} sums to {sum}, not {pred_len}"
+                );
+                assert!(weights.iter().all(|w| w.is_finite() && *w >= 0.), "{mode}");
+                // The decays are strictly monotone; the cutoff is a step, never negative.
+                match mode {
+                    HorizonLoss::Uniform => {
+                        assert_eq!(weights, vec![1.0; pred_len as usize], "uniform is not 1")
+                    }
+                    HorizonLoss::InverseSqrt | HorizonLoss::Inverse => assert!(
+                        weights.windows(2).all(|pair| pair[0] > pair[1]),
+                        "{mode} is not strictly decreasing"
+                    ),
+                    HorizonLoss::Cutoff(cut) => {
+                        let trained = weights.iter().filter(|w| **w > 0.).count() as i64;
+                        assert_eq!(trained, cut, "cutoff:{cut} trains {trained} horizons");
+                        assert!(
+                            weights[..cut as usize]
+                                .iter()
+                                .all(|w| (*w - pred_len as f64 / cut as f64).abs() < 1e-9),
+                            "cutoff:{cut} does not weight its trained horizons uniformly"
+                        );
+                    }
+                }
+            }
+        }
+        // The two decays BRACKET the rate rather than being two spellings of one. Both carry
+        // mean 1, so they must cross exactly once: `inv` concentrates strictly more of the
+        // objective on the short horizons that jobs 5190-5193 showed still improving, and
+        // strictly less on the long ones that rot. The ratio `w_inv / w_inv-sqrt` is `√h`
+        // scaled, hence strictly decreasing, which is what "one crossing" means here.
+        let (fast, slow) = (
+            HorizonLoss::Inverse.weights(192),
+            HorizonLoss::InverseSqrt.weights(192),
+        );
+        let ratio: Vec<f64> = fast.iter().zip(&slow).map(|(f, s)| f / s).collect();
+        assert!(
+            ratio.windows(2).all(|pair| pair[0] > pair[1]),
+            "the two decays do not order monotonically along the horizon axis"
+        );
+        assert!(
+            ratio[0] > 1.0 && *ratio.last().unwrap() < 1.0,
+            "the two decays must cross: ratio {} at h = 1, {} at h = 192",
+            ratio[0],
+            ratio.last().unwrap()
+        );
+        let head = |weights: &[f64]| weights[..8].iter().sum::<f64>();
+        let tail = |weights: &[f64]| weights[64..].iter().sum::<f64>();
+        assert!(
+            head(&fast) > head(&slow) && tail(&fast) < tail(&slow),
+            "1/h must move objective weight from the long end to the short end"
+        );
+    }
+
+    /// `uniform` is the control arm, so it has to reproduce the objective it replaced EXACTLY,
+    /// not merely closely: the jobs 5190-5193 curves are only comparable to a `uniform` arm if
+    /// the number means the same thing. The proof is structural, which is stronger than a
+    /// tolerance: every tensor the pre-knob loss read was `mask`, the weighted loss reads
+    /// `mask · w` and divides by `Σ w·mask·CHANNELS` instead of `Σ mask·CHANNELS`, and at
+    /// `w ≡ 1` both are the identity ON THE BITS - so every downstream kernel receives byte
+    /// for byte what it received before and emits byte for byte what it emitted before.
+    #[test]
+    fn uniform_horizon_loss_reproduces_the_previous_unweighted_objective() {
+        let _rng = crate::torch::test_rng::exclusive();
+        tch::manual_seed(23);
+        let config = small_config();
+        assert_eq!(
+            config.horizon_loss,
+            HorizonLoss::Uniform,
+            "the default must stay the control"
+        );
+        let store = nn::VarStore::new(Device::Cpu);
+        let model = CausalPatchModel::new(&store.root(), &config);
+        live_head(&model);
+        let batch = synthetic(&config, &[8, 5]);
+        let stats = model.statistics(&batch);
+        let (targets, mask) = model.targets(&batch, &stats, false);
+        // The fold and the denominator, both bit-exact identities at w = 1.
+        assert!(
+            (&mask * model.horizon_weight_buffer()).equal(&mask),
+            "the uniform fold is not the identity on the mask"
+        );
+        let count = (mask.sum(Kind::Float) * CHANNELS).clamp_min(1.0);
+        let weighted_count =
+            ((&mask * model.horizon_weight_buffer()).sum(Kind::Float) * CHANNELS).clamp_min(1.0);
+        assert!(
+            weighted_count.equal(&count),
+            "the uniform denominator is not the unweighted one"
+        );
+        // And the value against the pre-knob expression written out verbatim.
+        let head = model.forward(&batch, &stats, false, false);
+        let output = model.output(&head);
+        let previous = ((nll_elements(
+            &model.decode(&output, &stats),
+            &output.log_scale,
+            &targets,
+        ) * &mask)
+            .sum(Kind::Float)
+            / count)
+            .double_value(&[]);
+        let fused = model.losses(&head, &stats, &targets, &mask).nll.double_value(&[]);
+        assert!(previous.is_finite() && previous.abs() > 1e-3, "{previous}");
+        let relative = (fused - previous).abs() / previous.abs();
+        // The fused reassociation's own documented tolerance against the reference chain, not
+        // the weighting's: the weighting contributes exactly zero to this difference.
+        assert!(relative <= 1e-4, "uniform NLL {fused} vs {previous}");
+    }
+
+    /// `--target-basis cumulative` with uniform coefficient weights is a BIT-EXACT identity on
+    /// the objective. This is the gate on the whole knob: if the control arm's loss moves by an
+    /// ulp, no step-matched comparison against the `inv-sqrt` control means anything.
+    ///
+    /// The identity is established at two levels, and the distinction is not pedantry.
+    ///
+    /// **The control arm does not execute this code.** `basis` is `None` under `cumulative`, so
+    /// [`Self::losses`] falls through to the same fused call it made before the knob existed
+    /// and `uniform_horizon_loss_reproduces_the_previous_unweighted_objective` still pins its
+    /// value. That is a structural identity, not a numerical one, and it is the one that
+    /// matters for the control.
+    ///
+    /// **The coefficient path itself reproduces [`gaussian_nll`] on the bits, term for term.**
+    /// Every input to the reduction is bit-equal: the decoded mean, the rotation (a matmul by
+    /// the identity sums one value against exact zeros), the coefficient prior against
+    /// `½·ln h`, the per-element NLL against [`nll_elements`], the mask fold against
+    /// `mask·w`, and the denominator. The reduced SCALAR differs by exactly one fp32 ulp, and
+    /// the reason is measured here rather than waved at: `gaussian_nll`'s numerator tensor is
+    /// NON-contiguous (its log-scale term is a strided view of the head), so ATen's cascade
+    /// sum visits it in a different order than it visits this path's contiguous numerator.
+    /// Forcing the reference contiguous makes the scalars bit-equal too, which localizes the
+    /// ulp to the reference composition's strides and not to the reparametrization.
+    #[test]
+    fn cumulative_target_basis_is_a_bit_exact_identity_on_the_objective() {
+        let _rng = crate::torch::test_rng::exclusive();
+        tch::manual_seed(31);
+        let config = small_config();
+        assert_eq!(
+            config.target_basis,
+            TargetBasis::Cumulative,
+            "the default must stay the control"
+        );
+        let store = nn::VarStore::new(Device::Cpu);
+        let model = CausalPatchModel::new(&store.root(), &config);
+        assert!(
+            model.basis().is_none(),
+            "the control arm must not construct a transform at all"
+        );
+        live_head(&model);
+        // Complete windows: the identity claim is about the metric, and the row-completeness
+        // mask is a separate contract with its own test below.
+        let batch = synthetic(&config, &[config.pred_len, config.pred_len]);
+        let stats = model.statistics(&batch);
+        let (targets, mask) = model.targets(&batch, &stats, false);
+        let head = model.forward(&batch, &stats, false, false);
+        let output = model.output(&head);
+        let identity = BasisTransform::new(
+            TargetBasis::Cumulative,
+            BasisWeight::Uniform,
+            config.pred_len,
+            None,
+            Device::Cpu,
+        )
+        .unwrap();
+        assert!(
+            identity.half_log_prior().equal(model.half_log_horizon()),
+            "the identity coefficient prior is not bit-for-bit ½·ln h"
+        );
+        // Every input to the reduction, bit for bit. The implementation masks the residual
+        // before rotating, and on a complete window the mask is exactly 1, so that multiply is
+        // the identity on the bits and this mirrors it.
+        let prediction = model.decode(&output, &stats);
+        let error = &targets - &prediction;
+        let masked = &error * &mask;
+        assert!(
+            identity.rotate(&masked).equal(&masked),
+            "the identity rotation is not the identity on real residuals"
+        );
+        let reference_terms = nll_elements(&prediction, &output.log_scale, &targets);
+        let terms = (identity.rotate(&masked) * (-&output.log_scale).exp()).square() * 0.5
+            + &output.log_scale;
+        let weighted = mask.amin([-1i64].as_slice(), true) * identity.weight();
+        let weighted_mask = &mask * model.horizon_weight_buffer();
+        assert!(
+            weighted.equal(&weighted_mask),
+            "the coefficient weight fold is not bit-for-bit the horizon mask fold"
+        );
+        assert!(
+            (&terms * &weighted).equal(&(&reference_terms * &weighted_mask)),
+            "the weighted numerator is not bit-for-bit the reference's"
+        );
+        // And the scalar, once the reference's strides are taken out of the comparison.
+        let count = (weighted_mask.sum(Kind::Float) * CHANNELS).clamp_min(1.0);
+        let contiguous_reference =
+            (&reference_terms * &weighted_mask).contiguous().sum(Kind::Float) / &count;
+        let rotated = model.basis_losses(&identity, &head, &stats, &targets, &mask);
+        assert!(
+            rotated.nll.equal(&contiguous_reference),
+            "the identity basis NLL is {} not {}",
+            rotated.nll.double_value(&[]),
+            contiguous_reference.double_value(&[])
+        );
+        // The MSE is a diagnostic every arm must be comparable on, so it is bit-identical to
+        // the reference outright - no stride caveat, because both numerators are contiguous.
+        let reference = gaussian_nll(
+            &prediction,
+            &output.log_scale,
+            &targets,
+            &mask,
+            model.horizon_weight_buffer(),
+        );
+        assert!(
+            rotated.mse.equal(&reference.mse),
+            "the identity basis MSE is {} not {}",
+            rotated.mse.double_value(&[]),
+            reference.mse.double_value(&[])
+        );
+        // The remaining scalar difference against the strided reference is ONE ulp, stated as a
+        // number so a regression that grows it is visible.
+        let ulp = (rotated.nll.double_value(&[]) - reference.nll.double_value(&[])).abs()
+            / reference.nll.double_value(&[]).abs();
+        assert!(
+            ulp <= f64::from(f32::EPSILON),
+            "the identity basis NLL differs from the strided reference by {ulp:e} relative, \
+             more than one fp32 ulp; that is no longer a reduction-order difference"
+        );
+    }
+
+    /// The shipped rotation is a ROTATION in the arithmetic it ships in: `‖W·r‖ = ‖r‖` on real
+    /// fp32 residuals at the production horizon length. This is the operational form of
+    /// orthonormality - the Gram matrix test in [`super::target_basis`] proves the matrix, this
+    /// proves the GEMM that consumes it - and it is why the reparametrization restricts nothing.
+    #[test]
+    fn every_basis_preserves_the_residual_norm_at_the_production_horizon() {
+        let _rng = crate::torch::test_rng::exclusive();
+        tch::manual_seed(37);
+        let residual = Tensor::randn([16, 4, 192], (Kind::Float, Device::Cpu)) * 3.0;
+        let energy = residual.square().sum_dim_intlist([-1i64].as_slice(), false, Kind::Double);
+        for basis in [TargetBasis::Cumulative, TargetBasis::Haar, TargetBasis::Dct] {
+            let transform =
+                BasisTransform::new(basis, BasisWeight::Uniform, 192, None, Device::Cpu).unwrap();
+            let rotated = transform
+                .rotate(&residual)
+                .square()
+                .sum_dim_intlist([-1i64].as_slice(), false, Kind::Double);
+            let worst = ((&rotated - &energy).abs() / &energy).max().double_value(&[]);
+            assert!(
+                worst < 1e-5,
+                "{basis} moved the residual energy by {worst:e} relative; the map is not a \
+                 rotation in fp32 and therefore not a reparametrization"
+            );
+        }
+    }
+
+    /// A rotated objective must not restrict the head, which is the ONE way this could repeat
+    /// `--horizon-mean basis:8:8`'s failure. Every head row - all `2·CHANNELS·pred_len` of them,
+    /// mean rows and log-scale rows alike - receives nonzero gradient under a full-rank
+    /// rotation, because `W` is invertible and every coefficient reads every horizon.
+    #[test]
+    fn a_rotated_objective_leaves_no_head_row_untrained() {
+        let _rng = crate::torch::test_rng::exclusive();
+        for basis in [TargetBasis::Haar, TargetBasis::Dct] {
+            tch::manual_seed(41);
+            let config = ModelConfig {
+                target_basis: basis,
+                ..small_config()
+            };
+            let store = nn::VarStore::new(Device::Cpu);
+            let model = CausalPatchModel::new(&store.root(), &config);
+            assert_eq!(model.basis().map(BasisTransform::basis), Some(basis));
+            live_head(&model);
+            let batch = synthetic(&config, &[config.pred_len, config.pred_len]);
+            let stats = model.statistics(&batch);
+            let (targets, mask) = model.targets(&batch, &stats, false);
+            let head = model.forward(&batch, &stats, false, false);
+            let losses = model.losses(&head, &stats, &targets, &mask);
+            assert!(
+                losses.nll.double_value(&[]).is_finite(),
+                "{basis} produced a nonfinite NLL"
+            );
+            let gradient = Tensor::run_backward(
+                &[&losses.nll],
+                &[&model.head_output.ws],
+                false,
+                false,
+            )
+            .remove(0);
+            let dead = gradient
+                .abs()
+                .reshape([gradient.size()[0], -1])
+                .sum_dim_intlist([1i64].as_slice(), false, Kind::Double)
+                .eq(0.0)
+                .sum(Kind::Int64)
+                .int64_value(&[]);
+            assert_eq!(
+                dead, 0,
+                "{basis} left {dead} of {} head rows with exactly zero gradient",
+                gradient.size()[0]
+            );
+        }
+    }
+
+    /// A coefficient is a weighted sum over the WHOLE horizon window, so an origin whose window
+    /// is only partly observed carries no coefficient vector and must contribute NOTHING to the
+    /// rotated objective.
+    ///
+    /// The contract is a two-sided invariance, and both sides are load-bearing:
+    ///
+    /// - overwriting an UNOBSERVED entry with garbage may not move the objective by one bit -
+    ///   which is what "dropped, not zero-filled" means, and what a `0 · large` product after a
+    ///   192-term rotation would not survive;
+    /// - overwriting an OBSERVED entry MUST move it, so the test cannot pass by ignoring
+    ///   everything.
+    ///
+    /// The masked population is identified from the mask itself rather than assumed. Origins
+    /// sit at patch boundaries INSIDE the context, so with `pred_len` short futures only the
+    /// last origins of a short row read unobserved bars at all; a test that poisoned a fixed
+    /// horizon band across every origin would be poisoning observed data and asserting the
+    /// wrong thing.
+    #[test]
+    fn the_rotated_objective_ignores_every_incomplete_horizon_window() {
+        let _rng = crate::torch::test_rng::exclusive();
+        tch::manual_seed(43);
+        let config = ModelConfig {
+            target_basis: TargetBasis::Dct,
+            ..small_config()
+        };
+        let store = nn::VarStore::new(Device::Cpu);
+        let model = CausalPatchModel::new(&store.root(), &config);
+        live_head(&model);
+        // Row 0 complete, row 1 observed for only three of `pred_len` future bars.
+        let batch = synthetic(&config, &[config.pred_len, 3]);
+        let stats = model.statistics(&batch);
+        let (targets, mask) = model.targets(&batch, &stats, false);
+        // The masked population has to exist, or the test proves nothing.
+        let unobserved = mask
+            .eq(0.0)
+            .logical_and(&mask.amax([-1i64].as_slice(), true).gt(0.0));
+        assert!(
+            unobserved.sum(Kind::Int64).int64_value(&[]) > 0,
+            "this batch has no unobserved future bar on a scored origin, so the invariance is \
+             untested"
+        );
+        let head = model.forward(&batch, &stats, false, false);
+        let before = model.losses(&head, &stats, &targets, &mask);
+        assert!(before.nll.double_value(&[]).is_finite());
+        // Poison exactly the unobserved entries, wherever the mask says they are.
+        let poisoned = targets.where_self(&unobserved.logical_not(), &Tensor::from(1e6f32));
+        let after = model.losses(&head, &stats, &poisoned, &mask);
+        assert!(
+            after.nll.equal(&before.nll),
+            "an unobserved bar moved the objective: {} vs {}",
+            after.nll.double_value(&[]),
+            before.nll.double_value(&[])
+        );
+        // And the converse: an OBSERVED bar must move it, so the invariance above is not
+        // vacuous. The last origin of the complete row is observed at every horizon.
+        let observed = targets.shallow_clone();
+        let _ = observed
+            .narrow(0, 0, 1)
+            .narrow(1, config.origins() - 1, 1)
+            .fill_(1e3);
+        let moved = model.losses(&head, &stats, &observed, &mask);
+        assert!(
+            !moved.nll.equal(&before.nll),
+            "poisoning an OBSERVED bar left the objective unchanged, so the rotated loss is \
+             reading nothing"
+        );
+        // The rotated objective's denominator counts complete windows only, so the reported
+        // number stays a per-element mean - nats per bar - and stays comparable to the
+        // persistence anchor. Every scored origin except the incomplete ones is counted.
+        let complete = mask
+            .amin([-1i64].as_slice(), true)
+            .sum(Kind::Double)
+            .double_value(&[]);
+        let scored = mask
+            .amax([-1i64].as_slice(), true)
+            .sum(Kind::Double)
+            .double_value(&[]);
+        assert!(
+            complete > 0. && complete < scored,
+            "the completeness mask must drop some but not all scored origins, got {complete} \
+             of {scored}"
+        );
+    }
+
+    /// The knobs that would make an arm unattributable are refused, not silently composed.
+    #[test]
+    fn a_rotated_basis_refuses_a_horizon_weighting_and_a_rank_restriction() {
+        let error = ModelConfig {
+            target_basis: TargetBasis::Dct,
+            horizon_loss: HorizonLoss::InverseSqrt,
+            ..small_config()
+        }
+        .validate()
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("not the same axis"), "{error}");
+        let error = ModelConfig {
+            target_basis: TargetBasis::Haar,
+            horizon_mean: HorizonMean::Basis {
+                free: 2,
+                functions: 2,
+            },
+            ..small_config()
+        }
+        .validate()
+        .unwrap_err()
+        .to_string();
+        // The refusal is identified by the two knobs it names, not by its prose: a sibling
+        // rewrote this message today and a wording assertion would have failed while the
+        // behaviour was correct.
+        assert!(
+            error.contains("--target-basis") && error.contains("--horizon-mean"),
+            "{error}"
+        );
+        let error = ModelConfig {
+            basis_weight: BasisWeight::Snr,
+            ..small_config()
+        }
+        .validate()
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("--basis-stats"), "{error}");
+        // And the control composes with everything, exactly as it did before the knob.
+        ModelConfig {
+            horizon_loss: HorizonLoss::InverseSqrt,
+            ..small_config()
+        }
+        .validate()
+        .unwrap();
+    }
+
+    /// `cutoff:K` must genuinely stop the gradient, not merely shrink it. The head weight is
+    /// channel-major (`row = channel·pred_len + h`, see [`CausalPatchModel::head`]), so the
+    /// rows exclusive to horizons above `K` are exactly those with `row % pred_len >= K`, and
+    /// their gradient has to be the number 0, not a small number. Forecasts are still emitted
+    /// for every horizon, which is what keeps the per-horizon diagnostics readable on the
+    /// untrained end.
+    #[test]
+    fn a_horizon_cutoff_leaves_exactly_zero_gradient_above_it_and_still_forecasts_every_horizon() {
+        let _rng = crate::torch::test_rng::exclusive();
+        tch::manual_seed(29);
+        let cut = 3;
+        let config = ModelConfig {
+            horizon_loss: HorizonLoss::Cutoff(cut),
+            ..small_config()
+        };
+        let pred_len = config.pred_len;
+        let store = nn::VarStore::new(Device::Cpu);
+        let model = CausalPatchModel::new(&store.root(), &config);
+        live_head(&model);
+        let batch = synthetic(&config, &[8, 5]);
+        let stats = model.statistics(&batch);
+        let (targets, mask) = model.targets(&batch, &stats, false);
+        let head = model.forward(&batch, &stats, false, false);
+        // Every horizon is still emitted: the head shape is untouched by the mode.
+        assert_eq!(
+            model.output(&head).coordinates.size()[3],
+            pred_len,
+            "the cutoff must mask the loss, never shrink the head"
+        );
+        let losses = model.losses(&head, &stats, &targets, &mask);
+        assert!(losses.nll.double_value(&[]).is_finite());
+        let bias = model.head_output.bs.as_ref().unwrap();
+        let grads = Tensor::run_backward(
+            &[&losses.nll],
+            &[&model.head_output.ws, bias, &model.patch.ws],
+            false,
+            false,
+        );
+        for (name, gradient) in [("weight", &grads[0]), ("bias", &grads[1])] {
+            let rows = gradient.size()[0];
+            assert_eq!(rows, pred_len * OUTPUTS_PER_BAR);
+            let horizon = Tensor::arange(rows, (Kind::Int64, Device::Cpu)).remainder(pred_len);
+            let magnitude = gradient
+                .abs()
+                .reshape([rows, -1])
+                .sum_dim_intlist([1i64].as_slice(), false, Kind::Double);
+            assert_eq!(
+                magnitude.masked_select(&horizon.ge(cut)).max().double_value(&[]),
+                0.0,
+                "head {name} rows above cutoff:{cut} received gradient"
+            );
+            assert!(
+                magnitude.masked_select(&horizon.lt(cut)).min().double_value(&[]) > 0.0,
+                "head {name} rows at or below cutoff:{cut} received no gradient"
+            );
+        }
+        // The trunk still trains: the cutoff removes horizons, not layers.
+        assert!(grads[2].abs().max().double_value(&[]) > 0.0);
+    }
+
+    /// The spec parser is the only gate before a GPU-hours run starts, so it rejects at parse
+    /// time. `cutoff:0` and garbage die in `FromStr`; a cutoff past the horizon needs
+    /// `pred_len`, so it dies in [`ModelConfig::validate`] - the first statement of
+    /// `runner::train`, long before the corpus loads.
+    #[test]
+    fn horizon_loss_specs_round_trip_and_invalid_ones_are_refused_before_any_run() {
+        for mode in [
+            HorizonLoss::Uniform,
+            HorizonLoss::InverseSqrt,
+            HorizonLoss::Inverse,
+            HorizonLoss::Cutoff(1),
+            HorizonLoss::Cutoff(32),
+            HorizonLoss::Cutoff(192),
+        ] {
+            assert_eq!(mode.to_string().parse::<HorizonLoss>().unwrap(), mode);
+            assert_eq!(
+                serde_json::from_str::<HorizonLoss>(&serde_json::to_string(&mode).unwrap())
+                    .unwrap(),
+                mode
+            );
+        }
+        assert_eq!("cutoff:32".parse::<HorizonLoss>().unwrap(), HorizonLoss::Cutoff(32));
+        for garbage in [
+            "cutoff:0",
+            "cutoff:-4",
+            "cutoff:",
+            "cutoff:1.5",
+            "cutoff",
+            "uniform ",
+            "Uniform",
+            "inv_sqrt",
+            "inverse",
+            "",
+            "1/h",
+        ] {
+            assert!(
+                garbage.parse::<HorizonLoss>().is_err(),
+                "{garbage:?} parsed as a horizon loss"
+            );
+        }
+        // Past the horizon: accepted by the parser, refused by the configuration.
+        let config = ModelConfig {
+            horizon_loss: HorizonLoss::Cutoff(193),
+            ..ModelConfig::default()
+        };
+        assert_eq!(config.pred_len, 192);
+        let error = config.validate().unwrap_err().to_string();
+        assert!(
+            error.contains("cutoff:193") && error.contains("1..=192"),
+            "{error}"
+        );
+        assert!(ModelConfig {
+            horizon_loss: HorizonLoss::Cutoff(192),
+            ..ModelConfig::default()
+        }
+        .validate()
+        .is_ok());
+    }
+
+    /// `--horizon-mean free` is the CONTROL: every measurement the structured mean will be
+    /// compared against was taken by the head this branch has to reproduce, so "equal to
+    /// within tolerance" is not good enough - it has to be the same bits. And the fold's
+    /// one-hot rows have to be exact too, because that is what makes the free band and every
+    /// log scale under `basis:S:B` the same numbers the dense head would have produced: a
+    /// row of `Ψ` that sums one weight against `head_outputs - 1` exact zeros must return the
+    /// weight itself, not a rounding of it.
+    #[test]
+    fn free_horizon_mean_is_the_dense_head_and_the_fold_copies_one_hot_rows_exactly() {
+        let _rng = crate::torch::test_rng::exclusive();
+        tch::manual_seed(31);
+        let dense = ModelConfig {
+            features: FeatureSet::NONE,
+            ..small_config()
+        };
+        assert_eq!(dense.horizon_mean, HorizonMean::Free);
+        let store = nn::VarStore::new(Device::Cpu);
+        let model = CausalPatchModel::new(&store.root(), &dense);
+        assert!(
+            model.mean_expansion.is_none(),
+            "the control arm must not carry an expansion at all"
+        );
+        tch::no_grad(|| {
+            let _ = model.head_output.ws.shallow_clone().uniform_(-0.3, 0.3);
+            let _ = model
+                .head_output
+                .bs
+                .as_ref()
+                .expect("the head output is biased")
+                .shallow_clone()
+                .uniform_(-0.3, 0.3);
+        });
+        let batch = synthetic(&dense, &[8, 6]);
+        let stats = model.statistics(&batch);
+        let state = model.backbone(&batch, &stats, false, false);
+        let head = model.head(&batch, &state, false);
+        // The pre-knob body, transcribed. `FeatureSet::NONE` has no known-future channel, so
+        // the covariate branch is absent and the head input IS the backbone state, which is
+        // what lets the reference be the two lines that matter rather than a second copy of
+        // the covariate gather.
+        let hidden = linear(&state, &model.head_hidden).gelu("none");
+        let reference = hidden
+            .linear(
+                &(model.head_output.ws.to_kind(hidden.kind()) * HEAD_OUTPUT_SCALE),
+                model
+                    .head_output
+                    .bs
+                    .as_ref()
+                    .map(|bias| bias.to_kind(hidden.kind()) * HEAD_OUTPUT_SCALE),
+            )
+            .reshape([2, -1, OUTPUTS_PER_BAR, dense.pred_len]);
+        assert!(
+            head.0.equal(&reference),
+            "the free head is no longer the dense GEMM it was before the knob"
+        );
+        // Now the fold itself, on the full-covariate configuration, against an expansion that
+        // is nothing but one-hot rows: the identity. Same weights, same batch, same bits.
+        let covariate_config = small_config();
+        let folded_store = nn::VarStore::new(Device::Cpu);
+        let mut folded = CausalPatchModel::new(&folded_store.root(), &covariate_config);
+        let plain_store = nn::VarStore::new(Device::Cpu);
+        let plain = CausalPatchModel::new(&plain_store.root(), &covariate_config);
+        folded.mean_expansion = Some(Tensor::eye(
+            OUTPUTS_PER_BAR * covariate_config.pred_len,
+            (Kind::Float, Device::Cpu),
+        ));
+        tch::no_grad(|| {
+            for store in [&plain_store, &folded_store] {
+                tch::manual_seed(37);
+                for mut variable in store.trainable_variables() {
+                    let _ = variable.uniform_(-0.2, 0.2);
+                }
+            }
+        });
+        let batch = synthetic(&covariate_config, &[8, 8]);
+        let stats = plain.statistics(&batch);
+        let expected = plain.forward(&batch, &stats, false, false);
+        let through_fold = folded.forward(&batch, &stats, false, false);
+        assert!(
+            through_fold.0.equal(&expected.0),
+            "folding a one-hot expansion onto the head weight is not a copy"
+        );
+    }
+
+    /// The point of the restriction is that the free means above the band ARE NOT THERE. A
+    /// masked or frozen parameter is a different experiment: it still occupies optimizer
+    /// state, it still counts against weight decay, and one missing mask makes it trainable
+    /// again. So this checks the varstore itself - same entries, `704 · (HEAD_HIDDEN + 1)`
+    /// fewer numbers - and then checks that no surviving parameter is exclusive to one long
+    /// horizon, which is the property the deleted rows used to violate.
+    #[test]
+    fn basis_means_delete_the_long_horizon_parameters_rather_than_masking_them() {
+        let _rng = crate::torch::test_rng::exclusive();
+        tch::manual_seed(41);
+        let (free, functions) = (8i64, 8i64);
+        let control = ModelConfig {
+            pred_len: 192,
+            ..small_config()
+        };
+        let structured = ModelConfig {
+            horizon_mean: HorizonMean::Basis { free, functions },
+            ..control.clone()
+        };
+        let control_store = nn::VarStore::new(Device::Cpu);
+        let _control_model = CausalPatchModel::new(&control_store.root(), &control);
+        let structured_store = nn::VarStore::new(Device::Cpu);
+        let model = CausalPatchModel::new(&structured_store.root(), &structured);
+        let names = |store: &nn::VarStore| {
+            let mut names: Vec<String> = store.variables().into_keys().collect();
+            names.sort();
+            names
+        };
+        assert_eq!(
+            names(&control_store),
+            names(&structured_store),
+            "the structured mean must remove parameters from a tensor, not tensors from the model"
+        );
+        let numbers = |store: &nn::VarStore| {
+            store
+                .variables()
+                .values()
+                .map(|variable| variable.numel())
+                .sum::<usize>()
+        };
+        let (dense_rows, rows) = (
+            OUTPUTS_PER_BAR * control.pred_len,
+            structured.horizon_mean.head_outputs(control.pred_len),
+        );
+        assert_eq!((dense_rows, rows), (1536, 832));
+        assert_eq!(model.head_output.ws.size(), [rows, HEAD_HIDDEN]);
+        assert_eq!(
+            model
+                .head_output
+                .bs
+                .as_ref()
+                .expect("the head output is biased")
+                .size(),
+            [rows]
+        );
+        assert_eq!(
+            numbers(&control_store) - numbers(&structured_store),
+            (dense_rows - rows) as usize * (HEAD_HIDDEN as usize + 1),
+            "the parameter drop is the deleted rows and their biases, exactly"
+        );
+        // One restricted horizon's gradient. In the dense head this reaches exactly one mean
+        // row per coordinate channel and nothing else, which is precisely the freedom that
+        // memorized the training period. Here it must reach every coefficient row of every
+        // coordinate channel and NOT ONE row of the free band.
+        let batch = synthetic(&structured, &[192, 192]);
+        let stats = model.statistics(&batch);
+        let head = model.forward(&batch, &stats, true, false);
+        let probe = 100;
+        assert!(probe > free && probe < control.pred_len);
+        head.0
+            .narrow(2, 0, CHANNELS)
+            .narrow(3, probe, 1)
+            .sum(Kind::Float)
+            .backward();
+        let gradient = model.head_output.ws.grad().abs().sum_dim_intlist(
+            [1i64].as_slice(),
+            false,
+            Kind::Double,
+        );
+        let per_channel = free + functions;
+        for channel in 0..CHANNELS {
+            for slot in 0..per_channel {
+                let touched = gradient.double_value(&[channel * per_channel + slot]) > 0.0;
+                assert_eq!(
+                    touched,
+                    slot >= free,
+                    "channel {channel} slot {slot}: a restricted horizon must move the {functions} \
+                     coefficients and none of the {free} free means"
+                );
+            }
+        }
+        assert_eq!(
+            gradient
+                .narrow(0, CHANNELS * per_channel, CHANNELS * control.pred_len)
+                .gt(0.0)
+                .sum(Kind::Int64)
+                .int64_value(&[]),
+            0,
+            "a mean gradient must not reach the log-scale rows"
+        );
+        // And the cost side of the same change, at the shipped batch: the token-space GEMMs
+        // and every activation are untouched, and the fold's own arithmetic and traffic are
+        // the only movement. These literals are what `timexer_basis_means.md` quotes.
+        let (dense_cost, basis_cost) = (
+            ModelConfig {
+                horizon_mean: HorizonMean::Free,
+                ..ModelConfig::default()
+            }
+            .step_cost(256),
+            ModelConfig {
+                horizon_mean: HorizonMean::Basis { free, functions },
+                ..ModelConfig::default()
+            }
+            .step_cost(256),
+        );
+        assert_eq!(
+            basis_cost.matmul_flops - dense_cost.matmul_flops,
+            2. * 2. * 1536. * 832. * 1024.
+        );
+        assert_eq!(
+            basis_cost.traffic_bytes - dense_cost.traffic_bytes,
+            4. * 2. * 1536. * 1024.
+        );
+        println!(
+            "basis:8:8 at batch 256: {:.5} TFLOP and {:.4} GB against the dense head's {:.5} \
+             TFLOP and {:.4} GB; head output weight {rows}x{HEAD_HIDDEN} against \
+             {dense_rows}x{HEAD_HIDDEN}, {} parameters gone",
+            basis_cost.matmul_flops / 1e12,
+            basis_cost.traffic_bytes / 1e9,
+            dense_cost.matmul_flops / 1e12,
+            dense_cost.traffic_bytes / 1e9,
+            numbers(&control_store) - numbers(&structured_store)
+        );
+    }
+
+    /// Zero coefficients must be EXACTLY the persistence forecast, not approximately it: the
+    /// head is zero-initialised, so this is the forecast the first step departs from, and the
+    /// whole mis-scaling diagnostic is measured as a departure from it. A basis with an
+    /// intercept, or an expansion that added anything to the restricted rows, would show up
+    /// here as a nonzero coordinate.
+    #[test]
+    fn zero_basis_coefficients_are_exactly_persistence_above_the_free_band() {
+        let _rng = crate::torch::test_rng::exclusive();
+        tch::manual_seed(43);
+        let (free, functions) = (3i64, 2i64);
+        let config = ModelConfig {
+            horizon_mean: HorizonMean::Basis { free, functions },
+            ..small_config()
+        };
+        let store = nn::VarStore::new(Device::Cpu);
+        let model = CausalPatchModel::new(&store.root(), &config);
+        let per_channel = free + functions;
+        tch::no_grad(|| {
+            let _ = model.head_output.ws.shallow_clone().uniform_(-0.5, 0.5);
+            let bias = model
+                .head_output
+                .bs
+                .as_ref()
+                .expect("the head output is biased");
+            let _ = bias.shallow_clone().uniform_(-0.5, 0.5);
+            // Every coefficient to zero; the free band and the log scales keep their values,
+            // so a restricted horizon that is not exactly persistence can only come from the
+            // basis.
+            for channel in 0..CHANNELS {
+                let _ = model
+                    .head_output
+                    .ws
+                    .narrow(0, channel * per_channel + free, functions)
+                    .fill_(0.0);
+                let _ = bias.narrow(0, channel * per_channel + free, functions).fill_(0.0);
+            }
+        });
+        let batch = synthetic(&config, &[8, 8]);
+        let stats = model.statistics(&batch);
+        let output = model.output(&model.forward(&batch, &stats, false, false));
+        let restricted = config.pred_len - free;
+        let above = output.coordinates.narrow(3, free, restricted);
+        assert_eq!(
+            above.abs().max().double_value(&[]),
+            0.0,
+            "a zero coefficient must give a zero coordinate, bit for bit"
+        );
+        let scaled = model.decode(&output, &stats);
+        for channel in [0, 3] {
+            assert_eq!(
+                scaled
+                    .narrow(2, channel, 1)
+                    .narrow(3, free, restricted)
+                    .abs()
+                    .max()
+                    .double_value(&[]),
+                0.0,
+                "the open and close means above the free band must be the origin close exactly"
+            );
+        }
+        assert!(
+            output
+                .coordinates
+                .narrow(3, 0, free)
+                .abs()
+                .max()
+                .double_value(&[])
+                > 0.0,
+            "the free band must still be free, or this test proves nothing"
+        );
+        assert!(
+            output.log_scale.std(false).double_value(&[]) > 0.0,
+            "the log scales are deliberately unrestricted and must still vary per horizon"
+        );
+    }
+
+    /// THE restriction, as a measurement rather than a claim. A term structure of expected
+    /// return - here a hyperbolic decay, which is completely monotone and so a genuine
+    /// exponential mixture, but NOT one of the eight functions - has to survive the
+    /// projection. A per-horizon alternating pattern, which needs one sign change per horizon
+    /// against a span whose members change sign at most `functions - 1` times, has to be
+    /// destroyed by it. Both are pushed through the real head: the fitted coefficients are
+    /// written into the head bias, so what is measured is what the model can emit.
+    #[test]
+    fn the_basis_represents_a_term_structure_and_refuses_per_horizon_idiosyncrasy() {
+        let _rng = crate::torch::test_rng::exclusive();
+        tch::manual_seed(47);
+        let (free, functions) = (8i64, 8i64);
+        let config = ModelConfig {
+            pred_len: 192,
+            horizon_mean: HorizonMean::Basis { free, functions },
+            ..small_config()
+        };
+        let restricted = config.pred_len - free;
+        let basis = Tensor::from_slice(
+            &config
+                .horizon_mean
+                .basis(config.pred_len)
+                .expect("the basis mode has a basis"),
+        )
+        .reshape([restricted, functions])
+        .to_kind(Kind::Double);
+        let store = nn::VarStore::new(Device::Cpu);
+        let model = CausalPatchModel::new(&store.root(), &config);
+        let batch = synthetic(&config, &[8]);
+        let stats = model.statistics(&batch);
+        let bias = model
+            .head_output
+            .bs
+            .as_ref()
+            .expect("the head output is biased")
+            .shallow_clone();
+        // The head weight stays zero, so the emitted block is the folded bias alone and the
+        // coefficients are read straight off it. `HEAD_OUTPUT_SCALE` folds onto the bias too,
+        // hence the pre-division.
+        let emit = |coefficients: &Tensor| {
+            tch::no_grad(|| {
+                let _ = bias.shallow_clone().fill_(0.0);
+                let _ = bias
+                    .narrow(0, free, functions)
+                    .copy_(&(coefficients.to_kind(Kind::Float) / HEAD_OUTPUT_SCALE));
+            });
+            model
+                .output(&model.forward(&batch, &stats, false, false))
+                .coordinates
+                .narrow(2, 0, 1)
+                .narrow(3, free, restricted)
+                .reshape([-1, restricted])
+                .narrow(0, 0, 1)
+                .reshape([restricted])
+                .to_kind(Kind::Double)
+        };
+        let steps = (Tensor::arange(restricted, (Kind::Double, Device::Cpu)) + 1.0).reshape([restricted]);
+        let cases = [
+            // A term structure: signal-to-noise decaying hyperbolically over 24 bars. Bernstein
+            // says a completely monotone decay is a positive mixture of exponentials, so the
+            // geometric timescale grid should reach it closely.
+            ("hyperbolic term structure", (&steps / 24.0 + 1.0).reciprocal() * 0.8, 0.05),
+            // Per-horizon idiosyncrasy: one sign change per horizon.
+            (
+                "per-horizon alternating",
+                (&steps * std::f64::consts::PI).cos() * 0.8,
+                0.95,
+            ),
+        ];
+        let relative = |curve: &Tensor, target: &Tensor| {
+            ((curve - target).square().sum(Kind::Double).sqrt()
+                / target.square().sum(Kind::Double).sqrt())
+            .double_value(&[])
+        };
+        for (name, target, bound) in cases {
+            let (coefficients, ..) =
+                basis.linalg_lstsq(&target.reshape([restricted, 1]), None, "gelsd");
+            let coefficients = coefficients.reshape([functions]);
+            // Two numbers, because they answer two different questions. `span` is the best the
+            // SPAN can do, in fp64: the restriction itself, independent of any head. `head` is
+            // what the model actually emits once those coefficients are written into the head
+            // bias and expanded in fp32, and it is what the tolerance is stated on. The gap
+            // between them is the fp32 rounding of an fp64 least-squares solution that reaches
+            // its last digits through large cancelling coefficients - the Gram matrix of eight
+            // exponentials is ill-conditioned by construction, which is a property of this
+            // parameterization and not of its span. On a target the span cannot reach, that
+            // same cancellation can push the emitted curve past 1, further from the target than
+            // emitting nothing at all.
+            let span = relative(&basis.matmul(&coefficients), &target);
+            let head = relative(&emit(&coefficients), &target);
+            println!("{name}: best relative L2 residual, span {span:.4}, through the head {head:.4}");
+            if bound < 0.5 {
+                assert!(
+                    span < bound,
+                    "{name} must be representable to {bound}, the span reached {span}"
+                );
+                assert!(
+                    head < bound,
+                    "{name} must be EMITTABLE to {bound}, the head reached {head} against the \
+                     span's own {span}"
+                );
+            } else {
+                assert!(
+                    span > bound,
+                    "{name} must NOT be representable - that is the restriction - but the span \
+                     fitted it to {span}"
+                );
+                assert!(
+                    head > bound,
+                    "the head emitted {head} for a target the span fits no better than {span}"
+                );
+            }
+        }
+        // The mechanism behind the contrast, stated where it can be checked: every basis
+        // function is positive and strictly decreasing, so the span is smooth and monotone
+        // by construction rather than by fitting.
+        let column = |index: i64| basis.narrow(1, index, 1).reshape([restricted]);
+        for index in 0..functions {
+            let values = column(index);
+            let difference = values.narrow(0, 1, restricted - 1) - values.narrow(0, 0, restricted - 1);
+            assert_eq!(values.gt(0.0).all().int64_value(&[]), 1);
+            assert_eq!(difference.lt(0.0).all().int64_value(&[]), 1);
+        }
+        let timescales = config.horizon_mean.timescales(config.pred_len);
+        assert_eq!(timescales.len(), functions as usize);
+        assert!((timescales[0] - free as f64).abs() < 1e-9);
+        assert!((timescales[functions as usize - 1] - config.pred_len as f64).abs() < 1e-9);
+        for pair in timescales.windows(2) {
+            assert!(pair[1] > pair[0], "the timescale grid must be strictly increasing");
+        }
+    }
+
+    #[test]
+    fn horizon_mean_specs_round_trip_and_invalid_ones_are_refused_before_any_run() {
+        for mode in [
+            HorizonMean::Free,
+            HorizonMean::Basis {
+                free: 8,
+                functions: 8,
+            },
+            HorizonMean::Basis {
+                free: 1,
+                functions: 1,
+            },
+        ] {
+            assert_eq!(mode.to_string().parse::<HorizonMean>().unwrap(), mode);
+            assert_eq!(
+                serde_json::from_str::<HorizonMean>(&serde_json::to_string(&mode).unwrap())
+                    .unwrap(),
+                mode
+            );
+        }
+        assert_eq!(
+            "basis:8:8".parse::<HorizonMean>().unwrap(),
+            HorizonMean::Basis {
+                free: 8,
+                functions: 8
+            }
+        );
+        assert_eq!(HorizonMean::default(), HorizonMean::Free);
+        assert_eq!(
+            HorizonMean::Basis {
+                free: 8,
+                functions: 8
+            }
+            .stamp(),
+            "basis-8-8"
+        );
+        for garbage in [
+            "basis:0:8",
+            "basis:8:0",
+            "basis:-8:8",
+            "basis:8:-8",
+            "basis:8",
+            "basis:8:",
+            "basis::8",
+            "basis:8:8:8",
+            "basis:8.5:8",
+            "basis",
+            "basis:",
+            "free ",
+            "Free",
+            "dense",
+            "",
+        ] {
+            assert!(
+                garbage.parse::<HorizonMean>().is_err(),
+                "{garbage:?} parsed as a horizon mean"
+            );
+        }
+        // Accepted by the parser, refused by the configuration - before the corpus loads.
+        let past_the_horizon = ModelConfig {
+            horizon_mean: HorizonMean::Basis {
+                free: 192,
+                functions: 1,
+            },
+            ..ModelConfig::default()
+        };
+        assert_eq!(past_the_horizon.pred_len, 192);
+        let error = past_the_horizon.validate().unwrap_err().to_string();
+        assert!(
+            error.contains("basis:192:1") && error.contains("no restricted horizon"),
+            "{error}"
+        );
+        let too_many = ModelConfig {
+            horizon_mean: HorizonMean::Basis {
+                free: 8,
+                functions: 185,
+            },
+            ..ModelConfig::default()
+        };
+        let error = too_many.validate().unwrap_err().to_string();
+        assert!(
+            error.contains("basis:8:185") && error.contains("184"),
+            "{error}"
+        );
+        assert!(ModelConfig {
+            horizon_mean: HorizonMean::Basis {
+                free: 191,
+                functions: 1
+            },
+            ..ModelConfig::default()
+        }
+        .validate()
+        .is_ok());
+        assert!(ModelConfig {
+            horizon_mean: HorizonMean::Basis {
+                free: 8,
+                functions: 184
+            },
+            ..ModelConfig::default()
+        }
+        .validate()
+        .is_ok());
     }
 
     #[test]
@@ -2382,7 +5388,7 @@ mod tests {
         let block_lambdas = BlockLambdas {
             resid: [&resid_parts[0], &resid_parts[1]],
             post: [&post_parts[0], &post_parts[1]],
-            x0: &x0_scale,
+            x0: Some((&x0, &x0_scale)),
         };
         let projection = linear(&rms_norm(&input), &block.qkv);
         let parts = projection.split(width, -1);
@@ -2446,7 +5452,7 @@ mod tests {
         .reshape([rows, length, width]);
         let state = scaled_linear(&attended, &block.output, block_lambdas.post[0])
             .addcmul(&input, block_lambdas.resid[0])
-            .addcmul(&x0, block_lambdas.x0);
+            .addcmul(&x0, &x0_scale);
         let expected = scaled_linear(
             &linear(&rms_norm(&state), &block.first).relu().square(),
             &block.second,
@@ -2454,7 +5460,7 @@ mod tests {
         )
         .addcmul(&state, block_lambdas.resid[1]);
         let (actual, published) =
-            block.forward(&input, &x0, None, &block_lambdas, (&cosine, &sine), false);
+            block.forward(&input, None, &block_lambdas, (&cosine, &sine), false);
         // The SOURCE layer publishes exactly its own value, and mixes nothing into it.
         assert!(block.value_lambda.is_none(), "layer 0 owns no lambda");
         assert_eq!(
@@ -2834,6 +5840,119 @@ mod tests {
         );
     }
 
+    /// `--x0-lambdas disabled` must REMOVE the shortcut, not hold it at zero.
+    ///
+    /// Two things have to be true at once, and only together do they say the mode is a real
+    /// path: the parameter is gone from the varstore (so the optimizer has nothing to route,
+    /// the state dict has one fewer tensor and the chart has `layers` fewer series), and the
+    /// forward pass is bit-identical to the learned mode AT ITS INIT, where `λ0 = 0` makes the
+    /// injection an exact no-op. If the second failed, the mode would be a different model
+    /// rather than the same model without a shortcut; if the first failed, it would be a flag
+    /// guarding a zero-multiplied tensor that still costs traffic and still trains.
+    #[test]
+    fn disabling_the_x0_injection_removes_its_parameters_and_its_kernel() {
+        let _rng = crate::torch::test_rng::exclusive();
+        let learned = eight_layer_config();
+        let none = ModelConfig {
+            x0_lambdas: X0Lambdas::Disabled,
+            ..learned.clone()
+        };
+        // Same seed on both sides: every shared parameter draws from the same stream, and the
+        // x0 bank is a constant init that consumes none of it, so the two stores differ in
+        // exactly one tensor and in nothing else.
+        let build = |config: &ModelConfig| {
+            tch::manual_seed(20260906);
+            let store = nn::VarStore::new(Device::Cpu);
+            let model = CausalPatchModel::new(&store.root(), config);
+            (store, model)
+        };
+        let (learned_store, mut learned_model) = build(&learned);
+        let (none_store, none_model) = build(&none);
+        assert!(
+            learned_store.variables().contains_key("lambdas.x0"),
+            "the learned mode must register the bank"
+        );
+        assert!(
+            !none_store.variables().contains_key("lambdas.x0"),
+            "the disabled mode registered a bank it must not have"
+        );
+        assert_eq!(
+            none_store.variables().len() + 1,
+            learned_store.variables().len(),
+            "disabling the injection must drop exactly one varstore entry"
+        );
+        assert_eq!(
+            none_store.trainable_variables().len() + 1,
+            learned_store.trainable_variables().len(),
+            "the dropped entry must be a TRAINED parameter, not a buffer"
+        );
+        // Every scalar the chart reports, per mode: `layers` fewer series and not one of them
+        // an x0 label.
+        let labels = |model: &CausalPatchModel| -> Vec<String> {
+            model
+                .recipe_scalars()
+                .into_iter()
+                .map(|(label, _)| label)
+                .collect()
+        };
+        let (learned_labels, none_labels) = (labels(&learned_model), labels(&none_model));
+        assert_eq!(
+            none_labels.len() + learned.layers,
+            learned_labels.len(),
+            "one x0 series per layer must disappear"
+        );
+        assert!(
+            !none_labels.iter().any(|label| label.starts_with("x0 lambda"))
+                && learned_labels
+                    .iter()
+                    .filter(|label| label.starts_with("x0 lambda"))
+                    .count()
+                    == learned.layers,
+            "{none_labels:?}"
+        );
+        // And the traffic bound: exactly one `addcmul` over the residual stream per layer,
+        // forward and backward, is what the mode removes.
+        let (with, without) = (learned.step_cost(4), none.step_cost(4));
+        assert_eq!(
+            with.matmul_flops, without.matmul_flops,
+            "the injection is elementwise; it must not move the GEMM count"
+        );
+        assert!(
+            with.traffic_bytes > without.traffic_bytes,
+            "the removed `addcmul` must show up in the traffic bound"
+        );
+        let batch = synthetic(&learned, &[8, 5]);
+        let stats = learned_model.statistics(&batch);
+        let learned_output = learned_model.backbone(&batch, &stats, false, false);
+        let none_output = none_model.backbone(&batch, &stats, false, false);
+        assert!(
+            learned_output.abs().max().double_value(&[]) > 0.0,
+            "a zero backbone would make the comparison vacuous"
+        );
+        assert_eq!(
+            (&learned_output - &none_output).abs().max().double_value(&[]),
+            0.0,
+            "at `λ0 = 0` the two modes must agree bit for bit: the disabled path has to be the \
+             same model with the shortcut removed, not a different one"
+        );
+        // Live the shortcut, and only the learned mode can follow it.
+        tch::no_grad(|| {
+            let _ = learned_model
+                .x0_lambdas
+                .as_mut()
+                .expect("the learned mode owns the bank")
+                .fill_(0.25);
+        });
+        let injected = learned_model.backbone(&batch, &stats, false, false);
+        assert!(
+            (&injected - &none_output).abs().max().double_value(&[])
+                / none_output.abs().max().double_value(&[])
+                > 1e-3,
+            "a nonzero x0 lambda did not change the learned mode's output, so the bit-identity \
+             above says nothing about the injection"
+        );
+    }
+
     fn eight_layer_config() -> ModelConfig {
         ModelConfig {
             layers: 8,
@@ -2928,18 +6047,22 @@ mod tests {
         let kind = x0.kind();
         let resid = model.resid_lambdas.to_kind(kind).unbind(0);
         let post = model.post_lambdas.to_kind(kind).unbind(0);
-        let x0_lambdas = model.x0_lambdas.to_kind(kind).unbind(0);
+        let x0_lambdas = model
+            .x0_lambdas
+            .as_ref()
+            .expect("this model runs the learned injection")
+            .to_kind(kind)
+            .unbind(0);
         let mut state = x0.shallow_clone();
         let mut first_value: Option<Tensor> = None;
         for (index, block) in model.blocks.iter().enumerate() {
             let lambdas = BlockLambdas {
                 resid: [&resid[2 * index], &resid[2 * index + 1]],
                 post: [&post[2 * index], &post[2 * index + 1]],
-                x0: &x0_lambdas[index],
+                x0: Some((&x0, &x0_lambdas[index])),
             };
             let (next, published) = block.forward(
                 &state,
-                &x0,
                 first_value.as_ref(),
                 &lambdas,
                 (&model.rotation.0, &model.rotation.1),
@@ -3141,7 +6264,7 @@ mod tests {
         let block_lambdas = BlockLambdas {
             resid: [&resid_parts[0], &resid_parts[1]],
             post: [&post_parts[0], &post_parts[1]],
-            x0: &x0_scale,
+            x0: Some((&x0, &x0_scale)),
         };
         // The model WITHOUT the residual: the same block math `Block::forward` runs - gainless
         // pre-norm, QK-norm before the rotation, ReLU² feedforward, folded post-lambdas and
@@ -3171,7 +6294,7 @@ mod tests {
             .reshape([rows, length, width]);
             let state = scaled_linear(&attended, &block.output, block_lambdas.post[0])
                 .addcmul(&input, block_lambdas.resid[0])
-                .addcmul(&x0, block_lambdas.x0);
+                .addcmul(&x0, &x0_scale);
             scaled_linear(
                 &linear(&rms_norm(&state), &block.first).relu().square(),
                 &block.second,
@@ -3206,7 +6329,6 @@ mod tests {
             });
             let (actual, published) = block.forward(
                 &input,
-                &x0,
                 Some(&first),
                 &block_lambdas,
                 (&cosine, &sine),
@@ -3250,7 +6372,6 @@ mod tests {
         });
         let (output, _) = block.forward(
             &input,
-            &x0,
             Some(&first),
             &block_lambdas,
             (&cosine, &sine),

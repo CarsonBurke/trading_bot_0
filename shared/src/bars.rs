@@ -10,7 +10,27 @@ use memmap2::Advice;
 use memmap2::Mmap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufWriter, ErrorKind, Read, Seek, SeekFrom, Write};
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
+
+/// Inode-level identity of a mapped corpus file, captured by `fstat` on the very descriptor the
+/// mapping was made from, so it names the bytes a [`BarFile`] exposes rather than whatever the
+/// path resolves to afterwards.
+///
+/// `change_ns` is the load-bearing field for anything that caches a derivation of these bars.
+/// Linux offers no way to set a file's ctime from userspace - `utimensat` moves atime and mtime
+/// and BUMPS ctime - so a corpus file cannot be rewritten and then made to look untouched
+/// without raw block-device access or a backwards clock. `device`/`inode` pin which file it is
+/// (an atomic [`write_bar_file`] replaces the inode via rename), and `size` plus `modified_ns`
+/// catch the in-place [`append_bars`] path.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct BarIdentity {
+    pub device: u64,
+    pub inode: u64,
+    pub size: u64,
+    pub modified_ns: i128,
+    pub change_ns: i128,
+}
 
 /// UTC epoch millis of bar open, OHLC, volume, VWAP and trade count.
 ///
@@ -340,6 +360,7 @@ pub struct BarFile {
     symbol: String,
     res_secs: u32,
     count: usize,
+    identity: BarIdentity,
 }
 
 impl std::fmt::Debug for BarFile {
@@ -357,10 +378,10 @@ impl BarFile {
     pub fn open(path: &Path) -> Result<Self> {
         let file =
             File::open(path).with_context(|| format!("opening bar file {}", path.display()))?;
-        let len = file
+        let metadata = file
             .metadata()
-            .with_context(|| format!("stat of bar file {}", path.display()))?
-            .len();
+            .with_context(|| format!("stat of bar file {}", path.display()))?;
+        let len = metadata.len();
         ensure!(
             len >= HEADER_LEN as u64,
             "bar file {} is {len} bytes, shorter than its {HEADER_LEN}-byte header",
@@ -400,7 +421,22 @@ impl BarFile {
             symbol,
             res_secs: header.res_secs,
             count,
+            identity: BarIdentity {
+                device: metadata.dev(),
+                inode: metadata.ino(),
+                size: len,
+                modified_ns: i128::from(metadata.mtime()) * 1_000_000_000
+                    + i128::from(metadata.mtime_nsec()),
+                change_ns: i128::from(metadata.ctime()) * 1_000_000_000
+                    + i128::from(metadata.ctime_nsec()),
+            },
         })
+    }
+
+    /// Identity of the mapped inode; see [`BarIdentity`]. Free: `open` already stats the
+    /// descriptor to check the header against the file length.
+    pub fn identity(&self) -> BarIdentity {
+        self.identity
     }
     /// Disable speculative sequential readahead for corpus consumers that issue sparse,
     /// independently shuffled windows. The exact mapped bytes remain unchanged.

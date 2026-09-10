@@ -1,3 +1,5 @@
+pub mod calibration;
+pub mod cache;
 pub mod corpus;
 pub mod data;
 pub mod features;
@@ -5,4 +7,12 @@ pub mod compute;
 pub mod benchmark;
 pub mod model;
 pub mod reports;
+pub mod probe;
 pub mod runner;
+pub mod target_basis;
+pub mod supervision;
+pub mod teacher;
+mod utility;
+pub(super) mod portfolio;
+pub(super) mod portfolio_data;
+pub(super) mod portfolio_calibration;

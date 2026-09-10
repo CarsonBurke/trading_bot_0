@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use shared::bars::PackedBar;
 
 const RESOLUTION: u32 = 300;
-const SCHEMA: &str = "timexer-segment-ohlc-v2;persistence-anchored-sigma-scaled-log-returns;next-valid-observed-bars;shared-universe-utc-split-boundaries;left-label-purge;completed-five-minute-bars;purge-only-at-observed-partition-boundaries;strict-raw-timestamps;skip-only-nonfinite-nonpositive-or-inconsistent-source-OHLC-v1;logical-valid-bar-ordinals";
+pub(super) const SCHEMA: &str = "timexer-segment-ohlc-v2;persistence-anchored-sigma-scaled-log-returns;next-valid-observed-bars;shared-universe-utc-split-boundaries;left-label-purge;completed-five-minute-bars;purge-only-at-observed-partition-boundaries;strict-raw-timestamps;skip-only-nonfinite-nonpositive-or-inconsistent-source-OHLC-v1;logical-valid-bar-ordinals";
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct DataContract {
@@ -32,24 +32,23 @@ pub(super) fn valid_ohlc(bar: &PackedBar) -> bool {
         && bar.low <= bar.open.min(bar.close)
 }
 
-pub(super) fn filtered_contract(
-    ticker: &str,
-    bars: &[PackedBar],
-    context: usize,
-    pred_len: usize,
-    common_context: usize,
-    bounds: [i64; 3],
-) -> Result<DataContract> {
-    ensure!(
-        context > 0 && pred_len > 0 && common_context >= context,
-        "invalid history or prediction length"
-    );
-    ensure!(
-        bounds.windows(2).all(|pair| pair[0] < pair[1]),
-        "split timestamps must be strictly increasing"
-    );
+/// Everything a [`DataContract`] derives from the bar bytes alone: the per-bar grid and
+/// ordering checks, the quarantined OHLC indices, and the SHA-256 over the whole record
+/// region. Nothing here depends on the split boundaries or on the window geometry, which is
+/// precisely why it is separable - and it has to be separable, because it is the ONLY O(bars)
+/// part of building a contract and therefore the only part worth persisting.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub(super) struct BarAudit {
+    pub fingerprint: String,
+    pub source_bars: usize,
+    pub invalid_ohlc_indices: Vec<usize>,
+}
+
+/// One pass over `bars` plus one SHA-256 over their bytes: ~3.5 MB per average ticker and
+/// ~17 GB over the 4,873-ticker universe, which is why [`super::cache`] persists the result
+/// under the mapped inode's identity rather than recomputing it every run.
+pub(super) fn audit_bars(ticker: &str, bars: &[PackedBar]) -> Result<BarAudit> {
     let resolution_ms = i64::from(RESOLUTION) * 1000;
-    let now = chrono::Utc::now().timestamp_millis();
     let mut invalid_ohlc_indices = Vec::new();
     for (index, bar) in bars.iter().enumerate() {
         ensure!(
@@ -64,20 +63,7 @@ pub(super) fn filtered_contract(
             invalid_ohlc_indices.push(index);
         }
     }
-    ensure!(
-        bars.last().is_none_or(|bar| bar
-            .ts()
-            .checked_add(resolution_ms)
-            .is_some_and(|completion| completion <= now)),
-        "{ticker}: corpus contains an uncompleted bar"
-    );
     let source_bars = bars.len();
-    let valid_bars = source_bars - invalid_ohlc_indices.len();
-    let raw_boundaries = bounds.map(|timestamp| bars.partition_point(|bar| bar.ts() < timestamp));
-    let boundaries = raw_boundaries
-        .map(|boundary| boundary - invalid_ohlc_indices.partition_point(|&index| index < boundary));
-    let purge = pred_len.max(100);
-    let train_end = retained_partition_end(boundaries[0], valid_bars, purge);
     let mut digest = Digest::new(&SHA256);
     digest.update(SCHEMA.as_bytes());
     digest.update(&(ticker.len() as u64).to_le_bytes());
@@ -90,13 +76,72 @@ pub(super) fn filtered_contract(
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect();
+    Ok(BarAudit {
+        fingerprint,
+        source_bars,
+        invalid_ohlc_indices,
+    })
+}
+
+/// The rest of the contract, given an [`audit_bars`] result for the SAME bars and that ticker's
+/// three RAW bar indices at the shared partition timestamps. Both inputs are cached artifacts;
+/// what is left here is arithmetic over the quarantine list and touches no bar but the last. The
+/// completed-bar check stays here rather than in the audit because it is the one condition that
+/// depends on the wall clock, and a corpus that was complete when the audit was taken is still
+/// complete now.
+pub(super) fn filtered_contract(
+    ticker: &str,
+    bars: &[PackedBar],
+    audit: &BarAudit,
+    context: usize,
+    pred_len: usize,
+    common_context: usize,
+    bounds: [i64; 3],
+    raw_boundaries: [usize; 3],
+) -> Result<DataContract> {
+    ensure!(
+        context > 0 && pred_len > 0 && common_context >= context,
+        "invalid history or prediction length"
+    );
+    ensure!(
+        bounds.windows(2).all(|pair| pair[0] < pair[1]),
+        "split timestamps must be strictly increasing"
+    );
+    ensure!(
+        audit.source_bars == bars.len(),
+        "{ticker}: bar audit describes {} bars but the mapped corpus holds {}",
+        audit.source_bars,
+        bars.len()
+    );
+    let resolution_ms = i64::from(RESOLUTION) * 1000;
+    let now = chrono::Utc::now().timestamp_millis();
+    ensure!(
+        bars.last().is_none_or(|bar| bar
+            .ts()
+            .checked_add(resolution_ms)
+            .is_some_and(|completion| completion <= now)),
+        "{ticker}: corpus contains an uncompleted bar"
+    );
+    let source_bars = audit.source_bars;
+    let invalid_ohlc_indices = &audit.invalid_ohlc_indices;
+    let valid_bars = source_bars - invalid_ohlc_indices.len();
+    ensure!(
+        raw_boundaries.windows(2).all(|pair| pair[0] <= pair[1])
+            && raw_boundaries[2] <= source_bars,
+        "{ticker}: partition edges {raw_boundaries:?} are not a non-decreasing prefix of {source_bars} bars"
+    );
+    let boundaries = raw_boundaries
+        .map(|boundary| boundary - invalid_ohlc_indices.partition_point(|&index| index < boundary));
+    let purge = pred_len.max(100);
+    let train_end = retained_partition_end(boundaries[0], valid_bars, purge);
+    let fingerprint = audit.fingerprint.clone();
     Ok(DataContract {
         schema: SCHEMA.into(),
         ticker: ticker.into(),
         fingerprint,
         source_bars,
         valid_bars,
-        invalid_ohlc_indices,
+        invalid_ohlc_indices: invalid_ohlc_indices.clone(),
         boundaries,
         boundary_timestamps: bounds,
         context,
@@ -166,13 +211,36 @@ mod tests {
         assert_eq!(actual.finish().as_ref(), expected.finish().as_ref());
     }
 
+    /// Both halves back to back, the way `Corpus::load` runs them on a cold cache.
+    fn contract_of(
+        ticker: &str,
+        bars: &[PackedBar],
+        context: usize,
+        pred_len: usize,
+        common_context: usize,
+        bounds: [i64; 3],
+    ) -> Result<DataContract> {
+        let audit = audit_bars(ticker, bars)?;
+        let edges = bounds.map(|timestamp| bars.partition_point(|bar| bar.ts() < timestamp));
+        filtered_contract(
+            ticker,
+            bars,
+            &audit,
+            context,
+            pred_len,
+            common_context,
+            bounds,
+            edges,
+        )
+    }
+
     #[test]
     fn filtered_metadata_quarantines_invalid_rows_and_preserves_raw_authentication() {
         let mut source = bars();
         source[42].high = source[42].low;
         source[3000].open = f32::NAN;
         let bounds = [source[3500].ts(), source[4000].ts(), source[4500].ts()];
-        let contract = filtered_contract("ONE", &source, 96, 192, 128, bounds).unwrap();
+        let contract = contract_of("ONE", &source, 96, 192, 128, bounds).unwrap();
         assert_eq!(contract.source_bars, 5000);
         assert_eq!(contract.valid_bars, 4998);
         assert_eq!(contract.invalid_ohlc_indices, [42, 3000]);
@@ -180,19 +248,19 @@ mod tests {
         assert_eq!(contract.boundary_timestamps, bounds);
         assert_eq!(contract.train_end, 3306);
         source[42].volume *= 2.0;
-        let changed = filtered_contract("ONE", &source, 96, 192, 128, bounds).unwrap();
+        let changed = contract_of("ONE", &source, 96, 192, 128, bounds).unwrap();
         assert_eq!(contract.invalid_ohlc_indices, changed.invalid_ohlc_indices);
         assert_ne!(contract.fingerprint, changed.fingerprint);
         source[42].ts_ms = source[41].ts();
-        assert!(filtered_contract("ONE", &source, 96, 192, 128, bounds).is_err());
+        assert!(contract_of("ONE", &source, 96, 192, 128, bounds).is_err());
     }
 
     #[test]
     fn raw_source_fingerprint_is_identical_across_context_comparisons() {
         let source = bars();
         let bounds = [source[3500].ts(), source[4000].ts(), source[4500].ts()];
-        let short = filtered_contract("ONE", &source, 96, 192, 2048, bounds).unwrap();
-        let long = filtered_contract("ONE", &source, 2048, 192, 2048, bounds).unwrap();
+        let short = contract_of("ONE", &source, 96, 192, 2048, bounds).unwrap();
+        let long = contract_of("ONE", &source, 2048, 192, 2048, bounds).unwrap();
         assert_eq!(short.fingerprint, long.fingerprint);
         assert_eq!(short.boundaries, long.boundaries);
     }
@@ -204,7 +272,7 @@ mod tests {
         for bar in &mut source[..3500] {
             bar.close = 0.0;
         }
-        let contract = filtered_contract("ONE", &source, 96, 192, 128, bounds).unwrap();
+        let contract = contract_of("ONE", &source, 96, 192, 128, bounds).unwrap();
         assert_eq!(contract.train_end, 0);
         assert!(contract.train_end <= contract.common_context);
     }
@@ -217,7 +285,7 @@ mod tests {
             source[4999].ts() + 600_000,
             source[4999].ts() + 900_000,
         ];
-        let contract = filtered_contract("GONE", &source, 96, 192, 128, bounds).unwrap();
+        let contract = contract_of("GONE", &source, 96, 192, 128, bounds).unwrap();
         assert_eq!(contract.boundaries, [5000; 3]);
         assert_eq!(contract.train_end, 5000);
     }

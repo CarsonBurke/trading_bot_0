@@ -39,6 +39,27 @@ pub(crate) fn copy_nonblocking(dst: &mut Tensor, src: &Tensor) -> Result<(), Str
     read_torch_error()
 }
 
+/// A PINNED float32 host tensor, ALLOCATED rather than copied into place.
+///
+/// `Tensor::pin_memory` is a copy: it allocates the pinned block and memcpys a pageable
+/// tensor into it. A producer that writes every byte of the block itself - the corpus
+/// loader's packed row block, 114,131,968 bytes at batch 256 - pays a pageable allocation
+/// of that size and 228 MB of single-threaded host read+write traffic for bytes it is about
+/// to overwrite. This is the allocation without the copy.
+///
+/// The pinned allocator comes from torch's CUDA hooks, so this needs a CUDA-enabled torch;
+/// callers that may run without a device must allocate pageable instead.
+pub(crate) fn empty_pinned(size: &[i64]) -> Result<Tensor, String> {
+    let ptr = unsafe {
+        torch_sys::at_empty_pinned_float(size.as_ptr(), size.len() as libc::c_int)
+    };
+    read_torch_error()?;
+    if ptr.is_null() {
+        return Err("pinned host allocation returned no tensor".into());
+    }
+    Ok(unsafe { Tensor::from_ptr(ptr) })
+}
+
 /// Drain and clear libtorch's thread-local error slot left by a raw shim call.
 pub(crate) fn read_torch_error() -> Result<(), String> {
     let ptr = unsafe { torch_sys::get_and_reset_last_err() };

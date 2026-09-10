@@ -423,6 +423,8 @@ fn meta_chart_bases() -> Vec<&'static str> {
     ];
     bases.extend_from_slice(RL_META_REPORT_BASES);
     bases.extend_from_slice(PRETRAIN_REPORT_BASES);
+    // Includes the utility endpoint/cost panels. Historical residual-spread portfolio
+    // bases are retired in this registry, never silently reused for raw utility.
     bases.extend_from_slice(shared::report::TIMEXER_SEGMENT_REPORT_BASES);
     bases.sort_unstable();
     bases.dedup();
@@ -1223,6 +1225,41 @@ mod planner_inference_discovery_tests {
         assert_eq!(
             scanned, registered,
             "every timexer_segment_* base the TUI scans must be registered and vice versa"
+        );
+        // The step-indexed family, by name. The two sweeps above are shape assertions: they
+        // stay green if every one of these names disappears from the registry and the scan at
+        // once, which is exactly how a per-horizon trajectory got lost before it existed. A
+        // comparison of two runs at matched steps depends on all of them, and
+        // `_horizon_steps_signal` is the panel a cross-sectional model is adopted or rejected
+        // on, so each is pinned in both directions.
+        for step_indexed in [
+            "timexer_segment_generalization_gap",
+            "timexer_segment_horizon_steps",
+            "timexer_segment_horizon_steps_signal",
+            "timexer_segment_horizon_steps_signal_error",
+            "timexer_segment_horizon_steps_pooled",
+            "timexer_segment_horizon_steps_population",
+            "timexer_segment_horizon_steps_decomposition",
+            "timexer_segment_horizon_steps_gain",
+            "timexer_segment_horizon_steps_best_scale",
+            "timexer_segment_horizon_steps_calibration",
+        ] {
+            assert!(
+                registered.contains(&step_indexed),
+                "{step_indexed} must stay registered: it is a per-horizon or generalization \
+                 quantity that exists only on the step axis"
+            );
+            assert!(
+                bases.contains(&step_indexed),
+                "{step_indexed} is written but the TUI never scans for it"
+            );
+        }
+        // Retired: the mis-scaling cross term moved into `_horizon_steps_decomposition`
+        // beside the two components of the same identity, in the same unit. A name that is
+        // scanned with no writer renders as a permanently blank panel.
+        assert!(
+            !bases.contains(&"timexer_segment_horizon_steps_scaling"),
+            "the retired cross-term-only base must not be scanned"
         );
         assert_eq!(
             HEADLINE_CHART_BASES.first(),

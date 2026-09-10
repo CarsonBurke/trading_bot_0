@@ -86,10 +86,20 @@ struct Cli {
 enum Commands {
     /// Benchmark complete long-history TimeXer training steps and GPU occupancy.
     BenchmarkTimexerSegment(torch::timexer_segment::benchmark::BenchmarkArgs),
+    /// Attribute host batch assembly cost component by component, on the real corpus, CPU only.
+    AuditTimexerSegmentLoader(torch::timexer_segment::benchmark::LoaderAuditArgs),
     /// Train upstream-style TimeXer on complete same-ticker OHLC segments.
     TrainTimexerSegment(torch::timexer_segment::runner::TrainArgs),
     /// Evaluate an authenticated OHLC segment checkpoint on held-out validation.
     EvaluateTimexerSegment(torch::timexer_segment::runner::EvaluateArgs),
+    /// Probe a frozen checkpoint's trunk latent for long-horizon information the head misses.
+    ProbeTimexerSegment(torch::timexer_segment::runner::ProbeArgs),
+    /// Measure the per-horizon predictable-information ceiling and the gap to a checkpoint.
+    CeilingTimexerSegment(torch::timexer_segment::runner::CeilingArgs),
+    /// Fit the per-coefficient target-basis statistics an orthonormal-basis arm needs.
+    BasisStatsTimexerSegment(torch::timexer_segment::runner::BasisStatsArgs),
+    /// Evaluate a continuous synchronized account on validation; terminal test remains locked.
+    EvaluateTimexerPortfolio(torch::timexer_segment::runner::PortfolioEvaluateArgs),
     /// Render direct-horizon forecasts against observed validation candles.
     TimexerCandles(torch::single_ticker_timexer::candles::CandleArgs),
     /// Measure TimeXer batch and training throughput with numerical equivalence checks.
@@ -1876,6 +1886,15 @@ async fn run() {
             tokio::task::spawn_blocking(move || torch::timexer_segment::benchmark::run(args))
                 .await.expect("TimeXer segment benchmark panicked").expect("TimeXer segment benchmark failed");
         }
+        Some(Commands::AuditTimexerSegmentLoader(args)) => {
+            let args = args.clone();
+            tokio::task::spawn_blocking(move || {
+                torch::timexer_segment::benchmark::loader_audit(args)
+            })
+            .await
+            .expect("TimeXer segment loader audit panicked")
+            .expect("TimeXer segment loader audit failed");
+        }
         Some(Commands::TrainTimexerSegment(args)) => {
             let args = args.clone();
             tokio::task::spawn_blocking(move || torch::timexer_segment::runner::train(args))
@@ -1885,6 +1904,30 @@ async fn run() {
             let args = args.clone();
             tokio::task::spawn_blocking(move || torch::timexer_segment::runner::evaluate(args))
                 .await.expect("TimeXer segment evaluation panicked").expect("TimeXer segment evaluation failed");
+        }
+        Some(Commands::ProbeTimexerSegment(args)) => {
+            let args = args.clone();
+            tokio::task::spawn_blocking(move || torch::timexer_segment::runner::probe(args))
+                .await.expect("TimeXer segment latent probe panicked").expect("TimeXer segment latent probe failed");
+        }
+        Some(Commands::CeilingTimexerSegment(args)) => {
+            let args = args.clone();
+            tokio::task::spawn_blocking(move || torch::timexer_segment::runner::ceiling(args))
+                .await.expect("TimeXer segment information ceiling panicked").expect("TimeXer segment information ceiling failed");
+        }
+        Some(Commands::BasisStatsTimexerSegment(args)) => {
+            let args = args.clone();
+            tokio::task::spawn_blocking(move || torch::timexer_segment::runner::basis_stats(args))
+                .await.expect("TimeXer segment target basis statistics panicked").expect("TimeXer segment target basis statistics failed");
+        }
+        Some(Commands::EvaluateTimexerPortfolio(args)) => {
+            let args = args.clone();
+            tokio::task::spawn_blocking(move || {
+                torch::timexer_segment::runner::evaluate_portfolio(args)
+            })
+            .await
+            .expect("TimeXer portfolio evaluation panicked")
+            .expect("TimeXer portfolio evaluation failed");
         }
         Some(Commands::TrainTimexer(args)) => {
             let args = args.clone();

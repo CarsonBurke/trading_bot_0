@@ -26,15 +26,137 @@ pub enum OptimizerKind {
 /// modded-nanogpt `train_gpt.py` Adam / NorMuon bases (`:2065-2076`).
 const NANOGPT_ADAMW_LR: f64 = 0.008;
 const NANOGPT_MUON_LR: f64 = 0.023;
-/// AdamW learning-rate multiplier for the learnable recipe scalars, from modded-nanogpt's
-/// `"scalars"` group (`train_gpt.py:2030`, `lr_mul: 5.0`).
-const NANOGPT_SCALAR_LR_MULTIPLIER: f64 = 5.0;
-const NANOGPT_COOLDOWN_FRAC: f64 = 0.60;
-const NANOGPT_COOLDOWN_FLOOR: f64 = 0.15;
+/// Reference AdamW learning-rate multiplier for the learnable recipe scalars, from
+/// modded-nanogpt's `"scalars"` group (`train_gpt.py:2030`, `lr_mul: 5.0`). The CLI default and
+/// nothing more: the multiplier a run actually used is [`RecipeKnobs::scalar_lr_mult`], stamped
+/// into the optimizer recipe string, because 5x was tuned against a step budget two orders of
+/// magnitude shorter than a corpus epoch here.
+pub const NANOGPT_SCALAR_LR_MULTIPLIER: f64 = 5.0;
+/// The fraction of the step BUDGET the warmdown occupies, and the multiplier it ends on:
+/// modded-nanogpt `train_gpt.py:1887-1890` (`cooldown_frac=0.60`) and `:1968-1976`. Public and
+/// passed explicitly into [`LrSchedule::new`] rather than read from inside it, because the pair
+/// only means anything against a stated endpoint - upstream's is its 1,270-step run, ours is
+/// [`LrSchedule::budget_steps`] - and a run that changes the shape has to change it at a call
+/// site that is visible in a diff.
+pub const NANOGPT_COOLDOWN_FRAC: f64 = 0.60;
+pub const NANOGPT_COOLDOWN_FLOOR: f64 = 0.15;
 const NANOGPT_MUON_WARMUP_STEPS: usize = 300;
 const NANOGPT_MUON_COOLDOWN_STEPS: usize = 50;
 const NANOGPT_MOMENTUM_MIN: f64 = 0.85;
 const NANOGPT_MOMENTUM_MAX: f64 = 0.95;
+/// The effective NorMuon learning-rate multiplier upstream gives the MLP-down matrix: shape
+/// multiplier 2 for storing it tall `[4D, D]` (`train_gpt.py:509-523`) times its `c_proj`
+/// group's own `lr_mul = 2` (`:1299-1301`). Ours stores that matrix `[D, 4D]`, so
+/// `ortho_aspect_scale` returns 1 for it and the whole factor has to arrive as an `lr_scale`;
+/// see [`MlpDownLr`]. LR-only: nothing about the storage or the forward pass moves.
+pub const UPSTREAM_MLP_DOWN_LR_MULTIPLIER: f64 = 4.0;
+
+/// The run-level optimizer knobs that are configuration rather than recipe constants, threaded
+/// from the CLI so that a checkpoint's `optimizer_recipe` string names the numbers its weights
+/// were actually produced with.
+#[derive(Clone, Copy, Debug)]
+pub struct RecipeKnobs {
+    /// AdamW learning-rate multiplier for the scalar banks in [`scalar_lr_banks`].
+    pub scalar_lr_mult: f64,
+    /// Whether the `lambdas.x0` bank exists, which decides how many banks there are to route.
+    pub x0_lambdas: X0Lambdas,
+    /// The shape and endpoint every family's rate follows.
+    pub schedule: LrSchedule,
+    /// Whether the MLP-down matrix runs at the effective rate upstream gives it.
+    pub mlp_down_lr: MlpDownLr,
+}
+
+impl RecipeKnobs {
+    /// The reference recipe at a FLAT schedule: 5x scalars, learned x0 injection, our own
+    /// transposed MLP-down rate.
+    ///
+    /// The harnesses that take this - the fused/reference equivalence check, the capture audit,
+    /// the routing tests - compare steps against each other, so a moving rate would be a second
+    /// variable in every one of them. A training run states its budget instead.
+    pub fn reference(x0_lambdas: X0Lambdas) -> Self {
+        Self {
+            scalar_lr_mult: NANOGPT_SCALAR_LR_MULTIPLIER,
+            x0_lambdas,
+            schedule: LrSchedule::flat(),
+            mlp_down_lr: MlpDownLr::AspectOnly,
+        }
+    }
+}
+
+/// Which effective learning rate the block MLP-down matrix runs at.
+///
+/// Upstream stores both MLP matrices tall `[4D, D]`, so `max(1, rows/cols).sqrt()` hands both a
+/// shape multiplier of 2, and it then gives the down matrix's group a further `lr_mul = 2`
+/// (`train_gpt.py:509-523,1299-1301`): 2x up, 4x down. We store down as `[D, 4D]`, whose
+/// aspect scale is 1, and had no override - so on 8,388,608 trunk weights our effective rate
+/// was a quarter of upstream's. This selects between the two; it changes no storage and no
+/// forward pass, and under `quadratic_lr_weight_decay` it carries the same weight-decay factor
+/// upstream's `lr_mul` carries, because both enter the decay through exactly one of its two
+/// learning-rate factors (`optim/muon.rs:141-146`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, clap::ValueEnum)]
+pub enum MlpDownLr {
+    /// The rate our transposed storage implies on its own: aspect 1, no override.
+    #[default]
+    #[value(name = "aspect-only")]
+    AspectOnly,
+    /// Four times the base rate, the effective rate upstream applies.
+    #[value(name = "upstream-4x")]
+    Upstream4x,
+}
+
+impl MlpDownLr {
+    /// The `lr_scale` the MLP-down matrices take. Multiplies their aspect scale of 1.
+    pub fn multiplier(self) -> f64 {
+        match self {
+            Self::AspectOnly => 1.0,
+            Self::Upstream4x => UPSTREAM_MLP_DOWN_LR_MULTIPLIER,
+        }
+    }
+
+    fn stamp(self) -> &'static str {
+        match self {
+            Self::AspectOnly => "aspect-only-1x",
+            Self::Upstream4x => "upstream-4x",
+        }
+    }
+}
+
+/// The AdamW parameter-name fragments that take the scalar learning-rate multiplier, and the
+/// only place their number is decided. `polar_express` routes exactly this slice and asserts one
+/// match per entry, and [`OptimizerKind::recipe`] stamps this same slice into the recipe string,
+/// so a bank cannot be routed without being recorded or recorded without being routed.
+///
+/// `lambdas.post` is deliberately absent - the reference runs the post lambdas at 1x
+/// (`train_gpt.py:2035`) - and so is `block_*.value_lambda`, whose reference 0.02 is a scalar
+/// group's BASE rate rather than a multiplier over an AdamW base.
+fn scalar_lr_banks(x0_lambdas: X0Lambdas) -> &'static [&'static str] {
+    match x0_lambdas {
+        X0Lambdas::Enabled => &["lambdas.resid", "lambdas.x0", "skip_weights"],
+        X0Lambdas::Disabled => &["lambdas.resid", "skip_weights"],
+    }
+}
+
+/// The block's MLP-down matrix, `[d_model, ffn]`, named `second` by
+/// `CausalPatchBlock::new` (`model.rs:631`). The one name [`MlpDownLr`] routes on.
+const MLP_DOWN_MATRIX: &str = ".second.weight";
+
+/// One representative parameter per family whose REALIZED learning rate can differ from
+/// another's, and the label the trajectory chart gives it.
+///
+/// The four NorMuon entries are four different numbers even at one base rate, because
+/// `ortho_aspect_scale` derives a per-matrix multiplier from the registered shape - packed QKV
+/// is `[3D, D]`, so √3; attention-O is square, so 1; MLP-up is `[4D, D]`, so 2; MLP-down is
+/// `[D, 4D]`, so 1 times whatever [`MlpDownLr`] gives it. Layer 0 stands for every layer: the
+/// four shapes and their `lr_scales` are identical across the stack, and adding a per-layer
+/// schedule would have to add its own labels here.
+const LR_FAMILIES: &[(&str, &str)] = &[
+    ("NorMuon packed QKV", "block_0.qkv.weight"),
+    ("NorMuon attention output", "block_0.output.weight"),
+    ("NorMuon MLP up", "block_0.first.weight"),
+    ("NorMuon MLP down", "block_0.second.weight"),
+    ("AdamW dense", "head.output.weight"),
+    ("AdamW recipe scalars", "lambdas.resid"),
+];
 
 impl OptimizerKind {
     pub fn default_learning_rate(self) -> f64 {
@@ -48,52 +170,219 @@ impl OptimizerKind {
         (self == Self::PolarExpress).then_some(learning_rate * (NANOGPT_MUON_LR / NANOGPT_ADAMW_LR))
     }
 
-    pub fn recipe(self) -> &'static str {
+    /// `-v2`: the learning-rate schedule is no longer one ported constant, so the recipe states
+    /// the budget it was shaped against and the MLP-down effective rate the trunk ran at. The
+    /// superseded `…-v1` strings named `nanogpt-cooldown-frac=.60-floor=.15` with no endpoint,
+    /// which described a shape without the number that gives it a scale.
+    pub fn recipe(self, knobs: RecipeKnobs) -> String {
         match self {
-            Self::PolarExpress => {
-                "normuon-pe5-block-hidden2D-only;patch-covariates-norm-bias-lambda-vlambda-skipw-head-AdamW;lambda-vlambda-skipw-noWD;resid-x0-lambda-skipw-lrmul=5;muonLR=.023;adamwLR=.008;muonWD=1.2;adamwWD=.005;head-embed-wd_mul=150;quadraticWD;cautiousWD;b2=.9;nesterov;momentum=.85-to-.95-over300-cd50;AdamWbetas=.9,.95;eps=1e-10;AdamWevery=1;stepgraphs;nanogpt-cooldown-frac=.60-floor=.15-v1"
-            }
-            Self::Adam => {
-                "Adam-fp32-masters;betas=.9,.999;eps=1e-8;WD=0;nanogpt-cooldown-frac=.60-floor=.15-v1"
-            }
+            Self::PolarExpress => format!(
+                "normuon-pe5-block-hidden2D-only;patch-covariates-norm-bias-lambda-vlambda-skipw-head-AdamW;lambda-vlambda-skipw-noWD;x0-lambdas={};{}-lrmul={};muonLR=.023;adamwLR=.008;muonWD=1.2;adamwWD=.005;head-embed-wd_mul=150;quadraticWD;cautiousWD;b2=.9;nesterov;momentum=.85-to-.95-over300-cd50;AdamWbetas=.9,.95;eps=1e-10;AdamWevery=1;stepgraphs;mlp-down-lr={};{}-v2",
+                match knobs.x0_lambdas {
+                    X0Lambdas::Enabled => "enabled",
+                    X0Lambdas::Disabled => "disabled",
+                },
+                scalar_lr_banks(knobs.x0_lambdas).join("+"),
+                knobs.scalar_lr_mult,
+                knobs.mlp_down_lr.stamp(),
+                knobs.schedule.stamp(),
+            ),
+            Self::Adam => format!(
+                "Adam-fp32-masters;betas=.9,.999;eps=1e-8;WD=0;{}-v2",
+                knobs.schedule.stamp()
+            ),
         }
     }
 }
 
-/// Step multiplier from modded-nanogpt `TrainingSchedule.get_lr` without the
-/// batch-size stage bumps (`train_gpt.py:1968-1976`, `cooldown_frac=0.60`).
-pub fn nanogpt_lr_scale(step: usize, scheduled_steps: usize) -> f64 {
-    if scheduled_steps == 0 {
-        return 1.0;
-    }
-    let cooldown_start =
-        ((scheduled_steps as f64) * (1.0 - NANOGPT_COOLDOWN_FRAC)).floor() as usize;
-    if step < cooldown_start {
-        return 1.0;
-    }
-    let span = (scheduled_steps - cooldown_start).max(1) as f64;
-    let t = ((step - cooldown_start) as f64 / span).clamp(0.0, 1.0);
-    (1.0 - t) + NANOGPT_COOLDOWN_FLOOR * t
+/// The shape and endpoint the learning-rate warmdown is drawn against, stated rather than
+/// inherited.
+///
+/// modded-nanogpt's `get_lr` holds the base rate for the first `1 - cooldown_frac` of the run
+/// and then interpolates linearly to `floor` times the base rate at the endpoint
+/// (`train_gpt.py:1968-1976`). The endpoint is the only number that gives that shape a scale,
+/// and upstream's is its own 1,270-step run. Ours used to be `steps_per_epoch * epochs` -
+/// 9,590 steps at batch 256 - for no reason other than that being how many steps an epoch
+/// happens to contain, which put the cooldown's first step at 3,836 while every measured arm
+/// reaches its best held-out NLL at step 2,000 and degrades from there. So the budget is a
+/// knob of its own: a run may be shaped against 5,000 steps and still be allowed to run
+/// further, in which case it holds `floor` times the base rate past step 5,000 instead of
+/// never arriving at it.
+///
+/// The budget shapes the NorMuon momentum cooldown too ([`Self::muon_momentum`]), exactly as
+/// upstream shapes both against the same `num_steps`. A shortened budget therefore also moves
+/// the last 50 steps' momentum rampdown to the end of the budget; that is one coupled
+/// consequence, and it is 50 steps of 0.95 to 0.85, not a second free parameter.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct LrSchedule {
+    budget_steps: usize,
+    cooldown_frac: f64,
+    floor: f64,
 }
 
-/// NorMuon momentum from modded-nanogpt `get_muon_momentum` (`train_gpt.py:1995-2007`).
-pub fn nanogpt_muon_momentum(step: usize, scheduled_steps: usize) -> f64 {
-    if scheduled_steps == 0 {
-        return NANOGPT_MOMENTUM_MAX;
+impl LrSchedule {
+    /// `budget_steps` is the endpoint the shape is drawn against, in optimizer steps, and is
+    /// independent of how many steps the run is allowed to take. `cooldown_frac` is the share
+    /// of that budget the warmdown occupies and `floor` the multiplier it ends on; the
+    /// reference pair is [`NANOGPT_COOLDOWN_FRAC`] and [`NANOGPT_COOLDOWN_FLOOR`].
+    pub fn new(budget_steps: usize, cooldown_frac: f64, floor: f64) -> Result<Self> {
+        ensure!(
+            budget_steps > 0,
+            "a schedule budget of 0 steps has no endpoint to cool down to; \
+             LrSchedule::flat() is the deliberate no-warmdown schedule"
+        );
+        ensure!(
+            cooldown_frac.is_finite() && (0.0..=1.0).contains(&cooldown_frac),
+            "the cooldown fraction is a share of the {budget_steps}-step budget, got \
+             {cooldown_frac}"
+        );
+        ensure!(
+            floor.is_finite() && (0.0..=1.0).contains(&floor),
+            "the cooldown floor is a multiplier on the base rate, got {floor}"
+        );
+        Ok(Self {
+            budget_steps,
+            cooldown_frac,
+            floor,
+        })
     }
-    let cooldown_start = scheduled_steps.saturating_sub(NANOGPT_MUON_COOLDOWN_STEPS);
-    if step < NANOGPT_MUON_WARMUP_STEPS {
-        let frac = step as f64 / NANOGPT_MUON_WARMUP_STEPS as f64;
-        NANOGPT_MOMENTUM_MIN + frac * (NANOGPT_MOMENTUM_MAX - NANOGPT_MOMENTUM_MIN)
-    } else if step > cooldown_start {
-        let frac = ((step - cooldown_start) as f64 / NANOGPT_MUON_COOLDOWN_STEPS as f64).min(1.0);
-        NANOGPT_MOMENTUM_MAX - frac * (NANOGPT_MOMENTUM_MAX - NANOGPT_MOMENTUM_MIN)
-    } else {
-        NANOGPT_MOMENTUM_MAX
+
+    /// No warmdown: every step runs at the base rate and the momentum stays at its maximum.
+    ///
+    /// For the harnesses that compare steps against each other - the fused/reference
+    /// equivalence check, the capture audit, the routing tests - where a moving rate would be
+    /// a second variable. Not a training recipe: a training run states its budget.
+    pub const fn flat() -> Self {
+        Self {
+            budget_steps: 0,
+            cooldown_frac: NANOGPT_COOLDOWN_FRAC,
+            floor: NANOGPT_COOLDOWN_FLOOR,
+        }
+    }
+
+    pub fn budget_steps(self) -> usize {
+        self.budget_steps
+    }
+
+    pub fn cooldown_frac(self) -> f64 {
+        self.cooldown_frac
+    }
+
+    pub fn floor(self) -> f64 {
+        self.floor
+    }
+
+    /// The first step that runs below the base rate, `None` under [`Self::flat`].
+    pub fn cooldown_start(self) -> Option<usize> {
+        (self.budget_steps > 0)
+            .then(|| ((self.budget_steps as f64) * (1.0 - self.cooldown_frac)).floor() as usize)
+    }
+
+    /// The multiplier every family's base rate takes at `step`.
+    pub fn scale(self, step: usize) -> f64 {
+        let Some(cooldown_start) = self.cooldown_start() else {
+            return 1.0;
+        };
+        if step < cooldown_start {
+            return 1.0;
+        }
+        let span = (self.budget_steps - cooldown_start).max(1) as f64;
+        let t = ((step - cooldown_start) as f64 / span).clamp(0.0, 1.0);
+        (1.0 - t) + self.floor * t
+    }
+
+    /// NorMuon momentum from modded-nanogpt `get_muon_momentum` (`train_gpt.py:1995-2007`),
+    /// whose cooldown hangs off the same endpoint as the rate's.
+    pub fn muon_momentum(self, step: usize) -> f64 {
+        if self.budget_steps == 0 {
+            return NANOGPT_MOMENTUM_MAX;
+        }
+        let cooldown_start = self.budget_steps.saturating_sub(NANOGPT_MUON_COOLDOWN_STEPS);
+        if step < NANOGPT_MUON_WARMUP_STEPS {
+            let frac = step as f64 / NANOGPT_MUON_WARMUP_STEPS as f64;
+            NANOGPT_MOMENTUM_MIN + frac * (NANOGPT_MOMENTUM_MAX - NANOGPT_MOMENTUM_MIN)
+        } else if step > cooldown_start {
+            let frac = ((step - cooldown_start) as f64 / NANOGPT_MUON_COOLDOWN_STEPS as f64).min(1.0);
+            NANOGPT_MOMENTUM_MAX - frac * (NANOGPT_MOMENTUM_MAX - NANOGPT_MOMENTUM_MIN)
+        } else {
+            NANOGPT_MOMENTUM_MAX
+        }
+    }
+
+    /// The recipe-string fragment. Carries the resolved cooldown start, because that step is
+    /// the quantity a run is compared against and nobody should have to recompute a floor of a
+    /// product to read it.
+    fn stamp(self) -> String {
+        match self.cooldown_start() {
+            None => "schedule=flat-no-warmdown".to_owned(),
+            Some(start) => format!(
+                "schedule-budget={}-cooldown-frac={}-floor={}-cooldown-start={start}",
+                self.budget_steps, self.cooldown_frac, self.floor
+            ),
+        }
     }
 }
 
-fn polar_express(named: &[(String, Tensor)], learning_rate: f64) -> Muon {
+/// The realized per-family learning rates, one row per optimizer step.
+///
+/// Recorded from the optimizer's state after the step that used it - never from the schedule
+/// function - because `lr_scales` and the per-matrix aspect scale are exactly what make a
+/// family's applied rate differ from the base rate, and a chart of the intended schedule would
+/// hide the discrepancies this record exists to expose.
+///
+/// One `f64` per family per step in one flat buffer, appended in place: at 9,590 steps and six
+/// families that is 460 KB of host memory for the whole run, no device work, no
+/// synchronization, and no per-step allocation once the buffer has grown.
+#[derive(Debug)]
+pub struct LrTrajectory {
+    labels: Vec<&'static str>,
+    steps: Vec<u64>,
+    /// `steps.len() * labels.len()` rates, row-major by step.
+    rates: Vec<f64>,
+}
+
+impl LrTrajectory {
+    /// Sized against the run so the whole trajectory is one allocation.
+    pub fn new(engine: &Engine, expected_steps: usize) -> Self {
+        let labels = engine.learning_rate_labels();
+        Self {
+            steps: Vec::with_capacity(expected_steps),
+            rates: Vec::with_capacity(expected_steps * labels.len()),
+            labels,
+        }
+    }
+
+    /// Record what `step` ran at. Called AFTER the step, when the engine still holds the rates
+    /// that step applied.
+    pub fn record(&mut self, step: usize, engine: &Engine) -> Result<()> {
+        let before = self.rates.len();
+        engine.push_realized_learning_rates(&mut self.rates)?;
+        ensure!(
+            self.rates.len() - before == self.labels.len(),
+            "the optimizer reported {} learning-rate families, not the {} it was constructed with",
+            self.rates.len() - before,
+            self.labels.len()
+        );
+        self.steps.push(step as u64);
+        Ok(())
+    }
+
+    pub fn labels(&self) -> &[&'static str] {
+        &self.labels
+    }
+
+    pub fn steps(&self) -> &[u64] {
+        &self.steps
+    }
+
+    /// The recorded rates of one family, in step order.
+    pub fn series(&self, family: usize) -> impl Iterator<Item = f64> + '_ {
+        let stride = self.labels.len();
+        self.rates.iter().skip(family).step_by(stride).copied()
+    }
+}
+
+fn polar_express(named: &[(String, Tensor)], learning_rate: f64, knobs: RecipeKnobs) -> Muon {
     let mut optimizer = Muon::new_named(
         named,
         MuonConfig {
@@ -155,18 +444,43 @@ fn polar_express(named: &[(String, Tensor)], learning_rate: f64) -> Muon {
     // open, so neither can run at the rate a 512x512 matrix's per-coordinate step wants. The
     // value residual's `block_*.value_lambda` deliberately stays at 1x: the reference's 0.02 is
     // its scalar group's BASE learning rate, not a multiplier over an AdamW base.
+    //
+    // The MULTIPLIER is the run's, not the reference's: 5x was tuned on a few-thousand-step
+    // language-model run, and one scalar per layer moving the whole residual stream at 5x the
+    // matrix rate is the first suspect for lambdas that oscillate instead of settling.
+    //
     // The count is asserted here, not only in
     // `every_causal_patch_parameter_lands_in_its_intended_optimizer_group`: a silent zero-match
-    // leaves the banks at 1x, and a rename should fail loudly at construction rather than train
-    // a differently-tuned model. Same reason the disjointness below is an assert.
+    // leaves the banks at 1x, and a rename - or a bank that stops existing without
+    // `scalar_lr_banks` being told - should fail loudly at construction rather than train a
+    // differently-tuned model. Same reason the disjointness below is an assert.
+    let banks = scalar_lr_banks(knobs.x0_lambdas);
     assert_eq!(
-        optimizer.set_named_lr_scale(
-            &["lambdas.resid", "lambdas.x0", "skip_weights"],
-            NANOGPT_SCALAR_LR_MULTIPLIER
-        ),
-        3,
-        "the residual lambdas, the x0 lambdas and the U-net skip logits must each take the 5x \
-         Adam learning rate exactly once"
+        optimizer.set_named_lr_scale(banks, knobs.scalar_lr_mult),
+        banks.len(),
+        "each of {banks:?} must take the {}x Adam learning rate exactly once",
+        knobs.scalar_lr_mult
+    );
+    // The MLP-down effective rate, the one place its number is decided. Asserted for the same
+    // reason the banks above are: a silent zero-match would leave 8.4M trunk weights at a rate
+    // nobody chose, and `MLP_DOWN_MATRIX` is a name this module does not own.
+    //
+    // Always applied, including the 1x case, so that a rename of the block's second matrix
+    // fails at construction under either mode rather than only under one of them.
+    let down = named
+        .iter()
+        .filter(|(name, _)| name.starts_with("block_") && name.ends_with(MLP_DOWN_MATRIX))
+        .count();
+    assert!(
+        down > 0,
+        "no block parameter ends in {MLP_DOWN_MATRIX}: the MLP-down learning rate has nothing \
+         to route"
+    );
+    assert_eq!(
+        optimizer.set_named_lr_scale(&[MLP_DOWN_MATRIX], knobs.mlp_down_lr.multiplier()),
+        down,
+        "each of the {down} MLP-down matrices must take the {:?} rate exactly once",
+        knobs.mlp_down_lr
     );
     let muon: HashSet<_> = optimizer.muon_param_names().into_iter().collect();
     let adamw: HashSet<_> = optimizer.adamw_param_names().into_iter().collect();
@@ -194,7 +508,7 @@ fn polar_express(named: &[(String, Tensor)], learning_rate: f64) -> Muon {
 
 use super::{
     corpus::Batch,
-    model::{CausalPatchModel, Losses, ModelConfig},
+    model::{CausalPatchModel, Losses, ModelConfig, X0Lambdas},
 };
 
 const MIB: f64 = 1048576.;
@@ -340,7 +654,11 @@ pub struct Engine {
     optimizer: Optimizer,
     completed_steps: usize,
     base_lr: f64,
-    scheduled_steps: usize,
+    /// The shape the rate follows, and the one place the run's step budget lives.
+    schedule: LrSchedule,
+    /// The AdamW-family rate LAST HANDED to the optimizer, so that a report states the number
+    /// a step ran at rather than what the schedule function would say about its index.
+    applied_lr: f64,
     device: Device,
     /// Every trainable parameter, for the gradient-address check the capture protocol
     /// depends on. Shallow clones: they share the store's storage.
@@ -361,13 +679,17 @@ impl Engine {
     pub fn new(
         store: &nn::VarStore,
         learning_rate: f64,
+        knobs: RecipeKnobs,
         fused: bool,
         kind: OptimizerKind,
-        scheduled_steps: usize,
     ) -> Result<Self> {
         ensure!(
             learning_rate.is_finite() && learning_rate > 0.,
             "invalid learning rate"
+        );
+        ensure!(
+            knobs.scalar_lr_mult.is_finite() && knobs.scalar_lr_mult > 0.,
+            "the scalar learning-rate multiplier must be positive"
         );
         let device = store.device();
         // One pool for the whole process, minted before anything can capture into a pool
@@ -395,7 +717,7 @@ impl Engine {
             None => None,
         };
         let optimizer = if kind == OptimizerKind::PolarExpress {
-            let mut muon = polar_express(&named_trainable_variables(store), learning_rate);
+            let mut muon = polar_express(&named_trainable_variables(store), learning_rate, knobs);
             if let Some(pool) = &graph_pool {
                 muon.install_graph_pool(Arc::clone(pool));
             }
@@ -434,7 +756,8 @@ impl Engine {
             optimizer,
             completed_steps: 0,
             base_lr: learning_rate,
-            scheduled_steps,
+            schedule: knobs.schedule,
+            applied_lr: learning_rate,
             device,
             parameters: store.trainable_variables(),
             resident: None,
@@ -446,14 +769,50 @@ impl Engine {
         Ok(engine)
     }
 
+    /// The AdamW-family rate the last step actually ran at, read back rather than recomputed.
     pub fn learning_rate(&self) -> f64 {
-        let step = self.completed_steps.saturating_sub(1);
-        self.base_lr * nanogpt_lr_scale(step, self.scheduled_steps)
+        self.applied_lr
+    }
+
+    pub fn schedule(&self) -> LrSchedule {
+        self.schedule
+    }
+
+    /// The label of each family [`Self::push_realized_learning_rates`] emits, in that order.
+    pub fn learning_rate_labels(&self) -> Vec<&'static str> {
+        match &self.optimizer {
+            Optimizer::PolarExpress(_) => LR_FAMILIES.iter().map(|(label, _)| *label).collect(),
+            _ => vec!["Adam"],
+        }
+    }
+
+    /// Append the rate each family will apply on its next step, in [`LR_FAMILIES`] order.
+    ///
+    /// Read out of the optimizer's own state - `cfg.lr`, the parameter's `lr_scale`, its
+    /// per-matrix aspect scale and whether its step is enabled - which is the state the device
+    /// step scalars are published from, so this cannot disagree with what the step applied.
+    /// Recomputing [`LrSchedule::scale`] here would instead report the INTENDED rate and hide
+    /// every per-family multiplier, which is the whole reason the chart exists. Host-only: no
+    /// device read, no synchronization.
+    pub fn push_realized_learning_rates(&self, out: &mut Vec<f64>) -> Result<()> {
+        match &self.optimizer {
+            Optimizer::PolarExpress(optimizer) => {
+                for (label, parameter) in LR_FAMILIES {
+                    out.push(
+                        optimizer
+                            .applied_learning_rate(parameter)
+                            .with_context(|| format!("{label}'s representative parameter {parameter} is not in the optimizer"))?,
+                    );
+                }
+            }
+            // One group, no per-parameter scales: the rate handed to it IS the applied rate.
+            _ => out.push(self.applied_lr),
+        }
+        Ok(())
     }
 
     fn apply_schedule(&mut self) -> Result<()> {
-        let scale = nanogpt_lr_scale(self.completed_steps, self.scheduled_steps);
-        let adamw_lr = self.base_lr * scale;
+        let adamw_lr = self.base_lr * self.schedule.scale(self.completed_steps);
         match &mut self.optimizer {
             Optimizer::PolarExpress(optimizer) => {
                 optimizer.set_lr(
@@ -462,10 +821,7 @@ impl Engine {
                         .unwrap(),
                 );
                 optimizer.set_adamw_lr(adamw_lr);
-                optimizer.set_momentum(nanogpt_muon_momentum(
-                    self.completed_steps,
-                    self.scheduled_steps,
-                ));
+                optimizer.set_momentum(self.schedule.muon_momentum(self.completed_steps));
             }
             Optimizer::Native(optimizer) => optimizer.set_lr(adamw_lr),
             Optimizer::Fused(optimizer) => Python::attach(|py| -> Result<()> {
@@ -475,6 +831,7 @@ impl Engine {
                 Ok(())
             })?,
         }
+        self.applied_lr = adamw_lr;
         Ok(())
     }
 
@@ -857,7 +1214,13 @@ fn audit_phase(
     tch::Cuda::manual_seed_all(AUDIT_SEED as u64);
     let store = nn::VarStore::new(device);
     let model = CausalPatchModel::new(&store.root(), config);
-    let mut engine = Engine::new(&store, learning_rate, fused, kind, 0)?;
+    let mut engine = Engine::new(
+        &store,
+        learning_rate,
+        RecipeKnobs::reference(config.x0_lambdas),
+        fused,
+        kind,
+    )?;
     let mut budget = None;
     for step in 0..=CAPTURE_AFTER_STEPS {
         if capture && step == CAPTURE_AFTER_STEPS {
@@ -1101,6 +1464,10 @@ mod tests {
 
     #[test]
     fn polar_express_routes_only_hidden_matrices_and_keeps_readout_on_adamw() {
+        // A varstore variable's init is a DRAW from the process-global generator; see
+        // `torch::test_rng`. This test does not care what it draws, only that it must not
+        // perturb a seeded test running beside it.
+        let _rng = crate::torch::test_rng::shared();
         let store = nn::VarStore::new(Device::Cpu);
         for (path, name, shape) in [
             ("block_0.qkv", "weight", vec![24, 8]),
@@ -1127,7 +1494,8 @@ mod tests {
         // are outside the `block_*` allowlist and so cannot reach NorMuon.
         let _ = store.root().var("skip_weights", &[4], nn::Init::Const(-1.5));
         let named = named_trainable_variables(&store);
-        let optimizer = polar_express(&named, NANOGPT_ADAMW_LR);
+        let reference = RecipeKnobs::reference(X0Lambdas::Enabled);
+        let optimizer = polar_express(&named, NANOGPT_ADAMW_LR, reference);
         assert_eq!(optimizer.muon_param_names().len(), 4);
         assert_eq!(optimizer.adamw_param_names().len(), 10);
         let (lr_scale, betas, wd_multiplier) = optimizer
@@ -1166,9 +1534,9 @@ mod tests {
         let mut engine = Engine::new(
             &store,
             NANOGPT_ADAMW_LR,
+            reference,
             true,
             OptimizerKind::PolarExpress,
-            0,
         )
         .unwrap();
         engine.set_lr(NANOGPT_ADAMW_LR / 2.0).unwrap();
@@ -1188,8 +1556,9 @@ mod tests {
     /// parameter list is pinned here rather than spot-checked.
     #[test]
     fn every_causal_patch_parameter_lands_in_its_intended_optimizer_group() {
-        let store = nn::VarStore::new(Device::Cpu);
-        let config = ModelConfig {
+        // Model construction draws; see `torch::test_rng`.
+        let _rng = crate::torch::test_rng::shared();
+        let base = ModelConfig {
             seq_len: 96,
             pred_len: 8,
             patch_len: 8,
@@ -1200,109 +1569,386 @@ mod tests {
             min_history: 8,
             ..Default::default()
         };
-        let _model = CausalPatchModel::new(&store.root(), &config);
-        let named = named_trainable_variables(&store);
-        let optimizer = polar_express(&named, NANOGPT_ADAMW_LR);
-        let muon = optimizer.muon_param_names();
-        let mut expected_muon: Vec<String> = (0..config.layers)
-            .flat_map(|layer| {
-                ["qkv", "output", "first", "second"]
-                    .into_iter()
-                    .map(move |projection| format!("block_{layer}.{projection}.weight"))
-            })
-            .collect();
-        expected_muon.sort();
-        let mut sorted_muon = muon.clone();
-        sorted_muon.sort();
-        assert_eq!(
-            sorted_muon, expected_muon,
-            "NorMuon must hold exactly the four hidden matrices per block - no norm gains \
-             (the RMSNorm is gainless), no biases (the block projections have none), and no \
-             recipe scalars"
-        );
-        // Every remaining parameter, with the group settings the reference prescribes:
-        // `(lr scale, betas, weight-decay multiplier)`.
-        for (name, lr_scale, wd_mul) in [
-            ("lambdas.resid", 5.0, 0.0),
-            ("lambdas.post", 1.0, 0.0),
-            ("lambdas.x0", 5.0, 0.0),
-            ("patch.weight", 1.0, 150.0),
-            ("patch.bias", 1.0, 0.0),
-            ("head.hidden.weight", 1.0, 150.0),
-            ("head.hidden.bias", 1.0, 0.0),
-            ("head.output.weight", 1.0, 150.0),
-            ("head.output.bias", 1.0, 0.0),
+        // Both x0 modes, at DIFFERENT multipliers: the routing must follow the mode and the
+        // scale must follow the flag, and the store's entry count must record the mode.
+        let mut registered = Vec::new();
+        for (mode, multiplier, lambda_banks) in [
+            (X0Lambdas::Enabled, NANOGPT_SCALAR_LR_MULTIPLIER, 3usize),
+            (X0Lambdas::Disabled, 1.0, 2usize),
         ] {
-            let (scale, betas, decay) = optimizer
-                .adamw_group_settings(name)
-                .unwrap_or_else(|| panic!("{name} is not an AdamW parameter"));
-            assert!(
-                (scale - lr_scale).abs() < 1e-12,
-                "{name} learning-rate scale is {scale}, expected {lr_scale}"
+            let config = ModelConfig {
+                x0_lambdas: mode,
+                ..base.clone()
+            };
+            let store = nn::VarStore::new(Device::Cpu);
+            let _model = CausalPatchModel::new(&store.root(), &config);
+            let named = named_trainable_variables(&store);
+            registered.push(named.len());
+            let optimizer = polar_express(
+                &named,
+                NANOGPT_ADAMW_LR,
+                RecipeKnobs {
+                    scalar_lr_mult: multiplier,
+                    ..RecipeKnobs::reference(mode)
+                },
             );
-            assert!(
-                (decay - wd_mul).abs() < 1e-12,
-                "{name} weight-decay multiplier is {decay}, expected {wd_mul}"
+            let muon = optimizer.muon_param_names();
+            let mut expected_muon: Vec<String> = (0..config.layers)
+                .flat_map(|layer| {
+                    ["qkv", "output", "first", "second"]
+                        .into_iter()
+                        .map(move |projection| format!("block_{layer}.{projection}.weight"))
+                })
+                .collect();
+            expected_muon.sort();
+            let mut sorted_muon = muon.clone();
+            sorted_muon.sort();
+            assert_eq!(
+                sorted_muon, expected_muon,
+                "NorMuon must hold exactly the four hidden matrices per block - no norm gains \
+                 (the RMSNorm is gainless), no biases (the block projections have none), and no \
+                 recipe scalars"
             );
-            assert_eq!(betas, (0.9, 0.95), "{name} betas");
-        }
-        // And nothing outside those two lists exists: the union is the whole store, which
-        // `polar_express` already asserts, so it is enough to pin the AdamW count.
-        let lambda_banks = 3;
-        let per_block = 4;
-        assert_eq!(
-            muon.len(),
-            per_block * config.layers,
-            "one hidden matrix group per block projection"
-        );
-        assert_eq!(
-            optimizer.adamw_param_names().len(),
-            named.len() - per_block * config.layers,
-            "every non-hidden parameter is AdamW"
-        );
-        assert!(
-            optimizer
-                .adamw_param_names()
-                .iter()
-                .filter(|name| name.starts_with("lambdas."))
-                .count()
-                == lambda_banks,
-            "all three lambda banks are AdamW-routed"
-        );
-        for (name, tensor) in &named {
-            if name.starts_with("lambdas.") {
-                assert_eq!(
-                    tensor.dim(),
-                    1,
-                    "{name} must stay 1-D: a 2-D lambda bank is what NorMuon's router looks \
-                     for (optim/muon.rs:1316)"
+            for name in &muon {
+                let tensor = named
+                    .iter()
+                    .find(|(candidate, _)| candidate == name)
+                    .map(|(_, tensor)| tensor)
+                    .expect("every routed name is a store parameter");
+                assert!(
+                    name.starts_with("block_") && name.ends_with(".weight") && tensor.dim() == 2,
+                    "{name} reached NorMuon without being a 2-D block matrix"
                 );
             }
+            // Every remaining parameter, with the group settings the reference prescribes:
+            // `(lr scale, betas, weight-decay multiplier)`. The residual lambdas and the skip
+            // logits take the run's multiplier; the post lambdas stay at 1x.
+            let mut expected = vec![
+                ("lambdas.resid", multiplier, 0.0),
+                ("lambdas.post", 1.0, 0.0),
+                ("skip_weights", multiplier, 0.0),
+                ("patch.weight", 1.0, 150.0),
+                ("patch.bias", 1.0, 0.0),
+                ("head.hidden.weight", 1.0, 150.0),
+                ("head.hidden.bias", 1.0, 0.0),
+                ("head.output.weight", 1.0, 150.0),
+                ("head.output.bias", 1.0, 0.0),
+            ];
+            if mode.enabled() {
+                expected.push(("lambdas.x0", multiplier, 0.0));
+            } else {
+                assert!(
+                    optimizer.adamw_group_settings("lambdas.x0").is_none(),
+                    "the x0 bank must not exist at all under {mode:?}"
+                );
+            }
+            for (name, lr_scale, wd_mul) in expected {
+                let (scale, betas, decay) = optimizer
+                    .adamw_group_settings(name)
+                    .unwrap_or_else(|| panic!("{name} is not an AdamW parameter"));
+                assert!(
+                    (scale - lr_scale).abs() < 1e-12,
+                    "{name} learning-rate scale is {scale}, expected {lr_scale}"
+                );
+                assert!(
+                    (decay - wd_mul).abs() < 1e-12,
+                    "{name} weight-decay multiplier is {decay}, expected {wd_mul}"
+                );
+                assert_eq!(betas, (0.9, 0.95), "{name} betas");
+            }
+            // And nothing outside those two lists exists: the union is the whole store, which
+            // `polar_express` already asserts, so it is enough to pin the AdamW count.
+            let per_block = 4;
+            assert_eq!(
+                muon.len(),
+                per_block * config.layers,
+                "one hidden matrix group per block projection"
+            );
+            assert_eq!(
+                optimizer.adamw_param_names().len(),
+                named.len() - per_block * config.layers,
+                "every non-hidden parameter is AdamW"
+            );
+            assert_eq!(
+                optimizer
+                    .adamw_param_names()
+                    .iter()
+                    .filter(|name| name.starts_with("lambdas."))
+                    .count(),
+                lambda_banks,
+                "{mode:?} must present exactly {lambda_banks} AdamW-routed lambda banks"
+            );
+            for (name, tensor) in &named {
+                if name.starts_with("lambdas.") {
+                    assert_eq!(
+                        tensor.dim(),
+                        1,
+                        "{name} must stay 1-D: a 2-D lambda bank is what NorMuon's router looks \
+                         for (optim/muon.rs:1316)"
+                    );
+                }
+            }
         }
+        assert_eq!(
+            registered[1] + 1,
+            registered[0],
+            "disabling the x0 injection must remove exactly its one bank from the varstore, \
+             not leave a zeroed tensor behind: {registered:?}"
+        );
     }
+
+    /// The recipe string is a checkpoint's only record of the numbers its weights came from, so
+    /// two configurations that train differently must not stamp the same string.
     #[test]
-    fn nanogpt_lr_scale_holds_then_cools_to_the_floor() {
-        let scheduled = 1270;
-        let start = ((scheduled as f64) * 0.4).floor() as usize;
+    fn the_optimizer_recipe_records_the_scalar_multiplier_and_the_x0_mode() {
+        let reference = OptimizerKind::PolarExpress.recipe(RecipeKnobs::reference(X0Lambdas::Enabled));
+        assert!(
+            reference.contains("x0-lambdas=enabled")
+                && reference.contains("lambdas.resid+lambdas.x0+skip_weights-lrmul=5"),
+            "{reference}"
+        );
+        let flat = OptimizerKind::PolarExpress.recipe(RecipeKnobs {
+            scalar_lr_mult: 1.0,
+            ..RecipeKnobs::reference(X0Lambdas::Enabled)
+        });
+        assert!(
+            flat.contains("lambdas.resid+lambdas.x0+skip_weights-lrmul=1"),
+            "{flat}"
+        );
+        assert_ne!(reference, flat, "the multiplier must move the string");
+        let no_x0 = OptimizerKind::PolarExpress.recipe(RecipeKnobs {
+            scalar_lr_mult: 1.0,
+            ..RecipeKnobs::reference(X0Lambdas::Disabled)
+        });
+        assert!(
+            no_x0.contains("x0-lambdas=disabled")
+                && no_x0.contains("lambdas.resid+skip_weights-lrmul=1")
+                && !no_x0.contains("lambdas.x0"),
+            "{no_x0}"
+        );
+    }
+    /// A budget equal to the ported endpoint must reproduce the ported shape exactly: the same
+    /// hold, the same linear leg, the same floor. This is the fidelity anchor - the knob may
+    /// move the endpoint, and must not have moved the curve drawn against one.
+    #[test]
+    fn the_schedule_reproduces_the_ported_shape_at_the_budget_it_is_given() {
+        let upstream = LrSchedule::new(1270, NANOGPT_COOLDOWN_FRAC, NANOGPT_COOLDOWN_FLOOR).unwrap();
+        let start = upstream.cooldown_start().unwrap();
         assert_eq!(start, 508);
-        assert!((nanogpt_lr_scale(0, scheduled) - 1.0).abs() < 1e-12);
-        assert!((nanogpt_lr_scale(start, scheduled) - 1.0).abs() < 1e-12);
-        let mid = start + (scheduled - start) / 2;
-        assert!((nanogpt_lr_scale(mid, scheduled) - 0.575).abs() < 1e-12);
-        assert!((nanogpt_lr_scale(scheduled, scheduled) - 0.15).abs() < 1e-12);
-        assert!((nanogpt_lr_scale(scheduled + 15, scheduled) - 0.15).abs() < 1e-12);
-        assert!((nanogpt_lr_scale(0, 0) - 1.0).abs() < 1e-12);
+        assert!((upstream.scale(0) - 1.0).abs() < 1e-12);
+        assert!((upstream.scale(start) - 1.0).abs() < 1e-12);
+        let mid = start + (1270 - start) / 2;
+        assert!((upstream.scale(mid) - 0.575).abs() < 1e-12);
+        assert!((upstream.scale(1270) - 0.15).abs() < 1e-12);
+        assert!((upstream.scale(1270 + 15) - 0.15).abs() < 1e-12);
+
+        // And our epoch: the trajectory every completed arm actually ran, which is what
+        // `--schedule-budget 0` still reproduces. 3,836 is the first step below the base rate,
+        // 1,836 steps after the measured held-out NLL optimum, and by step 5,000 the rate has
+        // fallen only to 0.828 of its peak.
+        let epoch = LrSchedule::new(9590, NANOGPT_COOLDOWN_FRAC, NANOGPT_COOLDOWN_FLOOR).unwrap();
+        assert_eq!(epoch.cooldown_start(), Some(3836));
+        assert!((epoch.scale(2000) - 1.0).abs() < 1e-12);
+        assert!((epoch.scale(3835) - 1.0).abs() < 1e-12);
+        assert!(epoch.scale(3837) < 1.0);
+        assert!((epoch.scale(5000) - 0.828050052).abs() < 1e-9);
+        assert!((epoch.scale(9590) - 0.15).abs() < 1e-12);
+
+        // No warmdown at all is a stated schedule, not a zero budget.
+        assert_eq!(LrSchedule::flat().cooldown_start(), None);
+        assert!((LrSchedule::flat().scale(0) - 1.0).abs() < 1e-12);
+        assert!((LrSchedule::flat().scale(1_000_000) - 1.0).abs() < 1e-12);
+        assert!(LrSchedule::new(0, NANOGPT_COOLDOWN_FRAC, NANOGPT_COOLDOWN_FLOOR).is_err());
+        assert!(LrSchedule::new(9590, 1.5, NANOGPT_COOLDOWN_FLOOR).is_err());
+        assert!(LrSchedule::new(9590, NANOGPT_COOLDOWN_FRAC, 2.0).is_err());
+    }
+
+    /// The point of the knob: a budget shorter than the run reaches the floor at the step it
+    /// states and holds it, rather than never arriving.
+    #[test]
+    fn a_shorter_budget_reaches_its_floor_at_the_stated_step() {
+        let short = LrSchedule::new(5000, NANOGPT_COOLDOWN_FRAC, NANOGPT_COOLDOWN_FLOOR).unwrap();
+        assert_eq!(short.cooldown_start(), Some(2000));
+        assert!((short.scale(1999) - 1.0).abs() < 1e-12);
+        assert!((short.scale(2000) - 1.0).abs() < 1e-12);
+        assert!((short.scale(3500) - 0.575).abs() < 1e-12);
+        assert!((short.scale(5000) - 0.15).abs() < 1e-12);
+        // Past the budget the schedule holds the floor: the run may keep going, the shape is
+        // finished.
+        assert!((short.scale(9590) - 0.15).abs() < 1e-12);
+        // Same peak as the epoch-length budget - this is a shape change, not an LR cut. Halving
+        // the peak was measured and was strictly worse (2.2207 against 2.0669 at step 5,000).
+        let epoch = LrSchedule::new(9590, NANOGPT_COOLDOWN_FRAC, NANOGPT_COOLDOWN_FLOOR).unwrap();
+        assert!((short.scale(0) - epoch.scale(0)).abs() < 1e-12);
     }
 
     #[test]
-    fn nanogpt_muon_momentum_warms_up_and_cools_down() {
-        assert!((nanogpt_muon_momentum(0, 1270) - 0.85).abs() < 1e-12);
-        assert!((nanogpt_muon_momentum(150, 1270) - 0.90).abs() < 1e-12);
-        assert!((nanogpt_muon_momentum(300, 1270) - 0.95).abs() < 1e-12);
-        assert!((nanogpt_muon_momentum(1000, 1270) - 0.95).abs() < 1e-12);
-        assert!((nanogpt_muon_momentum(1245, 1270) - 0.90).abs() < 1e-12);
-        assert!((nanogpt_muon_momentum(1270, 1270) - 0.85).abs() < 1e-12);
-        assert!((nanogpt_muon_momentum(0, 0) - 0.95).abs() < 1e-12);
+    fn the_muon_momentum_cooldown_follows_the_same_budget() {
+        let upstream = LrSchedule::new(1270, NANOGPT_COOLDOWN_FRAC, NANOGPT_COOLDOWN_FLOOR).unwrap();
+        assert!((upstream.muon_momentum(0) - 0.85).abs() < 1e-12);
+        assert!((upstream.muon_momentum(150) - 0.90).abs() < 1e-12);
+        assert!((upstream.muon_momentum(300) - 0.95).abs() < 1e-12);
+        assert!((upstream.muon_momentum(1000) - 0.95).abs() < 1e-12);
+        assert!((upstream.muon_momentum(1245) - 0.90).abs() < 1e-12);
+        assert!((upstream.muon_momentum(1270) - 0.85).abs() < 1e-12);
+        assert!((LrSchedule::flat().muon_momentum(0) - 0.95).abs() < 1e-12);
+        // A 5,000-step budget moves the rampdown to the end of the budget, not the end of the
+        // epoch: the coupled consequence of shaping both against one endpoint.
+        let short = LrSchedule::new(5000, NANOGPT_COOLDOWN_FRAC, NANOGPT_COOLDOWN_FLOOR).unwrap();
+        assert!((short.muon_momentum(4949) - 0.95).abs() < 1e-12);
+        assert!((short.muon_momentum(5000) - 0.85).abs() < 1e-12);
+    }
+
+    /// The MLP-down fidelity port, and the realized rates the trajectory chart reports.
+    ///
+    /// Upstream's effective NorMuon multipliers come from two places at once: the shape
+    /// multiplier `max(1, rows/cols).sqrt()` its storage implies, and its group's `lr_mul`.
+    /// Storing MLP-down `[4D, D]` with `lr_mul = 2` gives 2 * 2 = 4; our `[D, 4D]` storage has
+    /// a shape multiplier of 1, so the whole 4 has to be an `lr_scale`. This pins the product,
+    /// not the decomposition, because the product is what steps the weights.
+    #[test]
+    fn the_mlp_down_matrices_run_at_the_documented_upstream_multiplier() {
+        // Model construction draws; see `torch::test_rng`.
+        let _rng = crate::torch::test_rng::shared();
+        let config = ModelConfig {
+            seq_len: 96,
+            pred_len: 8,
+            patch_len: 8,
+            layers: 2,
+            d_model: 32,
+            heads: 4,
+            ffn: 128,
+            min_history: 8,
+            ..Default::default()
+        };
+        let store = nn::VarStore::new(Device::Cpu);
+        let _model = CausalPatchModel::new(&store.root(), &config);
+        let named = named_trainable_variables(&store);
+        let muon_lr = OptimizerKind::PolarExpress
+            .muon_learning_rate(NANOGPT_ADAMW_LR)
+            .unwrap();
+        // `ffn = 4 * d_model`, so the two MLP matrices are the reference's own aspect ratios.
+        assert_eq!(config.ffn, 4 * config.d_model);
+        for (mode, expected_down) in [
+            (MlpDownLr::AspectOnly, 1.0),
+            (MlpDownLr::Upstream4x, UPSTREAM_MLP_DOWN_LR_MULTIPLIER),
+        ] {
+            let optimizer = polar_express(
+                &named,
+                NANOGPT_ADAMW_LR,
+                RecipeKnobs {
+                    mlp_down_lr: mode,
+                    ..RecipeKnobs::reference(config.x0_lambdas)
+                },
+            );
+            let applied = |name: &str| {
+                optimizer
+                    .applied_learning_rate(name)
+                    .unwrap_or_else(|| panic!("{name} must be an optimizer parameter"))
+            };
+            for layer in 0..config.layers {
+                let down = applied(&format!("block_{layer}.second.weight"));
+                let up = applied(&format!("block_{layer}.first.weight"));
+                assert!(
+                    (down - muon_lr * expected_down).abs() < 1e-15,
+                    "{mode:?} MLP-down effective rate is {down}, expected {}",
+                    muon_lr * expected_down
+                );
+                // MLP-up is `[4D, D]` in our storage too, so it already carries upstream's 2x
+                // and is the reference point the down matrix was a quarter of.
+                assert!((up - muon_lr * 2.0).abs() < 1e-15, "MLP-up rate {up}");
+                assert!((down / up - expected_down / 2.0).abs() < 1e-12);
+            }
+            // Untouched: packed QKV keeps the √3 its `[3D, D]` geometry implies - the ledger's
+            // reading is that √3 is a geometry mismatch against upstream's per-head-pair Q/K
+            // and square V, whose aggregate Frobenius update scale is already about 1, so
+            // dropping it alone would not be a faithful port either. Attention-O is square.
+            assert!(
+                (applied("block_0.qkv.weight") - muon_lr * 3f64.sqrt()).abs() < 1e-15,
+                "packed QKV must keep its aspect scale"
+            );
+            assert!((applied("block_0.output.weight") - muon_lr).abs() < 1e-15);
+            // The AdamW families the same chart reports, at their own realized rates.
+            assert!((applied("head.output.weight") - NANOGPT_ADAMW_LR).abs() < 1e-15);
+            assert!(
+                (applied("lambdas.resid") - NANOGPT_ADAMW_LR * NANOGPT_SCALAR_LR_MULTIPLIER).abs()
+                    < 1e-15
+            );
+            assert!(optimizer.applied_learning_rate("no.such.parameter").is_none());
+        }
+    }
+
+    /// The realized trajectory reports what the optimizer holds, per family, not the schedule
+    /// multiplier: six families at one base rate are six different numbers.
+    #[test]
+    fn the_realized_trajectory_records_every_family_at_its_own_rate() {
+        // Model construction draws; see `torch::test_rng`.
+        let _rng = crate::torch::test_rng::shared();
+        let config = ModelConfig {
+            seq_len: 96,
+            pred_len: 8,
+            patch_len: 8,
+            layers: 2,
+            d_model: 32,
+            heads: 4,
+            ffn: 128,
+            min_history: 8,
+            ..Default::default()
+        };
+        let store = nn::VarStore::new(Device::Cpu);
+        let _model = CausalPatchModel::new(&store.root(), &config);
+        let engine = Engine::new(
+            &store,
+            NANOGPT_ADAMW_LR,
+            RecipeKnobs {
+                mlp_down_lr: MlpDownLr::Upstream4x,
+                ..RecipeKnobs::reference(config.x0_lambdas)
+            },
+            false,
+            OptimizerKind::PolarExpress,
+        )
+        .unwrap();
+        let mut trajectory = LrTrajectory::new(&engine, 4);
+        assert_eq!(
+            trajectory.labels(),
+            [
+                "NorMuon packed QKV",
+                "NorMuon attention output",
+                "NorMuon MLP up",
+                "NorMuon MLP down",
+                "AdamW dense",
+                "AdamW recipe scalars",
+            ]
+        );
+        trajectory.record(7, &engine).unwrap();
+        let mut engine = engine;
+        engine.set_lr(NANOGPT_ADAMW_LR / 2.0).unwrap();
+        trajectory.record(8, &engine).unwrap();
+        assert_eq!(trajectory.steps(), [7, 8]);
+        let muon_lr = OptimizerKind::PolarExpress
+            .muon_learning_rate(NANOGPT_ADAMW_LR)
+            .unwrap();
+        let expected = [
+            muon_lr * 3f64.sqrt(),
+            muon_lr,
+            muon_lr * 2.0,
+            muon_lr * UPSTREAM_MLP_DOWN_LR_MULTIPLIER,
+            NANOGPT_ADAMW_LR,
+            NANOGPT_ADAMW_LR * NANOGPT_SCALAR_LR_MULTIPLIER,
+        ];
+        for (family, expected) in expected.into_iter().enumerate() {
+            let recorded: Vec<f64> = trajectory.series(family).collect();
+            assert_eq!(recorded.len(), 2, "family {family} must have one rate per step");
+            assert!(
+                (recorded[0] - expected).abs() < 1e-15,
+                "family {family} recorded {} at the base rate, expected {expected}",
+                recorded[0]
+            );
+            // Halving the ONE global knob halves every family: the chart's second row is the
+            // first row scaled, which is what makes a per-family divergence visible at all.
+            assert!((recorded[1] - expected / 2.0).abs() < 1e-15);
+        }
+        assert!((engine.learning_rate() - NANOGPT_ADAMW_LR / 2.0).abs() < 1e-15);
     }
 
 }

@@ -1,6 +1,6 @@
 use std::{
     path::{Path, PathBuf},
-    sync::mpsc,
+    sync::{mpsc, Arc},
     thread,
     time::{Duration, Instant},
 };
@@ -9,13 +9,17 @@ use anyhow::{ensure, Context, Result};
 use clap::Args;
 use nvml_wrapper::Nvml;
 use pyo3::{prelude::*, types::PyDict};
+use rand::{seq::SliceRandom, SeedableRng};
+use rand_chacha::ChaCha8Rng;
 use shared::report::{write_report, Report, ReportKind, ReportSeries, ScaleKind};
 use tch::{nn, Cuda, Device, Kind, Tensor};
 
 use super::{
-    compute::{Engine, OptimizerKind},
-    corpus::Batch,
-    model::{CausalPatchModel, ModelConfig, CHANNELS},
+    compute::{Engine, OptimizerKind, RecipeKnobs, CAPTURE_AFTER_STEPS},
+    corpus::{Batch, Corpus},
+    features::FeatureSet,
+    model::{CausalPatchModel, KernelClass, ModelConfig, CHANNELS},
+    runner::Prefetcher,
 };
 
 /// Steps the capture audit compares between the eager and the captured engine. Twenty
@@ -23,6 +27,12 @@ use super::{
 /// integrates every step's gradient into them, so one differing gradient element anywhere in
 /// the window shows up, and twenty steps of NorMuon is long enough for it to grow.
 const CAPTURE_AUDIT_STEPS: usize = 20;
+
+/// The measured bf16 GEMM peak of an UNCONTENDED card, job 5399: 230.99 TFLOPS. It is a
+/// measurement of this machine, not a spec number, and it exists so a run can say how far
+/// from quiet it was. Any cross-run step-time claim needs both runs near this figure; job
+/// 5452 sat at 193.32, 16.3% down, which is exactly why the paired arm exists.
+const QUIET_CARD_GEMM_TFLOPS: f64 = 230.99;
 
 #[derive(Clone, Debug, Args)]
 pub struct BenchmarkArgs {
@@ -34,7 +44,7 @@ pub struct BenchmarkArgs {
     pub batch_size: usize,
     #[arg(long, default_value_t = 20)]
     pub steps: usize,
-    #[arg(long, default_value_t = 5)]
+    #[arg(long, default_value_t = 8)]
     pub warmup: usize,
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
     pub fused: bool,
@@ -52,6 +62,123 @@ pub struct BenchmarkArgs {
     /// engines in sequence before the main benchmark, so it doubles the run's wall clock.
     #[arg(long)]
     pub capture_audit: bool,
+    /// Measure the fused loss chain against the composed-ATen chain PAIRED: both arms in one
+    /// process, alternated A-B-A-B, differencing inside the run. A cross-run step-time
+    /// comparison is not defensible on a shared card - job 5452's measured bf16 GEMM peak was
+    /// 16.3% below job 5399's, and one scalar cannot normalize a step that is part
+    /// arithmetic-bound, part bandwidth-bound and part launch-bound. Pairing puts the
+    /// contention in BOTH arms so it cancels in the difference, and the A-A spread across
+    /// repeats is the comparison's own error bound rather than an assumption.
+    #[arg(long)]
+    pub paired_loss: bool,
+    /// Alternations of the paired arm. Each one times both chains once, so the A-A spread is
+    /// measured over this many fused arms.
+    #[arg(long, default_value_t = 5)]
+    pub paired_repeats: usize,
+    /// Corpus directory for the third timed arm: the REAL host loader, prefetched exactly as
+    /// `runner::train` prefetches it. Without it that arm reports NaN and the loader's
+    /// contribution to the step is not measured at all.
+    #[arg(long)]
+    pub corpus: Option<PathBuf>,
+    /// Shared eligible-origin history for the corpus arm; must cover `--seq-len`.
+    #[arg(long, default_value_t = 6000)]
+    pub common_context: usize,
+    /// Minimum cross-section a shared grid slot needs to define a market step, for the corpus arm.
+    #[arg(long, default_value_t = 2000)]
+    pub market_min_cross_section: usize,
+}
+
+#[derive(Clone, Debug, Args)]
+pub struct LoaderAuditArgs {
+    #[arg(long, default_value_os_t = crate::data::ingest::bars_dir())]
+    pub data_dir: PathBuf,
+    #[arg(long)]
+    pub ticker: Vec<String>,
+    #[arg(long, default_value_t = 6000)]
+    pub seq_len: usize,
+    #[arg(long, default_value_t = 192)]
+    pub pred_len: usize,
+    #[arg(long, default_value_t = 6000)]
+    pub common_context: usize,
+    /// Comma-separated exogenous variates: time-of-day, day-of-week, session-gap, volume,
+    /// market, spy, dispersion, cross-section-z; `all` or `none`.
+    #[arg(long, default_value_t = FeatureSet::ALL)]
+    pub features: FeatureSet,
+    #[arg(long, default_value_t = 2000)]
+    pub market_min_cross_section: usize,
+    /// Row counts to audit, so one corpus load prices the whole batch-size scaling.
+    #[arg(long, value_delimiter = ',', default_value = "64,128,256")]
+    pub batch_size: Vec<usize>,
+    #[arg(long, default_value_t = 5)]
+    pub rounds: usize,
+}
+
+/// Component attribution of host batch assembly, on the real corpus, CPU only.
+///
+/// No device, deliberately. `Corpus::load` and `Corpus::host_batch` need none, and the whole
+/// question is what the host work costs in host time; running it under a GPU lease would put
+/// the measurement behind the queue it exists to explain. The pinned allocation the training
+/// path uses is therefore NOT exercised here - a pageable `Tensor::empty` of the same size
+/// stands in - and the audit says so in its own output.
+pub fn loader_audit(args: LoaderAuditArgs) -> Result<()> {
+    ensure!(
+        args.rounds > 0 && !args.batch_size.is_empty(),
+        "the loader audit needs at least one round and one batch size"
+    );
+    let corpus = Corpus::load(
+        &args.data_dir,
+        &args.ticker,
+        args.seq_len,
+        args.pred_len,
+        args.common_context,
+        &args.features,
+        args.market_min_cross_section,
+        0,
+    )?;
+    let mut rng = ChaCha8Rng::seed_from_u64(20260907);
+    let mut refs = corpus.train_refs.clone();
+    refs.shuffle(&mut rng);
+    println!(
+        "CausalPatch host loader audit (CPU only, pageable stand-in for the pinned block): {} tickers, {} training rows, context {}, horizon {}, {} auxiliary channels, {} rounds per rung",
+        corpus.contract.tickers.len(),
+        refs.len(),
+        args.seq_len,
+        args.pred_len,
+        args.features.channels(),
+        args.rounds
+    );
+    for &rows in &args.batch_size {
+        ensure!(
+            rows > 0 && rows <= refs.len(),
+            "audited batch size {rows} exceeds the {} available training rows",
+            refs.len()
+        );
+        let phases = corpus.audit_host_batch(&refs[..rows], args.rounds)?;
+        let removed: f64 = phases
+            .iter()
+            .filter(|phase| phase.name.starts_with("removed:"))
+            .map(|phase| phase.ms)
+            .sum();
+        let after = phases
+            .iter()
+            .find(|phase| phase.name.starts_with("production"))
+            .map(|phase| phase.ms)
+            .context("the audit ladder produced no production total")?;
+        println!("\nbatch {rows}, milliseconds per batch:");
+        for phase in &phases {
+            println!("  {:<78} {:>9.3}", phase.name, phase.ms);
+        }
+        println!(
+            "  {:<78} {:>9.3}\n  {:<78} {:>9.3}\n  {:<78} {:>9.2}x",
+            "before: production total plus both removed rungs",
+            after + removed,
+            "after: production total",
+            after,
+            "speedup of host batch assembly",
+            (after + removed) / after
+        );
+    }
+    Ok(())
 }
 
 pub fn cuda_memory(reset: bool) -> Result<(u64, u64)> {
@@ -183,12 +310,44 @@ pub fn write_hardware(output: &Path, title: &str, samples: &[[f64; 5]]) -> Resul
             }).collect())
 }
 
-fn timed<T>(operation: impl FnOnce() -> Result<T>) -> Result<(T, f64)> {
-    Cuda::synchronize(0);
-    let started = Instant::now();
-    let value = operation()?;
-    Cuda::synchronize(0);
-    Ok((value, started.elapsed().as_secs_f64() * 1000.))
+/// Per-phase milliseconds of one SAMPLED batch of a non-training accumulation pass.
+///
+/// Its own base rather than rows in `timexer_segment_timing`: see the registry entry in
+/// `shared::report`. The four series partition the sampled batch's wall clock exactly - the
+/// device is drained before the sample and each span is closed by a synchronization - so they
+/// may be read as a stacked budget, and the loader-wait row is the only one prefetch depth can
+/// hide. The drained run-ahead is deliberately NOT a fifth series: it is a different question
+/// in the same unit, and it rides in the title instead.
+pub fn write_eval_phases(output: &Path, title: &str, trace: &[[f64; 6]]) -> Result<()> {
+    let labels = [
+        "host loader wait (batch assembly the prefetch failed to hide)",
+        "H2D upload of the packed rows",
+        "forward: statistics, backbone, last-origin head",
+        "accumulate: nine fp64 per-timestamp scatter sums",
+    ];
+    write_report(
+        output.join("timexer_segment_eval_phases.report.bin"),
+        &Report {
+            title: title.to_owned(),
+            x_label: Some("batch ordinal within the pass, every stride-th batch sampled".to_owned()),
+            y_label: Some(
+                "milliseconds of one sampled batch; the four sum to that batch's wall clock, lower is faster".to_owned(),
+            ),
+            scale: ScaleKind::Linear,
+            kind: ReportKind::IndexedLines {
+                steps: trace.iter().map(|row| row[0] as u64).collect(),
+                series: labels
+                    .iter()
+                    .enumerate()
+                    .map(|(column, label)| ReportSeries {
+                        label: (*label).to_owned(),
+                        values: trace.iter().map(|row| row[column + 1] as f32).collect(),
+                    })
+                    .collect(),
+            },
+        },
+    )?;
+    Ok(())
 }
 
 /// Bytes the caching allocator currently holds LIVE, from the same torch that runs the kernels.
@@ -305,8 +464,8 @@ fn kernel_profile(
 ) -> Result<Vec<KernelRow>> {
     let device = batch.log_prices.device();
     let stats = model.statistics(batch);
-    let mut rows = Vec::new();
-    for class in model.kernel_classes(batch, &stats, true) {
+    let classes = model.kernel_classes(batch, &stats, true);
+    let measure = |class: &KernelClass<'_>, name: &'static str| -> Result<KernelRow> {
         let inputs: Vec<Tensor> = class
             .inputs
             .iter()
@@ -321,8 +480,7 @@ fn kernel_profile(
         let output = (class.run)(&inputs);
         Cuda::synchronize(0);
         let retained_bytes = cuda_allocated()? - before;
-        let output_bytes =
-            output.numel() as f64 * output.kind().elt_size_in_bytes() as f64;
+        let output_bytes = output.numel() as f64 * output.kind().elt_size_in_bytes() as f64;
         drop(output);
         let forward_ms = event_timed(rounds, || (class.run)(&inputs))?;
         let differentiable = !inputs.is_empty();
@@ -338,17 +496,102 @@ fn kernel_profile(
         } else {
             0.
         };
-        rows.push(KernelRow {
-            name: class.name,
+        Ok(KernelRow {
+            name,
             forward_ms,
             backward_ms,
             forward_bytes: class.forward_bytes,
             forward_flops: class.forward_flops,
             retained_bytes,
             output_bytes,
+        })
+    };
+    let mut rows = Vec::new();
+    for class in &classes {
+        rows.push(measure(class, class.name)?);
+    }
+    let attention = classes
+        .iter()
+        .find(|class| class.name == SDPA_CLASS)
+        .context("the kernel class list must contain the attention class")?;
+    for (row, forced) in SDPA_BACKENDS.iter().enumerate() {
+        let mut only = [false; SDPA_BACKENDS.len()];
+        only[row] = true;
+        set_sdpa_backends(&only)?;
+        rows.push(match silently(|| measure(attention, forced.row)) {
+            Some(measured) => measured?,
+            // The backend cannot run this shape at all: `causal SDPA (flash only)` reading NaN
+            // is the answer to "is flash even eligible at 375 tokens", not a failure to measure.
+            None => KernelRow {
+                name: forced.row,
+                forward_ms: f64::NAN,
+                backward_ms: f64::NAN,
+                forward_bytes: attention.forward_bytes,
+                forward_flops: attention.forward_flops,
+                retained_bytes: 0.,
+                output_bytes: 0.,
+            },
         });
     }
+    set_sdpa_backends(&[true; SDPA_BACKENDS.len()])?;
     Ok(rows)
+}
+
+const SDPA_CLASS: &str = "causal SDPA";
+
+/// One scaled-dot-product-attention backend: the `torch.backends.cuda` setter that admits it and
+/// the kernel row that reports it alone.
+struct SdpaBackend {
+    setter: &'static str,
+    row: &'static str,
+}
+
+/// Every backend the dispatcher can choose between, in no significant order: the point of forcing
+/// them one at a time is that the unforced `causal SDPA` row above must equal ONE of them, which
+/// identifies what training actually gets by timing rather than by trusting a precedence table
+/// that changes between torch releases. The alternatives are the actionable part - a faster one
+/// at `origins` = 375 costs a global flag to adopt.
+const SDPA_BACKENDS: [SdpaBackend; 4] = [
+    SdpaBackend {
+        setter: "enable_flash_sdp",
+        row: "causal SDPA (flash only)",
+    },
+    SdpaBackend {
+        setter: "enable_mem_efficient_sdp",
+        row: "causal SDPA (mem-efficient only)",
+    },
+    SdpaBackend {
+        setter: "enable_cudnn_sdp",
+        row: "causal SDPA (cuDNN only)",
+    },
+    SdpaBackend {
+        setter: "enable_math_sdp",
+        row: "causal SDPA (math only)",
+    },
+];
+
+/// Admit exactly the backends flagged `true`. These are process-global, so every caller restores
+/// the all-enabled state it found.
+fn set_sdpa_backends(admitted: &[bool; SDPA_BACKENDS.len()]) -> Result<()> {
+    Python::attach(|py| -> Result<()> {
+        let backends = py.import("torch")?.getattr("backends")?.getattr("cuda")?;
+        for (backend, on) in SDPA_BACKENDS.iter().zip(admitted) {
+            backends.call_method1(backend.setter, (*on,))?;
+        }
+        Ok(())
+    })
+}
+
+/// `operation` with libtorch's panic message suppressed: `None` when it raised.
+///
+/// An ineligible SDPA backend is a normal outcome of asking which backends this shape admits, so
+/// its stack trace is noise rather than news. Nothing else in this file catches anything.
+fn silently<T>(operation: impl FnOnce() -> T) -> Option<T> {
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {}));
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(operation)).ok();
+    std::panic::set_hook(previous);
+    outcome
 }
 
 /// Device ceilings, MEASURED rather than looked up: a large square bf16 GEMM for arithmetic and
@@ -366,7 +609,7 @@ fn kernel_profile(
 /// (`single_ticker_timexer/runner.rs:127` runs `configure_threads`, and
 /// `tch::set_num_interop_threads` ABORTS once torch has done parallel work), and this runs
 /// after the whole timing window.
-fn device_peaks(device: Device) -> Result<(f64, f64)> {
+pub(super) fn device_peaks(device: Device) -> Result<(f64, f64)> {
     let side = 8192i64;
     let left = Tensor::randn([side, side], (Kind::BFloat16, device));
     let right = Tensor::randn([side, side], (Kind::BFloat16, device));
@@ -400,8 +643,9 @@ fn verify_optimizer(config: &ModelConfig, batch: &Batch) -> Result<f64> {
     let mut fused_store = nn::VarStore::new(device);
     let _fused_model = CausalPatchModel::new(&fused_store.root(), &config);
     fused_store.copy(&reference_store)?;
-    let mut reference = Engine::new(&reference_store, 0.0001, false, OptimizerKind::Adam, 0)?;
-    let mut fused = Engine::new(&fused_store, 0.0001, true, OptimizerKind::Adam, 0)?;
+    let knobs = RecipeKnobs::reference(config.x0_lambdas);
+    let mut reference = Engine::new(&reference_store, 0.0001, knobs, false, OptimizerKind::Adam)?;
+    let mut fused = Engine::new(&fused_store, 0.0001, knobs, true, OptimizerKind::Adam)?;
     let source = reference_store.variables();
     let destination = fused_store.variables();
     for _ in 0..3 {
@@ -441,15 +685,196 @@ fn verify_optimizer(config: &ModelConfig, batch: &Batch) -> Result<f64> {
     Ok(difference)
 }
 
+/// Milliseconds per step with the batch arriving from the REAL corpus loader.
+///
+/// The loop is the training loop's order - receive, step, request the next - because that
+/// order is what decides whether the loader's service time overlaps device execution. The
+/// engine, the model and the capture are the caller's, already warmed and already armed, so
+/// the only difference from the pinned-host arm is where the bytes came from.
+fn loader_arm(
+    directory: &Path,
+    args: &BenchmarkArgs,
+    model: &CausalPatchModel,
+    engine: &mut Engine,
+    device: Device,
+) -> Result<f64> {
+    let mut corpus = Corpus::load(
+        directory,
+        &[],
+        args.model.seq_len as usize,
+        args.model.pred_len as usize,
+        args.common_context,
+        &args.model.features,
+        args.market_min_cross_section,
+        0,
+    )?;
+    corpus.prepare(device);
+    let corpus = Arc::new(corpus);
+    let mut refs = corpus.train_refs.clone();
+    refs.shuffle(&mut ChaCha8Rng::seed_from_u64(20260907));
+    let needed = (args.steps + args.warmup + 1) * args.batch_size;
+    ensure!(
+        refs.len() >= needed,
+        "the corpus arm needs {needed} training rows for {} warmup and {} timed steps at batch {}, and the corpus has {}",
+        args.warmup,
+        args.steps,
+        args.batch_size,
+        refs.len()
+    );
+    let loader = Prefetcher::new(Arc::clone(&corpus));
+    let mut served = 0usize;
+    let mut serve = |loader: &Prefetcher, served: &mut usize| -> Result<()> {
+        let start = *served * args.batch_size;
+        *served += 1;
+        loader.request(&refs[start..start + args.batch_size])
+    };
+    serve(&loader, &mut served)?;
+    // Warmed on real batches first: the pinned host block is a new size class for libtorch's
+    // caching host allocator, and its first `cudaHostAlloc` is not what a steady-state step
+    // pays.
+    for _ in 0..args.warmup {
+        let (host, _) = loader.receive()?;
+        let _ = engine.step(model, &host)?;
+        serve(&loader, &mut served)?;
+    }
+    Cuda::synchronize(0);
+    let started = Instant::now();
+    for _ in 0..args.steps {
+        let (host, _) = loader.receive()?;
+        let _ = engine.step(model, &host)?;
+        serve(&loader, &mut served)?;
+    }
+    Cuda::synchronize(0);
+    Ok(started.elapsed().as_secs_f64() * 1000. / args.steps as f64)
+}
+
+/// One paired measurement of the loss chain: both forms alternated inside ONE process.
+struct PairedLoss {
+    fused_ms: f64,
+    composed_ms: f64,
+    fused_drift_ms: f64,
+    composed_drift_ms: f64,
+    repeats: usize,
+    per_repeat: Vec<(f64, f64)>,
+    /// What scheduling this arm actually needs. Job 5461 died on a 188 MiB allocation under
+    /// foreign tenants, and a job whose requirement is unknown cannot be scheduled against a
+    /// card whose headroom is unknown - so the arm reports its own peak rather than leaving
+    /// both sides of that comparison to guesswork.
+    peak_allocated_mib: f64,
+    peak_reserved_mib: f64,
+}
+
+/// The fused loss chain against the composed-ATen chain it replaced, PAIRED.
+///
+/// WHY PAIRED. Job 5452 measured the fused class at 4.096 ms against job 5399's 15.192 -
+/// inside the pre-registered band - but its whole-step number was useless, because the
+/// harness's own `measured device bf16 GEMM TFLOPS` had fallen 16.3% under foreign tenants
+/// and every arithmetic-bound class fell with it while the bandwidth-saturated ones did not
+/// move at all. So contention taxed SM share and not DRAM, and no single scalar can
+/// normalize a step that is part arithmetic-bound, part bandwidth-bound and part
+/// launch-bound. Alternating the two chains inside one process makes whatever the machine is
+/// doing common to both arms, so it cancels in the DIFFERENCE, and the spread across the
+/// repeats of the same arm bounds the comparison's own error instead of being assumed away.
+///
+/// WHAT IS AND IS NOT IN THE WINDOW. Forward through the trunk and the head, the loss, and
+/// the full backward - eager, and eager in BOTH arms, which matters: if one arm could be
+/// captured and the other could not, the difference would measure capture rather than
+/// fusion. The optimizer is outside the window because it is identical in both arms and
+/// three times the size of the difference being measured. The batch, the statistics and the
+/// targets are built once and shared, so no arm pays for the harness's own assembly.
+///
+/// The two arms must produce the SAME loss, and this refuses to report if they do not: the
+/// chains are bit-identical by `fused_kernels`' own suite, so an inequality here means the
+/// benchmark is comparing two different objectives and its delta means nothing.
+fn paired_loss_arm(
+    model: &CausalPatchModel,
+    store: &nn::VarStore,
+    batch: &Batch,
+    rounds: usize,
+    repeats: usize,
+) -> Result<PairedLoss> {
+    ensure!(rounds > 0 && repeats > 0, "the paired arm needs a round and a repeat");
+    // Warmup's cached blocks go back to the driver first, and the peak counters start here,
+    // so the number this reports is THIS arm's requirement and not the whole run's history.
+    crate::torch::cuda::empty_cache();
+    cuda_memory(true)?;
+    let stats = model.statistics(batch);
+    let (targets, mask) = model.targets(batch, &stats, false);
+    let pass = |composed: bool| {
+        let head = model.forward(batch, &stats, true, false);
+        let losses = match composed {
+            true => model.composed_losses(&head, &stats, &targets, &mask),
+            false => model.losses(&head, &stats, &targets, &mask),
+        };
+        losses.nll.backward();
+        losses.nll.double_value(&[])
+    };
+    let clear = || {
+        for mut variable in store.trainable_variables() {
+            variable.zero_grad();
+        }
+    };
+    // The objective equality, checked before either arm is timed and with the gradient
+    // buffers cleared afterwards so neither arm inherits the other's accumulation.
+    let (fused_nll, composed_nll) = (pass(false), pass(true));
+    clear();
+    ensure!(
+        fused_nll.to_bits() == composed_nll.to_bits(),
+        "the paired arms disagree on the objective ({fused_nll} fused, {composed_nll} \
+         composed); the two chains are bit-identical by construction, so this is the \
+         benchmark comparing two different losses and its delta would be meaningless"
+    );
+    // Warm both arms outside the timed window: first touch allocates, and the composed chain
+    // allocates about fifty full-size fp32 tensors the fused one never asks for.
+    for _ in 0..2 {
+        let _ = pass(false);
+        let _ = pass(true);
+        clear();
+    }
+    let mut per_repeat = Vec::with_capacity(repeats);
+    for _ in 0..repeats {
+        let fused = event_timed(rounds, || pass(false))?;
+        clear();
+        let composed = event_timed(rounds, || pass(true))?;
+        clear();
+        per_repeat.push((fused, composed));
+    }
+    let spread = |values: &mut dyn Iterator<Item = f64>| -> f64 {
+        let (mut low, mut high) = (f64::INFINITY, f64::NEG_INFINITY);
+        for value in values {
+            low = low.min(value);
+            high = high.max(value);
+        }
+        high - low
+    };
+    let mean = |values: &mut dyn Iterator<Item = f64>| -> f64 {
+        let (sum, count) = values.fold((0., 0.), |(sum, count), value| (sum + value, count + 1.));
+        sum / count
+    };
+    // Read AFTER the timed window and before anything else allocates: the two arms are
+    // sequential, so this is the composed arm's own peak plus the shared inputs, not the sum
+    // of both arms.
+    let (peak, reserved) = cuda_memory(false)?;
+    Ok(PairedLoss {
+        fused_ms: mean(&mut per_repeat.iter().map(|pair| pair.0)),
+        composed_ms: mean(&mut per_repeat.iter().map(|pair| pair.1)),
+        fused_drift_ms: spread(&mut per_repeat.iter().map(|pair| pair.0)),
+        composed_drift_ms: spread(&mut per_repeat.iter().map(|pair| pair.1)),
+        repeats,
+        per_repeat,
+        peak_allocated_mib: peak as f64 / 1048576.,
+        peak_reserved_mib: reserved as f64 / 1048576.,
+    })
+}
+
 pub fn run(args: BenchmarkArgs) -> Result<()> {
     args.model.validate()?;
+    // Warmup must EXCEED `CAPTURE_AFTER_STEPS`, because the benchmark now arms the
+    // forward+backward capture on exactly the step the trainer arms it on, after that many
+    // warmup steps, and the arming step itself is not a timed step.
     ensure!(
-        args.batch_size > 0 && args.steps >= 10 && args.warmup >= 3,
-        "benchmark needs batch > 0, steps >= 10, warmup >= 3"
-    );
-    ensure!(
-        args.optimizer != OptimizerKind::PolarExpress || args.warmup >= 4,
-        "Polar Express benchmark needs at least four warmups to complete optimizer graph capture"
+        args.batch_size > 0 && args.steps >= 10 && args.warmup > CAPTURE_AFTER_STEPS,
+        "benchmark needs batch > 0, steps >= 10, warmup > {CAPTURE_AFTER_STEPS}"
     );
     ensure!(!args.output.exists(), "benchmark output already exists");
     let device = crate::torch::single_ticker_timexer::runner::cuda_device()?;
@@ -533,32 +958,79 @@ pub fn run(args: BenchmarkArgs) -> Result<()> {
         &store,
         args.learning_rate
             .unwrap_or(args.optimizer.default_learning_rate()),
+        RecipeKnobs::reference(args.model.x0_lambdas),
         args.fused,
         args.optimizer,
-        0,
     )?;
-    for _ in 0..args.warmup {
-        let _ = engine.step(&model, &gather())?;
+    // ONE batch, materialized once, shared by every arm. Calling `gather()` inside the timed
+    // loop - which this benchmark did until now - charged every step for 114 MB of device
+    // `index_select` and `cat` that the training path never runs, so the reported step time
+    // described the harness's own synthetic assembly as well as the model.
+    let device_batch = gather();
+    // What the training loader hands the engine: the same numbers in PINNED host memory, so
+    // the upload is a real asynchronous H2D of the packed row block rather than a D2D copy.
+    let pinned_batch = device_batch.host_copy(Some(device));
+    // Warmup and capture in exactly training's order: `CAPTURE_AFTER_STEPS` steps on the
+    // capture stream's warmup body, then the forward+backward capture, then the rest of the
+    // warmup on the replay. Before this, `run` never called `arm_step_graph` at all, so its
+    // timed loop measured an EAGER forward and backward with only the optimizer captured -
+    // a configuration the trainer has not used since `runner.rs` started arming the step.
+    for _ in 0..CAPTURE_AFTER_STEPS {
+        let _ = engine.step(&model, &device_batch)?;
     }
-    Cuda::synchronize(0);
+    ensure!(
+        engine.capture_ready(),
+        "this device cannot capture the forward and backward, so the benchmark cannot measure \
+         the configuration the trainer runs"
+    );
+    let _ = engine.arm_step_graph(&model, &device_batch)?;
+    for _ in CAPTURE_AFTER_STEPS + 1..args.warmup {
+        let _ = engine.step(&model, &device_batch)?;
+    }
+    let mut arm = |engine: &mut Engine, source: &Batch| -> Result<(f64, Tensor)> {
+        Cuda::synchronize(0);
+        let started = Instant::now();
+        let mut losses = Vec::with_capacity(args.steps);
+        for _ in 0..args.steps {
+            losses.push(engine.step(&model, source)?.nll);
+        }
+        Cuda::synchronize(0);
+        let ms = started.elapsed().as_secs_f64() * 1000. / args.steps as f64;
+        Ok((ms, Tensor::stack(&losses, 0)))
+    };
     cuda_memory(true)?;
     let sampler = HardwareSampler::start()?;
-    let started = Instant::now();
-    let mut losses = Vec::new();
-    for _ in 0..args.steps {
-        losses.push(engine.step(&model, &gather())?.nll);
-    }
-    Cuda::synchronize(0);
-    let step_ms = started.elapsed().as_secs_f64() * 1000. / args.steps as f64;
+    let (device_step_ms, losses) = arm(&mut engine, &device_batch)?;
     let hardware = sampler.finish()?;
     let (peak, reserved) = cuda_memory(false)?;
+    let (pinned_step_ms, _) = arm(&mut engine, &pinned_batch)?;
+    let loader_step_ms = match &args.corpus {
+        Some(directory) => loader_arm(directory, &args, &model, &mut engine, device)?,
+        None => f64::NAN,
+    };
+    // After every captured arm, so the paired arm's own allocations cannot displace the
+    // capture's private mempool, and before the summary that reports it.
+    let paired = match args.paired_loss {
+        true => Some(paired_loss_arm(
+            &model,
+            &store,
+            &device_batch,
+            args.steps,
+            args.paired_repeats,
+        )?),
+        false => None,
+    };
+    // The production step: what a training step costs when its batch arrives the way the
+    // trainer's batches arrive. The device-fed arm above is the same kernels without the
+    // host transfer, and the difference between them IS the upload.
+    let step_ms = pinned_step_ms;
     ensure!(peak > 0, "CUDA allocator instrumentation returned zero");
     ensure!(
-        Tensor::stack(&losses, 0).isfinite().all().int64_value(&[]) != 0,
+        losses.isfinite().all().int64_value(&[]) != 0,
         "nonfinite benchmark objective"
     );
     let title = format!(
-        "CausalPatch synthetic kernel benchmark | context {} | batch {} | {}",
+        "CausalPatch captured-step benchmark | context {} | batch {} | {}",
         args.model.seq_len,
         args.batch_size,
         match args.optimizer {
@@ -572,7 +1044,22 @@ pub fn run(args: BenchmarkArgs) -> Result<()> {
     let achieved_gbs = cost.traffic_bytes / (step_ms / 1000.) / 1e9;
     let (peak_tflops, peak_gbs) = device_peaks(device)?;
     let mut summary = vec![
-        ("end-to-end step milliseconds", step_ms),
+        // The production configuration: captured forward+backward, captured optimizer, batch
+        // uploaded from pinned host memory. The two arms beside it bracket the upload.
+        ("captured step from a pinned host batch, milliseconds", pinned_step_ms),
+        ("captured step from a device-resident batch, milliseconds", device_step_ms),
+        (
+            "packed row block upload, milliseconds (pinned-host arm minus device-resident arm)",
+            pinned_step_ms - device_step_ms,
+        ),
+        (
+            "captured step fed by the real corpus loader, milliseconds (NaN without --corpus)",
+            loader_step_ms,
+        ),
+        (
+            "host loader cost, milliseconds (corpus arm minus pinned-host arm; NaN without --corpus)",
+            loader_step_ms - pinned_step_ms,
+        ),
         (
             "origins per second",
             args.batch_size as f64 * 1000. / step_ms,
@@ -591,6 +1078,16 @@ pub fn run(args: BenchmarkArgs) -> Result<()> {
         ("achieved matmul TFLOPS", achieved_tflops),
         ("measured device bf16 GEMM TFLOPS", peak_tflops),
         ("achieved fraction of GEMM peak", achieved_tflops / peak_tflops),
+        // The GATE on any UNPAIRED step-time comparison. Job 5399 measured 230.99 TFLOPS on
+        // a quiet card and job 5452 measured 193.32 under foreign tenants; a cross-run step
+        // comparison between those two is not admissible in either direction. Nothing
+        // enforces this automatically because the harness cannot know which run it is being
+        // compared against - but the fraction is now on the chart, so the check is one
+        // subtraction rather than an archaeology exercise.
+        (
+            "measured bf16 GEMM TFLOPS as a fraction of the quiet-card reference (job 5399)",
+            peak_tflops / QUIET_CARD_GEMM_TFLOPS,
+        ),
         ("step activation traffic GB (analytic lower bound)", cost.traffic_bytes / 1e9),
         ("achieved HBM GB/s (analytic lower bound)", achieved_gbs),
         ("measured device copy GB/s", peak_gbs),
@@ -640,35 +1137,77 @@ pub fn run(args: BenchmarkArgs) -> Result<()> {
             ),
         ]);
     }
+    // The paired comparison as SERIES, not as a log line: the two arms, their difference,
+    // and the same-arm spread that bounds it, plus every repeat individually so a reader can
+    // see whether the drift was a trend or a single disturbed alternation.
+    if let Some(paired) = &paired {
+        let mean_delta = paired.composed_ms - paired.fused_ms;
+        summary.extend([
+            ("paired loss chain, fused forward+backward, milliseconds", paired.fused_ms),
+            ("paired loss chain, composed-ATen forward+backward, milliseconds", paired.composed_ms),
+            ("paired loss chain delta, milliseconds (composed minus fused)", mean_delta),
+            (
+                "paired loss chain, fused arm spread across repeats, milliseconds",
+                paired.fused_drift_ms,
+            ),
+            (
+                "paired loss chain, composed arm spread across repeats, milliseconds",
+                paired.composed_drift_ms,
+            ),
+            (
+                "paired loss chain delta as a multiple of the fused arm's own spread",
+                mean_delta / paired.fused_drift_ms.max(f64::MIN_POSITIVE),
+            ),
+            ("paired loss chain alternations", paired.repeats as f64),
+            // Scheduling information, deliberately beside the timing rows: this arm's peak is
+            // strictly HIGHER than either production step, because the composed chain
+            // materializes the intermediates the fusion exists to delete. It is the most
+            // OOM-prone job in the batch while being the one that most needs to run, so its
+            // requirement is measured rather than assumed.
+            ("paired loss chain peak allocator MiB", paired.peak_allocated_mib),
+            ("paired loss chain peak reserved MiB", paired.peak_reserved_mib),
+        ]);
+    }
+    // Owned labels, so the per-repeat rows are built where the series are and nothing has to
+    // manufacture a `'static` string for them.
+    let mut series: Vec<ReportSeries> = summary
+        .into_iter()
+        .map(|(label, value)| ReportSeries {
+            label: label.to_owned(),
+            values: vec![value as f32],
+        })
+        .collect();
+    if let Some(paired) = &paired {
+        for (index, (fused, composed)) in paired.per_repeat.iter().enumerate() {
+            series.push(ReportSeries {
+                label: format!("paired loss chain fused arm {}, milliseconds", index + 1),
+                values: vec![*fused as f32],
+            });
+            series.push(ReportSeries {
+                label: format!("paired loss chain composed arm {}, milliseconds", index + 1),
+                values: vec![*composed as f32],
+            });
+        }
+    }
     chart(
         &args.output,
         "timexer_segment_benchmark",
         &title,
         "named units",
         vec![args.batch_size as u64],
-        summary
-            .into_iter()
-            .map(|(label, value)| ReportSeries {
-                label: label.to_owned(),
-                values: vec![value as f32],
-            })
-            .collect(),
+        series,
     )?;
     write_hardware(&args.output, &title, &hardware)?;
     if args.profile {
-        let mut phase_values: Vec<[f64; 7]> = Vec::new();
+        // Fed from the PINNED host batch, so column 0 is the real asynchronous H2D of the
+        // packed row block, which is the upload the trainer pays. The synthetic device
+        // `gather()` that used to occupy a column of this chart is harness work, not a stand
+        // -in for the host batch: the host batch is built on the CPU from mapped bar files,
+        // and `audit-timexer-segment-loader` is what prices it.
+        let mut phase_values: Vec<[f64; 6]> = Vec::new();
         for _ in 0..3 {
-            let (batch, gather_ms) = timed(|| Ok(gather()))?;
-            let (_, phases) = engine.timed_step(&model, &batch)?;
-            phase_values.push([
-                gather_ms,
-                phases[0],
-                phases[1],
-                phases[2],
-                phases[3],
-                phases[4],
-                phases[5],
-            ]);
+            let (_, phases) = engine.timed_step(&model, &pinned_batch)?;
+            phase_values.push(phases);
         }
         chart(
             &args.output,
@@ -680,12 +1219,11 @@ pub fn run(args: BenchmarkArgs) -> Result<()> {
             "milliseconds",
             (1..=3).collect(),
             [
-                "input gather (synthetic, stands in for host batch)",
-                "batch upload into the resident device batch",
-                "forward backbone",
-                "forward head and loss",
-                "backward",
-                "captured forward+backward replay (NaN when not captured)",
+                "H2D of the packed row block into the resident device batch",
+                "forward backbone (NaN once captured: one replay is one launch)",
+                "forward head and loss (NaN once captured)",
+                "backward (NaN once captured)",
+                "captured forward+backward replay",
                 "optimizer update",
             ]
             .into_iter()
@@ -702,17 +1240,24 @@ pub fn run(args: BenchmarkArgs) -> Result<()> {
         // Per-kernel-class attribution. The phase chart above says how much of the step is
         // backbone; this says WHICH kernels inside it, and against which roof each one is
         // stuck. The classes are per-layer, so the step-level column scales by `layers`.
-        let kernels = kernel_profile(&model, &gather(), 8)?;
+        // Room for the per-class inputs beside the capture's private mempool: the pool holds
+        // the whole step's working set for the life of the graph and cannot be released, so
+        // the classes get what the allocator is merely caching on top of it.
+        crate::torch::cuda::empty_cache();
+        let kernels = kernel_profile(&model, &device_batch, 8)?;
         let layers = args.model.layers as f64;
+        // Two residual `addcmul`s per layer for the residual scales, plus one for the x0
+        // injection when the run has one.
+        let addcmuls = if args.model.x0_lambdas.enabled() { 3. } else { 2. };
         let scaled = |row: &KernelRow| {
             let name: &str = row.name;
             let repeats = match name {
-                // Two pre-norms per layer and three residual `addcmul`s (the residual scale
-                // on both sub-blocks plus the x0 injection), one U-net fold on half the
-                // layers, and one value-residual mix on every layer but the source; the
-                // embedding and the two pre-change reference forms run once for the whole step.
+                // Two pre-norms per layer and two or three residual `addcmul`s, one U-net fold
+                // on half the layers, and one value-residual mix on every layer but the source;
+                // the embedding and the two pre-change reference forms run once for the whole
+                // step.
                 "RMSNorm" => 2. * layers,
-                "residual addcmul" => 3. * layers,
+                "residual addcmul" => addcmuls * layers,
                 "value residual mix" => layers - 1.,
                 "patch embedding tokens" | "reference embedding (cast after cat)" => 1.,
                 _ => layers,
@@ -758,9 +1303,9 @@ pub fn run(args: BenchmarkArgs) -> Result<()> {
         }
         // Sum of the parts against the whole. The composed layer, the once-per-step embedding
         // and the two pre-change reference forms are not parts of a layer, and neither is the
-        // value-residual mix - the composed layer is layer 0, which is the mix's SOURCE and
-        // pays no mix. The pre-norm runs twice per layer and the residual `addcmul` three
-        // times.
+        // value residual mix - the composed layer is layer 0, which is the mix's SOURCE and
+        // pays no mix. The pre-norm runs twice per layer and the residual `addcmul` twice or
+        // three times, matching `CausalPatchModel::kernel_classes`'s composed layer.
         let parts: f64 = kernels
             .iter()
             .filter(|row| {
@@ -773,7 +1318,7 @@ pub fn run(args: BenchmarkArgs) -> Result<()> {
                 let each = row.forward_ms + row.backward_ms;
                 match row.name {
                     "RMSNorm" => 2. * each,
-                    "residual addcmul" => 3. * each,
+                    "residual addcmul" => addcmuls * each,
                     _ => each,
                 }
             })

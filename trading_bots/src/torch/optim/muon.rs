@@ -567,9 +567,6 @@ enum GraphStepOutcome {
     Fallback,
     /// The captured body ran and the update is applied.
     Applied,
-    /// A capture or replay failed part-way through the update, so the step is neither
-    /// applied nor safe to re-run. Anything it would have consumed stays where it is.
-    Forfeited,
 }
 
 /// One captured optimizer body.
@@ -1432,12 +1429,11 @@ impl Muon {
                     true
                 }
                 GraphStepOutcome::Applied => true,
-                GraphStepOutcome::Forfeited => false,
             };
-            // AdamW's retained gradient is released only once an update has consumed it.
-            // A forfeited step consumed nothing, so the accumulation carries into the next
-            // one rather than being thrown away: the cadence's whole point is that the
-            // gradient survives the steps that do not spend it.
+            // AdamW's retained gradient is released only once an update has consumed it, and
+            // every step that reaches here applied one: a capture or replay that fails
+            // part-way aborts the run rather than skipping an update, because a forfeited
+            // step is a hole in the trajectory that no chart would ever show.
             self.adamw_pending_grads = !(do_adamw && applied);
         });
     }
@@ -1484,6 +1480,22 @@ impl Muon {
         }
     }
 
+    /// The NorMuon rate this entry's parameter is stepped at: the configured rate, its own
+    /// `lr_scale`, and the shape multiplier `ortho_aspect_scale` derived from its registered
+    /// geometry. The ONE definition of that product - `resolve_step_scalars` publishes exactly
+    /// this into the device slot the step reads, and [`Muon::applied_learning_rate`] reports
+    /// exactly this, so a report cannot describe a rate the step did not take.
+    fn normuon_effective_lr(&self, entry: &Entry2D) -> f64 {
+        self.cfg.lr * self.lr_scales[entry.idx] * entry.aspect_scale
+    }
+
+    /// The AdamW group rate for `idx`, BEFORE bias correction: `-lr / bias_correction1` is the
+    /// step Adam takes, but the leading `1/bc1` is Adam's own moment normalization and not a
+    /// learning rate, so it is not folded in here.
+    fn adamw_effective_lr(&self, idx: usize) -> f64 {
+        self.cfg.adamw_lr * self.lr_scales[idx]
+    }
+
     /// Resolve every scheduled scalar this step needs, once.
     ///
     /// With `pack`, each one is written into a device-resident slot and handed back as
@@ -1507,12 +1519,11 @@ impl Muon {
         let mut normuon_decay = Vec::with_capacity(self.entries_2d.len());
         for (position, entry) in self.entries_2d.iter().enumerate() {
             let slot = SHARED_SLOT_COUNT + position * NORMUON_SLOTS_PER_ENTRY;
-            let lr = base_lr * self.lr_scales[entry.idx];
-            let eff_lr = lr * entry.aspect_scale;
+            let eff_lr = self.normuon_effective_lr(entry);
             let decay = if quadratic {
                 wd * base_lr * eff_lr
             } else {
-                wd * lr
+                wd * (base_lr * self.lr_scales[entry.idx])
             };
             normuon_step.push(take(slot, -eff_lr));
             // Whether the decay runs keys off the configured `weight_decay`, never off
@@ -1530,7 +1541,7 @@ impl Muon {
         let mut adamw_decay = Vec::with_capacity(self.adamw_indices.len());
         for (position, &idx) in self.adamw_indices.iter().enumerate() {
             let slot = adamw_base + position * ADAMW_SLOTS_PER_PARAM;
-            let lr = self.cfg.adamw_lr * self.lr_scales[idx];
+            let lr = self.adamw_effective_lr(idx);
             let settings = &self.adamw_settings[position];
             let (beta1, beta2) = settings.betas;
             // The clamp only covers parameters this step does not touch, whose slots
@@ -1666,13 +1677,11 @@ impl Muon {
                 self.step_graphs = StepGraphState::Armed(graphs);
                 GraphStepOutcome::Applied
             }
-            Err(err) => {
-                println!(
-                    "pretrain CUDA graphs disabled: {label} optimizer step failed ({err}); \
-                     this step is forfeited and every later step runs eagerly"
-                );
-                GraphStepOutcome::Forfeited
-            }
+            Err(err) => panic!(
+                "{label} captured optimizer step failed part-way through the update ({err}); \
+                 the step is neither applied nor safe to re-run, so the trajectory is no \
+                 longer the one this arm claims to be running"
+            ),
         }
     }
 
@@ -2183,6 +2192,26 @@ impl Muon {
             }
         }
         matched
+    }
+
+    /// The rate the next step will apply to `parameter_name`, whichever branch holds it, or
+    /// `None` if this optimizer does not hold that parameter at all.
+    ///
+    /// Not the base rate: the NorMuon branch's number includes the parameter's `lr_scale` and
+    /// the shape multiplier its registered geometry implies, which is why two 2-D matrices
+    /// under one `set_lr` are routinely stepped at rates differing by a factor of four. A
+    /// parameter whose step is disabled reports 0, because that is the rate it moves at.
+    pub fn applied_learning_rate(&self, parameter_name: &str) -> Option<f64> {
+        let idx = self.names.iter().position(|name| name == parameter_name)?;
+        if !self.step_enabled[idx] {
+            return Some(0.0);
+        }
+        if let Some(entry) = self.entries_2d.iter().find(|entry| entry.idx == idx) {
+            return Some(self.normuon_effective_lr(entry));
+        }
+        self.adamw_indices
+            .contains(&idx)
+            .then(|| self.adamw_effective_lr(idx))
     }
 
     /// Names of every parameter routed to the NorMuon (2D) branch, in registration

@@ -15,20 +15,113 @@ pub const TIMEXER_SEGMENT_REPORT_BASES: &[&str] = &[
     "timexer_segment_loss",
     "timexer_segment_error",
     "timexer_segment_calibration",
+    // The train-versus-held-out NLL gap on its own axis, and the step-indexed transposes of
+    // the per-horizon family. The horizon-indexed bases below are rewritten in place at every
+    // evaluation, so they state a moment and cannot state a trajectory; these carry the
+    // quantities a run-versus-run comparison turns on along the step axis, which is what makes
+    // two runs comparable at MATCHED steps rather than at whichever step each happened to
+    // write last.
+    //
+    // `_signal` is the decision panel: a cross-sectional model is adopted or rejected on
+    // whether the per-horizon within-timestamp information coefficient grows or decays over
+    // training, and it was previously the one quantity thrown away at every evaluation. The
+    // rest exist to explain a move in it: `_gain` is the MSE-optimal amplitude `β̂`, whose
+    // distance from 1 is exactly how much a rank-preserving forecast can lose on MSE;
+    // `_best_scale` pairs the achieved close ratio with the one an amplitude fix would reach;
+    // `_decomposition` splits the close gain into tilt, conditional signal and mis-scaling;
+    // `_calibration` is per-horizon σ coverage, which the aggregate `timexer_segment_
+    // calibration` above cannot show because every horizon contributes the same bar count to
+    // it; `_pooled` is the pooled correlation, on its own base because it is a different
+    // population from the cross-sectional IC; and `_population` is the count behind all of
+    // them, so a thin draw reads as thin rather than as a statistic that moved.
+    //
+    // The retired `timexer_segment_horizon_steps_scaling` carried the mis-scaling cross term
+    // alone; `_decomposition` carries it beside the two components it only means anything
+    // against, in the same unit.
+    "timexer_segment_generalization_gap",
     "timexer_segment_horizon",
     "timexer_segment_horizon_error",
     "timexer_segment_horizon_robust",
     "timexer_segment_horizon_rates",
+    "timexer_segment_horizon_steps",
+    "timexer_segment_horizon_steps_signal",
+    "timexer_segment_horizon_steps_signal_error",
+    "timexer_segment_horizon_steps_pooled",
+    "timexer_segment_horizon_steps_population",
+    "timexer_segment_horizon_steps_decomposition",
+    "timexer_segment_horizon_steps_gain",
+    "timexer_segment_horizon_steps_best_scale",
+    "timexer_segment_horizon_steps_calibration",
+    // The per-horizon weight the training objective actually applies. Constant within a run,
+    // so it is horizon-indexed and not step-indexed; it belongs beside the horizon family
+    // because it is the reason two horizons' curves are not comparable to each other.
+    "timexer_segment_horizon_loss_weight",
     "timexer_segment_decomposition",
     "timexer_segment_signal",
     "timexer_segment_offset",
     "timexer_segment_tradable",
     "timexer_segment_tradable_rates",
-    "timexer_segment_portfolio",
-    "timexer_segment_portfolio_sharpe",
+    // In-run out-of-sample amplitude calibration of the conditional MEAN. `_calibration_gain`
+    // carries the dimensionless gain: what was applied, what each population's own MSE-optimal
+    // amplitude is, and the in-sample training comparand that says whether the amplitude error
+    // is over-fitting or an objective defect. `_amplitude_calibration` carries what applying it
+    // does to the MSE ratio, which is a different unit and therefore a different base - the two
+    // must never share an axis. Horizon-indexed, beside the diagnostics that motivate them:
+    // `timexer_segment_horizon_steps_gain` says how far the amplitude is from 1 and
+    // `_best_scale` says what fixing it is worth, so a fitted gain that does not move the ratio
+    // toward that bound is legible as a calibration that did not work.
+    "timexer_segment_calibration_gain",
+    "timexer_segment_amplitude_calibration",
+    // The two moments `β̂` is a quotient of, as shares of the same persistence MSE. Its own
+    // base and not a pair of series on `_calibration_gain`, because a share of an MSE and a
+    // dimensionless gain are different units: a gain above 1 is a real under-amplitude only if
+    // the `Var(f)` under it is large enough for correcting it to be worth anything, and that
+    // comparison is unreadable on an axis scaled to a gain curve.
+    "timexer_segment_calibration_moments",
+    // Raw endpoint-cohort diagnostics use distinct bases from retired residual-log spreads.
+    "timexer_segment_utility_payoff",
+    "timexer_segment_utility_payoff_cost_0p5",
+    "timexer_segment_utility_payoff_cost_1",
+    "timexer_segment_utility_payoff_cost_2",
+    "timexer_segment_utility_payoff_cost_5",
+    "timexer_segment_utility_payoff_cost_10",
+    "timexer_segment_utility_rate",
+    "timexer_segment_utility_rate_cost_0p5",
+    "timexer_segment_utility_rate_cost_1",
+    "timexer_segment_utility_rate_cost_2",
+    "timexer_segment_utility_rate_cost_5",
+    "timexer_segment_utility_rate_cost_10",
+    "timexer_segment_utility_breakeven",
+    "timexer_segment_utility_gross_exposure",
+    "timexer_segment_utility_net_exposure",
+    "timexer_segment_utility_active_fraction",
+    "timexer_segment_utility_turnover",
+    "timexer_segment_utility_payoff_std",
+    "timexer_segment_utility_worst_payoff",
+    "timexer_segment_utility_census",
+    "timexer_segment_account_value",
+    "timexer_segment_account_costs",
+    "timexer_segment_account_risk",
+    "timexer_segment_account_activity",
+    "timexer_segment_account_daily_pnl",
+    "timexer_segment_account_daily_return",
+    "timexer_segment_account_monthly_pnl",
+    "timexer_segment_account_monthly_return",
+    "timexer_segment_account_summary_money",
+    "timexer_segment_account_summary_risk",
+    "timexer_segment_account_summary_census",
+    "timexer_segment_account_timing",
     "timexer_segment_progress",
     "timexer_segment_recipe_scalars",
+    // The rate each optimizer family actually stepped at, per step. Beside the recipe scalars
+    // because both answer "what did the optimizer do", and on its own axis because a NorMuon
+    // matrix rate, an AdamW dense rate and a 5x scalar-bank rate span an order of magnitude.
+    "timexer_segment_lr_trajectory",
     "timexer_segment_timing",
+    // One-time cost of everything a run pays before its first step. Its own base rather than
+    // rows in `timexer_segment_timing`: a 10^5 ms constant on the 2-180 ms per-step axis
+    // flattens every series that panel exists to show.
+    "timexer_segment_startup",
     "timexer_segment_capture",
     "timexer_segment_candles",
     "timexer_segment_hardware",
@@ -38,6 +131,117 @@ pub const TIMEXER_SEGMENT_REPORT_BASES: &[&str] = &[
     "timexer_segment_benchmark_kernel_roofline",
     "timexer_segment_benchmark_kernel_activations",
     "timexer_segment_fused_kernels",
+    // The frozen-trunk latent probe. Three bases and not one, for the reason stated at the top
+    // of this list: the decision quantity is a correlation near 0.05, the amplitude-neutral
+    // comparison is an MSE ratio near 1.0, and the fit's conditioning spans decades. On one
+    // axis the first two render as a flat line under the third.
+    //
+    // `_latent_probe` is the verdict panel: the trained head's within-timestamp IC, each
+    // probe's, and the PAIRED difference beside the two pre-registered decision thresholds, so
+    // the World A / World B call is read off the chart rather than asserted in prose.
+    // `_latent_probe_ratio` carries the same comparison in MSE, achieved and oracle-rescaled on
+    // both sides, because a probe compared to the head on raw MSE would be re-measuring the
+    // known amplitude defect instead of information content. `_latent_probe_conditioning` is
+    // the discount panel: a probe that only wins through an ill-conditioned inverse is not
+    // evidence, and the fitted parameter count rides in each series label.
+    "timexer_segment_latent_probe",
+    "timexer_segment_latent_probe_ratio",
+    "timexer_segment_latent_probe_conditioning",
+    // Same family, different QUESTION, and therefore a fourth base rather than a fourth series:
+    // the three above ask whether the latent beats the head at a fixed fit sample, this one asks
+    // whether that answer is limited by information or by sample size. Its x axis is
+    // coefficient-fit origins, not bars ahead, so it cannot share a panel with them.
+    "timexer_segment_latent_probe_scaling",
+    // And a fifth, for the third explanation the other four are blind to: how much of the
+    // probe's edge is RECENCY rather than latent information. Its series are fit-block tranches
+    // and its decisive line is a threshold ADJUSTMENT, not an IC, so it belongs beside the
+    // verdict panel rather than inside it.
+    "timexer_segment_latent_probe_recency",
+    // The per-horizon predictable-information CEILING, beside the checkpoint's own IC and the
+    // paired gap between them. ONE base and not three: a ceiling, a realized IC, their
+    // difference and the standard error of that difference are all correlation coefficients
+    // and all answer one question - how much within-timestamp IC is left at this horizon -
+    // so putting them on separate axes would hide the only comparison the panel exists for.
+    //
+    // It is a property of the TARGETS, not of any model: an upper bound on what any causal
+    // forecaster can reach, computed from the within-timestamp second moments of the 192
+    // cumulative market-neutral targets under a martingale-residual assumption and a stated
+    // one-bar ceiling. Nothing a run does can move it, which is what makes it the reference
+    // every architecture decision is judged against rather than another run-dependent curve.
+    "timexer_segment_information_ceiling",
+    // How the market-neutral target's cross-sectional variance ACCUMULATES with the horizon,
+    // in variance-ratio units, on every population the curve is measured over. It sits beside
+    // the ceiling rather than inside it because a ratio near 0.35 on the ceiling's correlation
+    // axis would be read as an IC of 0.35, which is two orders of magnitude wrong.
+    //
+    // The decoder's persistence anchor scales its predicted mean and scale by √h, which is the
+    // correct growth for a random walk and the wrong one for anything else. This curve is the
+    // measured replacement: it is a functional of the targets alone, costs no model, and once
+    // it agrees across `training`, the calibration block and `held-out full` it may be frozen
+    // into training as a data-derived scale.
+    "timexer_segment_variance_ratio",
+    // The MECHANISM behind that ratio: the measured lag-1 cross-sectional autocorrelation of
+    // the per-bar returns beside the lag-1 autocorrelation an MA(1) residual would need to
+    // produce the measured ratio. Correlation units, so its own axis. Two series that must
+    // agree for the plateau to be readable as microstructure, and whose disagreement is the
+    // finding that the reversal is spread over many lags instead.
+    "timexer_segment_return_autocorrelation",
+    // Per-coefficient predictive SNR and per-coefficient fitted amplitude gain in whichever
+    // orthonormal horizon basis the objective is measured in - see
+    // `timexer_segment::target_basis`. Both series are dimensionless ratios of the SAME
+    // question, "where along the coefficient axis does the forecast carry signal and where is
+    // its amplitude wrong", so they share one axis: `ρ̂²` is the share of a coefficient's
+    // variance the forecast explains and `β̂` is the multiple its amplitude is off by, with 1
+    // correct and below 1 over-amplified. In an orthonormal basis the amplitude defect is
+    // DIAGONAL, so this is the one panel where the 3.8x over-amplification at h = 192 can be
+    // attributed to a subspace rather than smeared across 192 near-duplicate rows.
+    "timexer_segment_target_basis",
+    // How much of its own training signal the run has actually consumed, per step: the share
+    // of this arm's distinct supervised (absolute origin, horizon) outcomes that have received
+    // at least one, two, four, eight and sixteen gradient passes, plus its epoch progress.
+    //
+    // Its own base because it is the only panel that is not a property of the model: it is a
+    // property of the row pool, computed in closed form from the MEASURED per-outcome
+    // multiplicity histogram of the rows the arm retained. It exists so the step at which a
+    // run runs out of fresh outcomes is READ off a chart instead of recomputed by hand
+    // afterwards - and so an arm whose held-out skill peaks somewhere other than its own
+    // saturation step refutes the occupancy explanation on sight.
+    //
+    // Every series is a share of the same denominator, so one axis carries all of them; the
+    // mean exposure COUNT is the epoch-progress series times the mean multiplicity the title
+    // states, which keeps a count off an axis of fractions.
+    "timexer_segment_supervision_occupancy",
+    // The one panel that separates OVERFITTING from NON-STATIONARITY, which every other
+    // explanation of a held-out peak hangs on. Chronological splits make every other
+    // `held-out *` draw out-of-sample in ORIGIN IDENTITY and out-of-period in MARKET REGIME
+    // simultaneously, and those two have opposite fixes - capacity/regularization/effective
+    // sample size versus data recency/target definition/online adaptation. This base carries
+    // an IN-PERIOD draw, cut from a purged hole inside the training span so it shares no
+    // origin and no target bar with any surviving training row, against the out-of-period
+    // draw at the same optimizer step.
+    //
+    // ONE base and not three: two ICs, their difference and all three standard errors are
+    // correlation coefficients answering one question, so separate axes would hide the only
+    // comparison the panel exists for. Reading rule, pre-registered in `reports.rs` before any
+    // run existed: in-period improving while out-of-period collapses is non-stationarity; both
+    // collapsing together is overfitting on a correlated-sample budget; in-period peaking less
+    // severely is reported as a ratio and decides nothing on its own.
+    "timexer_segment_temporal_generalization",
+    // Where a NON-TRAINING pass's batch goes: the four synchronized spans - exposed host
+    // loader wait, H2D upload, forward, and the nine fp64 per-timestamp scatter sums - that
+    // partition one sampled batch of `ceiling-timexer-segment`'s accumulation loop.
+    //
+    // Deliberately NOT rows in `timexer_segment_timing`. That base is the TRAINING step's
+    // panel: its x axis is the optimizer step and its values are an interval's means. This
+    // one's x axis is the batch ordinal inside a single diagnostic pass, and the two clocks
+    // cannot share an axis without one of them becoming unreadable. Same unit, different
+    // question, different axis - so a different base.
+    //
+    // The diagnostics are the project's measurement instruments and they run repeatedly under
+    // a lease budget; before this base existed, the only throughput number any of them
+    // produced was one wall clock covering three populations, a corpus load and a `finish`,
+    // which is why a 75 ms batch was read as a 189 ms one.
+    "timexer_segment_eval_phases",
 ];
 
 pub const RL_META_REPORT_BASES: &[&str] = &[

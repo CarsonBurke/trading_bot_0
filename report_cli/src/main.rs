@@ -166,7 +166,7 @@ fn resolve_run(
 ) -> Result<RunDir> {
     Ok(match (run_name, run_root) {
         (Some(name), None) => RunDir::select(runs_root, name)?,
-        (None, Some(root)) => RunDir::open(root)?,
+        (None, Some(root)) => RunDir::open_observable(root)?,
         (None, None) => RunDir::latest(runs_root.to_string_lossy().as_ref())?,
         (Some(_), Some(_)) => unreachable!(),
     })

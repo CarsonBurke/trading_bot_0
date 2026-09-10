@@ -132,8 +132,12 @@ def read_evidence(name, context, features):
     return {"identity": contract_identity(contract), "model": model, "mse": mse,
             "persistence": persistence, "validation_origins": manifest["eval_origins"],
             "completed_origins": manifest["completed_origins"],
+            # `scalar_lr_mult` and `base_learning_rate` belong here for the same reason the
+            # recipe string does: two arms that trained the scalar banks at different rates are
+            # NOT a matched comparison, and this dict is what refuses one.
             "protocol": {key: manifest[key] for key in (
-                "format", "objective", "numerics", "learning_rate", "eval_every", "optimizer", "optimizer_recipe")}}
+                "format", "objective", "numerics", "learning_rate", "base_learning_rate",
+                "scalar_lr_mult", "eval_every", "optimizer", "optimizer_recipe")}}
 
 
 def launch_final(args):
