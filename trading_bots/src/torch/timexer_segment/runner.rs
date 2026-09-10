@@ -3801,6 +3801,25 @@ mod tests {
             best_step: Some(1000),
             best_objective_nll: Some(1.3),
             weights_sha256: file_sha256(directory.0.join("model.safetensors")).unwrap(),
+            // A seven-horizon frozen gain, non-identity so the digest covers a real curve, with
+            // one gated horizon carried signed: the manifest is the only place the applied
+            // amplitude is recorded, so it has to survive the round trip and the digest.
+            mean_gain: FrozenGain {
+                estimator: "test".into(),
+                blocks: Blocks {
+                    calibration_first_origin_ms: 700_000,
+                    calibration_last_origin_ms: 780_000,
+                    calibration_last_target_ms: 790_000,
+                    calibration_origins: 512,
+                    evaluation_first_origin_ms: 800_000,
+                    evaluation_last_origin_ms: 890_000,
+                    evaluation_origins: 128,
+                    purge_gap_ms: 10_000,
+                },
+                anchor: vec![3.662, 2.4, 1.9, 1.2, 0.9, 0.5, 0.2],
+                offset: vec![1.1, 1.05, 1.0, 0.98, 0.95, 0.9, 0.85],
+                measured_anchor: vec![3.7, 2.3, 1.95, 1.18, 0.88, -0.04, f64::NAN],
+            },
             manifest_sha256: String::new(),
         };
         manifest.manifest_sha256 = manifest.digest().unwrap();

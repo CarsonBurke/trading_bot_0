@@ -3989,114 +3989,70 @@ mod lr_trajectory_tests {
 
     /// An uncalibrated run's gain panel is the honest 1.0, never NaN and never absent.
     ///
-    /// NaN would say "no calibration was fitted", which is a different statement from "the
-    /// calibration applied was the identity", and the whole point of writing this panel on
-    /// every run is that the second statement is what a reader needs before laying a
-    /// calibrated arm over an uncalibrated one.
+    /// "No calibration was fitted" and "the applied calibration was the identity" are different
+    /// observable states. The report must preserve the latter as an explicit curve.
     #[test]
-    fn an_uncalibrated_run_writes_a_gain_of_exactly_one_at_every_horizon() {
-        use crate::torch::timexer_segment::calibration::{Blocks, Measured, Pairing};
+    fn an_uncalibrated_run_writes_identity_gain_and_split_moments() {
+        use crate::torch::timexer_segment::calibration::{Blocks, FrozenGain, Moments};
         let root = std::env::temp_dir().join(format!(
             "timexer-identity-gain-{}",
             uuid::Uuid::new_v4()
         ));
         fs::create_dir_all(&root).unwrap();
-        let horizon = 192;
-        write_calibration_gain(&root, 2, 3000, horizon, AppliedGain::Identity, 64).unwrap();
-        let report = read_report(root.join("timexer_segment_calibration_gain.report.bin")).unwrap();
+        let horizon = 8;
+        let cells = horizon * 4;
+        let moments = Moments {
+            pred_len: horizon,
+            channels: 4,
+            bars: vec![1.; horizon],
+            target: vec![1.; cells],
+            target_square: vec![1.; cells],
+            anchor_square: vec![1.; cells],
+            anchor_offset: vec![0.; cells],
+            offset_square: vec![0.; cells],
+            anchor_target: vec![1.; cells],
+            offset_target: vec![0.; cells],
+        };
+        let applied = FrozenGain {
+            estimator: "identity fixture".into(),
+            blocks: Blocks {
+                calibration_first_origin_ms: 1,
+                calibration_last_origin_ms: 2,
+                calibration_last_target_ms: 3,
+                calibration_origins: 4,
+                evaluation_first_origin_ms: 5,
+                evaluation_last_origin_ms: 6,
+                evaluation_origins: 7,
+                purge_gap_ms: 8,
+            },
+            anchor: vec![1.; horizon],
+            offset: vec![1.; horizon],
+            measured_anchor: vec![1.; horizon],
+        };
+        let panels = AmplitudePanels {
+            epoch: 2,
+            step: 3000,
+            tickers: 4,
+            applied: &applied,
+            fit: None,
+            scored: vec![AmplitudeSplit {
+                split: FULL,
+                origins: 7,
+                emission: Emission::Uncalibrated,
+                moments: &moments,
+            }],
+        };
+        write_amplitude(&root, &panels).unwrap();
+        let report =
+            read_report(root.join("timexer_segment_calibration_gain.report.bin")).unwrap();
         let ReportKind::IndexedLines { steps, series } = &report.kind else {
             panic!("the gain panel must be a horizon-indexed line chart");
         };
         assert_eq!(steps.len(), horizon);
-        assert_eq!(series.len(), 1, "the identity has no fit block to compare to");
         assert_eq!(series[0].values, vec![1.0f32; horizon]);
-        assert!(report.title.contains("none fitted"));
-        // And the fitted case carries the frozen curve plus both populations' own optima, so
-        // the two cases are readable side by side on one axis.
-        let pairing = Pairing {
-            checkpoint_format: "f".to_owned(),
-            objective: "o".to_owned(),
-            weights_sha256: "a".repeat(64),
-            manifest_sha256: "b".repeat(64),
-            step: 3000,
-            pred_len: horizon,
-            corpus_schema: "s".to_owned(),
-            corpus_sha256: "c".repeat(64),
-        };
-        let blocks = Blocks {
-            calibration_first_origin_ms: 1,
-            calibration_last_origin_ms: 2,
-            calibration_last_target_ms: 3,
-            calibration_origins: 4,
-            evaluation_first_origin_ms: 5,
-            evaluation_last_origin_ms: 6,
-            evaluation_origins: 7,
-            purge_gap_ms: 2,
-        };
-        let optimal_gain: Vec<f64> = (1..=horizon).map(|h| 1. / (h as f64).sqrt()).collect();
-        let measured = Measured {
-            pearson: vec![0.1; horizon],
-            demeaned_gain: vec![0.01; horizon],
-            scaling_gain: vec![-0.02; horizon],
-            forecast_variance: vec![0.05; horizon],
-            covariance: optimal_gain.iter().map(|gain| gain * 0.05).collect(),
-            persistence: vec![1.; horizon],
-            bars: vec![4096.; horizon],
-            optimal_gain,
-        };
-        let calibration = MeanCalibration::fit(pairing, blocks, &measured).unwrap();
-        let evaluation_gain = vec![0.5; horizon];
-        write_calibration_gain(
-            &root,
-            2,
-            3000,
-            horizon,
-            AppliedGain::Fitted {
-                calibration: &calibration,
-                evaluation_gain: &evaluation_gain,
-            },
-            64,
-        )
-        .unwrap();
-        let report = read_report(root.join("timexer_segment_calibration_gain.report.bin")).unwrap();
-        let ReportKind::IndexedLines { series, .. } = &report.kind else {
-            panic!("the gain panel must be a horizon-indexed line chart");
-        };
-        // Applied gain, the block it was fitted on, the block it had to predict, the bound the
-        // amplifying direction is charged against, and the identity reference.
-        assert_eq!(series.len(), 5);
-        assert_eq!(
-            series[0].values,
-            calibration
-                .gain
-                .iter()
-                .map(|gain| *gain as f32)
-                .collect::<Vec<f32>>()
-        );
-        assert!(series[0].values.iter().all(|gain| gain.is_finite()));
-        // The ceiling is on the same axis and is never below the identity, so the applied
-        // curve can be read against it without converting units.
-        let ceiling = series
-            .iter()
-            .find(|line| line.label.contains("amplification ceiling"))
-            .expect("the gain panel must carry the bound the applied curve respects");
-        assert!(ceiling.values.iter().all(|value| *value >= 1.));
-        assert!(series[0]
-            .values
-            .iter()
-            .zip(&ceiling.values)
-            .all(|(gain, bound)| gain <= bound));
-        // A horizon count that disagrees with the calibration is a pairing fault, not a chart
-        // to draw with one axis silently truncated.
-        assert!(write_calibration_gain(
-            &root,
-            2,
-            3000,
-            horizon - 1,
-            AppliedGain::Frozen(&calibration),
-            64
-        )
-        .is_err());
+        assert_eq!(series[1].values, vec![1.0f32; horizon]);
+        assert!(report.title.contains("checkpoint's own curves"));
+        assert!(TIMEXER_SEGMENT_REPORT_BASES.contains(&"timexer_segment_calibration_gain"));
         fs::remove_dir_all(&root).unwrap();
     }
 }

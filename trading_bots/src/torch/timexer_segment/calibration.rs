@@ -958,7 +958,7 @@ fn fit_curve(
     if !gain.iter().all(|value| value.is_finite() && *value > 0.) {
         return CurveFit::identity(
             coordinate,
-            horizons,
+            measured_gain,
             format!("the fitted {} gain left the positive range", coordinate.label()),
         );
     }
