@@ -1055,7 +1055,7 @@ pub(super) fn evaluate(
     let gated = !applied.tradable(horizon) || !applied.tradable(entry);
     if gated {
         prepared.assumptions.push(format!(
-            "SIZED TO ZERO BY THE AMPLITUDE GATE: the checkpoint's calibration block measured a non-positive or unidentifiable close-anchor gain at h{horizon} ({}) or at the h1 entry anchor ({}), so this account takes no position. The fitted curve is positive everywhere by construction and cannot express this; the signed measurement is what gates. Reported, never clipped: an all-zero book with no stated reason is indistinguishable from a broken pipeline.",
+            "SIZED TO ZERO BY THE AMPLITUDE GATE: the checkpoint's calibration block measured a non-positive or unidentifiable close-anchor gain at h{horizon} ({:?}) or at the h1 entry anchor ({:?}), so this account takes no position. The fitted curve is positive everywhere by construction and cannot express this; the signed measurement is what gates. Reported, never clipped: an all-zero book with no stated reason is indistinguishable from a broken pipeline.",
             applied.measured_anchor[horizon - 1],
             applied.measured_anchor[entry - 1]
         ));
@@ -1076,11 +1076,11 @@ pub(super) fn evaluate(
     );
     prepared.summary.insert(
         "calibration_measured_gain_ratio".into(),
-        applied.measured_anchor[horizon - 1],
+        applied.measured_anchor[horizon - 1].unwrap_or(f64::NAN),
     );
     prepared.summary.insert(
         "entry_calibration_measured_gain_ratio".into(),
-        applied.measured_anchor[entry - 1],
+        applied.measured_anchor[entry - 1].unwrap_or(f64::NAN),
     );
     prepared
         .summary

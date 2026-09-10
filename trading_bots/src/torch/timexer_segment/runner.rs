@@ -3818,7 +3818,15 @@ mod tests {
                 },
                 anchor: vec![3.662, 2.4, 1.9, 1.2, 0.9, 0.5, 0.2],
                 offset: vec![1.1, 1.05, 1.0, 0.98, 0.95, 0.9, 0.85],
-                measured_anchor: vec![3.7, 2.3, 1.95, 1.18, 0.88, -0.04, f64::NAN],
+                measured_anchor: vec![
+                    Some(3.7),
+                    Some(2.3),
+                    Some(1.95),
+                    Some(1.18),
+                    Some(0.88),
+                    Some(-0.04),
+                    None,
+                ],
             },
             manifest_sha256: String::new(),
         };

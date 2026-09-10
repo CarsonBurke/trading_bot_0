@@ -3687,7 +3687,16 @@ mod tests {
             offset: vec![0.5, 1.4, 0.9, 2.0, 1.0, 0.25, 3.0, 1.7],
             // The signed measurement the curves were smoothed from: it rides with the frozen
             // gain but nothing in the model reads it, which is what this fixture pins.
-            measured_anchor: vec![3.6, 2.7, 2.2, 1.0, 0.9, 0.4, -0.3, f64::NAN],
+            measured_anchor: vec![
+                Some(3.6),
+                Some(2.7),
+                Some(2.2),
+                Some(1.0),
+                Some(0.9),
+                Some(0.4),
+                Some(-0.3),
+                None,
+            ],
         };
         assert_eq!(frozen.anchor.len(), config.pred_len as usize);
         let weights = |store: &nn::VarStore| {

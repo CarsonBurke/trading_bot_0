@@ -2602,10 +2602,16 @@ fn write_gain_panel(output: &Path, panels: &AmplitudePanels<'_>, horizon: usize)
     if panels.fit.is_none() {
         // A loaded checkpoint has no fit block resident, but it carries the measurement its
         // curve was smoothed from - signed and unmodified, which is what makes a gated horizon
-        // legible on this panel rather than only in a log line.
+        // legible on this panel rather than only in a log line. An unmeasured horizon draws as
+        // a gap, not as a zero: a zero would read as a measured collapse.
         series.push(curve(
             format!("{CALIBRATION} close-anchor MSE-optimal gain carried by the checkpoint, signed"),
-            &panels.applied.measured_anchor,
+            &panels
+                .applied
+                .measured_anchor
+                .iter()
+                .map(|gain| gain.unwrap_or(f64::NAN))
+                .collect::<Vec<f64>>(),
         ));
     }
     for split in &panels.scored {
@@ -2650,7 +2656,10 @@ fn gated_note(applied: &FrozenGain) -> String {
     let listed = gated
         .iter()
         .take(8)
-        .map(|(horizon, measured)| format!("h={horizon} at {measured:.4}"))
+        .map(|(horizon, measured)| match measured {
+            Some(value) => format!("h={horizon} at {value:.4}"),
+            None => format!("h={horizon} unmeasured"),
+        })
         .collect::<Vec<_>>()
         .join(", ");
     format!(
@@ -4027,7 +4036,7 @@ mod lr_trajectory_tests {
             },
             anchor: vec![1.; horizon],
             offset: vec![1.; horizon],
-            measured_anchor: vec![1.; horizon],
+            measured_anchor: vec![Some(1.); horizon],
         };
         let panels = AmplitudePanels {
             epoch: 2,
