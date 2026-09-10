@@ -96,6 +96,7 @@ void at_set_int64_value_at_indexes(tensor, int *indexes, int indexes_len, int64_
 
 void at_copy_(tensor dst, tensor src);
 void at_copy_nonblocking(tensor dst, tensor src);
+tensor at_empty_pinned_float(int64_t *dims, int ndims);
 
 void at_print(tensor);
 char *at_to_string(tensor, int line_size);

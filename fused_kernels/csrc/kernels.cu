@@ -724,6 +724,275 @@ int launch_qk_norm_rope_backward(const void *grad, const void *input, const void
     return static_cast<int>(cudaGetLastError());
 }
 
+// ---------------------------------------------------------------------------------------
+// Fused candle geometry and Gaussian NLL.
+//
+// This one is not a two-op fusion: it is a forty-eight-op elementwise chain over the
+// 147 M-element head space, and every op in it was its own full-size fp32 pass. What it
+// does NOT fuse is the twelve `dot`s the chain feeds. A reduction's summation tree is
+// cuBLAS's, not ours, so the kernel writes exactly the twelve fp32 vectors those `dot`s
+// consume and ATen still performs them - the loss value and the MSE keep the bits they had.
+// The saving is the forty-eight intermediates that never cross HBM, and a backward that
+// recomputes the chain from `head` instead of reading twelve retained tensors.
+// ---------------------------------------------------------------------------------------
+
+// Fields of the `rounding` selector. Each one is a place where the fp32 form ATen's own
+// build emitted is not deducible from the mathematics, only measured: which of two
+// associations a backward kernel was written with, and whether `nvcc` contracted a
+// multiply-add that changes the last bit. `FK_LOSS_GEOMETRY_ROUNDING` in `lib.rs` carries
+// the measured value and `loss_geometry_rounding_is_the_measured_form` is the measurement.
+constexpr int kLossDivTrue = 1;       // bit 0: `x / ln2` rather than `x * (1/ln2)`
+constexpr int kLossTanhFma = 2;       // bit 1: tanh backward contracts `1 - y·y`
+constexpr int kLossSigmoidSwap = 4;   // bit 2: sigmoid backward as `(g·y)·(1-y)`
+constexpr int kLossSoftplusShift = 3; // bits 3-4: softplus backward's association
+constexpr int kLossSoftplusMask = 3;
+
+// Explicit round-to-nearest primitives, not `*`/`+`/`-`//`/`. Every one of these operations
+// was a SEPARATE ATen kernel, so the composition had no opportunity to contract a product
+// and a sum into one `fma` - and `nvcc` contracts by default, which would silently move the
+// last bit of a fused chain. Writing the intrinsics is how the fusion stays bit-identical
+// instead of merely more accurate.
+__device__ __forceinline__ float fk_mul(float a, float b) { return __fmul_rn(a, b); }
+__device__ __forceinline__ float fk_add(float a, float b) { return __fadd_rn(a, b); }
+__device__ __forceinline__ float fk_sub(float a, float b) { return __fsub_rn(a, b); }
+__device__ __forceinline__ float fk_div(float a, float b) { return __fdiv_rn(a, b); }
+
+// `softplus` with ATen's defaults: `(x·β) > threshold ? x : log1p(exp(x·β))/β` at β = 1,
+// threshold = 20. Both `·1` and `/1` are exact, so they are not written.
+__device__ __forceinline__ float fk_softplus(float x) {
+    return x > 20.0f ? x : log1pf(expf(x));
+}
+
+// ATen's fp32 sigmoid is `1/(1+exp(-x))` in the opmath type, not a `tanh` identity.
+__device__ __forceinline__ float fk_sigmoid(float x) {
+    return fk_div(1.0f, fk_add(1.0f, expf(-x)));
+}
+
+// `div` by a HOST scalar on CUDA multiplies by the fp32 reciprocal - ATen computes
+// `1/scalar` once in the opmath type and removes the operand - while `div` by a device
+// tensor is a true division. `1/ln2` is not exactly representable, so the two disagree, and
+// which one the composition used is a measured fact.
+__device__ __forceinline__ float fk_scale_ln2(float value, float ln2, float inverse_ln2,
+                                              int rounding) {
+    return (rounding & kLossDivTrue) ? fk_div(value, ln2) : fk_mul(value, inverse_ln2);
+}
+
+__device__ __forceinline__ float fk_tanh_backward(float grad, float output, int rounding) {
+    return (rounding & kLossTanhFma)
+               ? fk_mul(grad, __fmaf_rn(-output, output, 1.0f))
+               : fk_mul(grad, fk_sub(1.0f, fk_mul(output, output)));
+}
+
+__device__ __forceinline__ float fk_sigmoid_backward(float grad, float output,
+                                                     int rounding) {
+    return (rounding & kLossSigmoidSwap)
+               ? fk_mul(fk_mul(grad, output), fk_sub(1.0f, output))
+               : fk_mul(fk_mul(grad, fk_sub(1.0f, output)), output);
+}
+
+__device__ __forceinline__ float fk_softplus_backward(float grad, float input,
+                                                      int rounding) {
+    if (input > 20.0f) {
+        return grad;
+    }
+    const float z = expf(input);
+    switch ((rounding >> kLossSoftplusShift) & kLossSoftplusMask) {
+    case 1:
+        return fk_mul(grad, fk_div(z, fk_add(z, 1.0f)));
+    case 2:
+        return fk_mul(fk_div(grad, fk_add(z, 1.0f)), z);
+    default:
+        return fk_div(fk_mul(grad, z), fk_add(z, 1.0f));
+    }
+}
+
+// The candle geometry for one (origin, bar): the σ-scaled close, the relative range, the
+// two positions inside it and the three offsets that place low/high/open. `channel` points
+// at this element's coordinate-0 lane; consecutive channels are `horizon` apart.
+struct LossGeometry {
+    float close, relative_range, position_low, position_open;
+    float low, high, open, precision;
+    float sigma, range, horizon_scale;
+    float sigmoid_low, sigmoid_open;
+};
+
+__device__ __forceinline__ LossGeometry
+loss_geometry_of(const __nv_bfloat16 *__restrict__ channel, int64_t horizon, float sigma,
+                 float range, float horizon_scale, float weighted_mask,
+                 float inverse_horizon, float gain, float ln2, float inverse_ln2,
+                 int rounding) {
+    LossGeometry geometry;
+    geometry.sigma = sigma;
+    geometry.range = range;
+    geometry.horizon_scale = horizon_scale;
+    geometry.close = fk_mul(__bfloat162float(channel[0]), horizon_scale);
+    const float softplus = fk_softplus(__bfloat162float(channel[horizon]));
+    geometry.relative_range =
+        fk_scale_ln2(fk_mul(softplus, range), ln2, inverse_ln2, rounding);
+    geometry.sigmoid_low = fk_sigmoid(__bfloat162float(channel[2 * horizon]));
+    geometry.position_low = fk_mul(geometry.sigmoid_low, geometry.relative_range);
+    geometry.low =
+        fk_sub(geometry.close, fk_div(log1pf(geometry.position_low), sigma));
+    geometry.high = fk_add(geometry.low, fk_div(log1pf(geometry.relative_range), sigma));
+    geometry.sigmoid_open = fk_sigmoid(__bfloat162float(channel[3 * horizon]));
+    geometry.position_open = fk_mul(geometry.sigmoid_open, geometry.relative_range);
+    geometry.open = fk_add(geometry.low, fk_div(log1pf(geometry.position_open), sigma));
+    geometry.precision = fk_mul(weighted_mask, inverse_horizon);
+    (void)gain;
+    return geometry;
+}
+
+// `targets` is addressed by STRIDE, not assumed dense. The real path builds it with
+// `unfold` and TensorIterator allocates the arithmetic below it in the inputs' own
+// permuted layout, so what arrives is channel-innermost - sizes
+// `[rows, origins, 4, horizon]`, strides `[origins·4·horizon, 4·horizon, 1, 4]`. The
+// composition tolerated that silently because every pointwise op it called accepts strided
+// inputs; a fused kernel has to say so. Three extra int64 arguments and one multiply per
+// channel read cost nothing, where a `.contiguous()` would copy 295 MB and read it back.
+__global__ void loss_geometry_forward_kernel(
+    const __nv_bfloat16 *__restrict__ head, const float *__restrict__ targets,
+    const float *__restrict__ weighted_mask, const float *__restrict__ sigma,
+    const float *__restrict__ range, const float *__restrict__ horizon_scale,
+    const float *__restrict__ inverse_horizon, const float *__restrict__ log_scale_gain,
+    float *__restrict__ close_out, float *__restrict__ workspace, int64_t elements,
+    int64_t horizon, int64_t target_token_stride, int64_t target_channel_stride,
+    int64_t target_bar_stride, float cap, float ln2, float inverse_ln2, int rounding) {
+    const float gain = log_scale_gain[0];
+    const float slope = -2.0f * cap;
+    const int64_t stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
+    for (int64_t index = blockIdx.x * static_cast<int64_t>(blockDim.x) + threadIdx.x;
+         index < elements; index += stride) {
+        const int64_t token = index / horizon;
+        const int64_t bar = index - token * horizon;
+        const __nv_bfloat16 *channel = head + token * 8 * horizon + bar;
+        const LossGeometry geometry = loss_geometry_of(
+            channel, horizon, sigma[token], range[token], horizon_scale[bar],
+            weighted_mask[index], inverse_horizon[bar], gain, ln2, inverse_ln2, rounding);
+        const float prediction[4] = {geometry.open, geometry.high, geometry.low,
+                                     geometry.close};
+        const float *target =
+            targets + token * target_token_stride + bar * target_bar_stride;
+        close_out[index] = geometry.close;
+#pragma unroll
+        for (int channel_index = 0; channel_index < 4; ++channel_index) {
+            const float scale = tanhf(
+                fk_mul(__bfloat162float(channel[(4 + channel_index) * horizon]), gain));
+            const float weight =
+                fk_mul(expf(fk_mul(scale, slope)), geometry.precision);
+            const float difference =
+                fk_sub(target[channel_index * target_channel_stride],
+                       prediction[channel_index]);
+            workspace[channel_index * elements + index] = fk_mul(difference, difference);
+            workspace[(4 + channel_index) * elements + index] = weight;
+            workspace[(8 + channel_index) * elements + index] = scale;
+        }
+    }
+}
+
+// The transpose of the whole chain. The accumulation ORDERS below are not free choices:
+// `low` reaches three consumers and `relative_range` three, and the autograd engine sums a
+// buffer's contributions in DESCENDING node-creation order (it pops the highest sequence
+// number first). So `low` accumulates open, then the channel-2 residual, then high; and
+// `relative_range` accumulates the open position, then the full-range `log1p`, then the low
+// position. Any other grouping differs in the last bit, which
+// `composed_loss_geometry_accumulates_in_descending_creation_order` pins.
+__global__ void loss_geometry_backward_kernel(
+    const __nv_bfloat16 *__restrict__ head, const float *__restrict__ targets,
+    const float *__restrict__ weighted_mask, const float *__restrict__ sigma,
+    const float *__restrict__ range, const float *__restrict__ horizon_scale,
+    const float *__restrict__ inverse_horizon, const float *__restrict__ log_scale_gain,
+    const float *__restrict__ grad_terms, const float *__restrict__ grad_close,
+    __nv_bfloat16 *__restrict__ grad_head, int64_t elements, int64_t horizon,
+    int64_t target_token_stride, int64_t target_channel_stride, int64_t target_bar_stride,
+    float cap, float ln2, float inverse_ln2, int rounding) {
+    const float gain = log_scale_gain[0];
+    const float slope = -2.0f * cap;
+    float term[8];
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        term[i] = grad_terms == nullptr ? 0.0f : grad_terms[i];
+    }
+    const int64_t stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
+    for (int64_t index = blockIdx.x * static_cast<int64_t>(blockDim.x) + threadIdx.x;
+         index < elements; index += stride) {
+        const int64_t token = index / horizon;
+        const int64_t bar = index - token * horizon;
+        const __nv_bfloat16 *channel = head + token * 8 * horizon + bar;
+        const float mask = weighted_mask[index];
+        const LossGeometry geometry =
+            loss_geometry_of(channel, horizon, sigma[token], range[token],
+                             horizon_scale[bar], mask, inverse_horizon[bar], gain, ln2,
+                             inverse_ln2, rounding);
+        const float prediction[4] = {geometry.open, geometry.high, geometry.low,
+                                     geometry.close};
+        const float *target =
+            targets + token * target_token_stride + bar * target_bar_stride;
+        __nv_bfloat16 *out = grad_head + token * 8 * horizon + bar;
+        float grad_prediction[4];
+#pragma unroll
+        for (int channel_index = 0; channel_index < 4; ++channel_index) {
+            const float raw = __bfloat162float(channel[(4 + channel_index) * horizon]);
+            const float scale = tanhf(fk_mul(raw, gain));
+            const float exponential = expf(fk_mul(scale, slope));
+            const float weight = fk_mul(exponential, geometry.precision);
+            const float difference =
+                fk_sub(target[channel_index * target_channel_stride],
+                       prediction[channel_index]);
+            const float square = fk_mul(difference, difference);
+            // `dot`'s backward is `grad · other`, and the reference's `·½` and `·cap`
+            // scalar multiplies ride on the term gradient first.
+            const float grad_dot = fk_mul(term[2 * channel_index], 0.5f);
+            const float grad_square = fk_mul(grad_dot, weight);
+            const float grad_weight = fk_mul(grad_dot, square);
+            // `scale` has two consumers - the precision weight and its own `dot` against
+            // the weighted mask - and two addends commute exactly, so this pair needs no
+            // measured order.
+            const float grad_scale = fk_add(
+                fk_mul(fk_mul(term[2 * channel_index + 1], cap), mask),
+                fk_mul(fk_mul(fk_mul(grad_weight, geometry.precision), exponential),
+                       slope));
+            out[(4 + channel_index) * horizon] = __float2bfloat16(
+                fk_mul(fk_tanh_backward(grad_scale, scale, rounding), gain));
+            // `square` is `difference · difference`, so the two identical products the
+            // multiply's backward accumulates double exactly, and the `neg` the residual's
+            // backward applies carries the sign of an exact zero: at an invalid origin
+            // `weight` is `+0`, this sum is `+0` and the reference's gradient is `-0`.
+            const float half = fk_mul(grad_square, difference);
+            grad_prediction[channel_index] = -fk_add(half, half);
+        }
+        const float grad_low = fk_add(fk_add(grad_prediction[0], grad_prediction[2]),
+                                      grad_prediction[1]);
+        const float grad_position_open =
+            fk_div(fk_div(grad_prediction[0], geometry.sigma),
+                   fk_add(geometry.position_open, 1.0f));
+        const float grad_position_low = fk_div(
+            fk_div(-grad_low, geometry.sigma), fk_add(geometry.position_low, 1.0f));
+        const float grad_relative_range = fk_add(
+            fk_add(fk_mul(grad_position_open, geometry.sigmoid_open),
+                   fk_div(fk_div(grad_prediction[1], geometry.sigma),
+                          fk_add(geometry.relative_range, 1.0f))),
+            fk_mul(grad_position_low, geometry.sigmoid_low));
+        const float grad_softplus = fk_mul(
+            fk_scale_ln2(grad_relative_range, ln2, inverse_ln2, rounding), geometry.range);
+        out[horizon] = __float2bfloat16(fk_softplus_backward(
+            grad_softplus, __bfloat162float(channel[horizon]), rounding));
+        out[2 * horizon] = __float2bfloat16(fk_sigmoid_backward(
+            fk_mul(grad_position_low, geometry.relative_range), geometry.sigmoid_low,
+            rounding));
+        out[3 * horizon] = __float2bfloat16(fk_sigmoid_backward(
+            fk_mul(grad_position_open, geometry.relative_range), geometry.sigmoid_open,
+            rounding));
+        // `close` reaches `low` and the channel-3 residual, which commute; an external
+        // consumer of the mean coordinate is a THIRD addend, and it is added last because
+        // its node is created first and therefore runs last.
+        float grad_close_total = fk_add(grad_prediction[3], grad_low);
+        if (grad_close != nullptr) {
+            grad_close_total = fk_add(grad_close_total, grad_close[index]);
+        }
+        out[0] = __float2bfloat16(fk_mul(grad_close_total, geometry.horizon_scale));
+    }
+}
+
 } // namespace
 
 extern "C" int fk_relu_square_forward(const void *input, void *output, int64_t count,
@@ -832,5 +1101,57 @@ extern "C" int fk_stream_copy(const void *input, void *output, int64_t count, vo
     const int64_t vectors = count / 8;
     stream_copy_vec<<<grid_for(vectors), kThreads, 0, static_cast<cudaStream_t>(stream)>>>(
         static_cast<const Vec8 *>(input), static_cast<Vec8 *>(output), vectors);
+    return static_cast<int>(cudaGetLastError());
+}
+
+extern "C" int
+fk_loss_geometry_forward(const void *head, const void *targets,
+                         const void *weighted_mask, const void *sigma, const void *range,
+                         const void *horizon_scale, const void *inverse_horizon,
+                         const void *log_scale_gain, void *close, void *workspace,
+                         int64_t tokens, int64_t horizon, int64_t target_token_stride,
+                         int64_t target_channel_stride, int64_t target_bar_stride,
+                         float cap, float ln2, float inverse_ln2, int rounding,
+                         void *stream) {
+    const int64_t elements = tokens * horizon;
+    if (elements <= 0) {
+        return static_cast<int>(cudaSuccess);
+    }
+    loss_geometry_forward_kernel<<<grid_for(elements), kThreads, 0,
+                                   static_cast<cudaStream_t>(stream)>>>(
+        static_cast<const __nv_bfloat16 *>(head), static_cast<const float *>(targets),
+        static_cast<const float *>(weighted_mask), static_cast<const float *>(sigma),
+        static_cast<const float *>(range), static_cast<const float *>(horizon_scale),
+        static_cast<const float *>(inverse_horizon),
+        static_cast<const float *>(log_scale_gain), static_cast<float *>(close),
+        static_cast<float *>(workspace), elements, horizon, target_token_stride,
+        target_channel_stride, target_bar_stride, cap, ln2, inverse_ln2, rounding);
+    return static_cast<int>(cudaGetLastError());
+}
+
+extern "C" int
+fk_loss_geometry_backward(const void *head, const void *targets,
+                          const void *weighted_mask, const void *sigma, const void *range,
+                          const void *horizon_scale, const void *inverse_horizon,
+                          const void *log_scale_gain, const void *grad_terms,
+                          const void *grad_close, void *grad_head, int64_t tokens,
+                          int64_t horizon, int64_t target_token_stride,
+                          int64_t target_channel_stride, int64_t target_bar_stride,
+                          float cap, float ln2, float inverse_ln2, int rounding,
+                          void *stream) {
+    const int64_t elements = tokens * horizon;
+    if (elements <= 0) {
+        return static_cast<int>(cudaSuccess);
+    }
+    loss_geometry_backward_kernel<<<grid_for(elements), kThreads, 0,
+                                    static_cast<cudaStream_t>(stream)>>>(
+        static_cast<const __nv_bfloat16 *>(head), static_cast<const float *>(targets),
+        static_cast<const float *>(weighted_mask), static_cast<const float *>(sigma),
+        static_cast<const float *>(range), static_cast<const float *>(horizon_scale),
+        static_cast<const float *>(inverse_horizon),
+        static_cast<const float *>(log_scale_gain),
+        static_cast<const float *>(grad_terms), static_cast<const float *>(grad_close),
+        static_cast<__nv_bfloat16 *>(grad_head), elements, horizon, target_token_stride,
+        target_channel_stride, target_bar_stride, cap, ln2, inverse_ln2, rounding);
     return static_cast<int>(cudaGetLastError());
 }

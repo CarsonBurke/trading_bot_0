@@ -85,6 +85,56 @@ int fk_qk_norm_rope_backward(const void *grad, const void *input, const void *co
 // comparison with a differently-shaped kernel.
 int fk_stream_copy(const void *input, void *output, int64_t count, void *stream);
 
+// The candle-geometry + Gaussian-NLL element chain in one pass.
+//
+// `head` is `[tokens, 8, horizon]` bf16 (four candle coordinates then four log scales),
+// `targets` `[tokens, 4, horizon]` fp32, `weighted_mask` `[tokens, horizon]` fp32,
+// `sigma`/`range` `[tokens]` fp32 already clamped, and `horizon_scale`/`inverse_horizon`
+// `[horizon]` fp32. `log_scale_gain` is a one-element fp32 buffer read on the device, never
+// on the host, so the launch stays graph-capturable.
+//
+// The channel count is FOUR and is not a parameter: the geometry is a candle - one close,
+// one range and two positions inside it - and there is no meaning to a fifth coordinate.
+//
+// Outputs, in the layout the reductions consume: `close` is `[tokens, horizon]` fp32 (the
+// σ-scaled mean coordinate, which the amplitude prior reduces), and `workspace` is
+// `[12, tokens*horizon]` fp32 - rows 0-3 the squared errors, 4-7 the precision weights,
+// 8-11 the capped log scales. Each row is contiguous, so the twelve `dot`s that follow are
+// ATen's own and their summation trees are untouched.
+//
+// `rounding` selects the fp32 forms ATen's own build emitted; see the definition of
+// `FK_LOSS_GEOMETRY_ROUNDING` for the fields and for why they are measured, not chosen.
+// `targets` is `[tokens, 4, horizon]` fp32 addressed by the three strides below rather
+// than assumed dense: the real path builds it with `unfold`, and TensorIterator allocates
+// the arithmetic under it in the inputs' own permuted layout, which is channel-innermost.
+int fk_loss_geometry_forward(const void *head, const void *targets,
+                             const void *weighted_mask, const void *sigma,
+                             const void *range, const void *horizon_scale,
+                             const void *inverse_horizon, const void *log_scale_gain,
+                             void *close, void *workspace, int64_t tokens, int64_t horizon,
+                             int64_t target_token_stride, int64_t target_channel_stride,
+                             int64_t target_bar_stride, float cap, float ln2,
+                             float inverse_ln2, int rounding, void *stream);
+
+// The same chain's transpose in one pass. `grad_terms` is `[8]` fp32 - per channel the
+// gradient of `dot(square, weight)·½` then of `dot(log_scale, weighted_mask)·cap` - and
+// `grad_close` is either `[tokens, horizon]` fp32 or null when nothing consumes the mean
+// coordinate. Nothing the forward computed is retained: every intermediate is recomputed
+// from `head` and the targets, which is one read of data already resident against twelve
+// full-size fp32 tensors the composition kept alive.
+//
+// `grad_head` is the dense `[tokens, 8, horizon]` bf16 gradient, written once. The
+// composition needed a `cat` over eight slices to produce it.
+int fk_loss_geometry_backward(const void *head, const void *targets,
+                              const void *weighted_mask, const void *sigma,
+                              const void *range, const void *horizon_scale,
+                              const void *inverse_horizon, const void *log_scale_gain,
+                              const void *grad_terms, const void *grad_close,
+                              void *grad_head, int64_t tokens, int64_t horizon,
+                              int64_t target_token_stride, int64_t target_channel_stride,
+                              int64_t target_bar_stride, float cap, float ln2,
+                              float inverse_ln2, int rounding, void *stream);
+
 #ifdef __cplusplus
 }
 #endif

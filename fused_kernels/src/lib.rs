@@ -1,7 +1,7 @@
 //! Fused bf16 kernels for the CausalPatch backbone, and the composed-ATen references they
 //! are bit-identical to.
 //!
-//! Two fusions, both chosen by measurement rather than taste:
+//! Four fusions, all chosen by measurement rather than taste:
 //!
 //! * [`relu_square`] replaces `x.relu().square()`. The composition makes four full passes
 //!   over the `[tokens, ffn]` hidden activation in forward and six in backward; this makes
@@ -10,15 +10,21 @@
 //! * [`rope`] replaces the packed `q‖k` rotation, which ATen has no operator for at all:
 //!   the composition is two full-width products plus a half-crossing sum, seven passes
 //!   over the `[tokens, 2·d_model]` block in forward, against this kernel's two.
+//! * [`qk_norm_rope`] folds the per-head RMS normalization into that rotation, so the
+//!   normalized block and its `rstd` are never materialized at all.
+//! * [`loss_geometry`] replaces the candle geometry and the Gaussian NLL: forty-eight
+//!   elementwise ops over the 147 M-element head space, 65 kernels forward and 70 backward,
+//!   become one kernel each side. The twelve `dot`s are deliberately NOT fused - see the
+//!   function - so the objective keeps its bits while 3.8x of its traffic disappears.
 //!
-//! Both are differentiable from Rust with no further plumbing: the returned tensor carries
+//! All are differentiable from Rust with no further plumbing: the returned tensor carries
 //! a real `grad_fn`, so [`tch::Tensor::backward`] and [`tch::Tensor::run_backward`] drive
 //! the fused backward kernels. See `csrc/bridge.cpp` for the mechanism and why it is sound.
 //!
-//! Both are CUDA-graph-capturable: no host synchronization, no device-to-host read, and a
-//! grid that is a pure function of the launch arguments. The only allocation is the output,
-//! taken from the caching allocator exactly like any ATen op's, which is what a capture's
-//! private mempool is for.
+//! All are CUDA-graph-capturable: no host synchronization, no device-to-host read, and a
+//! grid that is a pure function of the launch arguments. The only allocations are the
+//! outputs, taken from the caching allocator exactly like any ATen op's, which is what a
+//! capture's private mempool is for.
 
 pub mod probe;
 
@@ -59,6 +65,21 @@ extern "C" {
         heads: i64,
         rounding: i64,
     ) -> *mut C_tensor;
+    fn fk_loss_geometry(
+        head: *const C_tensor,
+        targets: *const C_tensor,
+        weighted_mask: *const C_tensor,
+        mask: *const C_tensor,
+        sigma: *const C_tensor,
+        range: *const C_tensor,
+        horizon_scale: *const C_tensor,
+        inverse_horizon: *const C_tensor,
+        log_scale_gain: *const C_tensor,
+        cap: f64,
+        ln2: f64,
+        rounding: i64,
+        outputs: *mut *mut C_tensor,
+    ) -> i32;
     fn fk_stream_copy_tensor(input: *const C_tensor) -> *mut C_tensor;
     fn fk_timer_new() -> *mut std::ffi::c_void;
     fn fk_timer_start(timer: *mut std::ffi::c_void) -> i32;
@@ -72,17 +93,21 @@ extern "C" {
 /// `Result` it has no way to handle.
 fn finish(raw: *mut C_tensor, operation: &str) -> Tensor {
     if raw.is_null() {
-        let message = unsafe { fk_last_error() };
-        let message = if message.is_null() {
-            "no message".to_owned()
-        } else {
-            unsafe { CStr::from_ptr(message) }
-                .to_string_lossy()
-                .into_owned()
-        };
-        panic!("fused {operation} failed: {message}");
+        panic!("fused {operation} failed: {}", last_error());
     }
     unsafe { Tensor::from_ptr(raw) }
+}
+
+/// The bridge's thread-local failure message, cleared by the next call on this thread.
+fn last_error() -> String {
+    let message = unsafe { fk_last_error() };
+    if message.is_null() {
+        "no message".to_owned()
+    } else {
+        unsafe { CStr::from_ptr(message) }
+            .to_string_lossy()
+            .into_owned()
+    }
 }
 
 /// `relu(x)^2` in one pass, with a one-pass backward.
@@ -201,6 +226,165 @@ pub fn qk_norm_rope(input: &Tensor, cosine: &Tensor, sine: &Tensor, heads: i64) 
         },
         "qk_norm_rope",
     )
+}
+
+/// The candle channel count the fused loss is defined on: one close, one range and two
+/// positions inside it, each with its own log predictive scale.
+pub const LOSS_CHANNELS: i64 = 4;
+
+/// The fp32 forms ATen's own build emitted for the loss chain, as a five-bit selector.
+///
+/// MEASURED, not chosen, exactly like [`QK_NORM_ROUNDING`], and for the same reason: each
+/// field is a place where the composition's last bit depends on how a kernel happened to be
+/// written rather than on the mathematics. The value below is `2`, and what that means field
+/// by field is the measurement `loss_geometry_rounding_is_the_measured_form` performs:
+///
+/// * bit 0, CLEAR - `div` by the host scalar `ln 2` is a multiply by its fp32 RECIPROCAL.
+///   ATen's CUDA `div_true` special-cases a CPU scalar divisor and removes the operand, so
+///   `x·(1/ln2)` is the reference and `x/ln2` is a different tensor. Note this is the
+///   opposite of the CPU build, where the same expression is a true division - which is why
+///   an off-device probe cannot answer the question and this sweep can.
+/// * bit 1, SET - `tanh_backward`'s `1 - y·y` arrives CONTRACTED into one `fma`.
+/// * bit 2, CLEAR - `sigmoid_backward` is `(g·(1-y))·y`, not `(g·y)·(1-y)`.
+/// * bits 3-4, ZERO - `softplus_backward` is `(g·z)/(z+1)`; `1` selects `g·(z/(z+1))` and
+///   `2` selects `(g/(z+1))·z`, and `3` is the same form as `0`.
+///
+/// Each field moves the last bit of a gradient over 147 M elements, and each was previously
+/// a guess in this repository. The sweep is the artefact: any future fused kernel over this
+/// chain can read the four answers off this constant instead of re-deriving them.
+pub const LOSS_GEOMETRY_ROUNDING: i64 = 2;
+
+/// What the fused candle geometry and Gaussian NLL hands back.
+///
+/// `terms` and `squares` are the REDUCED scalars - the twelve `dot`s are still ATen's, so
+/// their summation trees are the reference's - and `close` is the full
+/// `[rows, origins, 1, pred_len]` σ-scaled mean coordinate, the one full-size intermediate
+/// anything outside the loss has a use for.
+pub struct LossGeometry {
+    /// `[rows, origins, 1, pred_len]` fp32: `coordinate_0 · horizon_scale`, differentiable.
+    pub close: Tensor,
+    /// `[2·LOSS_CHANNELS]` fp32: per channel `½·dot(square, weight)` then
+    /// `cap·dot(log_scale, weighted_mask)`, in that order. Their sum is the objective's
+    /// unnormalized numerator.
+    pub terms: Tensor,
+    /// `[LOSS_CHANNELS]` fp32, gradient-free: `dot(square, mask)`, the diagnostic MSE's
+    /// numerator per channel.
+    pub squares: Tensor,
+}
+
+/// The candle geometry and the masked Gaussian NLL element chain in ONE pass, with a
+/// one-pass backward.
+///
+/// `head` is the dense `[rows, origins, 2·LOSS_CHANNELS, pred_len]` bf16 head output -
+/// four candle coordinates then four log scales - `targets` the fp32
+/// `[rows, origins, LOSS_CHANNELS, pred_len]` σ-scaled log returns, and `mask` /
+/// `weighted_mask` the fp32 `[rows, origins, 1, pred_len]` validity flags, raw and folded
+/// with the objective's per-horizon weight. `sigma` and `range` are the per-origin
+/// statistics, already clamped, and `horizon_scale` / `inverse_horizon` / `log_scale_gain`
+/// the resident per-horizon buffers.
+///
+/// WHAT IS FUSED AND WHAT IS NOT. The forty-eight elementwise ops of the composition - the
+/// bf16 widening, the softplus, three `log1p`s, two sigmoids, four `tanh`s, four `exp`s, the
+/// mask folds, the residuals and their squares - become one kernel. The twelve `dot`s do
+/// NOT: a reduction's summation tree is cuBLAS's and cannot be reproduced, so the kernel
+/// materializes exactly the twelve fp32 vectors they consume and ATen reduces them, which is
+/// what keeps the loss VALUE bit-identical rather than merely close. The backward is one
+/// kernel too: it recomputes the chain from `head` instead of reading the twelve retained
+/// tensors plus the geometry's five, so the whole chain retains nothing beyond its inputs.
+///
+/// Bit-identical to [`reference::loss_geometry`] in both directions when nothing consumes
+/// `close`. When something does, its gradient is a THIRD addend on the mean coordinate and
+/// this kernel adds it after the two the loss itself contributes; the composition's autograd
+/// engine would order it by node creation instead, so that one channel agrees to a rounding
+/// rather than to the bit. Nothing in the incumbent objective takes that path.
+///
+/// Off CUDA this IS [`reference::loss_geometry`], for the reason given on [`relu_square`].
+#[allow(clippy::too_many_arguments)]
+pub fn loss_geometry(
+    head: &Tensor,
+    targets: &Tensor,
+    weighted_mask: &Tensor,
+    mask: &Tensor,
+    sigma: &Tensor,
+    range: &Tensor,
+    horizon_scale: &Tensor,
+    inverse_horizon: &Tensor,
+    log_scale_gain: &Tensor,
+    cap: f64,
+) -> LossGeometry {
+    loss_geometry_with_rounding(
+        head,
+        targets,
+        weighted_mask,
+        mask,
+        sigma,
+        range,
+        horizon_scale,
+        inverse_horizon,
+        log_scale_gain,
+        cap,
+        LOSS_GEOMETRY_ROUNDING,
+    )
+}
+
+/// [`loss_geometry`] with the rounding selector open, so the discovery test can prove which
+/// of the thirty-two forms ATen's build emitted and that the others disagree. The model path
+/// calls [`loss_geometry`].
+#[allow(clippy::too_many_arguments)]
+pub fn loss_geometry_with_rounding(
+    head: &Tensor,
+    targets: &Tensor,
+    weighted_mask: &Tensor,
+    mask: &Tensor,
+    sigma: &Tensor,
+    range: &Tensor,
+    horizon_scale: &Tensor,
+    inverse_horizon: &Tensor,
+    log_scale_gain: &Tensor,
+    cap: f64,
+    rounding: i64,
+) -> LossGeometry {
+    if !head.device().is_cuda() {
+        return reference::loss_geometry(
+            head,
+            targets,
+            weighted_mask,
+            mask,
+            sigma,
+            range,
+            horizon_scale,
+            inverse_horizon,
+            log_scale_gain,
+            cap,
+        );
+    }
+    let mut outputs = [std::ptr::null_mut::<C_tensor>(); 3];
+    let status = unsafe {
+        fk_loss_geometry(
+            head.as_ptr(),
+            targets.as_ptr(),
+            weighted_mask.as_ptr(),
+            mask.as_ptr(),
+            sigma.as_ptr(),
+            range.as_ptr(),
+            horizon_scale.as_ptr(),
+            inverse_horizon.as_ptr(),
+            log_scale_gain.as_ptr(),
+            cap,
+            std::f64::consts::LN_2,
+            rounding,
+            outputs.as_mut_ptr(),
+        )
+    };
+    if status != 0 {
+        panic!("fused loss_geometry failed: {}", last_error());
+    }
+    let [close, terms, squares] = outputs;
+    LossGeometry {
+        close: unsafe { Tensor::from_ptr(close) },
+        terms: unsafe { Tensor::from_ptr(terms) },
+        squares: unsafe { Tensor::from_ptr(squares) },
+    }
 }
 
 /// The gradient kernels called directly, with no autograd node around them.
@@ -450,6 +634,63 @@ pub mod reference {
         heads: i64,
     ) -> Tensor {
         super::rope(&qk_norm(input, heads), cosine, sine, heads)
+    }
+
+    /// The composed candle geometry and Gaussian NLL, transcribed op for op from what
+    /// `CausalPatchModel::losses` ran before the fusion landed.
+    ///
+    /// Every line here is one full-size fp32 kernel and every one of them is what the fused
+    /// kernel deletes. It is also the numerical definition of the objective: the ORDER of
+    /// the twelve `dot`s, the `·½` and `·cap` scalars on the terms, the `no_grad` on the
+    /// diagnostic squares and the fact that the mask fold happens once at mask width are
+    /// all load-bearing, and a reference that paraphrased any of them would pin nothing.
+    ///
+    /// `close` is returned as well as consumed, which the pre-fusion form did not do - the
+    /// amplitude prior reduces it. Handing back the same tensor the loss already built
+    /// costs nothing and keeps the two definitions from drifting.
+    #[allow(clippy::too_many_arguments)]
+    pub fn loss_geometry(
+        head: &Tensor,
+        targets: &Tensor,
+        weighted_mask: &Tensor,
+        mask: &Tensor,
+        sigma: &Tensor,
+        range: &Tensor,
+        horizon_scale: &Tensor,
+        inverse_horizon: &Tensor,
+        log_scale_gain: &Tensor,
+        cap: f64,
+    ) -> super::LossGeometry {
+        let channels = head.split(1, 2);
+        let last = super::LOSS_CHANNELS as usize;
+        let coordinate = |index: usize| channels[index].to_kind(tch::Kind::Float);
+        let close = &channels[0] * horizon_scale;
+        let relative_range = coordinate(1).softplus() * range / std::f64::consts::LN_2;
+        let low = &close - (coordinate(2).sigmoid() * &relative_range).log1p() / sigma;
+        let high = &low + relative_range.log1p() / sigma;
+        let open = &low + (coordinate(3).sigmoid() * &relative_range).log1p() / sigma;
+        let flat = |tensor: &Tensor| tensor.reshape([-1]);
+        let mask_flat = flat(mask);
+        let weighted_flat = flat(weighted_mask);
+        let precision = weighted_mask * inverse_horizon;
+        let mut terms = Vec::with_capacity(2 * last);
+        let mut squares = Vec::with_capacity(last);
+        for (channel, prediction) in [open, high, low, close.shallow_clone()]
+            .into_iter()
+            .enumerate()
+        {
+            let scale = (&channels[last + channel] * log_scale_gain).tanh();
+            let weight = (&scale * (-2.0 * cap)).exp() * &precision;
+            let square = (targets.narrow(2, channel as i64, 1) - prediction).square();
+            terms.push(flat(&square).dot(&flat(&weight)) * 0.5);
+            terms.push(flat(&scale).dot(&weighted_flat) * cap);
+            squares.push(tch::no_grad(|| flat(&square).dot(&mask_flat)));
+        }
+        super::LossGeometry {
+            close,
+            terms: Tensor::stack(&terms, 0),
+            squares: Tensor::stack(&squares, 0),
+        }
     }
 }
 
@@ -899,16 +1140,36 @@ mod tests {
         let hidden = bf16_randn(&[batch * length, 512], device).set_requires_grad(true);
         let packed = bf16_randn(&[batch, length, 2 * width], device).set_requires_grad(true);
         let raw_packed = bf16_randn(&[batch, length, 2 * width], device).set_requires_grad(true);
+        // The loss chain allocates twelve reduction vectors and runs twelve `dot`s inside the
+        // window, so it is the one op here whose capturability is not obvious.
+        tch::manual_seed(37);
+        let loss = loss_inputs(batch, 96, 16, device, 2.0);
 
         let step = || {
             let activation = relu_square(&hidden);
             let rotated = rope(&packed, &cosine, &sine, heads);
             let normed = qk_norm_rope(&raw_packed, &cosine, &sine, heads);
-            let objective =
-                activation.sum(Kind::Float) + rotated.sum(Kind::Float) + normed.sum(Kind::Float);
+            let geometry = loss_geometry(
+                &loss.head,
+                &loss.targets,
+                &loss.weighted_mask,
+                &loss.mask,
+                &loss.sigma,
+                &loss.range,
+                &loss.horizon_scale,
+                &loss.inverse_horizon,
+                &loss.log_scale_gain,
+                LOSS_CAP,
+            );
+            let objective = activation.sum(Kind::Float)
+                + rotated.sum(Kind::Float)
+                + normed.sum(Kind::Float)
+                + geometry.terms.sum(Kind::Float)
+                + geometry.squares.sum(Kind::Float)
+                + geometry.close.sum(Kind::Float);
             let gradients = Tensor::run_backward(
                 &[&objective],
-                &[&hidden, &packed, &raw_packed],
+                &[&hidden, &packed, &raw_packed, &loss.head],
                 false,
                 false,
             );
@@ -916,6 +1177,7 @@ mod tests {
                 gradients[0].shallow_clone(),
                 gradients[1].shallow_clone(),
                 gradients[2].shallow_clone(),
+                gradients[3].shallow_clone(),
                 objective,
             )
         };
@@ -944,10 +1206,12 @@ mod tests {
         let fresh_hidden = bf16_randn(&hidden.size(), device);
         let fresh_packed = bf16_randn(&packed.size(), device);
         let fresh_raw = bf16_randn(&raw_packed.size(), device);
+        let fresh_head = bf16_randn(&loss.head.size(), device);
         tch::no_grad(|| {
             hidden.detach().copy_(&fresh_hidden);
             packed.detach().copy_(&fresh_packed);
             raw_packed.detach().copy_(&fresh_raw);
+            loss.head.detach().copy_(&fresh_head);
         });
         unsafe {
             torch_sys::at_cuda_graph_stream_begin(graph, 0);
@@ -965,15 +1229,32 @@ mod tests {
         let hidden_leaf = fresh_hidden.detach().copy().set_requires_grad(true);
         let packed_leaf = fresh_packed.detach().copy().set_requires_grad(true);
         let raw_leaf = fresh_raw.detach().copy().set_requires_grad(true);
+        let head_leaf = fresh_head.detach().copy().set_requires_grad(true);
         let eager = {
             let activation = reference::relu_square(&hidden_leaf);
             let rotated = reference::rope(&packed_leaf, &cosine, &sine, heads);
             let normed = reference::qk_norm_rope(&raw_leaf, &cosine, &sine, heads);
-            let objective =
-                activation.sum(Kind::Float) + rotated.sum(Kind::Float) + normed.sum(Kind::Float);
+            let geometry = reference::loss_geometry(
+                &head_leaf,
+                &loss.targets,
+                &loss.weighted_mask,
+                &loss.mask,
+                &loss.sigma,
+                &loss.range,
+                &loss.horizon_scale,
+                &loss.inverse_horizon,
+                &loss.log_scale_gain,
+                LOSS_CAP,
+            );
+            let objective = activation.sum(Kind::Float)
+                + rotated.sum(Kind::Float)
+                + normed.sum(Kind::Float)
+                + geometry.terms.sum(Kind::Float)
+                + geometry.squares.sum(Kind::Float)
+                + geometry.close.sum(Kind::Float);
             let gradients = Tensor::run_backward(
                 &[&objective],
-                &[&hidden_leaf, &packed_leaf, &raw_leaf],
+                &[&hidden_leaf, &packed_leaf, &raw_leaf, &head_leaf],
                 false,
                 false,
             );
@@ -981,6 +1262,7 @@ mod tests {
                 gradients[0].shallow_clone(),
                 gradients[1].shallow_clone(),
                 gradients[2].shallow_clone(),
+                gradients[3].shallow_clone(),
                 objective,
             )
         };
@@ -996,12 +1278,23 @@ mod tests {
             identical(&captured.2, &eager.2),
             "the replayed qk_norm_rope gradient is not the composition's gradient of the new input"
         );
+        // The mean coordinate has an external consumer here, so this one channel is a
+        // rounding rather than the bit - see
+        // `fused_loss_geometry_carries_the_mean_coordinate_gradient`.
+        for channel in 1..2 * LOSS_CHANNELS {
+            assert!(
+                identical(
+                    &captured.3.narrow(2, channel, 1),
+                    &eager.3.narrow(2, channel, 1)
+                ),
+                "the replayed loss gradient is not the composition's on channel {channel}"
+            );
+        }
         assert_eq!(
-            captured.3.double_value(&[]),
-            eager.3.double_value(&[]),
+            captured.4.double_value(&[]),
+            eager.4.double_value(&[]),
             "the replayed objective does not match an eager evaluation on the same bytes"
         );
-        unsafe { torch_sys::at_cuda_graph_free(graph) };
     }
 
     /// A packed input with the interesting values forced in rather than hoped for. The
@@ -1239,6 +1532,760 @@ mod tests {
             identical(&statistic, &expected),
             "ATen's rstd is not the four-element-partial binary tree the kernel implements, max |delta| {}",
             max_absolute(&statistic, &expected)
+        );
+    }
+
+    /// Everything `loss_geometry` takes, at one shape, with the ranges that actually reach
+    /// every branch: the head is scaled so `softplus`'s `x > 20` cutover, the `tanh` cap's
+    /// saturated ends and `log1p`'s near-`-1` region are all populated rather than hoped for.
+    struct LossInputs {
+        head: Tensor,
+        targets: Tensor,
+        weighted_mask: Tensor,
+        mask: Tensor,
+        sigma: Tensor,
+        range: Tensor,
+        horizon_scale: Tensor,
+        inverse_horizon: Tensor,
+        log_scale_gain: Tensor,
+    }
+
+    const LOSS_CAP: f64 = 4.0;
+
+    fn loss_inputs(rows: i64, origins: i64, horizon: i64, device: Device, scale: f64) -> LossInputs {
+        let float = (Kind::Float, device);
+        let head = (Tensor::randn([rows, origins, 2 * LOSS_CHANNELS, horizon], float) * scale)
+            .to_kind(Kind::BFloat16)
+            .set_requires_grad(true);
+        let mask = Tensor::rand([rows, origins, 1, horizon], float)
+            .gt(0.25)
+            .to_kind(Kind::Float);
+        // Not the identity: a weight vector of ones would let a kernel that dropped the fold
+        // entirely pass. Mean 1 over the axis is the model's own normalization.
+        let weight = Tensor::rand([1, 1, 1, horizon], float) + 0.5;
+        let index = Tensor::arange(horizon, float) + 1.0;
+        LossInputs {
+            head,
+            targets: Tensor::randn([rows, origins, LOSS_CHANNELS, horizon], float),
+            weighted_mask: &mask * &weight,
+            mask,
+            sigma: Tensor::rand([rows, origins, 1, 1], float) + 0.25,
+            range: Tensor::rand([rows, origins, 1, 1], float) + 0.05,
+            horizon_scale: index.sqrt().reshape([1, 1, 1, horizon]),
+            inverse_horizon: index.reciprocal().reshape([1, 1, 1, horizon]),
+            log_scale_gain: Tensor::full([1, 1, 1, 1], 1.0 / LOSS_CAP, float),
+        }
+    }
+
+    /// The fused chain and the composition it replaces, driven by the SAME upstream gradient
+    /// so the comparison is of the two kernels and not of two objectives. `close_upstream`
+    /// present is the amplitude prior's path: a third addend on the mean coordinate.
+    fn loss_pair(
+        inputs: &LossInputs,
+        upstream: &Tensor,
+        close_upstream: Option<&Tensor>,
+        rounding: i64,
+    ) -> (LossGeometry, Tensor, LossGeometry, Tensor) {
+        let run = |geometry: LossGeometry| {
+            let mut objective = geometry.terms.dot(upstream);
+            if let Some(weight) = close_upstream {
+                objective = objective + (&geometry.close * weight).sum(Kind::Float);
+            }
+            let gradient =
+                Tensor::run_backward(&[&objective], &[&inputs.head], false, false).remove(0);
+            (geometry, gradient)
+        };
+        let (composed, composed_gradient) = run(reference::loss_geometry(
+            &inputs.head,
+            &inputs.targets,
+            &inputs.weighted_mask,
+            &inputs.mask,
+            &inputs.sigma,
+            &inputs.range,
+            &inputs.horizon_scale,
+            &inputs.inverse_horizon,
+            &inputs.log_scale_gain,
+            LOSS_CAP,
+        ));
+        let (fused, fused_gradient) = run(loss_geometry_with_rounding(
+            &inputs.head,
+            &inputs.targets,
+            &inputs.weighted_mask,
+            &inputs.mask,
+            &inputs.sigma,
+            &inputs.range,
+            &inputs.horizon_scale,
+            &inputs.inverse_horizon,
+            &inputs.log_scale_gain,
+            LOSS_CAP,
+            rounding,
+        ));
+        (composed, composed_gradient, fused, fused_gradient)
+    }
+
+    /// Differing elements across the whole comparison: the mean coordinate, the eight
+    /// objective terms, the four diagnostic squares and the dense head gradient. Every one
+    /// is `differing`, which counts a sign flip on an exact zero as a difference - see
+    /// `the_masked_signed_zero_is_the_compositions_and_reaches_a_parameter_gradient_intact`
+    /// for why that bar is meetable here and what it took to meet it.
+    fn loss_differences(
+        composed: &LossGeometry,
+        composed_gradient: &Tensor,
+        fused: &LossGeometry,
+        fused_gradient: &Tensor,
+    ) -> [i64; 4] {
+        [
+            differing(&composed.close, &fused.close),
+            differing(&composed.terms, &fused.terms),
+            differing(&composed.squares, &fused.squares),
+            differing(composed_gradient, fused_gradient),
+        ]
+    }
+
+    /// WHICH fp32 forms ATen's own build emitted, measured over all thirty-two.
+    ///
+    /// Five bits, four questions, and not one of them answerable from the mathematics: a
+    /// CUDA `div` by a host scalar becomes a multiply by an fp32 reciprocal, `nvcc` contracts
+    /// `1 - y·y` into an `fma` unless stopped, and `sigmoid_backward` and
+    /// `softplus_backward` were each written with one association out of two and three. Every
+    /// one of them moves the last bit of a gradient over 147 M elements. This is the same
+    /// discovery `qk_norm_rope_rounding_is_the_measured_pair` performs, for the same reason:
+    /// the alternative is a kernel that is "close" and a training curve that quietly is not
+    /// the one the checkpoint was selected on.
+    ///
+    /// It also answers the question that decides whether this fusion can exist at all. The
+    /// chain runs `expf`, `tanhf`, `log1pf` and `softplus` inside the kernel, compiled by THIS
+    /// box's nvcc, against a libtorch built with a different CUDA toolkit. If libdevice's fp32
+    /// transcendentals disagreed across those two, no selector would rescue it and every one
+    /// of the thirty-two would differ in the millions.
+    #[test]
+    fn loss_geometry_rounding_is_the_measured_form() {
+        let Some(claim) = cuda() else { return };
+        let device = *claim;
+        tch::manual_seed(19);
+        let inputs = loss_inputs(4, 1000, 64, device, 3.0);
+        let upstream = Tensor::randn([2 * LOSS_CHANNELS], (Kind::Float, device));
+        let mut matching = Vec::new();
+        let mut best = (i64::MAX, -1i64);
+        for rounding in 0..32 {
+            let (composed, composed_gradient, fused, fused_gradient) =
+                loss_pair(&inputs, &upstream, None, rounding);
+            let counts =
+                loss_differences(&composed, &composed_gradient, &fused, &fused_gradient);
+            let total: i64 = counts.iter().sum();
+            println!(
+                "rounding {rounding:2}: close {}, terms {}, squares {}, gradient {}",
+                counts[0], counts[1], counts[2], counts[3]
+            );
+            if total < best.0 {
+                best = (total, rounding);
+            }
+            if total == 0 {
+                matching.push(rounding);
+            }
+        }
+        assert!(
+            !matching.is_empty(),
+            "no rounding form reproduces the composition; the closest is {} with {} \
+             differing elements, which at zero is a selector question and in the millions is \
+             a libdevice mismatch between this nvcc and libtorch's",
+            best.1,
+            best.0
+        );
+        assert!(
+            matching.contains(&LOSS_GEOMETRY_ROUNDING),
+            "LOSS_GEOMETRY_ROUNDING is {LOSS_GEOMETRY_ROUNDING} but the forms that reproduce \
+             the composition are {matching:?}"
+        );
+    }
+
+    /// Bit-for-bit against the composition at the REAL shape, forward and backward.
+    ///
+    /// `rows = 256`, `origins = 375`, `pred_len = 192`: 96 000 scored origins, a 147 M-element
+    /// head and an 18.4 M-element channel slice. The shape is the point. A chain of `log1p`s
+    /// and `exp`s that agrees on 128 elements and disagrees on one in 10^6 would pass every
+    /// toy test and still move a training curve, and the grid-stride loop, the `index / horizon`
+    /// addressing and the twelve-row workspace are all only exercised at scale.
+    #[test]
+    fn fused_loss_geometry_is_bit_identical_at_the_production_shape() {
+        let Some(claim) = cuda() else { return };
+        let device = *claim;
+        tch::manual_seed(23);
+        let inputs = loss_inputs(256, 375, 192, device, 2.0);
+        let upstream = Tensor::randn([2 * LOSS_CHANNELS], (Kind::Float, device));
+        let (composed, composed_gradient, fused, fused_gradient) =
+            loss_pair(&inputs, &upstream, None, LOSS_GEOMETRY_ROUNDING);
+        let counts = loss_differences(&composed, &composed_gradient, &fused, &fused_gradient);
+        println!(
+            "production shape: {} elements scored, close {}, terms {}, squares {}, \
+             gradient {} differing",
+            inputs.head.numel(),
+            counts[0],
+            counts[1],
+            counts[2],
+            counts[3]
+        );
+        assert_eq!(
+            counts,
+            [0, 0, 0, 0],
+            "the fused loss is not bit-identical at the production shape; \
+             max |delta| close {}, terms {}, squares {}, gradient {}",
+            max_absolute(&composed.close, &fused.close),
+            max_absolute(&composed.terms, &fused.terms),
+            max_absolute(&composed.squares, &fused.squares),
+            max_absolute(&composed_gradient, &fused_gradient)
+        );
+        // The objective is a real number, not an artefact of the comparison.
+        let objective = composed.terms.sum(Kind::Float).double_value(&[]);
+        assert!(objective.is_finite() && objective.abs() > 1.0, "{objective}");
+    }
+
+    /// The targets as the TRAINING PATH builds them, strides and all.
+    ///
+    /// This is the defect job 5448 found, and it is the more important lesson of the two the
+    /// fusion taught. `CausalPatchModel::targets` builds its future windows with `unfold` and
+    /// then does arithmetic on that view; TensorIterator allocates the result in its inputs'
+    /// own permuted layout, so what reaches the loss is channel-INNERMOST - sizes
+    /// `[rows, origins, 4, horizon]`, strides `[origins·4·horizon, 4·horizon, 1, 4]` - and
+    /// NOT dense. The ATen composition accepted it silently because every pointwise op it
+    /// called is strided. A kernel that assumed `channel · horizon` addressing read the wrong
+    /// elements, and the version before this one asserted contiguity and aborted the run.
+    ///
+    /// Every other test in this module builds its targets with `Tensor::randn`, which is
+    /// contiguous by construction - shape-correct and stride-wrong, which is exactly the
+    /// class of test that passes green while the real path crashes. So this one reproduces
+    /// the construction rather than the dimensions, and asserts the layout it got is really
+    /// the strided one before it compares anything.
+    #[test]
+    fn the_real_paths_strided_targets_are_read_as_the_composition_reads_them() {
+        let Some(claim) = cuda() else { return };
+        let device = *claim;
+        tch::manual_seed(31);
+        let (rows, origins, horizon, patch) = (32i64, 375i64, 192i64, 16i64);
+        let context = patch * origins;
+        let float = (Kind::Float, device);
+        // `CausalPatchModel::future_windows` verbatim: narrow off the first patch, then
+        // unfold `pred_len` windows at the patch stride, on a channel-major series.
+        let series = Tensor::randn([rows, context + horizon, LOSS_CHANNELS], float);
+        let future = series
+            .narrow(1, patch, context + horizon - patch)
+            .unfold(1, horizon, patch);
+        let log_close = Tensor::randn([rows, origins, 1, 1], float);
+        let sigma = Tensor::rand([rows, origins, 1, 1], float) + 0.25;
+        let drift = Tensor::randn([rows, origins, 1, horizon], float) * 0.01;
+        let targets = (future - &log_close) / &sigma - &drift;
+        assert_eq!(targets.size(), [rows, origins, LOSS_CHANNELS, horizon]);
+        assert_eq!(
+            targets.stride(),
+            [origins * LOSS_CHANNELS * horizon, LOSS_CHANNELS * horizon, 1, LOSS_CHANNELS],
+            "the real path's targets are channel-innermost; if this layout changed, the \
+             kernel's stride arguments are being tested against the wrong thing"
+        );
+        assert!(
+            !targets.is_contiguous(),
+            "this test exists for the NON-contiguous case and the tensor it built is dense"
+        );
+        let inputs = LossInputs {
+            targets,
+            ..loss_inputs(rows, origins, horizon, device, 2.0)
+        };
+        let upstream = Tensor::randn([2 * LOSS_CHANNELS], float);
+        let (composed, composed_gradient, fused, fused_gradient) =
+            loss_pair(&inputs, &upstream, None, LOSS_GEOMETRY_ROUNDING);
+        let counts = loss_differences(&composed, &composed_gradient, &fused, &fused_gradient);
+        assert_eq!(
+            counts,
+            [0, 0, 0, 0],
+            "the fused loss does not read the real path's strided targets the way the \
+             composition does; max |delta| close {}, terms {}, squares {}, gradient {}",
+            max_absolute(&composed.close, &fused.close),
+            max_absolute(&composed.terms, &fused.terms),
+            max_absolute(&composed.squares, &fused.squares),
+            max_absolute(&composed_gradient, &fused_gradient)
+        );
+        // Reading strided is INTERPRETING the strides, not tolerating them: the same values
+        // in a dense copy, with every other operand shared, must give the same bits. Without
+        // this, a kernel that ignored the strides and read the buffer densely could still
+        // pass above whenever the composition happened to be compared against itself.
+        let dense = targets_dense(&inputs);
+        assert!(dense.targets.is_contiguous() && dense.targets.equal(&inputs.targets));
+        let dense_geometry = loss_geometry_with_rounding(
+            &dense.head,
+            &dense.targets,
+            &dense.weighted_mask,
+            &dense.mask,
+            &dense.sigma,
+            &dense.range,
+            &dense.horizon_scale,
+            &dense.inverse_horizon,
+            &dense.log_scale_gain,
+            LOSS_CAP,
+            LOSS_GEOMETRY_ROUNDING,
+        );
+        assert!(
+            identical(&dense_geometry.terms, &fused.terms)
+                && identical(&dense_geometry.squares, &fused.squares)
+                && identical(&dense_geometry.close, &fused.close),
+            "the fused loss read the strided targets differently from a dense copy of the \
+             same values; max |delta| terms {}, squares {}, close {}",
+            max_absolute(&dense_geometry.terms, &fused.terms),
+            max_absolute(&dense_geometry.squares, &fused.squares),
+            max_absolute(&dense_geometry.close, &fused.close)
+        );
+    }
+
+    /// The same inputs with a DENSE copy of the targets and every other operand shared,
+    /// including the head leaf, so a comparison between the two is a comparison of layouts.
+    fn targets_dense(inputs: &LossInputs) -> LossInputs {
+        LossInputs {
+            head: inputs.head.shallow_clone(),
+            targets: inputs.targets.contiguous(),
+            weighted_mask: inputs.weighted_mask.shallow_clone(),
+            mask: inputs.mask.shallow_clone(),
+            sigma: inputs.sigma.shallow_clone(),
+            range: inputs.range.shallow_clone(),
+            horizon_scale: inputs.horizon_scale.shallow_clone(),
+            inverse_horizon: inputs.inverse_horizon.shallow_clone(),
+            log_scale_gain: inputs.log_scale_gain.shallow_clone(),
+        }
+    }
+
+    /// NaN, ±inf and the mask, which is where a fused loss goes wrong silently.
+    ///
+    /// Two claims. First, the chain PROPAGATES nonfinite values exactly as the composition
+    /// does - a NaN coordinate must poison the same terms and the same gradient elements, not
+    /// a superset or a subset. Second, a masked element contributes EXACTLY zero: the mask
+    /// enters through the precision weight and through the `dot`s' second operand, so
+    /// `0 · anything` is the contribution, and the test proves it by zeroing the mask
+    /// everywhere and requiring literal zeros out of the reductions rather than small numbers.
+    #[test]
+    fn fused_loss_geometry_matches_the_composition_at_nonfinite_and_masked_elements() {
+        let Some(claim) = cuda() else { return };
+        let device = *claim;
+        tch::manual_seed(29);
+        let inputs = loss_inputs(3, 257, 37, device, 6.0);
+        // Forced, not hoped for: a NaN and both infinities in the coordinates, in the log
+        // scales and in the targets, at elements that are valid and at elements that are not.
+        let poison = [f64::NAN, f64::INFINITY, f64::NEG_INFINITY];
+        tch::no_grad(|| {
+            for (slot, value) in poison.iter().enumerate() {
+                for channel in 0..2 * LOSS_CHANNELS {
+                    let _ = inputs
+                        .head
+                        .select(0, 0)
+                        .select(0, slot as i64)
+                        .select(0, channel)
+                        .narrow(0, slot as i64, 1)
+                        .fill_(*value);
+                }
+                let _ = inputs
+                    .targets
+                    .select(0, 1)
+                    .select(0, slot as i64)
+                    .select(0, 0)
+                    .narrow(0, slot as i64, 1)
+                    .fill_(*value);
+            }
+            // One whole origin invalid, so a poisoned element sits behind a zero mask too.
+            let _ = inputs.mask.select(0, 0).select(0, 1).fill_(0.0);
+            let _ = inputs.weighted_mask.select(0, 0).select(0, 1).fill_(0.0);
+        });
+        let upstream = Tensor::randn([2 * LOSS_CHANNELS], (Kind::Float, device));
+        let (composed, composed_gradient, fused, fused_gradient) =
+            loss_pair(&inputs, &upstream, None, LOSS_GEOMETRY_ROUNDING);
+        assert_eq!(
+            loss_differences(&composed, &composed_gradient, &fused, &fused_gradient),
+            [0, 0, 0, 0],
+            "the fused loss disagrees with the composition on nonfinite or masked elements"
+        );
+        assert!(
+            composed.terms.isnan().any().int64_value(&[]) != 0,
+            "the poisoned elements did not reach the objective, so this test proved nothing"
+        );
+
+        // Now a CLEAN batch with the mask everywhere zero: every reduction must be a literal
+        // zero from both forms. Clean, because a nonfinite element behind a zero mask is NOT
+        // zero and must not be - `NaN · 0` is `NaN` in the composition too, and pretending
+        // otherwise is exactly the kind of "helpful" divergence this bar exists to forbid.
+        tch::manual_seed(41);
+        let mut blind = loss_inputs(3, 257, 37, device, 6.0);
+        tch::no_grad(|| {
+            let _ = blind.mask.fill_(0.0);
+            let _ = blind.weighted_mask.fill_(0.0);
+        });
+        let (composed, composed_gradient, fused, fused_gradient) =
+            loss_pair(&blind, &upstream, None, LOSS_GEOMETRY_ROUNDING);
+        assert_eq!(
+            loss_differences(&composed, &composed_gradient, &fused, &fused_gradient),
+            [0, 0, 0, 0],
+            "the fused loss disagrees with the composition under a fully masked batch"
+        );
+        for (name, reduced) in [
+            ("composed terms", &composed.terms),
+            ("fused terms", &fused.terms),
+            ("composed squares", &composed.squares),
+            ("fused squares", &fused.squares),
+        ] {
+            let squared = reduced.square().sum(Kind::Float).double_value(&[]);
+            assert_eq!(
+                squared, 0.0,
+                "{name} reduce to {squared} under a zero mask, not exactly zero"
+            );
+        }
+        // The gradient of a fully masked batch is zero too, in both forms, because every
+        // path to the head runs through the precision weight or the folded mask.
+        for (name, gradient) in [
+            ("composed", &composed_gradient),
+            ("fused", &fused_gradient),
+        ] {
+            let magnitude = gradient
+                .to_kind(Kind::Float)
+                .abs()
+                .max()
+                .double_value(&[]);
+            assert_eq!(
+                magnitude, 0.0,
+                "{name} head gradient is {magnitude} under a zero mask, not exactly zero"
+            );
+        }
+    }
+
+    /// The amplitude prior's path: something outside the loss reduces the mean coordinate, so
+    /// its gradient is a THIRD addend on channel 0.
+    ///
+    /// Verified NUMERICALLY and not bit-exactly, deliberately and only here. The kernel adds
+    /// the external gradient after the two the loss contributes; the composition's autograd
+    /// engine orders a buffer's addends by node creation, which for a consumer of the RETURNED
+    /// coordinate puts it first. Three fp32 addends do not reassociate exactly, and there is
+    /// no incumbent bit pattern to preserve for a term that did not exist before the prior.
+    /// Everything else - all eight channels under `grad_close = None`, and the forward - stays
+    /// bit-exact, which is what the production-shape test pins.
+    #[test]
+    fn fused_loss_geometry_carries_the_mean_coordinate_gradient() {
+        let Some(claim) = cuda() else { return };
+        let device = *claim;
+        tch::manual_seed(31);
+        let inputs = loss_inputs(4, 512, 48, device, 2.0);
+        let upstream = Tensor::randn([2 * LOSS_CHANNELS], (Kind::Float, device));
+        let close_upstream =
+            Tensor::randn(inputs.mask.size(), (Kind::Float, device)) * &inputs.mask;
+        let (composed, composed_gradient, fused, fused_gradient) = loss_pair(
+            &inputs,
+            &upstream,
+            Some(&close_upstream),
+            LOSS_GEOMETRY_ROUNDING,
+        );
+        // The forward is untouched by the extra consumer, so it stays exact.
+        assert_eq!(
+            differing(&composed.close, &fused.close),
+            0,
+            "the mean coordinate itself is not bit-identical"
+        );
+        let scale = composed_gradient
+            .to_kind(Kind::Float)
+            .abs()
+            .max()
+            .double_value(&[]);
+        assert!(scale > 0.0, "the comparison ran on a zero gradient");
+        let error = max_absolute(&composed_gradient, &fused_gradient) / scale;
+        println!("mean-coordinate gradient path: {error:.3e} relative");
+        assert!(
+            error <= 1e-2,
+            "the mean coordinate's gradient is not a rounding of the composition's: {error} \
+             relative, which is a wrong derivative and not an accumulation order"
+        );
+        // And the eight channels that do NOT take the external addend are still exact: a
+        // wrong chain would not confine its error to channel 0.
+        for channel in 1..2 * LOSS_CHANNELS {
+            assert_eq!(
+                differing(
+                    &composed_gradient.narrow(2, channel, 1),
+                    &fused_gradient.narrow(2, channel, 1)
+                ),
+                0,
+                "channel {channel} moved when only the mean coordinate gained a consumer"
+            );
+        }
+    }
+
+    /// TEMPORARY diagnosis: which channel diverges, under which rounding bits, and the exact
+    /// fp32 inputs of the worst element so the CUDA form can be identified off-device.
+    #[test]
+    fn diagnose_loss_geometry_gradient() {
+        let Some(claim) = cuda() else { return };
+        let device = *claim;
+        tch::manual_seed(23);
+        let inputs = loss_inputs(64, 375, 192, device, 2.0);
+        let upstream = Tensor::randn([2 * LOSS_CHANNELS], (Kind::Float, device));
+        for rounding in 0..32 {
+            let (composed, composed_gradient, fused, fused_gradient) =
+                loss_pair(&inputs, &upstream, None, rounding);
+            let per_channel: Vec<i64> = (0..2 * LOSS_CHANNELS)
+                .map(|channel| {
+                    differing(
+                        &composed_gradient.narrow(2, channel, 1),
+                        &fused_gradient.narrow(2, channel, 1),
+                    )
+                })
+                .collect();
+            println!(
+                "rounding {rounding:2}: close {} terms {} squares {} channels {per_channel:?}",
+                differing(&composed.close, &fused.close),
+                differing(&composed.terms, &fused.terms),
+                differing(&composed.squares, &fused.squares),
+            );
+        }
+
+        let (_, composed_gradient, _, fused_gradient) =
+            loss_pair(&inputs, &upstream, None, LOSS_GEOMETRY_ROUNDING);
+        let horizon = inputs.head.size()[3];
+        let flatten = |tensor: &Tensor| tensor.reshape([-1]).to_kind(Kind::Float);
+        for channel in 0..2 * LOSS_CHANNELS {
+            let left = flatten(&composed_gradient.narrow(2, channel, 1));
+            let right = flatten(&fused_gradient.narrow(2, channel, 1));
+            let mismatch = left
+                .ne_tensor(&right)
+                .logical_or(&left.signbit().logical_xor(&right.signbit()));
+            let count = mismatch.to_kind(Kind::Int64).sum(Kind::Int64).int64_value(&[]);
+            if count == 0 {
+                continue;
+            }
+            let zero = (left.abs() + right.abs()).eq(0.0);
+            let masked = flatten(&inputs.mask).eq(0.0);
+            let tally = |predicate: &Tensor| {
+                mismatch
+                    .logical_and(predicate)
+                    .to_kind(Kind::Int64)
+                    .sum(Kind::Int64)
+                    .int64_value(&[])
+            };
+            println!(
+                "channel {channel}: {count} mismatched, {} both zero, {} behind a zero mask, \
+                 {} composed-negative, {} fused-negative",
+                tally(&zero),
+                tally(&masked),
+                tally(&left.signbit()),
+                tally(&right.signbit()),
+            );
+            let flat = mismatch.to_kind(Kind::Float).argmax(0, false).int64_value(&[]);
+            let (token, bar) = (flat / horizon, flat % horizon);
+            let at = |tensor: &Tensor, index: i64| -> String {
+                let value = tensor
+                    .reshape([-1])
+                    .narrow(0, index, 1)
+                    .to_kind(Kind::Float)
+                    .double_value(&[]) as f32;
+                format!("{:#010x}", value.to_bits())
+            };
+            let head = inputs.head.reshape([-1, 2 * LOSS_CHANNELS, horizon]);
+            let targets = inputs.targets.reshape([-1, LOSS_CHANNELS, horizon]);
+            let heads: Vec<String> = (0..2 * LOSS_CHANNELS)
+                .map(|source| at(&head.select(0, token).select(0, source), bar))
+                .collect();
+            let goals: Vec<String> = (0..LOSS_CHANNELS)
+                .map(|source| at(&targets.select(0, token).select(0, source), bar))
+                .collect();
+            let terms: Vec<String> = (0..2 * LOSS_CHANNELS)
+                .map(|index| at(&upstream, index))
+                .collect();
+            println!("  token {token} bar {bar} head {heads:?} target {goals:?}");
+            println!(
+                "  wmask {} mask {} sigma {} range {} hs {} ih {} gain {} upstream {terms:?}",
+                at(&inputs.mask, flat),
+                at(&inputs.weighted_mask, flat),
+                at(&inputs.sigma, token),
+                at(&inputs.range, token),
+                at(&inputs.horizon_scale, bar),
+                at(&inputs.inverse_horizon, bar),
+                at(&inputs.log_scale_gain, 0),
+            );
+            println!("  composed {} fused {}", at(&left, flat), at(&right, flat));
+        }
+
+        // What the COMPOSITION hands to the mean coordinate itself, one level above the
+        // head: if the sign of a zero is already decided here then the disagreement is in
+        // the accumulation onto `close` and not in the cast or the `horizon_scale` product.
+        let geometry = reference::loss_geometry(
+            &inputs.head,
+            &inputs.targets,
+            &inputs.weighted_mask,
+            &inputs.mask,
+            &inputs.sigma,
+            &inputs.range,
+            &inputs.horizon_scale,
+            &inputs.inverse_horizon,
+            &inputs.log_scale_gain,
+            LOSS_CAP,
+        );
+        let objective = geometry.terms.dot(&upstream);
+        let grads = Tensor::run_backward(&[&objective], &[&geometry.close], false, false);
+        let close_gradient = flatten(&grads[0]);
+        let head_zero = flatten(&composed_gradient.narrow(2, 0, 1));
+        let negative_close = close_gradient
+            .signbit()
+            .logical_and(&close_gradient.eq(0.0))
+            .to_kind(Kind::Int64)
+            .sum(Kind::Int64)
+            .int64_value(&[]);
+        let negative_head = head_zero
+            .signbit()
+            .logical_and(&head_zero.eq(0.0))
+            .to_kind(Kind::Int64)
+            .sum(Kind::Int64)
+            .int64_value(&[]);
+        let fused_zero = flatten(&fused_gradient.narrow(2, 0, 1));
+        let negative_fused = fused_zero
+            .signbit()
+            .logical_and(&fused_zero.eq(0.0))
+            .to_kind(Kind::Int64)
+            .sum(Kind::Int64)
+            .int64_value(&[]);
+        println!(
+            "negative zeros: composed close {negative_close}, composed head {negative_head}, \
+             fused head {negative_fused}"
+        );
+    }
+
+    /// The masked path's NEGATIVE ZERO is the composition's, and it reaches the optimizer
+    /// unchanged. This is the test that found the one real defect in the fused backward.
+    ///
+    /// The mechanism, named rather than characterized. Where an origin is invalid the folded
+    /// mask is `+0`, so `precision = mask·h⁻¹` is `+0` and `weight = exp(-2·cap·s)·precision`
+    /// is `+0`. Every gradient below it is then a signed zero whose sign is a pure XOR of the
+    /// signs of `grad_dot`, of the residual `target - prediction` and of the `neg` that the
+    /// residual's backward applies - a product chain, so IEEE fixes it, and both forms agree
+    /// on it. The mean coordinate is the ONE channel whose gradient is a SUM of two such
+    /// zeros, the channel-3 residual plus the `low` path: `-0 + -0` is `-0` and every other
+    /// pairing is `+0`, so it is the only channel where a spurious zero ADDEND is observable
+    /// at all. Channels 1-3 re-derive the sign through a `sigmoid_backward` or
+    /// `softplus_backward` product and channels 4-7 never touch `close`.
+    ///
+    /// The defect it exposed was a spurious addend, and it was in the BRIDGE. Autograd
+    /// materializes an unused output's gradient as a freshly zeroed tensor, so the mean
+    /// coordinate's `grad_close` arrived defined and full of `+0` even with nothing consuming
+    /// it, and the kernel dutifully added it: `-0 + +0` is `+0`, against the composition's
+    /// `-0`, on 3244 of 4,608,000 elements - every one of them an invalid origin.
+    /// `ctx->set_materialize_grads(false)` is the fix, and the lesson generalizes past zeros:
+    /// a materialized gradient is an EXTRA operand, and a fused op with optional outputs has
+    /// to refuse it rather than trust that adding zero is free.
+    ///
+    /// The comparison is promoted one level above the head deliberately. What the bar exists
+    /// to protect is the parameter gradient the optimizer consumes, so this test puts the
+    /// real head-output GEMM under the loss and requires the weight AND activation gradients
+    /// to be bit-identical, sign bit included. It also refuses to pass vacuously: the
+    /// composition must actually produce negative zeros, or the sign convention was never
+    /// exercised and the test proved nothing.
+    #[test]
+    fn the_masked_signed_zero_is_the_compositions_and_reaches_a_parameter_gradient_intact() {
+        let Some(claim) = cuda() else { return };
+        let device = *claim;
+        tch::manual_seed(43);
+        let (rows, origins, horizon, hidden) = (8i64, 375i64, 192i64, 64i64);
+        let inputs = loss_inputs(rows, origins, horizon, device, 2.0);
+        let upstream = Tensor::randn([2 * LOSS_CHANNELS], (Kind::Float, device));
+        let activation =
+            bf16_randn(&[rows * origins, hidden], device).set_requires_grad(true);
+        let weight = (bf16_randn(&[hidden, 2 * LOSS_CHANNELS * horizon], device) * 0.25)
+            .set_requires_grad(true);
+        let shape = [rows, origins, 2 * LOSS_CHANNELS, horizon];
+
+        let run = |fused: bool| {
+            let head = activation.matmul(&weight).reshape(shape);
+            let geometry = if fused {
+                loss_geometry(
+                    &head,
+                    &inputs.targets,
+                    &inputs.weighted_mask,
+                    &inputs.mask,
+                    &inputs.sigma,
+                    &inputs.range,
+                    &inputs.horizon_scale,
+                    &inputs.inverse_horizon,
+                    &inputs.log_scale_gain,
+                    LOSS_CAP,
+                )
+            } else {
+                reference::loss_geometry(
+                    &head,
+                    &inputs.targets,
+                    &inputs.weighted_mask,
+                    &inputs.mask,
+                    &inputs.sigma,
+                    &inputs.range,
+                    &inputs.horizon_scale,
+                    &inputs.inverse_horizon,
+                    &inputs.log_scale_gain,
+                    LOSS_CAP,
+                )
+            };
+            let objective = geometry.terms.dot(&upstream);
+            let gradients = Tensor::run_backward(
+                &[&objective],
+                &[&weight, &activation, &head],
+                false,
+                false,
+            );
+            (
+                gradients[0].shallow_clone(),
+                gradients[1].shallow_clone(),
+                gradients[2].shallow_clone(),
+            )
+        };
+        let (composed_weight, composed_activation, composed_head) = run(false);
+        let (fused_weight, fused_activation, fused_head) = run(true);
+
+        // The masked path is LIVE - the batch really does contain invalid origins, so the
+        // negative zeros this test exists for are present rather than hypothetical - and the
+        // two forms agree on every one of them, sign bit included.
+        let negatives = |tensor: &Tensor| {
+            let flat = tensor.reshape([-1]).to_kind(Kind::Float);
+            flat.signbit()
+                .logical_and(&flat.eq(0.0))
+                .to_kind(Kind::Int64)
+                .sum(Kind::Int64)
+                .int64_value(&[])
+        };
+        let seeds = negatives(&composed_head);
+        assert!(
+            seeds > 0,
+            "the composition produced no negative zero at this shape, so the sign convention \
+             this test exists for was never exercised"
+        );
+        assert!(
+            identical(&composed_head, &fused_head),
+            "the head gradient is not bit-identical: {} of {} elements differ, max |delta| {}, \
+             composed negative zeros {seeds}, fused {}",
+            differing(&composed_head, &fused_head),
+            composed_head.numel(),
+            max_absolute(&composed_head, &fused_head),
+            negatives(&fused_head)
+        );
+
+        // And it washes out: what the optimizer receives is bit-identical, sign bit included.
+        assert!(
+            composed_weight
+                .to_kind(Kind::Float)
+                .abs()
+                .max()
+                .double_value(&[])
+                > 0.0,
+            "the weight gradient is all zero, so the comparison is vacuous"
+        );
+        assert!(
+            identical(&composed_weight, &fused_weight),
+            "the head-output weight gradient is not bit-identical: {} of {} elements differ, \
+             max |delta| {}",
+            differing(&composed_weight, &fused_weight),
+            composed_weight.numel(),
+            max_absolute(&composed_weight, &fused_weight)
+        );
+        assert!(
+            identical(&composed_activation, &fused_activation),
+            "the head activation gradient is not bit-identical: {} of {} elements differ, \
+             max |delta| {}",
+            differing(&composed_activation, &fused_activation),
+            composed_activation.numel(),
+            max_absolute(&composed_activation, &fused_activation)
         );
     }
 }

@@ -419,6 +419,24 @@ void at_copy_(tensor dst, tensor src) { PROTECT(dst->copy_(*src);) }
 // the copy retires.
 void at_copy_nonblocking(tensor dst, tensor src) { PROTECT(dst->copy_(*src, true);) }
 
+// Allocate a PINNED float32 host tensor directly, without copying one into place.
+//
+// `pin_memory()` is a COPY: it allocates a pinned block and memcpys an existing pageable
+// tensor into it. A loader that writes every byte of the block itself wants only the block,
+// and at batch 256 the pageable original plus that copy cost 228 MB of single-threaded host
+// read+write traffic per batch for bytes all of which are then overwritten. ATen reaches the
+// pinned allocator only through TensorOptions, which the generated bindings do not carry.
+//
+// Float32 rather than dtype-generic because the scalar-type code is an ATen enum the caller
+// would have to mirror by hand, and every producer that needs this writes f32.
+tensor at_empty_pinned_float(int64_t *dims, int ndims) {
+  PROTECT(auto options =
+              at::device(at::kCPU).dtype(at::kFloat).pinned_memory(true);
+          return new torch::Tensor(
+              torch::empty(torch::IntArrayRef(dims, ndims), options));)
+  return nullptr;
+}
+
 cuda_graph at_cuda_graph_new() {
 #ifdef TCH_CUDA_GRAPHS
   PROTECT(return new TchCudaGraph();)

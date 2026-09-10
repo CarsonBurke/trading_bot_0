@@ -36,6 +36,7 @@ extern "C" {
     pub fn at_shallow_clone(arg: *mut C_tensor) -> *mut C_tensor;
     pub fn at_copy_(dst: *mut C_tensor, src: *mut C_tensor);
     pub fn at_copy_nonblocking(dst: *mut C_tensor, src: *mut C_tensor);
+    pub fn at_empty_pinned_float(dims: *const i64, ndims: c_int) -> *mut C_tensor;
     pub fn at_data_ptr(arg: *mut C_tensor) -> *mut c_void;
     pub fn at_defined(arg: *mut C_tensor) -> c_int;
     pub fn at_is_sparse(arg: *mut C_tensor) -> c_int;
