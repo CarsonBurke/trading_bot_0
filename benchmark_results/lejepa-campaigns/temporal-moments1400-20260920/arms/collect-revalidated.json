@@ -1,0 +1,17 @@
+{
+  "complete": "/home/marvin/Documents/repositories/trading_bot_0/benchmark_results/lejepa-campaigns/temporal-moments1400-20260920/complete.json",
+  "complete_sha256": "a4254ec392f6e4fdacab2d2442b36e070a2ad694f04d05a039c7fc082e4467d7",
+  "finished_at": "2026-09-20T19:00:24.494178+00:00",
+  "original_failed_receipt": "/home/marvin/Documents/repositories/trading_bot_0/benchmark_results/lejepa-campaigns/temporal-moments1400-20260920/arms/collect-finished.json",
+  "original_failed_receipt_sha256": "7651cbb8628338fb8c32e067b6855f33ac8bdc8d7946563135bf4f1c6ac2aae8",
+  "original_lifecycle_status": "failed",
+  "pinned_validator_sha256": "1721ed2d87ed08b47f4ddaee799113a0672456e9db1232bba4f7bc86b3c32c37",
+  "plan_sha256": "aa6103658bec9f69c0bbeea1ab3eaa84520aea4eee0974240ee95ef5ec946b81",
+  "recovered_after_validator_failure": true,
+  "schema": "lejepa-collection-revalidation-v1",
+  "started_at": "2026-09-20T19:00:22.521136+00:00",
+  "status": "complete",
+  "task": "collect",
+  "validator_sha256": "190df09af466d234af1b0dd198ea3c03934045bb151e1cee849c31525245414c",
+  "validator_source": "/home/marvin/Documents/repositories/trading_bot_0/benchmarks/lejepa_campaign.py"
+}

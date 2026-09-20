@@ -1,0 +1,7 @@
+{
+  "failure": "[Errno 2] No such file or directory: '/home/marvin/Documents/repositories/trading_bot_0/benchmark_results/lejepa-campaigns/temporal-moments1400-20260920/benchmark_results'",
+  "finished_at": "2026-09-20T18:52:46.088996+00:00",
+  "plan_sha256": "aa6103658bec9f69c0bbeea1ab3eaa84520aea4eee0974240ee95ef5ec946b81",
+  "started_at": "2026-09-20T18:52:44.104022+00:00",
+  "status": "failed"
+}

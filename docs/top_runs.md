@@ -18,6 +18,10 @@ Protocol: `lejepa-fixed1400-20260919`; 1400 updates, batch 256, seed 20260919, f
 | Conditional return CF, decoupled/lattice | 0.980716 | 50.54% | 0.04137 | `temporal-conditional1400-20260920-conditional` |
 | Conditional return CF, full/none | 0.980497 | 51.71% | 0.02468 | `temporal-conditional1400-20260920-conditional-full-none` |
 | Reference-sized 16D projected SIGReg | 0.994632 | 50.49% | 0.01979 | `sigreg-small1400-20260920-projected-small` |
+| Direct decision-MSE reweighting, 0.125 | 0.976482 | 52.83% | 0.03435 | `temporal-moments1400-20260920-decision-mse` |
+| Conditional mean moments, 0.125 | 0.978702 | 52.29% | 0.03956 | `temporal-moments1400-20260920-moment` |
+| Conditional mean moments, 0.5 | 0.976320 | 52.44% | 0.03870 | `temporal-moments1400-20260920-moment-strong` |
+| Moments + decision MSE, 0.125 each | 0.979404 | 50.88% | 0.05494 | `temporal-moments1400-20260920-moment-plus-mse` |
 
 At h192, no-SIGReg JEPA = **0.997561**, full/none = 1.000512, decoupled/lattice = 1.001884. A horizon-specific win is not a global win. Latent-only one/multi-horizon close scores ≈0.99935/0.99998: not competitive.
 
@@ -32,12 +36,15 @@ Same scoring observations, but **2500 updates, different seed, frozen calibrated
 
 ## Evidence and operational state
 
-- [Latest paired accuracy reports](../benchmark_results/accuracy-temporal-sigreg-final-20260920/): **14 checkpoints**, 25 `timexer_accuracy_*` `.report.bin` bases and authenticated protocol; job **8523 succeeded**, **25.945s**. [Commands and interpretation](timexer_segment.md#temporal-sigreg-diagnosis).
+- [Latest paired accuracy reports](../benchmark_results/accuracy-temporal-moments-20260920/): **18 checkpoints** (16 matched, 2 historical) plus persistence, 25 `timexer_accuracy_*` `.report.bin` bases and authenticated protocol; job **8599 succeeded**. [Objective and completed experiment](temporal_sigreg.md#completed-matched-experiment).
 - Evaluation job **8480 succeeded**, nine models in **26.845s**. Original six models: job **8444 succeeded**, each 233–268s. Missing full/none trained in **237.02s**.
 - Five new fixed-1400 runs completed: projected ±SIGReg **276.06/280.62s**, conditional CF decoupled/full **243.97/242.36s**, 16D projected **247.11s**. Training jobs **8494/8495/8512/8513/8521**; all old endpoints reused.
 - Full/none job **8476** failed only in post-training validation of omitted Serde defaults. Validator corrected; saved endpoint independently authenticated and scored without retraining. Original failed receipt preserved; [reverification provenance](../benchmark_results/accuracy-decoupled-comparison-20260920-assets/control-endpoint-reverification.json).
 - New campaigns use one bounded queue job per model, fixed update budget, 420s watchdog; extending a matched campaign reuses authenticated endpoints.
+- [Frozen residual diagnosis](../benchmark_results/temporal-moment-witness-20260920-full-none/): train-only tuned/refitted fixed instruments and frozen-state corrections worsen the leader's close score to **0.977356 / 0.977343**, from 0.975143. Neither is promoted. Job **8570 succeeded**; all 46 emitted binary report bases are registered for the TUI.
+- Four moment/direct-MSE arms completed in **263.60 / 252.23 / 252.04 / 247.32s**, jobs **8574–8577**. Collector **8578** then failed on relocated-validator certificate path resolution; dependent accuracy **8583** was skipped. [Explicit revalidation](../benchmark_results/lejepa-campaigns/temporal-moments1400-20260920/arms/collect-revalidated.json) authenticated all 14 collection endpoints and the corrected validator without retraining or overwriting the original failure; [execution provenance](../benchmark_results/temporal-moments-20260920-assets/execution.json).
+- All four treatment witness jobs **8584–8587** succeeded. Both fixed and state corrections worsen every treatment's aggregate validation score; five witness runs each emit the same 46 registered report bases. Exact correction scores and report links are in the completed experiment.
 
 ## Active question
 
-**Decision: retain full/none forecasting-only; no temporal auxiliary is promoted.** Moving SIGReg off the forecast input reverses its measured penalty, but neither 512D nor 16D projected SIGReg beats forecasting-only. Fixed-return CF learns held-out conditional features (3–8% error reduction versus frozen train-only means), yet worsens price accuracy. Better Gaussianity, latent prediction, or conditional-feature skill is insufficient. Which predictable components are task-irrelevant remains unisolated; no claim of a global optimum or absence of learnable price information.
+**Decision: retain full/none forecasting-only, with both new auxiliary weights zero.** Neither training-time conditional mean moments nor direct decision-MSE reweighting beats its **0.975143** aggregate score. Moment weight 0.5 improves h8/h128/h192, but sacrifices other horizons; higher IC alone does not satisfy the price-error criterion. Train-only residual corrections fail to transfer for the leader and all four treatments. The active question is whether residual structure can be shown to transfer across additional predeclared chronological development regimes before imposing stronger conditional constraints—not whether the latent distribution can be made more Gaussian. No global-optimum, significance or no-signal claim.

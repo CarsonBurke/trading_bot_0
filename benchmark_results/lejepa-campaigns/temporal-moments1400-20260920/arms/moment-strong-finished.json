@@ -1,0 +1,231 @@
+{
+  "evidence": {
+    "checkpoint": "/home/marvin/Documents/repositories/trading_bot_0/training/runs/temporal-moments1400-20260920-moment-strong/weights/jepa-manifest.json",
+    "checkpoint_sha256": "bec9609ff86b489b71974af9e1c76a4b4c7ecf7b76c4a8a4c8ec984ca85cce17",
+    "cross_section_sha256": "91eb1ee756b9835317316883b68ba5b0e0e97e2e8056b04f6c1b4bfea64615c3",
+    "probe_fit_origins_sha256": "5920db02a55834558982d048eb0c9549ed47d4dec1995e55941c0c92709bbf2e",
+    "reports": [
+      {
+        "path": "/home/marvin/Documents/repositories/trading_bot_0/training/runs/temporal-moments1400-20260920-moment-strong/gens/0/timexer_segment_decomposition.report.bin",
+        "sha256": "286643305c5f6da386cea011c92cecf9679a936f8372d4834ba15298ca686508"
+      },
+      {
+        "path": "/home/marvin/Documents/repositories/trading_bot_0/training/runs/temporal-moments1400-20260920-moment-strong/gens/0/timexer_segment_horizon.report.bin",
+        "sha256": "3725adea2a8069ec34928a05d4129a11879de1e83a2d67c534e24bca7a97f2c2"
+      },
+      {
+        "path": "/home/marvin/Documents/repositories/trading_bot_0/training/runs/temporal-moments1400-20260920-moment-strong/gens/0/timexer_segment_horizon_error.report.bin",
+        "sha256": "4ce89d2e72c1e22df1f7f55d2f18fd5e0cdc7bc61b03f49be09b7609caddcddf"
+      },
+      {
+        "path": "/home/marvin/Documents/repositories/trading_bot_0/training/runs/temporal-moments1400-20260920-moment-strong/gens/0/timexer_segment_horizon_rates.report.bin",
+        "sha256": "334a169a723acc812fea90343bf4c0443c406b823b54d30e7e7aa7e157fca141"
+      },
+      {
+        "path": "/home/marvin/Documents/repositories/trading_bot_0/training/runs/temporal-moments1400-20260920-moment-strong/gens/0/timexer_segment_horizon_robust.report.bin",
+        "sha256": "3052bdef47b2e126738ba3e35b3835e4d18e047ed0a7f63a4f2b34f16625bb61"
+      },
+      {
+        "path": "/home/marvin/Documents/repositories/trading_bot_0/training/runs/temporal-moments1400-20260920-moment-strong/gens/0/timexer_segment_jepa_forecast.report.bin",
+        "sha256": "53fa192c9533fb490a7d9ca907a4224f88b5586fb5041fa869ca5cf6f30d3eb2"
+      },
+      {
+        "path": "/home/marvin/Documents/repositories/trading_bot_0/training/runs/temporal-moments1400-20260920-moment-strong/gens/0/timexer_segment_jepa_objective.report.bin",
+        "sha256": "62c036da958c86cf2f9c519baa23bb046775b3ed5323b951c0dd65d1f7e63f7a"
+      },
+      {
+        "path": "/home/marvin/Documents/repositories/trading_bot_0/training/runs/temporal-moments1400-20260920-moment-strong/gens/0/timexer_segment_jepa_panel.report.bin",
+        "sha256": "ddd55222da2aaf9eb673fb56ccf5da19cd22fcb346b0028994924913abf9da2b"
+      },
+      {
+        "path": "/home/marvin/Documents/repositories/trading_bot_0/training/runs/temporal-moments1400-20260920-moment-strong/gens/0/timexer_segment_jepa_probe_correlation.report.bin",
+        "sha256": "0130431e9c205fe22aab40eab9e0418c3a61826acd118f0046ca6c430741f68d"
+      },
+      {
+        "path": "/home/marvin/Documents/repositories/trading_bot_0/training/runs/temporal-moments1400-20260920-moment-strong/gens/0/timexer_segment_jepa_probe_count.report.bin",
+        "sha256": "b8cdb73d43062a5b6d46539b8cb3d4f7fee3f83d774800a551157f626f306c7d"
+      },
+      {
+        "path": "/home/marvin/Documents/repositories/trading_bot_0/training/runs/temporal-moments1400-20260920-moment-strong/gens/0/timexer_segment_jepa_probe_error.report.bin",
+        "sha256": "b03f2f2d1da2b51daf7aac75b83bd110dc9c669497ee11f8eca7531500bfe646"
+      },
+      {
+        "path": "/home/marvin/Documents/repositories/trading_bot_0/training/runs/temporal-moments1400-20260920-moment-strong/gens/0/timexer_segment_jepa_probe_gap.report.bin",
+        "sha256": "1ef47254a69423086312b0c28ad830d8f7ca93ac84ba8c35da41ae2463e52712"
+      },
+      {
+        "path": "/home/marvin/Documents/repositories/trading_bot_0/training/runs/temporal-moments1400-20260920-moment-strong/gens/0/timexer_segment_jepa_probe_penalty.report.bin",
+        "sha256": "aa8e97c0851f00d0868808ba6011a25b9bff2e028f0f5239700a6d7f75877d35"
+      },
+      {
+        "path": "/home/marvin/Documents/repositories/trading_bot_0/training/runs/temporal-moments1400-20260920-moment-strong/gens/0/timexer_segment_jepa_probe_population.report.bin",
+        "sha256": "5066744eed075316e4edcac97a7029fba96505620db5aea0516a91e597aabfdf"
+      },
+      {
+        "path": "/home/marvin/Documents/repositories/trading_bot_0/training/runs/temporal-moments1400-20260920-moment-strong/gens/0/timexer_segment_jepa_probe_ratio.report.bin",
+        "sha256": "57bc3462c9a219c34b332b126049ba0e6918b1e693445e23da5fe3c1bfba561c"
+      },
+      {
+        "path": "/home/marvin/Documents/repositories/trading_bot_0/training/runs/temporal-moments1400-20260920-moment-strong/gens/0/timexer_segment_jepa_reconstruction.report.bin",
+        "sha256": "43903dc06012204e0021061fc85b3d1603cc52cdc330e7ffbebafd656b0cdad3"
+      },
+      {
+        "path": "/home/marvin/Documents/repositories/trading_bot_0/training/runs/temporal-moments1400-20260920-moment-strong/gens/0/timexer_segment_jepa_reconstruction_correlation.report.bin",
+        "sha256": "96ba5b943574c6fd393d874fad2271767a9efb4178c5aa4f75f6a3984df2c17f"
+      },
+      {
+        "path": "/home/marvin/Documents/repositories/trading_bot_0/training/runs/temporal-moments1400-20260920-moment-strong/gens/0/timexer_segment_jepa_reconstruction_count.report.bin",
+        "sha256": "f37574d3d834559aa958552e35e3f65b39caf7887d2e40bfcab4c07dfc516c4f"
+      },
+      {
+        "path": "/home/marvin/Documents/repositories/trading_bot_0/training/runs/temporal-moments1400-20260920-moment-strong/gens/0/timexer_segment_jepa_runtime.report.bin",
+        "sha256": "ad5d6323fced7d239aeafb0ff3243856d97e0e7b375d4cf24726670a488f4d34"
+      },
+      {
+        "path": "/home/marvin/Documents/repositories/trading_bot_0/training/runs/temporal-moments1400-20260920-moment-strong/gens/0/timexer_segment_jepa_token_variance.report.bin",
+        "sha256": "cf25d8e3aefe4c44f1aeefe45107f80a2f522d379aec9f706f1fcde599e00d1e"
+      },
+      {
+        "path": "/home/marvin/Documents/repositories/trading_bot_0/training/runs/temporal-moments1400-20260920-moment-strong/gens/0/timexer_segment_offset.report.bin",
+        "sha256": "da302591d0ab19ab18fa4746766190096ce15c48e26b1be58af238e1a5beaea9"
+      },
+      {
+        "path": "/home/marvin/Documents/repositories/trading_bot_0/training/runs/temporal-moments1400-20260920-moment-strong/gens/0/timexer_segment_progress.report.bin",
+        "sha256": "05056b4fa9a70d5ccd2dcd00e082567368e7f673bc50f5684fe516b07829b0cf"
+      },
+      {
+        "path": "/home/marvin/Documents/repositories/trading_bot_0/training/runs/temporal-moments1400-20260920-moment-strong/gens/0/timexer_segment_signal.report.bin",
+        "sha256": "f34fd939592c67a6555e44a32ca8250825945f2ec9d319d0e15760de93d62711"
+      },
+      {
+        "path": "/home/marvin/Documents/repositories/trading_bot_0/training/runs/temporal-moments1400-20260920-moment-strong/gens/0/timexer_segment_supervision_occupancy.report.bin",
+        "sha256": "e8a2677f0e587478e80ff5b6c22acdf4cb6d35801c7e24c117747ac29e5692eb"
+      },
+      {
+        "path": "/home/marvin/Documents/repositories/trading_bot_0/training/runs/temporal-moments1400-20260920-moment-strong/gens/0/timexer_segment_temporal_moment_train.report.bin",
+        "sha256": "f9cd910bfa1dfef7fd9a4404146aaf2e8cff825a196c49c237268874f4ef0863"
+      },
+      {
+        "path": "/home/marvin/Documents/repositories/trading_bot_0/training/runs/temporal-moments1400-20260920-moment-strong/gens/0/timexer_segment_temporal_moment_train_bias.report.bin",
+        "sha256": "e74df9e9b3b3763685dbb43856f53efa3ef8664a4f1df7687abb14ccf7a4bec8"
+      },
+      {
+        "path": "/home/marvin/Documents/repositories/trading_bot_0/training/runs/temporal-moments1400-20260920-moment-strong/gens/0/timexer_segment_temporal_moment_train_error.report.bin",
+        "sha256": "8a5fc82f363bf8b79af0e166233ba98d87898ee722e99668e66fe621fbd1957c"
+      },
+      {
+        "path": "/home/marvin/Documents/repositories/trading_bot_0/training/runs/temporal-moments1400-20260920-moment-strong/gens/0/timexer_segment_temporal_moment_train_pairs.report.bin",
+        "sha256": "0df68bfc47d7a384e37be62b58499b3c6e0951541c3219e2548708ada5b4deed"
+      },
+      {
+        "path": "/home/marvin/Documents/repositories/trading_bot_0/training/runs/temporal-moments1400-20260920-moment-strong/gens/0/timexer_segment_temporal_moment_train_rows.report.bin",
+        "sha256": "e38b3213a5fe2c1158bdcb4072b23c8c71d2e6cc75481691f1d5b307347ec5b8"
+      },
+      {
+        "path": "/home/marvin/Documents/repositories/trading_bot_0/training/runs/temporal-moments1400-20260920-moment-strong/gens/0/timexer_segment_temporal_moment_train_weights.report.bin",
+        "sha256": "ab8c9d72960b2a468d50b4dd5269e3e91d2faadb18cb5b94c4c78e8deaf5cb33"
+      },
+      {
+        "path": "/home/marvin/Documents/repositories/trading_bot_0/training/runs/temporal-moments1400-20260920-moment-strong/gens/0/timexer_segment_tradable.report.bin",
+        "sha256": "320aa2ce36c8ec89548c5ec2f526668295235e9459e16fdde512e4794aecc4a9"
+      },
+      {
+        "path": "/home/marvin/Documents/repositories/trading_bot_0/training/runs/temporal-moments1400-20260920-moment-strong/gens/0/timexer_segment_tradable_rates.report.bin",
+        "sha256": "4ce4a76d394e46e2bf0c3beb3e625a3fe3f8655c5696b446a91b46faabd13c37"
+      },
+      {
+        "path": "/home/marvin/Documents/repositories/trading_bot_0/training/runs/temporal-moments1400-20260920-moment-strong/gens/0/timexer_segment_utility_active_fraction.report.bin",
+        "sha256": "3b39d6d900c95c301b8d6038fd7751a9b2ecbe2efbb3503145b53d5925aefb51"
+      },
+      {
+        "path": "/home/marvin/Documents/repositories/trading_bot_0/training/runs/temporal-moments1400-20260920-moment-strong/gens/0/timexer_segment_utility_breakeven.report.bin",
+        "sha256": "39dfc7d50f1578e544f8c7252014e8589123f2c376b26f30f9b69c5b0ea5fe44"
+      },
+      {
+        "path": "/home/marvin/Documents/repositories/trading_bot_0/training/runs/temporal-moments1400-20260920-moment-strong/gens/0/timexer_segment_utility_census.report.bin",
+        "sha256": "9b7b723de9c5b354fb07e78f556d11ba47b18d7353b96c735c3652fb1f427bb1"
+      },
+      {
+        "path": "/home/marvin/Documents/repositories/trading_bot_0/training/runs/temporal-moments1400-20260920-moment-strong/gens/0/timexer_segment_utility_gross_exposure.report.bin",
+        "sha256": "b69067071960eccdb89c84ed029b6afb1398e8a8b8cb60bfc1775a225a2d40a1"
+      },
+      {
+        "path": "/home/marvin/Documents/repositories/trading_bot_0/training/runs/temporal-moments1400-20260920-moment-strong/gens/0/timexer_segment_utility_net_exposure.report.bin",
+        "sha256": "8fd65fa13054a93d53ff454dc3c651ac24d032d4e6bddb298e2f8e6abf503074"
+      },
+      {
+        "path": "/home/marvin/Documents/repositories/trading_bot_0/training/runs/temporal-moments1400-20260920-moment-strong/gens/0/timexer_segment_utility_payoff.report.bin",
+        "sha256": "e1b9445d5e6c38aae46b99b3702fcd95a3e01fc6291964f63198a7ebe4522ce9"
+      },
+      {
+        "path": "/home/marvin/Documents/repositories/trading_bot_0/training/runs/temporal-moments1400-20260920-moment-strong/gens/0/timexer_segment_utility_payoff_cost_0p5.report.bin",
+        "sha256": "a156766a8c88a203e7472d4fe2b616ce8ecea331cee5de85bfe29ad809b1441f"
+      },
+      {
+        "path": "/home/marvin/Documents/repositories/trading_bot_0/training/runs/temporal-moments1400-20260920-moment-strong/gens/0/timexer_segment_utility_payoff_cost_1.report.bin",
+        "sha256": "4d0ee6ad2bf5edba88b676a83f7766deb2b8a7f7cccce4b1f5ebafbd9f293cd6"
+      },
+      {
+        "path": "/home/marvin/Documents/repositories/trading_bot_0/training/runs/temporal-moments1400-20260920-moment-strong/gens/0/timexer_segment_utility_payoff_cost_10.report.bin",
+        "sha256": "7769add2ca7750f32adf6244c090317eccb67d258947dfe8aa48caf6d0c9c927"
+      },
+      {
+        "path": "/home/marvin/Documents/repositories/trading_bot_0/training/runs/temporal-moments1400-20260920-moment-strong/gens/0/timexer_segment_utility_payoff_cost_2.report.bin",
+        "sha256": "86607cbc7d12b91dc21108feafdd758a69de48e3c6be3d266ee6b8b4bbdb52f0"
+      },
+      {
+        "path": "/home/marvin/Documents/repositories/trading_bot_0/training/runs/temporal-moments1400-20260920-moment-strong/gens/0/timexer_segment_utility_payoff_cost_5.report.bin",
+        "sha256": "032404d259914aa61189f0efaca71f81ba068d4bd62bc0e3f20f4336872ced7b"
+      },
+      {
+        "path": "/home/marvin/Documents/repositories/trading_bot_0/training/runs/temporal-moments1400-20260920-moment-strong/gens/0/timexer_segment_utility_payoff_std.report.bin",
+        "sha256": "6d0cb1417a8e2ec0198920d7c6cb368df240c0ca7accc21b07ce1c9b91332a98"
+      },
+      {
+        "path": "/home/marvin/Documents/repositories/trading_bot_0/training/runs/temporal-moments1400-20260920-moment-strong/gens/0/timexer_segment_utility_rate.report.bin",
+        "sha256": "28d059cca1b600e32df2653ef3e2311ec67a3f3fb47386f02151ca3eb19b6da5"
+      },
+      {
+        "path": "/home/marvin/Documents/repositories/trading_bot_0/training/runs/temporal-moments1400-20260920-moment-strong/gens/0/timexer_segment_utility_rate_cost_0p5.report.bin",
+        "sha256": "b4b19b3fff11735eedbef3561e862e494a6f5afb73bc05d60b66d11f0b79e8c2"
+      },
+      {
+        "path": "/home/marvin/Documents/repositories/trading_bot_0/training/runs/temporal-moments1400-20260920-moment-strong/gens/0/timexer_segment_utility_rate_cost_1.report.bin",
+        "sha256": "595388c65d66b19b228962b543b0ffb7889e5f9f5eb443a7af5031d5d10d95fc"
+      },
+      {
+        "path": "/home/marvin/Documents/repositories/trading_bot_0/training/runs/temporal-moments1400-20260920-moment-strong/gens/0/timexer_segment_utility_rate_cost_10.report.bin",
+        "sha256": "de6579dc8c2732b7da348121e5ad0da7bbada00d657e1d1056194e38b7421db3"
+      },
+      {
+        "path": "/home/marvin/Documents/repositories/trading_bot_0/training/runs/temporal-moments1400-20260920-moment-strong/gens/0/timexer_segment_utility_rate_cost_2.report.bin",
+        "sha256": "a6436ff42ec18728cb08014b6d4240d41becb2d3b89cbb93b6f559ba45c229ad"
+      },
+      {
+        "path": "/home/marvin/Documents/repositories/trading_bot_0/training/runs/temporal-moments1400-20260920-moment-strong/gens/0/timexer_segment_utility_rate_cost_5.report.bin",
+        "sha256": "faa3ecf0c7600111dbcd5ba73223e9b08ec424b1f573d72c3f2887d660e72801"
+      },
+      {
+        "path": "/home/marvin/Documents/repositories/trading_bot_0/training/runs/temporal-moments1400-20260920-moment-strong/gens/0/timexer_segment_utility_turnover.report.bin",
+        "sha256": "557de591a63e4e8915a586996e596ffdcc3e818010b33b7a057d45e8f9e197ce"
+      },
+      {
+        "path": "/home/marvin/Documents/repositories/trading_bot_0/training/runs/temporal-moments1400-20260920-moment-strong/gens/0/timexer_segment_utility_worst_payoff.report.bin",
+        "sha256": "47fe7f1de04b0ac8332ab4734c3902fb1791eb2c1b184f87f022f8234808def5"
+      }
+    ],
+    "sample_plan_sha256": "0786d2f617ab5d91585456fbd906748aa2d5c05e0bd79bab62205c1abfcb4f93",
+    "training_origins_sha256": "0f2375c8af73ffdf4915ced389900fd1616ea27b4f419a8735ca5c394c475594",
+    "validation_origins_sha256": "fbe7ebacd6fe79dd424786ce050e9bf17a59e1bbb5fb7d720f8c1bfc76c08046",
+    "weights_sha256": "cb47e690ca005433f995220f2baaf4671915a216f23583520a2fd2c027dffb2f"
+  },
+  "failure": null,
+  "finished_at": "2026-09-20T18:47:24.981418+00:00",
+  "idempotency_key": "lejepa-aa6103658bec9f69c0bbeea1ab3eaa84520aea4eee0974240ee95ef5ec946b81-moment-strong",
+  "plan_sha256": "aa6103658bec9f69c0bbeea1ab3eaa84520aea4eee0974240ee95ef5ec946b81",
+  "shared_identity_sha256": "7cacf03f15b60a61a4b433ab5eebf49391493ea9418aec78792fe4fb33f1d49c",
+  "started_at": "2026-09-20T18:43:12.946042+00:00",
+  "status": "complete",
+  "task": "moment-strong",
+  "wall_seconds": 252.03532852300123
+}

@@ -1,0 +1,14 @@
+{
+  "after_success": [
+    8574,
+    8575,
+    8576,
+    8577
+  ],
+  "id": 8578,
+  "idempotency_key": "lejepa-aa6103658bec9f69c0bbeea1ab3eaa84520aea4eee0974240ee95ef5ec946b81-collect",
+  "plan_sha256": "aa6103658bec9f69c0bbeea1ab3eaa84520aea4eee0974240ee95ef5ec946b81",
+  "request_sha256": "7547fe6e319456aa93590a72b7ad0d33190cb6a56ac5df98198198c9e1419c4d",
+  "submitted_at": "2026-09-20T18:34:08.190908+00:00",
+  "task": "collect"
+}

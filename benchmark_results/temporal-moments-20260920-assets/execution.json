@@ -1,0 +1,510 @@
+{
+  "schema": "temporal-moment-research-execution-v1",
+  "assets": {
+    "initial_tests": {
+      "path": "/home/marvin/Documents/repositories/trading_bot_0/benchmark_results/temporal-moments-20260920-assets/library-tests",
+      "source": "/var/tmp/cargo-build/a0/1fb30e0f0e2b3c/release/build/trading_bot_0/735888772b722b5a/out/trading_bot_0-735888772b722b5a",
+      "sha256": "f290a0f182e05f6887b2517de28b7eb73051bf1a82752d9cc469f66c4a236c74"
+    },
+    "tests": {
+      "path": "/home/marvin/Documents/repositories/trading_bot_0/benchmark_results/temporal-moments-20260920-assets/library-tests-v2",
+      "source": "/var/tmp/cargo-build/a0/1fb30e0f0e2b3c/release/build/trading_bot_0/735888772b722b5a/out/trading_bot_0-735888772b722b5a",
+      "sha256": "6348bab19e6f2d1ae8108fb5f4c20ba65f3d14d220dd4b883778d88096616bb3"
+    },
+    "initial_trainer": {
+      "path": "/home/marvin/Documents/repositories/trading_bot_0/benchmark_results/temporal-moments-20260920-assets/trading_bot_0",
+      "source": "/home/marvin/Documents/repositories/trading_bot_0/target/release/trading_bot_0",
+      "sha256": "ba837a9b6dc440979daa6d0506eb6b774f2337205c330ba5f9c0fe3a3d24975c"
+    },
+    "trainer": {
+      "path": "/home/marvin/Documents/repositories/trading_bot_0/benchmark_results/temporal-moments-20260920-assets/trading_bot_0-v2",
+      "source": "/home/marvin/Documents/repositories/trading_bot_0/target/release/trading_bot_0",
+      "sha256": "0296744c21214239139824f4fa809a3484fe32aa9fbe5be60836a39821d82346"
+    },
+    "report_cli": {
+      "path": "/home/marvin/Documents/repositories/trading_bot_0/benchmark_results/temporal-moments-20260920-assets/report_cli-v2",
+      "source": "/home/marvin/Documents/repositories/trading_bot_0/target/release/report_cli",
+      "sha256": "a273a635d36b855d66d8082f09eec816b90b47afab0ca3db7cafe801848773f1"
+    }
+  },
+  "contract_job": {
+    "id": 8569,
+    "name": "temporal-moment-contracts-v2-20260920",
+    "state": "queued",
+    "eligibility": "backfill_window_open: job 8544",
+    "maxParallelRuns": 1,
+    "priority": 0,
+    "cwd": "/home/marvin/Documents/repositories/trading_bot_0",
+    "args": [
+      "/home/marvin/Documents/repositories/trading_bot_0/benchmark_results/temporal-moments-20260920-assets/library-tests-v2",
+      "torch::timexer_segment::temporal_",
+      "torch::timexer_segment::model::tests::temporal_",
+      "torch::timexer_segment::model::tests::selected_temporal_",
+      "torch::timexer_segment::model::tests::cuda_temporal_",
+      "torch::timexer_segment::jepa_eval::tests",
+      "--test-threads=1"
+    ],
+    "maxAttempts": 1,
+    "retryDelayMs": 0,
+    "timeLimitMs": 300000,
+    "readySequence": 7939,
+    "attemptCount": 0,
+    "createdAt": 1789928539320,
+    "updatedAt": 1789928539320,
+    "attempts": []
+  },
+  "frozen_witness_job": {
+    "id": 8570,
+    "name": "temporal-moment-witness-v2-20260920",
+    "state": "queued",
+    "eligibility": "waiting_for_dependencies: jobs [8569]",
+    "maxParallelRuns": 1,
+    "priority": 0,
+    "cwd": "/home/marvin/Documents/repositories/trading_bot_0",
+    "args": [
+      "/home/marvin/Documents/repositories/trading_bot_0/benchmark_results/temporal-moments-20260920-assets/trading_bot_0-v2",
+      "diagnose-temporal-moments",
+      "--run-root",
+      "training/runs/lejepa-full-none1400-20260920-full-none-forecast",
+      "--data-dir",
+      "long_data/bars",
+      "--output",
+      "benchmark_results/temporal-moment-witness-20260920-full-none",
+      "--batch-size",
+      "64"
+    ],
+    "maxAttempts": 1,
+    "retryDelayMs": 0,
+    "timeLimitMs": 300000,
+    "attemptCount": 0,
+    "createdAt": 1789928546958,
+    "updatedAt": 1789928546958,
+    "dependencies": [
+      {
+        "parent": 8569,
+        "condition": "succeeded",
+        "parentState": "queued"
+      }
+    ],
+    "attempts": []
+  },
+  "superseded_before_execution": [
+    {
+      "id": 8565,
+      "state": "cancelled",
+      "attempt_count": 0,
+      "reason": "Review found exact-equality assertion sensitive to one-ulp prefix subtraction; replaced test and derived shared horizons."
+    },
+    {
+      "id": 8566,
+      "state": "skipped",
+      "reason": "Dependency8565 cancelled before start; replaced with8570."
+    }
+  ],
+  "campaign_plan": "benchmark_results/lejepa-campaigns/temporal-moments1400-20260920/plan.json",
+  "campaign_plan_sha256": "aa6103658bec9f69c0bbeea1ab3eaa84520aea4eee0974240ee95ef5ec946b81",
+  "plan_command": [
+    "python3",
+    "benchmarks/lejepa_campaign.py",
+    "plan",
+    "--executable",
+    "/home/marvin/Documents/repositories/trading_bot_0/benchmark_results/temporal-moments-20260920-assets/trading_bot_0-v2",
+    "--report-cli",
+    "/home/marvin/Documents/repositories/trading_bot_0/benchmark_results/temporal-moments-20260920-assets/report_cli-v2",
+    "--data-dir",
+    "long_data/bars",
+    "--data-contract",
+    "/home/marvin/Documents/repositories/trading_bot_0/benchmark_results/lejepa-campaigns/sigreg-small1400-20260920/pinned/expected-data-contract.json",
+    "--output-root",
+    "benchmark_results/lejepa-campaigns",
+    "--campaign",
+    "temporal-moments1400-20260920",
+    "--suite",
+    "temporal-moments",
+    "--reference-plan",
+    "/home/marvin/Documents/repositories/trading_bot_0/benchmark_results/lejepa-campaigns/sigreg-small1400-20260920/plan.json",
+    "--recovered-reference",
+    "benchmark_results/accuracy-decoupled-comparison-20260920-assets/control-endpoint-reverification.json",
+    "--max-steps",
+    "1400",
+    "--seed",
+    "20260919",
+    "--batch-size",
+    "256",
+    "--eval-every",
+    "350",
+    "--eval-origins",
+    "2048",
+    "--probe-fit-origins",
+    "2048",
+    "--eval-batch-size",
+    "64",
+    "--select",
+    "decision-mse",
+    "--select",
+    "moment",
+    "--select",
+    "moment-strong",
+    "--select",
+    "moment-plus-mse"
+  ],
+  "queue_policy": {
+    "priority": 0,
+    "max_parallel_runs": 1,
+    "max_attempts": 1
+  },
+  "accuracy_command": [
+    "/home/marvin/Documents/repositories/trading_bot_0/benchmark_results/temporal-moments-20260920-assets/trading_bot_0-v2",
+    "compare-timexer-accuracy",
+    "--reference-run",
+    "training/runs/lejepa-fixed1400-20260919-forecast",
+    "--data-dir",
+    "long_data/bars",
+    "--output",
+    "benchmark_results/accuracy-temporal-moments-20260920",
+    "--research-run",
+    "decoupled-lattice-1400=training/runs/lejepa-fixed1400-20260919-forecast",
+    "--research-run",
+    "jepa-latent-one-1400=training/runs/lejepa-fixed1400-20260919-latent-one",
+    "--research-run",
+    "jepa-latent-multi-1400=training/runs/lejepa-fixed1400-20260919-latent-multi",
+    "--research-run",
+    "jepa-anchored-1400=training/runs/lejepa-fixed1400-20260919-anchored",
+    "--research-run",
+    "jepa-no-sigreg-1400=training/runs/lejepa-fixed1400-20260919-no-sigreg",
+    "--research-run",
+    "jepa-reconstruct-1400=training/runs/lejepa-fixed1400-20260919-reconstruct",
+    "--research-run",
+    "full-none-1400=/home/marvin/Documents/repositories/trading_bot_0/training/runs/lejepa-full-none1400-20260920-full-none-forecast",
+    "--legacy-checkpoint",
+    "historical-decoupled-lattice-2500=training/runs/timexer-decoupled-lattice-2500/weights/preview-latest",
+    "--legacy-checkpoint",
+    "historical-full-none-2500=training/runs/timexer-full-none-control-2500/weights/preview-latest",
+    "--research-run",
+    "projected-1400=/home/marvin/Documents/repositories/trading_bot_0/training/runs/sigreg-projection1400-20260920-projected",
+    "--research-run",
+    "projected-no-sigreg-1400=/home/marvin/Documents/repositories/trading_bot_0/training/runs/sigreg-projection1400-20260920-projected-no-sigreg",
+    "--research-run",
+    "conditional-1400=/home/marvin/Documents/repositories/trading_bot_0/training/runs/temporal-conditional1400-20260920-conditional",
+    "--research-run",
+    "conditional-full-none-1400=/home/marvin/Documents/repositories/trading_bot_0/training/runs/temporal-conditional1400-20260920-conditional-full-none",
+    "--research-run",
+    "projected-small-1400=/home/marvin/Documents/repositories/trading_bot_0/training/runs/sigreg-small1400-20260920-projected-small",
+    "--research-run",
+    "temporal-decision-mse-1400=/home/marvin/Documents/repositories/trading_bot_0/training/runs/temporal-moments1400-20260920-decision-mse",
+    "--research-run",
+    "temporal-moment-1400=/home/marvin/Documents/repositories/trading_bot_0/training/runs/temporal-moments1400-20260920-moment",
+    "--research-run",
+    "temporal-moment-strong-1400=/home/marvin/Documents/repositories/trading_bot_0/training/runs/temporal-moments1400-20260920-moment-strong",
+    "--research-run",
+    "temporal-moment-plus-mse-1400=/home/marvin/Documents/repositories/trading_bot_0/training/runs/temporal-moments1400-20260920-moment-plus-mse"
+  ],
+  "accuracy_job": {
+    "id": 8599,
+    "name": "temporal-moment-accuracy-revalidated-20260920",
+    "state": "queued",
+    "eligibility": "waiting_for_higher_priority: job 8598 (pri 1)",
+    "maxParallelRuns": 1,
+    "priority": 0,
+    "cwd": "/home/marvin/Documents/repositories/trading_bot_0",
+    "args": [
+      "/home/marvin/Documents/repositories/trading_bot_0/benchmark_results/temporal-moments-20260920-assets/trading_bot_0-v2",
+      "compare-timexer-accuracy",
+      "--reference-run",
+      "training/runs/lejepa-fixed1400-20260919-forecast",
+      "--data-dir",
+      "long_data/bars",
+      "--output",
+      "benchmark_results/accuracy-temporal-moments-20260920",
+      "--research-run",
+      "decoupled-lattice-1400=training/runs/lejepa-fixed1400-20260919-forecast",
+      "--research-run",
+      "jepa-latent-one-1400=training/runs/lejepa-fixed1400-20260919-latent-one",
+      "--research-run",
+      "jepa-latent-multi-1400=training/runs/lejepa-fixed1400-20260919-latent-multi",
+      "--research-run",
+      "jepa-anchored-1400=training/runs/lejepa-fixed1400-20260919-anchored",
+      "--research-run",
+      "jepa-no-sigreg-1400=training/runs/lejepa-fixed1400-20260919-no-sigreg",
+      "--research-run",
+      "jepa-reconstruct-1400=training/runs/lejepa-fixed1400-20260919-reconstruct",
+      "--research-run",
+      "full-none-1400=/home/marvin/Documents/repositories/trading_bot_0/training/runs/lejepa-full-none1400-20260920-full-none-forecast",
+      "--legacy-checkpoint",
+      "historical-decoupled-lattice-2500=training/runs/timexer-decoupled-lattice-2500/weights/preview-latest",
+      "--legacy-checkpoint",
+      "historical-full-none-2500=training/runs/timexer-full-none-control-2500/weights/preview-latest",
+      "--research-run",
+      "projected-1400=/home/marvin/Documents/repositories/trading_bot_0/training/runs/sigreg-projection1400-20260920-projected",
+      "--research-run",
+      "projected-no-sigreg-1400=/home/marvin/Documents/repositories/trading_bot_0/training/runs/sigreg-projection1400-20260920-projected-no-sigreg",
+      "--research-run",
+      "conditional-1400=/home/marvin/Documents/repositories/trading_bot_0/training/runs/temporal-conditional1400-20260920-conditional",
+      "--research-run",
+      "conditional-full-none-1400=/home/marvin/Documents/repositories/trading_bot_0/training/runs/temporal-conditional1400-20260920-conditional-full-none",
+      "--research-run",
+      "projected-small-1400=/home/marvin/Documents/repositories/trading_bot_0/training/runs/sigreg-small1400-20260920-projected-small",
+      "--research-run",
+      "temporal-decision-mse-1400=/home/marvin/Documents/repositories/trading_bot_0/training/runs/temporal-moments1400-20260920-decision-mse",
+      "--research-run",
+      "temporal-moment-1400=/home/marvin/Documents/repositories/trading_bot_0/training/runs/temporal-moments1400-20260920-moment",
+      "--research-run",
+      "temporal-moment-strong-1400=/home/marvin/Documents/repositories/trading_bot_0/training/runs/temporal-moments1400-20260920-moment-strong",
+      "--research-run",
+      "temporal-moment-plus-mse-1400=/home/marvin/Documents/repositories/trading_bot_0/training/runs/temporal-moments1400-20260920-moment-plus-mse"
+    ],
+    "maxAttempts": 1,
+    "retryDelayMs": 0,
+    "timeLimitMs": 300000,
+    "readySequence": 7971,
+    "attemptCount": 0,
+    "createdAt": 1789930845075,
+    "updatedAt": 1789930845075,
+    "dependencies": [
+      {
+        "parent": 8574,
+        "condition": "succeeded",
+        "parentState": "succeeded",
+        "resolution": "satisfied",
+        "parentOutcome": "succeeded",
+        "resolvedAt": 1789930845075
+      },
+      {
+        "parent": 8575,
+        "condition": "succeeded",
+        "parentState": "succeeded",
+        "resolution": "satisfied",
+        "parentOutcome": "succeeded",
+        "resolvedAt": 1789930845075
+      },
+      {
+        "parent": 8576,
+        "condition": "succeeded",
+        "parentState": "succeeded",
+        "resolution": "satisfied",
+        "parentOutcome": "succeeded",
+        "resolvedAt": 1789930845075
+      },
+      {
+        "parent": 8577,
+        "condition": "succeeded",
+        "parentState": "succeeded",
+        "resolution": "satisfied",
+        "parentOutcome": "succeeded",
+        "resolvedAt": 1789930845075
+      }
+    ],
+    "attempts": []
+  },
+  "model_jobs": {
+    "decision-mse": 8574,
+    "moment": 8575,
+    "moment-strong": 8576,
+    "moment-plus-mse": 8577
+  },
+  "collect_job": 8578,
+  "treatment_witness_jobs": {
+    "decision-mse": {
+      "id": 8584,
+      "name": "temporal-witness-decision-mse-20260920",
+      "state": "queued",
+      "eligibility": "backfill_window_open: job 8563",
+      "maxParallelRuns": 1,
+      "priority": 0,
+      "cwd": "/home/marvin/Documents/repositories/trading_bot_0",
+      "args": [
+        "/home/marvin/Documents/repositories/trading_bot_0/benchmark_results/temporal-moments-20260920-assets/trading_bot_0-v2",
+        "diagnose-temporal-moments",
+        "--run-root",
+        "/home/marvin/Documents/repositories/trading_bot_0/training/runs/temporal-moments1400-20260920-decision-mse",
+        "--data-dir",
+        "long_data/bars",
+        "--output",
+        "benchmark_results/temporal-moment-witness-20260920-decision-mse",
+        "--batch-size",
+        "64"
+      ],
+      "maxAttempts": 1,
+      "retryDelayMs": 0,
+      "timeLimitMs": 300000,
+      "readySequence": 7955,
+      "attemptCount": 0,
+      "createdAt": 1789930267675,
+      "updatedAt": 1789930267675,
+      "dependencies": [
+        {
+          "parent": 8574,
+          "condition": "succeeded",
+          "parentState": "succeeded",
+          "resolution": "satisfied",
+          "parentOutcome": "succeeded",
+          "resolvedAt": 1789930267675
+        }
+      ],
+      "attempts": []
+    },
+    "moment": {
+      "id": 8585,
+      "name": "temporal-witness-moment-20260920",
+      "state": "queued",
+      "eligibility": "backfill_window_open: job 8563",
+      "maxParallelRuns": 1,
+      "priority": 0,
+      "cwd": "/home/marvin/Documents/repositories/trading_bot_0",
+      "args": [
+        "/home/marvin/Documents/repositories/trading_bot_0/benchmark_results/temporal-moments-20260920-assets/trading_bot_0-v2",
+        "diagnose-temporal-moments",
+        "--run-root",
+        "/home/marvin/Documents/repositories/trading_bot_0/training/runs/temporal-moments1400-20260920-moment",
+        "--data-dir",
+        "long_data/bars",
+        "--output",
+        "benchmark_results/temporal-moment-witness-20260920-moment",
+        "--batch-size",
+        "64"
+      ],
+      "maxAttempts": 1,
+      "retryDelayMs": 0,
+      "timeLimitMs": 300000,
+      "readySequence": 7956,
+      "attemptCount": 0,
+      "createdAt": 1789930267697,
+      "updatedAt": 1789930267697,
+      "dependencies": [
+        {
+          "parent": 8575,
+          "condition": "succeeded",
+          "parentState": "succeeded",
+          "resolution": "satisfied",
+          "parentOutcome": "succeeded",
+          "resolvedAt": 1789930267697
+        }
+      ],
+      "attempts": []
+    },
+    "moment-strong": {
+      "id": 8586,
+      "name": "temporal-witness-moment-strong-20260920",
+      "state": "queued",
+      "eligibility": "backfill_window_open: job 8563",
+      "maxParallelRuns": 1,
+      "priority": 0,
+      "cwd": "/home/marvin/Documents/repositories/trading_bot_0",
+      "args": [
+        "/home/marvin/Documents/repositories/trading_bot_0/benchmark_results/temporal-moments-20260920-assets/trading_bot_0-v2",
+        "diagnose-temporal-moments",
+        "--run-root",
+        "/home/marvin/Documents/repositories/trading_bot_0/training/runs/temporal-moments1400-20260920-moment-strong",
+        "--data-dir",
+        "long_data/bars",
+        "--output",
+        "benchmark_results/temporal-moment-witness-20260920-moment-strong",
+        "--batch-size",
+        "64"
+      ],
+      "maxAttempts": 1,
+      "retryDelayMs": 0,
+      "timeLimitMs": 300000,
+      "readySequence": 7957,
+      "attemptCount": 0,
+      "createdAt": 1789930267717,
+      "updatedAt": 1789930267717,
+      "dependencies": [
+        {
+          "parent": 8576,
+          "condition": "succeeded",
+          "parentState": "succeeded",
+          "resolution": "satisfied",
+          "parentOutcome": "succeeded",
+          "resolvedAt": 1789930267717
+        }
+      ],
+      "attempts": []
+    },
+    "moment-plus-mse": {
+      "id": 8587,
+      "name": "temporal-witness-moment-plus-mse-20260920",
+      "state": "queued",
+      "eligibility": "waiting_for_dependencies: jobs [8577]",
+      "maxParallelRuns": 1,
+      "priority": 0,
+      "cwd": "/home/marvin/Documents/repositories/trading_bot_0",
+      "args": [
+        "/home/marvin/Documents/repositories/trading_bot_0/benchmark_results/temporal-moments-20260920-assets/trading_bot_0-v2",
+        "diagnose-temporal-moments",
+        "--run-root",
+        "/home/marvin/Documents/repositories/trading_bot_0/training/runs/temporal-moments1400-20260920-moment-plus-mse",
+        "--data-dir",
+        "long_data/bars",
+        "--output",
+        "benchmark_results/temporal-moment-witness-20260920-moment-plus-mse",
+        "--batch-size",
+        "64"
+      ],
+      "maxAttempts": 1,
+      "retryDelayMs": 0,
+      "timeLimitMs": 300000,
+      "attemptCount": 0,
+      "createdAt": 1789930267735,
+      "updatedAt": 1789930267735,
+      "dependencies": [
+        {
+          "parent": 8577,
+          "condition": "succeeded",
+          "parentState": "running"
+        }
+      ],
+      "attempts": []
+    }
+  },
+  "revalidation_command": [
+    "python3",
+    "/home/marvin/Documents/repositories/trading_bot_0/benchmarks/lejepa_campaign.py",
+    "revalidate-collection",
+    "--plan",
+    "benchmark_results/lejepa-campaigns/temporal-moments1400-20260920/plan.json",
+    "--plan-sha256",
+    "aa6103658bec9f69c0bbeea1ab3eaa84520aea4eee0974240ee95ef5ec946b81",
+    "--failed-receipt-sha256",
+    "7651cbb8628338fb8c32e067b6855f33ac8bdc8d7946563135bf4f1c6ac2aae8",
+    "--validator-sha256",
+    "190df09af466d234af1b0dd198ea3c03934045bb151e1cee849c31525245414c"
+  ],
+  "revalidation_validator": {
+    "path": "/home/marvin/Documents/repositories/trading_bot_0/benchmark_results/temporal-moments-20260920-assets/lejepa_campaign-revalidated.py",
+    "source": "/home/marvin/Documents/repositories/trading_bot_0/benchmarks/lejepa_campaign.py",
+    "sha256": "190df09af466d234af1b0dd198ea3c03934045bb151e1cee849c31525245414c"
+  },
+  "revalidation_receipt": "benchmark_results/lejepa-campaigns/temporal-moments1400-20260920/arms/collect-revalidated.json",
+  "complete_sha256": "a4254ec392f6e4fdacab2d2442b36e070a2ad694f04d05a039c7fc082e4467d7",
+  "skipped_accuracy_job": {
+    "id": 8583,
+    "reason": "Original collector8578 failed on pinned-driver relative certificate path; no attempt started. Collection explicitly revalidated without retraining."
+  },
+  "completed_outcomes": {
+    "8584": {
+      "state": "succeeded",
+      "attemptCount": 1
+    },
+    "8585": {
+      "state": "succeeded",
+      "attemptCount": 1
+    },
+    "8586": {
+      "state": "succeeded",
+      "attemptCount": 1
+    },
+    "8587": {
+      "state": "succeeded",
+      "attemptCount": 1
+    },
+    "8599": {
+      "state": "succeeded",
+      "attemptCount": 1
+    }
+  },
+  "final_accuracy_protocol": {
+    "path": "benchmark_results/accuracy-temporal-moments-20260920/accuracy-protocol.json",
+    "sha256": "48538c7e4004a34fc67dbac76e1d2dfb4488f01c75c85201821540d31e81102a"
+  }
+}

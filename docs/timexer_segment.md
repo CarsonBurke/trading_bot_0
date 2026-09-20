@@ -2,6 +2,8 @@
 
 Current leaders, comparison eligibility, and active research question: [short top-run ledger](top_runs.md).
 
+Approved task-aligned temporal regularization design and experiment protocol: [conditional-moment SIGReg](temporal_sigreg.md).
+
 `train-timexer-segment` / `evaluate-timexer-segment` train a decoder-only causal patch transformer with dense per-token multi-horizon heteroscedastic heads (TimesFM/Toto style). Existing categorical, LeJEPA, and other models remain available.
 
 Each row is one ticker's 6,000 completed five-minute OHLC context bars plus the next 192 bars. Training pools the entire eligible ticker universe; every history, target, and attention operation stays within its row's ticker. The only cross-ticker information is the exogenous market/SPY variates and the cumulative market path the targets are demeaned by. `--ticker` optionally selects an explicit comma-separated subset.
