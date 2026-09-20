@@ -1,0 +1,219 @@
+{
+  "evidence": {
+    "checkpoint": "/home/marvin/Documents/repositories/trading_bot_0/training/runs/sigreg-projection1400-20260920-projected-no-sigreg/weights/jepa-manifest.json",
+    "checkpoint_sha256": "b56b477c1b82028ebeefed53a150cdda0611e4f3d68f752a4b13cbb1e1bd245d",
+    "cross_section_sha256": "91eb1ee756b9835317316883b68ba5b0e0e97e2e8056b04f6c1b4bfea64615c3",
+    "probe_fit_origins_sha256": "5920db02a55834558982d048eb0c9549ed47d4dec1995e55941c0c92709bbf2e",
+    "reports": [
+      {
+        "path": "/home/marvin/Documents/repositories/trading_bot_0/training/runs/sigreg-projection1400-20260920-projected-no-sigreg/gens/0/timexer_segment_decomposition.report.bin",
+        "sha256": "4d10bce4ffd357515197a1eddb9077967d865bd1dbe77997c0815d14d17e7e28"
+      },
+      {
+        "path": "/home/marvin/Documents/repositories/trading_bot_0/training/runs/sigreg-projection1400-20260920-projected-no-sigreg/gens/0/timexer_segment_horizon.report.bin",
+        "sha256": "c4d137b3af38409fe33521cb4db52d8a1d046d80dd3b1f5030f96f896880d580"
+      },
+      {
+        "path": "/home/marvin/Documents/repositories/trading_bot_0/training/runs/sigreg-projection1400-20260920-projected-no-sigreg/gens/0/timexer_segment_horizon_decimation.report.bin",
+        "sha256": "53b7b94ee68531cf1fb045fb8891092c7c26e82efa7d9cba17819e8c26bdb3d0"
+      },
+      {
+        "path": "/home/marvin/Documents/repositories/trading_bot_0/training/runs/sigreg-projection1400-20260920-projected-no-sigreg/gens/0/timexer_segment_horizon_decimation_count.report.bin",
+        "sha256": "d9f25dc6a8c7d7b7f70af6916a6f391f3aca066935396e641baf138e4b52a55d"
+      },
+      {
+        "path": "/home/marvin/Documents/repositories/trading_bot_0/training/runs/sigreg-projection1400-20260920-projected-no-sigreg/gens/0/timexer_segment_horizon_error.report.bin",
+        "sha256": "8c1adc4f8d2eb0b936f4401bb3430783010bee8ffb00243280fd642d24568cc0"
+      },
+      {
+        "path": "/home/marvin/Documents/repositories/trading_bot_0/training/runs/sigreg-projection1400-20260920-projected-no-sigreg/gens/0/timexer_segment_horizon_rates.report.bin",
+        "sha256": "74bf49bfcf6dd17dbc914a1e3de93476eaf74368ecedebc241b7845233cbcf7b"
+      },
+      {
+        "path": "/home/marvin/Documents/repositories/trading_bot_0/training/runs/sigreg-projection1400-20260920-projected-no-sigreg/gens/0/timexer_segment_horizon_robust.report.bin",
+        "sha256": "e41d329c64cac641df475b1069104f02d91cb15a832e324b058b88676c85f16f"
+      },
+      {
+        "path": "/home/marvin/Documents/repositories/trading_bot_0/training/runs/sigreg-projection1400-20260920-projected-no-sigreg/gens/0/timexer_segment_jepa_forecast.report.bin",
+        "sha256": "9b16126478ebf422dfd7c582377e826460f2f18ef29edfd6f21132996336eccc"
+      },
+      {
+        "path": "/home/marvin/Documents/repositories/trading_bot_0/training/runs/sigreg-projection1400-20260920-projected-no-sigreg/gens/0/timexer_segment_jepa_geometry.report.bin",
+        "sha256": "0261dd7e38733c54d09bbb0872221ced0bed1ea9362a40ea9ac1dd12a5fe7c84"
+      },
+      {
+        "path": "/home/marvin/Documents/repositories/trading_bot_0/training/runs/sigreg-projection1400-20260920-projected-no-sigreg/gens/0/timexer_segment_jepa_objective.report.bin",
+        "sha256": "10665cbea30995b61f6800e41eb86fd9e7e19c5e81573e3d3cb2d261f1e4e0b1"
+      },
+      {
+        "path": "/home/marvin/Documents/repositories/trading_bot_0/training/runs/sigreg-projection1400-20260920-projected-no-sigreg/gens/0/timexer_segment_jepa_panel.report.bin",
+        "sha256": "ae5ce7216052e6c5fcae4fca1d92f7f40c6a89eb61459bee97708f6f85793848"
+      },
+      {
+        "path": "/home/marvin/Documents/repositories/trading_bot_0/training/runs/sigreg-projection1400-20260920-projected-no-sigreg/gens/0/timexer_segment_jepa_probe_correlation.report.bin",
+        "sha256": "493225da656d4e6ea2d1341c6010c1c421c65a5f223bf95a102213cd676dbdad"
+      },
+      {
+        "path": "/home/marvin/Documents/repositories/trading_bot_0/training/runs/sigreg-projection1400-20260920-projected-no-sigreg/gens/0/timexer_segment_jepa_probe_count.report.bin",
+        "sha256": "5cff80fbe03c2374c32cc3e42ee14ae2657ce48a0c93341e7e6a0d8008382bb9"
+      },
+      {
+        "path": "/home/marvin/Documents/repositories/trading_bot_0/training/runs/sigreg-projection1400-20260920-projected-no-sigreg/gens/0/timexer_segment_jepa_probe_error.report.bin",
+        "sha256": "c994dde3fed0c235a2ca802452ba73a0afa993df221636434404fc4618bb6764"
+      },
+      {
+        "path": "/home/marvin/Documents/repositories/trading_bot_0/training/runs/sigreg-projection1400-20260920-projected-no-sigreg/gens/0/timexer_segment_jepa_probe_gap.report.bin",
+        "sha256": "29095e3d0aac2fbc3774afab8dbd2d938f1ed2f57a6c4ebddebd37f11ce33866"
+      },
+      {
+        "path": "/home/marvin/Documents/repositories/trading_bot_0/training/runs/sigreg-projection1400-20260920-projected-no-sigreg/gens/0/timexer_segment_jepa_probe_penalty.report.bin",
+        "sha256": "8a56d5cb35348396c5a7808c2fe9836c254c6c74eb3d1e3760e6555b19db0129"
+      },
+      {
+        "path": "/home/marvin/Documents/repositories/trading_bot_0/training/runs/sigreg-projection1400-20260920-projected-no-sigreg/gens/0/timexer_segment_jepa_probe_population.report.bin",
+        "sha256": "5066744eed075316e4edcac97a7029fba96505620db5aea0516a91e597aabfdf"
+      },
+      {
+        "path": "/home/marvin/Documents/repositories/trading_bot_0/training/runs/sigreg-projection1400-20260920-projected-no-sigreg/gens/0/timexer_segment_jepa_probe_ratio.report.bin",
+        "sha256": "0df1fa14fc57b24d261c8fb6b76b04c1fa0ab4cbcae415a7b9e635e94aff35b5"
+      },
+      {
+        "path": "/home/marvin/Documents/repositories/trading_bot_0/training/runs/sigreg-projection1400-20260920-projected-no-sigreg/gens/0/timexer_segment_jepa_reconstruction.report.bin",
+        "sha256": "5e9d1c56d6e4285569b7872774a85226d97938e81077d24dee9ec54532e5fbee"
+      },
+      {
+        "path": "/home/marvin/Documents/repositories/trading_bot_0/training/runs/sigreg-projection1400-20260920-projected-no-sigreg/gens/0/timexer_segment_jepa_reconstruction_correlation.report.bin",
+        "sha256": "566c2bbaedf77eb9da117d4935b2fcefba27aba459bf1ac6a852ec7f05e6ff7e"
+      },
+      {
+        "path": "/home/marvin/Documents/repositories/trading_bot_0/training/runs/sigreg-projection1400-20260920-projected-no-sigreg/gens/0/timexer_segment_jepa_reconstruction_count.report.bin",
+        "sha256": "f37574d3d834559aa958552e35e3f65b39caf7887d2e40bfcab4c07dfc516c4f"
+      },
+      {
+        "path": "/home/marvin/Documents/repositories/trading_bot_0/training/runs/sigreg-projection1400-20260920-projected-no-sigreg/gens/0/timexer_segment_jepa_runtime.report.bin",
+        "sha256": "c3a9431d9e90149304b22fa2324c0df14527b1c82e786c93159d8b8c5a0d37c3"
+      },
+      {
+        "path": "/home/marvin/Documents/repositories/trading_bot_0/training/runs/sigreg-projection1400-20260920-projected-no-sigreg/gens/0/timexer_segment_jepa_token_variance.report.bin",
+        "sha256": "fd3da411091dc69f0ca999c0b10677d08702ddeb6c35cc1c43273660b40f239e"
+      },
+      {
+        "path": "/home/marvin/Documents/repositories/trading_bot_0/training/runs/sigreg-projection1400-20260920-projected-no-sigreg/gens/0/timexer_segment_offset.report.bin",
+        "sha256": "b3367d1464dc680150e5a029e2e8e9d5e13f5265c0dce6c5ff83f78ab8ea730b"
+      },
+      {
+        "path": "/home/marvin/Documents/repositories/trading_bot_0/training/runs/sigreg-projection1400-20260920-projected-no-sigreg/gens/0/timexer_segment_progress.report.bin",
+        "sha256": "05056b4fa9a70d5ccd2dcd00e082567368e7f673bc50f5684fe516b07829b0cf"
+      },
+      {
+        "path": "/home/marvin/Documents/repositories/trading_bot_0/training/runs/sigreg-projection1400-20260920-projected-no-sigreg/gens/0/timexer_segment_signal.report.bin",
+        "sha256": "748086e507be076da001ba36f980329b51a94139f082f8ad05ffa731333ac581"
+      },
+      {
+        "path": "/home/marvin/Documents/repositories/trading_bot_0/training/runs/sigreg-projection1400-20260920-projected-no-sigreg/gens/0/timexer_segment_supervision_occupancy.report.bin",
+        "sha256": "e8a2677f0e587478e80ff5b6c22acdf4cb6d35801c7e24c117747ac29e5692eb"
+      },
+      {
+        "path": "/home/marvin/Documents/repositories/trading_bot_0/training/runs/sigreg-projection1400-20260920-projected-no-sigreg/gens/0/timexer_segment_tradable.report.bin",
+        "sha256": "74a8c621786ac1e6ad9ff5d94a9441ab05221c39e507c93b432a6604d4aa24e2"
+      },
+      {
+        "path": "/home/marvin/Documents/repositories/trading_bot_0/training/runs/sigreg-projection1400-20260920-projected-no-sigreg/gens/0/timexer_segment_tradable_rates.report.bin",
+        "sha256": "c0156c06eef9313861b8ab6828519c46eabd7172d471cfa4698549adcd8c6890"
+      },
+      {
+        "path": "/home/marvin/Documents/repositories/trading_bot_0/training/runs/sigreg-projection1400-20260920-projected-no-sigreg/gens/0/timexer_segment_utility_active_fraction.report.bin",
+        "sha256": "3b39d6d900c95c301b8d6038fd7751a9b2ecbe2efbb3503145b53d5925aefb51"
+      },
+      {
+        "path": "/home/marvin/Documents/repositories/trading_bot_0/training/runs/sigreg-projection1400-20260920-projected-no-sigreg/gens/0/timexer_segment_utility_breakeven.report.bin",
+        "sha256": "9c89876e327d6684eb170b7a8255b27e6139765fe473eee147e993e63df835d4"
+      },
+      {
+        "path": "/home/marvin/Documents/repositories/trading_bot_0/training/runs/sigreg-projection1400-20260920-projected-no-sigreg/gens/0/timexer_segment_utility_census.report.bin",
+        "sha256": "9b7b723de9c5b354fb07e78f556d11ba47b18d7353b96c735c3652fb1f427bb1"
+      },
+      {
+        "path": "/home/marvin/Documents/repositories/trading_bot_0/training/runs/sigreg-projection1400-20260920-projected-no-sigreg/gens/0/timexer_segment_utility_gross_exposure.report.bin",
+        "sha256": "b69067071960eccdb89c84ed029b6afb1398e8a8b8cb60bfc1775a225a2d40a1"
+      },
+      {
+        "path": "/home/marvin/Documents/repositories/trading_bot_0/training/runs/sigreg-projection1400-20260920-projected-no-sigreg/gens/0/timexer_segment_utility_net_exposure.report.bin",
+        "sha256": "5a9928ad97162436f2ec38d32dfe8585c884962a8027962dc3562ca1a2b84d11"
+      },
+      {
+        "path": "/home/marvin/Documents/repositories/trading_bot_0/training/runs/sigreg-projection1400-20260920-projected-no-sigreg/gens/0/timexer_segment_utility_payoff.report.bin",
+        "sha256": "860c5ed858c06b103a9b15721546bef5fc2a8e5ee45a86647ad6fd174377d884"
+      },
+      {
+        "path": "/home/marvin/Documents/repositories/trading_bot_0/training/runs/sigreg-projection1400-20260920-projected-no-sigreg/gens/0/timexer_segment_utility_payoff_cost_0p5.report.bin",
+        "sha256": "e37fb65c1512fea7791960a658a6f596c02b25ae483b12aaa7679f930655f860"
+      },
+      {
+        "path": "/home/marvin/Documents/repositories/trading_bot_0/training/runs/sigreg-projection1400-20260920-projected-no-sigreg/gens/0/timexer_segment_utility_payoff_cost_1.report.bin",
+        "sha256": "0ddff1f94ea1e011abde790973a01518d58baad9de56e5ac6393ad810c919729"
+      },
+      {
+        "path": "/home/marvin/Documents/repositories/trading_bot_0/training/runs/sigreg-projection1400-20260920-projected-no-sigreg/gens/0/timexer_segment_utility_payoff_cost_10.report.bin",
+        "sha256": "a235b3e0e1f83178581b1967ffea6070af83ea6831715d8aaa5f4c7829cb7e33"
+      },
+      {
+        "path": "/home/marvin/Documents/repositories/trading_bot_0/training/runs/sigreg-projection1400-20260920-projected-no-sigreg/gens/0/timexer_segment_utility_payoff_cost_2.report.bin",
+        "sha256": "74ee83db710cc3b880e475d55587589ce248cce3cd044dc221cd239141bcdd55"
+      },
+      {
+        "path": "/home/marvin/Documents/repositories/trading_bot_0/training/runs/sigreg-projection1400-20260920-projected-no-sigreg/gens/0/timexer_segment_utility_payoff_cost_5.report.bin",
+        "sha256": "780c2263a755293c8326153fc6705588998a961e61366e808b34dd185e993f9f"
+      },
+      {
+        "path": "/home/marvin/Documents/repositories/trading_bot_0/training/runs/sigreg-projection1400-20260920-projected-no-sigreg/gens/0/timexer_segment_utility_payoff_std.report.bin",
+        "sha256": "cc91a9d5204e3cd2febbfaf921d814ba518d614f1cc3492e65ab98204dacb49a"
+      },
+      {
+        "path": "/home/marvin/Documents/repositories/trading_bot_0/training/runs/sigreg-projection1400-20260920-projected-no-sigreg/gens/0/timexer_segment_utility_rate.report.bin",
+        "sha256": "60e2cd81b58179418fa0e4ad63f44863fa48877130ac5395515602d94a3c06a1"
+      },
+      {
+        "path": "/home/marvin/Documents/repositories/trading_bot_0/training/runs/sigreg-projection1400-20260920-projected-no-sigreg/gens/0/timexer_segment_utility_rate_cost_0p5.report.bin",
+        "sha256": "214e1dce2a9e4583b9b493daa4a039eb7b9e908d218cd7564be854955587eb39"
+      },
+      {
+        "path": "/home/marvin/Documents/repositories/trading_bot_0/training/runs/sigreg-projection1400-20260920-projected-no-sigreg/gens/0/timexer_segment_utility_rate_cost_1.report.bin",
+        "sha256": "ec2c8ac4baf94b736fe9f531b8b2f2c0b33727acd375bef85ae3ea6db90d5cba"
+      },
+      {
+        "path": "/home/marvin/Documents/repositories/trading_bot_0/training/runs/sigreg-projection1400-20260920-projected-no-sigreg/gens/0/timexer_segment_utility_rate_cost_10.report.bin",
+        "sha256": "292e6b77736a1192f901dd5b43dddd65b647231176f01ce6b016c4064839676f"
+      },
+      {
+        "path": "/home/marvin/Documents/repositories/trading_bot_0/training/runs/sigreg-projection1400-20260920-projected-no-sigreg/gens/0/timexer_segment_utility_rate_cost_2.report.bin",
+        "sha256": "d9897978fdca318e2c8ae7c0278b2ed02206acc3d500f98767ed770110c63f2a"
+      },
+      {
+        "path": "/home/marvin/Documents/repositories/trading_bot_0/training/runs/sigreg-projection1400-20260920-projected-no-sigreg/gens/0/timexer_segment_utility_rate_cost_5.report.bin",
+        "sha256": "b86345728e3ab22dd34d60d87c42b7f83a1ed6757d85599491d2a49e641bbb99"
+      },
+      {
+        "path": "/home/marvin/Documents/repositories/trading_bot_0/training/runs/sigreg-projection1400-20260920-projected-no-sigreg/gens/0/timexer_segment_utility_turnover.report.bin",
+        "sha256": "a66df4d3990a0c8592d722a2040c9d57c5036ebfedce694bfcae1651139fc4b7"
+      },
+      {
+        "path": "/home/marvin/Documents/repositories/trading_bot_0/training/runs/sigreg-projection1400-20260920-projected-no-sigreg/gens/0/timexer_segment_utility_worst_payoff.report.bin",
+        "sha256": "c8f221da914bb34f62467af2489535eff813336f1ace1386c9b875e09c6ce83d"
+      }
+    ],
+    "sample_plan_sha256": "0786d2f617ab5d91585456fbd906748aa2d5c05e0bd79bab62205c1abfcb4f93",
+    "training_origins_sha256": "0f2375c8af73ffdf4915ced389900fd1616ea27b4f419a8735ca5c394c475594",
+    "validation_origins_sha256": "fbe7ebacd6fe79dd424786ce050e9bf17a59e1bbb5fb7d720f8c1bfc76c08046",
+    "weights_sha256": "be1ac3efc48c6b7fad43757d183e555f325a785c120813affc1514c3655d3ee3"
+  },
+  "failure": null,
+  "finished_at": "2026-09-20T06:49:55.760327+00:00",
+  "idempotency_key": "lejepa-c70c221ddaad7e0c3a389844d3ae6aff7492323eee4ffe931658a8c3239b6a45-projected-no-sigreg",
+  "plan_sha256": "c70c221ddaad7e0c3a389844d3ae6aff7492323eee4ffe931658a8c3239b6a45",
+  "shared_identity_sha256": "7cacf03f15b60a61a4b433ab5eebf49391493ea9418aec78792fe4fb33f1d49c",
+  "started_at": "2026-09-20T06:45:15.140292+00:00",
+  "status": "complete",
+  "task": "projected-no-sigreg",
+  "wall_seconds": 280.61999570899934
+}

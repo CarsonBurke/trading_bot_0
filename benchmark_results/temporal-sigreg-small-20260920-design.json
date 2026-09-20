@@ -1,0 +1,10 @@
+{
+  "schema": "temporal-sigreg-dimensionality-control-v1",
+  "rationale": "The 512-dimensional projected SIGReg endpoint has low target participation rank and is worse than forecast-only. Local LeJEPA's successful minimal example uses a 16-dimensional output projector. Isolate dimensionality after the paired placement experiment; do not infer temporal incompatibility from an oversized target.",
+  "treatment": "anchored-projected-small: D512 -> D512 GELU -> 16 target projector, matching 16-dimensional predictor outputs, 16-dimensional random-sphere SIGReg directions",
+  "comparison": "existing anchored-projected D512-target endpoint; identical weights, hidden widths, observed-bar horizons, forecast backbone/head, population masks and training protocol; no new no-SIGReg run because that control already demonstrates auxiliary collapse",
+  "protocol": {"updates": 1400, "schedule_budget": 1400, "seed": 20260919, "batch_size": 256, "d_model": 512, "layers": 8, "recipe": "decoupled-lattice", "future_calendar": false, "training_population": "complete eligible corpus", "validation_origins": 2048},
+  "diagnostics": "same authenticated population/gradient packet; observation directions remain D512, target directions D16 with same declared seed and null expectation; distinct dimensions explicitly recorded",
+  "selection": "predefined seven-horizon actual-close MSE/persistence with directional, IC, per-horizon and calibration tradeoffs; Gaussianity and latent predictability are explanatory only",
+  "metrics": "registered .report.bin only"
+}

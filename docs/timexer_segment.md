@@ -1,5 +1,7 @@
 # CausalPatch full-segment forecasting
 
+Current leaders, comparison eligibility, and active research question: [short top-run ledger](top_runs.md).
+
 `train-timexer-segment` / `evaluate-timexer-segment` train a decoder-only causal patch transformer with dense per-token multi-horizon heteroscedastic heads (TimesFM/Toto style). Existing categorical, LeJEPA, and other models remain available.
 
 Each row is one ticker's 6,000 completed five-minute OHLC context bars plus the next 192 bars. Training pools the entire eligible ticker universe; every history, target, and attention operation stays within its row's ticker. The only cross-ticker information is the exogenous market/SPY variates and the cumulative market path the targets are demeaned by. `--ticker` optionally selects an explicit comma-separated subset.
@@ -34,8 +36,8 @@ Forecast scoring uses the row's final origin only (`k = 374`, `c = c_ctx`, σ ov
 context). Market-neutral forecasting metrics compare β-adjusted residual targets against
 the predicted conditional mean, with zero-mean/√h-scale persistence. These include NLL,
 MSE, per-horizon and robustness diagnostics, coverage and invalid-candle fraction.
-Unweighted forecasting NLL remains separate from the horizon-weighted objective NLL used
-for checkpoint selection and the train-versus-held-out objective gap.
+Unweighted forecasting NLL remains separate from the horizon-weighted objective NLL, which is
+reported and drives the train-versus-held-out objective gap but no longer selects anything.
 Raw-space MSE adds realized market drift back to the target, keeps the same forecast and
 zero persistence, and allows comparison with generations trained on raw returns. USD
 RMSE/MAE compare raw forecast prices with observed prices. Candle charts re-base the
@@ -55,10 +57,22 @@ select or resize positions. Cohorts need at least 20 original names. If any memb
 entry or terminal outcome, the entire cohort is excluded at that horizon for every policy.
 This complete-outcome selection is a limitation, not an investable universe filter.
 
-Every 1,000 optimizer steps (`--eval-every`), 2,048 fixed held-out segments (`--eval-origins`) form the `held-out sample`; each such evaluation is saved as `weights/preview-latest`, and whenever its NLL improves the weights are also saved as `weights/preview-best` and `weights/best` is pointed at them. `--preview-patience N` (default 3) stops the run once held-out sample NLL has gone N consecutive evaluations without improving, not counting the first two; the stop is logged with the triggering metrics and `weights/best` keeps the best of those weights. Epoch completion evaluates the `held-out full` population, saves `weights/epoch-NNNN`, and feeds `--patience` (complete epochs without improved held-out full NLL); only a run that never reaches a held-out sample evaluation points `weights/best` at its epoch checkpoint. The `--preview-patience` flag and the `preview-*` checkpoint directory names are retained CLI and filesystem identifiers, not report vocabulary.
+Every 1,000 optimizer steps (`--eval-every`), 2,048 fixed held-out segments (`--eval-origins`) form the `held-out sample`; each such evaluation is saved as `weights/preview-latest`, and whenever its SELECTION OBJECTIVE improves the weights are also saved as `weights/preview-best` and `weights/best` is pointed at them. `--preview-patience N` (default 3) stops the run once that scalar has gone N consecutive evaluations without improving, not counting the first two; the stop is logged with the triggering metrics and `weights/best` keeps the best of those weights. Epoch completion evaluates the `held-out full` population, saves `weights/epoch-NNNN`, and feeds `--patience` (complete epochs without an improved held-out full selection objective); only a run that never reaches a held-out sample evaluation points `weights/best` at its epoch checkpoint. The `--preview-patience` flag and the `preview-*` checkpoint directory names are retained CLI and filesystem identifiers, not report vocabulary.
 
-Checkpoint and stopping selection remain the existing horizon-weighted held-out objective
-NLL; utility never selects weights, thresholds, costs, horizons, or policies on held-out data.
+Checkpoint and stopping selection minimize the SCALE-FREE objective: the training objective's
+own per-horizon weighting (`model.horizon_weights()`, normalized) applied to the close
+channel's MSE ratio at each horizon's own best scale, charted on `timexer_segment_skill` as
+`<split> selection objective (horizon-weighted close best-scale MSE ratio)` and stamped in the
+manifest as `best_scale_free_objective` under the `selection` string `min held-out sample
+horizon-weighted close best-scale MSE ratio (horizon-loss=<spec>)`. It replaced the held-out
+objective NLL because the NLL is a function of the learned input-dependent `log_scale` as much
+as of the mean and the scale absorbs the mean's error: two states differing 2.3x in h = 1
+information coefficient differed in NLL only in the fourth decimal. The scalar is free — it is
+a host weighted mean over the per-horizon best-scale ratios the selection draw's existing
+`TradingCurve` already carries — and the conditional half of it is exactly invariant to any
+positive per-horizon amplitude gain. Every checkpoint written before this change carries the
+old `selection` string and is refused by name on load. Utility never selects weights,
+thresholds, costs, horizons, or policies on held-out data.
 All seven policies and the cost sweep are frozen upfront. The terminal test remains locked.
 
 ## Synchronized strategy/account evaluation
@@ -220,6 +234,17 @@ The `[70%, 80%)` calibration partition reserved by those boundaries yielded ZERO
 
 Batch 256, bf16 activations, fp32 master weights, flash SDPA, NorMuon with five-step Polar Express orthogonalization. Transformer block matrices (`block_*`) use NorMuon at 0.023; the patch embedding, covariate projection, heads, norms, and biases use AdamW at 0.008. Weight decay, schedule (constant to 40% of planned steps, linear cooldown to 0.15), and momentum warmup/cooldown follow `../modded-nanogpt/train_gpt.py`. `--learning-rate` sets the AdamW base and scales NorMuon by 0.023/0.008. The optimizer step is CUDA-graphed. No gradient accumulation or model chunking. The corpus uses memory-mapped bar files, parallel batch construction, pinned host memory, and a bounded prefetcher.
 
+The schedule's endpoint is `schedule_budget(args, steps_per_epoch)`: `--schedule-budget N` where
+stated, `--max-steps N` where a cap is set without an explicit budget, and `steps_per_epoch *
+epochs` where neither is. A cap therefore ANNEALS by default. It did not before: the cooldown
+occupies the last 60% of the budget, so at the production geometry (9,590 steps per epoch) it
+starts at step 3,836, and six capped 2,500-step arms spent every step at rate multiplier 1.0
+without ever measuring an annealed weight state. `--max-steps 4000 --schedule-budget 9590` still
+runs the first 4,000 steps of a 9,590-step arm's own trajectory, which is the shape a
+step-matched cross-arm comparison needs; it is now stated rather than the silent default. The
+resolved budget, the cooldown start, both flags and the planned length are printed before the
+first optimizer step of every run.
+
 Forward and backward ARE graph-captured in the training path. `runner.rs` arms the capture on the step after `CAPTURE_AFTER_STEPS` (5) warmup steps and every later step is one replay; the sampled step's phase breakdown reports `captured forward+backward replay` and NaN for the three eager phases, which is how a report tells you which body ran. This paragraph previously opened by asserting the opposite and then used that assertion to argue that capture was declined on purpose. It was wrong about the binary, and any conclusion that leaned on it needs re-reading: what the audit actually establishes is that capture is nearly FREE, not that it is absent. Both halves of the budget were measured at batch 256 on an idle device with `benchmark-timexer-segment --capture-audit` (job 5184, `timexer_segment_benchmark`'s capture scalars): the audit warms up on a side stream, calls `empty_cache` (reserved 18,912 MiB after warmup, 952 MiB after the release, 599 MiB of it live and pinned by the optimizer's already-captured bodies) and only then captures, so the private mempool it reserves - 17,854 MiB - is the working set's new home rather than a second copy of it. Reserved at capture end is 18,806 MiB of 32,116 MiB, which is 184 MiB BELOW the same run's eager peak reserved. The earlier "~15 GB on top of the global pool" accounting, and job 5116's `CUDA out of memory. Tried to allocate 282.00 MiB`, were both from the older ordering that captured without releasing first. What capture is worth on time: replay 167.38 ms against 166.96 ms eager, +0.25%, because the fusions removed six of eight rotation kernels, the QK-norm kernel and one of two activation kernels per layer, and the step is no longer launch-bound. What it is worth structurally is the reason to keep it: one launch per step instead of hundreds, and a FIXED input address, which is what lets the loader upload into a resident batch asynchronously instead of allocating one per step. Correctness is not an obstacle - the replay's objective differs from eager by 4.8e-4 worst over 20 steps against an eager-vs-eager null of the same order. What the step also keeps: no scalar crosses to the host inside a step (the objective's finiteness is accumulated on device as an indicator and read once per report interval with the interval's mean loss), which is why the host runs ahead of the device and the loop period is `max(device work, host batch service time)` rather than their sum.
 
 ## TUI reports
@@ -258,7 +283,9 @@ all but one of them as a flat line.
 - `timexer_segment_skill` — **the headline, checked first**, and first in the TUI panel order.
   Ratios only, `ratio vs persistence (dimensionless; < 1 = skill)`: aggregate forecast /
   persistence MSE for both splits in both spaces, the median over scored windows of each
-  window's market-neutral ratio for both splits, and a parity line at 1.0.
+  window's market-neutral ratio for both splits, the SELECTION OBJECTIVE for both splits
+  (`<split> selection objective (horizon-weighted close best-scale MSE ratio)`, the scalar
+  `weights/best` and both patience rules are actually decided on), and a parity line at 1.0.
 - `timexer_segment_loss` — `nats per bar`: training objective NLL, held-out objective NLL
   with the same horizon weighting, and separate unweighted forecast/persistence NLL curves.
 - `timexer_segment_generalization_gap` — training objective NLL minus held-out objective
@@ -497,11 +524,15 @@ mlq submit --name timexer-universe --max-parallel-runs 1 --time-limit 12h \
   --run timexer-universe --features all
 ```
 
-Model flags: `--layers`, `--d-model`, `--heads`, `--ffn`, `--dropout`, `--min-history`, `--features`, `--seq-len`, `--pred-len`, `--patch-len` (`seq_len % patch_len == 0`), `--x0-lambdas`, `--horizon-loss`, `--horizon-mean`, `--amplitude-prior`, `--batch-size`, `--market-min-cross-section`, learning-rate and optimizer flags; run control: `--eval-every`, `--eval-origins`, `--preview-patience`, `--patience`, `--epochs`. When increasing history, increase `--common-context` to at least that length. Checkpoints are inference checkpoints; optimizer resume is not implemented.
+Model flags: `--layers`, `--d-model`, `--heads`, `--ffn`, `--dropout`, `--min-history`, `--features`, `--seq-len`, `--pred-len`, `--patch-len` (`seq_len % patch_len == 0`), `--x0-lambdas`, `--horizon-loss`, `--horizon-mean`, `--amplitude-prior`, `--scale-coupling`, `--batch-size`, `--market-min-cross-section`, learning-rate and optimizer flags; run control: `--eval-every`, `--eval-origins`, `--preview-patience`, `--patience`, `--epochs`. When increasing history, increase `--common-context` to at least that length. Checkpoints are inference checkpoints; optimizer resume is not implemented.
 
 `--amplitude-prior <λ>` (default `0`, the control) adds `R = (λ/(2H))·Σ_h w_h·(1/N_h)·Σ_b mask·(m - m̄_h)²` to the objective, on the σ-scaled close mean coordinate `m` the decoder already materializes and with the objective's own `w_h`. It penalizes the predicted mean FUNCTION's cross-sectional energy, which is why it cannot be undone the way a fixed output multiplier is: scaling an upstream weight by `k` scales `R` by `k²`. Because the NLL's mean gradient carries `1/s²` with `s ≈ σ√h` while the penalty carries no `h`, one scalar λ produces the horizon-increasing shrinkage `1/(1 + 4λh)` — flat where the measured `β̂` is already at or above 1, strong at the long end where it is `0.26`. At `λ = 0` no kernel runs, `step_cost` charges nothing, no `kernel_classes` entry is registered and the manifest serializes byte-identically to one written before the knob existed; at `λ > 0` it costs 22 fp32 passes over the `[rows, origins, 1, pred_len]` close slice (1.62 GB, 1.1% of the step's 143.4 GB) and `selection_criterion` names the λ so a penalized arm cannot be read as an unpenalized one.
 
 `--horizon-loss <spec>` selects the objective's horizon weighting: `uniform` (the control, `w ≡ 1`), `inv-sqrt`, `inv`, or `cutoff:K`. Invalid spellings and `cutoff:0` are refused by the parser; a `cutoff:K` past `--pred-len` is refused by `ModelConfig::validate`, the first statement of `train`, before the corpus loads. `cutoff:K` costs the same as `uniform`: the head still emits all `--pred-len` horizons and only the loss is masked, so at `cutoff:32` of 192 4.4% of the step's 16.98 TFLOP (the head-output GEMM) and 11.9% of its 143.43 GB (the head geometry and NLL traffic) are spent on horizons the objective weights at zero. That is deliberate — every per-horizon diagnostic keeps reading the untrained end. The weighting itself costs 3 of the 278 passes over the `[rows, origins, 1, pred_len]` fp32 channel space, 0.22 GB or +0.15% of step traffic, and zero matmul FLOPs, identically in every mode.
+
+`--scale-coupling <full|decoupled>` (default `full`, the control) decides whether the squared-error term's gradient into the MEAN carries the head's own predicted precision. Under `full` — the textbook Gaussian NLL — one quadratic `½·r²·exp(-2·ls)` serves both parameter groups, so on an origin the trunk has memorized the residual shrinks, the head answers with a smaller scale, and the mean's gradient weight RISES: a super-linear reward for memorization, largest exactly where memorization is cheapest, which is the long end of the horizon axis where consecutive windows are almost the same window. `decoupled` splits the term into `½·dot(r², w·m·(1/h))` for the mean, `½·dot(detach(r²), w·m·(1/h)·exp(-2·CAP·s))` for the scale and the unchanged `CAP·dot(s, w·m)`. The stationary point in the scale is identical to the original NLL's — detaching `r²` removes no `s`-dependence — and the mean's `1/h` is precisely the horizon-fixed factor the objective already carried, so `--horizon-loss` remains the only knob on that axis. This is deliberately not Seitzer et al.'s multiplicative β-NLL (arXiv:2203.09168), whose `detach(σ^{2β})` factor would also rescale the log term by `exp(2·CAP·s)` — `e^-8` to `e^+8` element by element — or by `h`, up to 192×.
+
+The training loss VALUE under `decoupled` is not a likelihood: its two quadratic rows count the same squared error under two weightings. `Losses::nll` therefore reports the true NLL to the bit — the full coupling's own twelve terms, reduced gradient-free — while handing back the decoupled gradient, so held-out NLL, the selection scalar and every chart built on them stay comparable to the control's. The cost is the fused loss kernel: the split quadratic is not what the CUDA forward computes, so the mode runs `fused_kernels::reference::decoupled_loss_geometry`. Measured at the production shape (`rows = 256`, `origins = 375`, `pred_len = 192`, forward plus backward, best of ten after two warmups on the 5090): fused `full` 2.88 ms, composed `full` 14.36 ms, `decoupled` 14.74 ms — `+11.9` ms, about `+7%` of the 168 ms step, of which the split itself is `+0.4` ms and the rest is the un-fused chain. At `full` nothing moves: the kernel, the term count and the manifest bytes are the pre-knob ones.
 
 ```bash
 mlq submit --name timexer-validation --max-parallel-runs 1 --time-limit 3h \
@@ -515,7 +546,8 @@ per-horizon mean gain on the corpus's RESERVED `[70%, 80%)` calibration partitio
 part in neither training nor checkpoint selection — freezes the curve to a stamped artifact,
 and scores the held-out full `[80%, 90%)` split before and after applying it. There is no split
 knob: cutting the held-out split in half instead would leave both halves carrying the same
-selection bias, because `weights/best` was chosen by minimizing NLL over that whole split.
+selection bias, because `weights/best` was chosen by minimizing the selection objective over
+that whole split.
 `Blocks::spanning` measures the separation on the realized timestamps and refuses the run if
 the first scored origin is not strictly after the last bar any fit target reads.
 
@@ -548,3 +580,371 @@ a `v1` shrinkage-only artifact fails format authentication rather than being rei
 ## Matched context and feature campaign
 
 `benchmarks/timexer_universe_campaign.py` queues complete-corpus, one-epoch comparisons (2,048-bar history, 6,000-bar history, 6,000-bar history with all exogenous variates) after an existing 96-bar reference job and selects the final configuration from held-out full MSE read through `report_cli`. Ties retain OHLC alone; the final context is 6,000 regardless of shorter-history results.
+
+## Fixed-step temporal LeJEPA research
+
+`train-timexer-segment --research-panel` uses this same CausalPatch backbone, full eligible
+training population, BF16/FA4 path, captured optimizer, and captured forward/backward.
+It completes exactly `--max-steps`; `--schedule-budget` must be zero or that same budget.
+There is no early stopping, best-checkpoint selection, calibration fit, or terminal-test use.
+The separate research checkpoint is not accepted by the production portfolio loader.
+
+All `--jepa-mode` arms retain the forecast head:
+
+| Mode | Backbone objective |
+| --- | --- |
+| `off` | Fixed-observable forecasting only |
+| `latent-one` | Attached future-observation prediction at one patch + population SIGReg |
+| `latent-multi` | Attached future-observation prediction at 1, 2, 4, 8, 12 patches + population SIGReg |
+| `anchored` | Multi-horizon latent objective + attached forecasting anchor |
+| `anchored-no-sigreg` | Anchored objective without SIGReg |
+| `anchored-reconstruct` | Anchored objective + current normalized OHLC-patch reconstruction |
+| `anchored-projected` | Anchored latent objective on a separate D→D GELU→D target projector |
+| `anchored-projected-no-sigreg` | Same projected targets without SIGReg |
+| `anchored-projected-small` | Same projected SIGReg objective with 16-dimensional targets/predictions |
+| `anchored-conditional` | Forecast anchor + fixed future-return conditional characteristic prediction; no SIGReg |
+
+In latent-only arms, the forecast head trains on detached states: it measures an online
+readout, not an implicit forecasting anchor. The raw observation is always the shared
+full-width patch embedding entering the causal trunk. Original latent modes predict and
+regularize it directly; projected modes use a disposable nonlinear target projection outside
+the forecast path. Those learned future targets remain attached. Conditional mode instead
+uses fixed data-derived future-return features, with no learned target branch. Where enabled,
+SIGReg operates across batch rows at each sampled time view; it never pools correlated time
+positions and does not Gaussianize causal states or predicted conditional means. Directions
+and views refresh through an independent RNG into graph-resident buffers; conditional mode
+does not allocate or refresh them. Gaussian geometry alone does not establish predictive sufficiency.
+
+The matched campaign requires `--future-calendar false`: timestamps of future *observed*
+bars can reveal gaps or halts and are not known at the decision. Historical calendar and
+other requested exogenous features remain available. The shared baseline is context 6000,
+patch 16, horizon 192, width 512, eight layers, all features, disabled x0 injection,
+decoupled mean/scale gradients, and lattice supervision.
+
+### Sampling, probes, and checkpoint authentication
+
+`prepare-jepa` authenticates the corpus and writes the fixed research panel without loading
+a model. Training still shuffles the entire eligible training pool. The bounded validation
+and train-only probe-fit draws are deterministic, ticker-balanced and time-stratified,
+without replacement. This is a ticker-balanced diagnostic estimand, not a full-population
+row-weighted score; the manifest includes zero-coverage tickers, masks, timestamps and hashes.
+The common probe source must be strictly later than the latest target used anywhere in
+backbone training. Its lookback follows the actual patch boundary, including non-patch-aligned
+forecast horizons. Invalid cached UTC split edges are rebuilt rather than trusted.
+
+Frozen CUDA ridge probes compare direct patch input, observation embedding, a recomputed
+four-patch recent state, full-history state, and each available matching-horizon predicted
+latent. Learned representations retain their full model width; there is no random projection.
+The direct-input control has its actual patch-input width and is labeled separately.
+Future-close-return probes and same-time OHLC reconstruction answer different questions.
+Ridge penalties use a target-purged chronological holdout inside the training panel, followed
+by a training-only refit. Validation never chooses probe penalties. The realized purged fit
+population is checked before training; insufficient rows are an error, not silent subsampling.
+Explicit cache limits are 4096 fit origins and 2048 scored origins.
+
+After endpoint probes succeed, training writes `weights/jepa.safetensors` and the authenticated
+`weights/jepa-manifest.json`. `evaluate-jepa --run-root ... --output ...` verifies the weights,
+manifest, regenerated sample plan and corpus, then reproduces forecasting and frozen probes.
+Research metrics use `timexer_segment_jepa_*` `.report.bin` bases registered for the TUI and
+readable with `report_cli`; existing horizon and trading reports are also emitted.
+
+`benchmarks/lejepa_campaign.py plan` pins the executable, report CLI, driver and expected data
+contract. It captures an explicit runtime environment allowlist or inherits the authenticated
+reference campaign's environment; repeated `--env NAME=VALUE` supplies nonsecret overrides.
+`submit --plan ...` queues **one exclusive normal-priority job per model**, followed by a
+lightweight after-success collector. The default per-model watchdog is 420 seconds plus
+30 seconds of termination grace; this is a failure bound, not a replacement for fixed updates.
+`follow --plan ...` observes existing jobs; an observer timeout never resubmits them.
+Submission recovery retains the original queue-client environment and idempotency key.
+Completion requires verified exact-step endpoints, identities and binary forecast reports.
+
+Named suites are `objective-comparison`, `forecasting-controls`, `matched-comparison`,
+`sigreg-placement`, `sigreg-dimensionality`, and `temporal-conditional`.
+The baseline is explicitly `decoupled-lattice-forecast`; `full-none-forecast` changes both
+mean/scale coupling and supervision decimation, not the architecture or eligible population.
+For example, `--suite forecasting-controls --select full-none-forecast --reference-plan OLD/plan.json`
+trains only the missing control and reuses completed matched endpoints. Reference ancestry
+is authenticated transitively so extending an extended comparison retains its original baseline.
+Old one-job campaign snapshots remain immutable historical records; new plans use the
+per-model protocol.
+
+### Controlled-history evidence
+
+`benchmark-jepa-memory` trains all six objectives on relevant-cue and irrelevant-cue tasks.
+Paired examples have identical recent prices, covariates and normalization anchors but
+opposite distant cues; the relevant cue changes a known future law. The price pulse returns
+to zero at the context endpoint, preventing global centering from leaking the cue.
+Reports include Bayes-reference error, regret, paired effect magnitude/sign, the irrelevant-cue
+null, and exact input equality. This synthetic intervention supplies counterfactual ground
+truth; arbitrary real-market history swaps do not.
+
+Job 8414 (`benchmark_results/lejepa-controlled-history-20260919`) completed 1024 updates per
+arm/task with a two-layer, width-128 model, batch 64 and 256 validation pairs. At horizon 64:
+
+| Objective | MSE / persistence | Paired effect / known effect |
+| --- | ---: | ---: |
+| Forecast only | 0.18325 | 0.9988 |
+| One-horizon latent | 0.33990 | 0.5620 |
+| Multi-horizon latent | 0.20464 | 0.8837 |
+| Anchored | 0.18386 | 0.9857 |
+| Anchored without SIGReg | 0.18358 | 0.9870 |
+| Anchored + reconstruction | 0.18492 | 0.9674 |
+| Bayesian reference | 0.18209 | 1.0000 |
+
+Recent-input differences were exactly zero at every evaluation. All arms had correct cue
+effect signs; irrelevant-cue MSE ratios were 0.9997–0.9998. These results support the value of
+multi-horizon prediction and a forecasting anchor on this task, not a market-performance claim.
+
+The full-shape timing run 8437 (`benchmark_results/lejepa-throughput-lifetime-fix-20260919`)
+measured 180.52 ms per captured update with the real corpus loader at batch 256. Five paired
+forward/backward alternations measured 145.13 ms fused versus 157.50 ms composed, a 12.37 ms
+saving against 1.35 ms fused-arm spread. Eager comparisons run before training-graph capture
+so their activations do not compete with its 21.4 GiB private pool. These are throughput
+measurements, not learning evidence.
+
+### Matched market result: 1400 updates
+
+Campaign job 8444 completed all six authenticated endpoints at batch 256, seed 20260919,
+1400 updates and a matching 1400-update schedule. Each model process, including startup,
+four evaluations, frozen probes and checkpointing, took 233–268 seconds. The queue displayed
+one 25m33s job because it contained six sequential runs; this is not a per-model runtime.
+The corpus contained 4873 eligible tickers and 2455276 training origins. Each arm used the
+same 2048-origin ticker-balanced validation panel and 2048-origin train-only probe panel.
+Artifacts: `benchmark_results/lejepa-campaigns/lejepa-fixed1400-20260919/plan.json` and
+`training/runs/lejepa-fixed1400-20260919-{forecast,latent-one,latent-multi,anchored,no-sigreg,reconstruct}`.
+
+| Arm | Neutral OHLC MSE / persistence | Fixed-horizon close MSE / persistence | Signed cross-sectional IC h64 | Wall seconds |
+| --- | ---: | ---: | ---: | ---: |
+| Forecast only | 0.997576 | 0.978749 | 0.01723 | 232.60 |
+| One-horizon latent | 0.998009 | 0.999352 | 0.03525 | 237.05 |
+| Multi-horizon latent | 0.998833 | 0.999985 | 0.01824 | 266.92 |
+| Anchored | 1.000274 | 1.000185 | -0.01461 | 260.15 |
+| Anchored without SIGReg | 0.994165 | 0.987293 | 0.03318 | 268.13 |
+| Anchored + reconstruction | 0.995588 | 0.982099 | 0.03309 | 268.12 |
+
+The fixed-horizon score averages the predefined 1, 8, 16, 32, 64, 128 and 192-bar close ratios;
+it does not choose a horizon after seeing results. Forecast-only also had the best Gaussian
+NLL, 2.07101 versus persistence 2.36862. Without SIGReg was the strongest JEPA candidate on
+aggregate OHLC MSE, while forecasting alone remained strongest on the fixed-horizon close
+score and NLL. These one-seed, short-budget development-panel results do not establish
+statistical significance, economic value, or terminal-test superiority.
+
+Frozen full-state return probes stayed close to persistence: h64 ratios ranged from
+0.999668 to 1.000019 and h192 from 0.998727 to 1.000242 across arms. They do not establish
+strong linearly accessible long-memory alpha. Reconstruction improved the anchored full-state
+mean coordinate error ratio from 0.3563 to 0.2015, but forecast-only was already 0.1962.
+These reconstruction averages exclude the identically zero normalized endpoint-close
+coordinate; its zero-baseline ratio is undefined. Better reconstruction is not proof of
+better future prediction. Retain forecast-only as the control and anchored-without-SIGReg
+as the leading research candidate; do not promote the default SIGReg objective on this evidence.
+
+### Direct accuracy comparison against named baselines
+
+`compare-timexer-accuracy` scores saved checkpoints without training, fitting probes, selecting
+checkpoints, or refitting gains. An authenticated research reference supplies the exact
+validation and synchronized cross-section panels; every candidate must match the corpus and
+source/target geometry. Matched research models must additionally match seed, batch size,
+completed updates, schedule and optimizer settings. Objective and coupling/decimation
+treatments may differ. Legacy checkpoints retain their authenticated frozen gain and are
+explicitly labeled **NONMATCHED historical; calibrated; future-calendar**. Both scored
+panels must begin strictly after every included historical calibration's final target.
+
+```bash
+mlq submit --name paired-forecast-accuracy --max-parallel-runs 1 \
+  --max-attempts 1 --time-limit 5m --cwd "$PWD" -- \
+  ./torch-env.sh target/release/trading_bot_0 compare-timexer-accuracy \
+  --reference-run training/runs/lejepa-fixed1400-20260919-forecast \
+  --research-run decoupled-lattice-1400=training/runs/lejepa-fixed1400-20260919-forecast \
+  --research-run jepa-no-sigreg-1400=training/runs/lejepa-fixed1400-20260919-no-sigreg \
+  --research-run full-none-1400=training/runs/lejepa-full-none1400-20260920-full-none-forecast \
+  --legacy-checkpoint historical-decoupled-lattice-2500=training/runs/timexer-decoupled-lattice-2500/weights/preview-latest \
+  --output benchmark_results/paired-forecast-accuracy
+```
+
+Repeat `--research-run NAME=PATH` and `--legacy-checkpoint NAME=PATH` for additional models.
+Naming the reference again does not rescore it. Output must be fresh. The 25
+`timexer_accuracy_*` report bases contain actual close/delayed-return error, conditional
+directional hit rates, signed pooled Pearson and cross-sectional IC, neutral/raw OHLC error,
+Gaussian NLL, predictive coverage, baseline deltas and sample/IC populations. Latent JEPA
+loss is deliberately absent. `accuracy-protocol.json` records identities, comparability and
+panel hashes, not a second metric channel. Ratios below one beat persistence. Hit rates
+exclude zero forecasts and zero targets; delayed metrics exclude the first future close
+and are not execution P&L. Gaussian NLL omits the same model-independent constant as training.
+
+Job 8480 compared nine checkpoints on 2048 identical validation origins plus 4000 identical
+cross-sectional origins (100 eligible timestamps at h64), in 26.845 seconds.
+Reports: `benchmark_results/accuracy-decoupled-comparison-20260920`.
+The new full/none control completed 1400 updates in 237.02 seconds using the exact binary
+of the previous six-run campaign. Job 8476's post-run verifier initially rejected omitted
+Serde defaults for full coupling/no decimation after training had succeeded. The validator
+was corrected and the checkpoint independently reverified without retraining; its original
+failed lifecycle remains recorded. Reverification provenance is in
+`benchmark_results/accuracy-decoupled-comparison-20260920-assets/control-endpoint-reverification.json`.
+
+| Matched causal model, 1400 updates | Mean predefined close MSE ratio | Close hit h64 | Signed IC h64 |
+| --- | ---: | ---: | ---: |
+| Decoupled + lattice, forecasting only | 0.978749 | 51.90% | 0.01723 |
+| Full coupling + no decimation, forecasting only | 0.975143 | 52.39% | 0.03563 |
+| JEPA one-horizon | 0.999352 | 51.86% | 0.03525 |
+| JEPA multi-horizon | 0.999985 | 50.00% | 0.01824 |
+| JEPA anchored | 1.000185 | 50.93% | -0.01461 |
+| JEPA anchored without SIGReg | 0.987293 | 52.20% | 0.03318 |
+| JEPA anchored + reconstruction | 0.982099 | 52.05% | 0.03309 |
+
+The full/none control is the strongest measured short-budget aggregate close-error baseline;
+JEPA has not established a general accuracy improvement. Horizon dependence remains:
+at h192, anchored without SIGReg scores 0.997561 versus full/none 1.000512 and decoupled/lattice
+1.001884. Do not select the horizon after observing these results and call that a global win.
+IC standard errors across timestamps at h64 are roughly 0.015–0.019 for these arms; this
+single-seed development panel does not establish significant ranking improvements.
+
+For historical reference on the **same scoring observations**, decoupled/lattice-2500 has
+mean close ratio 0.978768, h64 close ratio 0.985270, h64 hit 51.76% and IC 0.04870.
+Historical full/none-2500 has mean close ratio 0.995667, h64 close ratio 0.995200, h64 hit
+51.03% and IC 0.05353. Their 2500-update schedule, different seed, calibrated means and
+future-observed-calendar inputs prohibit attributing differences from the causal 1400-update
+runs solely to architecture or objective. No historical manifest was rewritten to force
+compatibility, and the terminal test remains locked.
+
+### Temporal SIGReg diagnosis
+
+`diagnose-temporal-sigreg --run-root RUN --output FRESH --batch-size 256` authenticates the
+saved checkpoint/corpus/panel and performs no parameter update. Queue it exclusively through
+`mlq`. It uses all 2048 validation rows for covariance, and the first predetermined 256 rows
+for patch-weight/bias derivatives, at the common source whose decisions follow every training
+target. Positions remain separate populations; time is never flattened into independent rows.
+Metrics are registered `timexer_segment_sigreg_*` binary reports, with provenance beside them.
+
+Source audit against `../lejepa/MINIMAL.md` and its Epps–Pulley library found the same
+unit-sphere projections, doubled-half-interval quadrature and population-N multiplier.
+The N multiplier is intentional. The finite IID Gaussian null has expected statistic
+**1.052464**, not zero; correlated market rows need not follow that IID null.
+
+The important differences are structural and statistical:
+
+- Reference LeJEPA uses a separate nonlinear projector and same-image augmented views.
+  The original temporal objective applies SIGReg directly to the affine patch embedding
+  consumed by the forecast trunk. With all features, that map is 416→512; one input is the
+  identically zero endpoint close, so full I512 covariance is impossible in exact arithmetic.
+  Finite random projections can nevertheless approximate normality without full rank.
+- Future temporal views introduce genuinely unpredictable information. Their price patch is
+  centered on its own future endpoint, while calendar/other auxiliary coordinates and shared
+  prefix-volatility information remain. This target is not the source-to-future return.
+- Gainless RMSNorm approximately removes common input scale. Shrinking latent MSE without
+  SIGReg does not itself show lost forecasting information; increasing marginal variance
+  with SIGReg does not show more useful information.
+
+Completed jobs **8489–8492** inspect the original forecast, anchored, no-SIGReg and
+reconstruction endpoints. Reports are under
+`benchmark_results/temporal-sigreg-diagnosis-20260920-{forecast,anchored,no-sigreg,reconstruct}`.
+At the common source:
+
+| Model | Observation participation rank | State participation rank |
+| --- | ---: | ---: |
+| Forecast-only | 3.061 | 14.022 |
+| Anchored SIGReg | 23.486 | 5.915 |
+| Anchored without SIGReg | 4.715 | 7.217 |
+| Anchored + reconstruction | 24.510 | 8.780 |
+
+On anchored, the configured-weight SIGReg patch derivative is **6.01×** the forecast-training
+derivative, but its cosine with the predefined mean close-error-ratio derivative is **+0.03465**.
+Its radial activation-gradient energy share is only **1.44%**. Thus strong, largely unrelated
+geometry pressure is supported; a story of strongly opposite accuracy gradients or merely
+radial scale chasing is not. These are endpoint derivatives on one held-out cohort, not a
+reconstruction of historical Adam updates or proof of the entire training trajectory.
+
+At h64, anchored latent target variance is **0.95579**, prediction variance **0.18853**,
+their covariance **0.18532**, and latent MSE **0.80266** versus persistence **1.47549**.
+The predictor captures real variation in its own target without delivering good price
+accuracy. This does not prove which nuisance coordinate it uses. The same-mask identity
+`MSE = Vtarget + Vpred - 2*covariance + squared_mean_bias` is reported directly; do not call
+`Vtarget - Vpred` innovation variance unless conditional-mean orthogonality is established.
+
+The `sigreg-placement` campaign tests `anchored-projected` against
+`anchored-projected-no-sigreg`: a disposable D→D GELU→D target projector, with unchanged raw
+forecast input, target dimension, attached targets and loss weights. A common improvement
+belongs to the projection architecture; only the within-pair difference measures SIGReg.
+
+
+The completed placement pair (jobs 8494/8495, comparison 8497) gives predefined close scores
+**0.984327 with SIGReg** and **0.985620 without**, versus the original direct-input pair
+**1.000185 with** and **0.987293 without**. The sign of the measured SIGReg effect reverses.
+Runs took 276.06s and 280.62s; reports are in
+`benchmark_results/accuracy-sigreg-projection-20260920`.
+Neither beats the 0.978749 decoupled/lattice or 0.975143 full/none forecast-only controls.
+
+Follow-up diagnostic jobs 8504/8505 show the unregularized projector and predictor have
+zero measured population variance, with h64 latent MSE **3.03e-8**. The forecast state still
+has participation rank **7.43**: auxiliary collapse is not whole-model collapse. Projected
+SIGReg avoids that collapse (target rank **5.46**, h64 target variance **0.9980**, covariance
+with prediction **0.6226**, latent MSE **0.3586**). Its patch gradient remains **13.19×**
+the forecast-training gradient; the projector does not simply absorb all regularization
+pressure. A separate `anchored-projected-small`/`sigreg-dimensionality` control reduces
+the auxiliary target/prediction width to **16**, while retaining the D512 forecast backbone,
+D512 projector hidden layer, weights, masks and horizons. This matches the output-dimensional
+scale of the local LeJEPA example without bundling a BatchNorm or loss-weight change.
+
+The subsequent `anchored-conditional` candidate predicts fixed characteristic features of
+source-anchored future neutral returns, normalized by source sigma and square-root horizon.
+Its target is interleaved cos/sin at frequencies 0.25, 0.5, 1, 2 and 4. Under squared feature
+error, the population optimum is the conditional characteristic vector, not an isotropic
+state or a unit-variance conditional mean. Fixed targets prevent encoder-driven target
+collapse and reward persistent nuisance only insofar as it predicts the declared outcomes.
+Five frequencies identify those moments, not the full distribution; volatility skill need
+not improve point accuracy. Forecast accuracy remains the acceptance criterion.
+
+### Completed temporal objective search
+
+All five new runs use the same full-corpus 1400-update/B256/seed20260919 protocol, BF16
+backbone and captured training. The terminal test remains untouched. Each ran as its own
+exclusive normal-priority queue job and completed in under five minutes.
+
+| Treatment | Mean predefined neutral close MSE ratio | h64 directional hit | h64 signed IC | Wall seconds |
+| --- | ---: | ---: | ---: | ---: |
+| Existing full/none forecast-only | **0.975143** | **52.39%** | 0.03563 | 237.02 |
+| Existing decoupled/lattice forecast-only | 0.978749 | 51.90% | 0.01723 | 232.60 |
+| Projected D512 SIGReg | 0.984327 | 52.10% | 0.03967 | 276.06 |
+| Projected D512 without SIGReg | 0.985620 | 49.51% | 0.03507 | 280.62 |
+| Projected D16 SIGReg | 0.994632 | 50.49% | 0.01979 | 247.11 |
+| Conditional return CF, decoupled/lattice | 0.980716 | 50.54% | 0.04137 | 243.97 |
+| Conditional return CF, full/none | 0.980497 | 51.71% | 0.02468 | 242.36 |
+
+The D16 target has participation rank **10.13/16**, h64 latent target variance **1.0437**,
+prediction covariance **0.8358**, and latent MSE **0.2136**. Those diagnostics improve over
+the D512 projected target while price accuracy deteriorates. Target dimensionality alone
+is not the missing solution.
+
+The fixed-return CF auxiliary has genuine held-out skill against its frozen training-mean
+baseline. Error ratios at 16/32/64/128/192 bars are
+**0.9248/0.9332/0.9511/0.9634/0.9672** with decoupled/lattice, and
+**0.9238/0.9360/0.9521/0.9653/0.9670** with full/none. These are binary
+`timexer_segment_jepa_conditional_cf_{error,ratio,count}` reports in the run directories.
+The empirical mean is fitted only on the already-authenticated inner+holdout training
+cache; validation never fits a baseline. No second model pass is required.
+Nevertheless both actual forecast scores are worse than their corresponding forecast-only
+control, and both h128/h192 close ratios exceed one. Conditional-distribution predictability
+is not equivalent to better point forecasts; these aggregate feature scores do not isolate
+whether the gain is in direction, volatility or another moment.
+
+At the seven predefined horizons, full/none also retains lower mean neutral OHLC error,
+raw OHLC error and NLL than these five new treatments. Conditional full/none nearly matches
+its NLL (**1.450305 vs 1.450276**) but does not recover its close accuracy. Horizon-specific
+IC differences remain descriptive, not significance or economic-value claims.
+
+**Decision:** retain full/none forecasting-only as the measured aggregate leader and
+decoupled/lattice as the mandatory baseline. Do not promote a temporal auxiliary based on
+normality or prediction of its own targets. The evidence establishes a harmful transfer
+design (direct affine-input regularization), and shows that repairing placement, reducing
+target width and predicting fixed conditional outcome features are insufficient to beat
+the controls in this representative budget. It does not prove that temporal SIGReg cannot
+work, identify every nuisance component, or establish a global optimum.
+
+Final shared-panel evidence: `benchmark_results/accuracy-temporal-sigreg-final-20260920`
+(job **8523**, 14 checkpoints, **25.945s**). Immutable plans are
+`benchmark_results/lejepa-campaigns/{sigreg-projection1400-20260920,temporal-conditional1400-20260920,sigreg-small1400-20260920}/plan.json`.
+Frozen diagnostic jobs **8489–8492, 8504–8505, 8524** succeeded. Cargo checks/release builds,
+19 focused CPU/CUDA regressions (job **8520**) and the TUI chart-discovery regression passed.
+Review found a reconstruction-only assertion in the expanded capture test; it now checks
+the appropriate objective. An earlier projector test fixture also incorrectly randomized
+only one compared trunk before checking initialization; moving that intervention after
+the initialization comparison fixed the test without changing any trained model.

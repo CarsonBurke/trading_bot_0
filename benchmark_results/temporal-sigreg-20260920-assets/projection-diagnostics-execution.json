@@ -1,0 +1,37 @@
+{
+  "binary": {
+    "path": "benchmark_results/temporal-sigreg-20260920-assets/trading_bot_0",
+    "sha256": "68f521ee31742d76369c512973a87c146691b6cea887d40c1968ab4e129dd984",
+    "source": "/home/marvin/Documents/repositories/trading_bot_0/target/release/trading_bot_0"
+  },
+  "jobs": [
+    {
+      "arm": "projected",
+      "command": [
+        "benchmark_results/temporal-sigreg-20260920-assets/trading_bot_0",
+        "diagnose-temporal-sigreg",
+        "--run-root",
+        "/home/marvin/Documents/repositories/trading_bot_0/training/runs/sigreg-projection1400-20260920-projected",
+        "--output",
+        "benchmark_results/temporal-sigreg-diagnosis-20260920-projected",
+        "--batch-size",
+        "256"
+      ],
+      "job": 8504
+    },
+    {
+      "arm": "projected-no-sigreg",
+      "command": [
+        "benchmark_results/temporal-sigreg-20260920-assets/trading_bot_0",
+        "diagnose-temporal-sigreg",
+        "--run-root",
+        "/home/marvin/Documents/repositories/trading_bot_0/training/runs/sigreg-projection1400-20260920-projected-no-sigreg",
+        "--output",
+        "benchmark_results/temporal-sigreg-diagnosis-20260920-projected-no-sigreg",
+        "--batch-size",
+        "256"
+      ],
+      "job": 8505
+    }
+  ]
+}

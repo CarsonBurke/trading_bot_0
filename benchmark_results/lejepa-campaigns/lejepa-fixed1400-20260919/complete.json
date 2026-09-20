@@ -1,0 +1,12 @@
+{
+  "arms": [
+    "forecast",
+    "latent-one",
+    "latent-multi",
+    "anchored",
+    "no-sigreg",
+    "reconstruct"
+  ],
+  "finished_at": "2026-09-20T04:17:30.986364+00:00",
+  "plan_sha256": "e93b1f0a16d7334eae098ecf6c42db631740ec13c17728d35fce62eb56eb1f69"
+}

@@ -1,0 +1,16 @@
+{
+  "schema": "temporal-conditional-characteristic-experiment-v1",
+  "decision_inputs": ["benchmark_results/temporal-sigreg-20260920-design.json", "benchmark_results/temporal-sigreg-diagnosis-20260920-forecast", "benchmark_results/temporal-sigreg-diagnosis-20260920-anchored", "benchmark_results/temporal-sigreg-diagnosis-20260920-no-sigreg", "benchmark_results/temporal-sigreg-diagnosis-20260920-reconstruct"],
+  "objective": "L_forecast + mean_valid ||a_k(state_t) - psi(Y_tk)||^2 / 10; default auxiliary weight 1, no marginal Gaussian regularizer",
+  "target": "Y_tk=(logclose(t+h)-logclose(t)-beta_t*(marketcum(t+h)-marketcum(t)))/(sigma_t*sqrt(h)); only source-causal statistics, no learned target encoder or fitted normalization",
+  "features": {"frequencies": [0.25, 0.5, 1.0, 2.0, 4.0], "ordering": "interleaved cos(wY),sin(wY)", "horizons_observed_bars": [16, 32, 64, 128, 192]},
+  "predictor": "existing D512 -> 256 GELU -> 50 direct outputs at same eligible source positions; forecasting trunk/head unchanged",
+  "mask": "valid full source patch, source minimum history, and every bar from t+1 through t+h; no time pooling as population",
+  "population_reasoning": "The optimum is E[psi(Y)|history]. Irreducible future variability is fixed by data, cannot be shrunk by an encoder. Independent future noise cannot improve expected skill against the marginal-mean baseline; predictable nuisance helps only if it predicts the declared outcome features. Finite frequencies identify these conditional moments, not the full conditional distribution.",
+  "risks": ["Predictable volatility can improve characteristic-feature skill without improving point accuracy", "Finite-sample spurious associations and optimizer interference remain", "The auxiliary overlaps existing forecasting supervision; improvement is not guaranteed", "This is task-anchored temporal self-supervision, not a claim of target-agnostic LeJEPA equivalence"],
+  "runs": [{"name": "conditional", "recipe": "decoupled-lattice"}, {"name": "conditional-full-none", "recipe": "full-none"}],
+  "protocol": {"updates": 1400, "schedule_budget": 1400, "seed": 20260919, "batch_size": 256, "d_model": 512, "layers": 8, "eval_every": 350, "validation_origins": 2048, "probe_fit_origins": 2048, "causal_inputs": true, "full_training_pool": true},
+  "evaluation": "Reuse identical authenticated actual-forecast panels against both original forecast recipes, all original JEPA arms and projected placement pair. Primary predefined aggregate close MSE/persistence over 1,8,16,32,64,128,192 bars; report direction, signed IC, per-horizon error and calibration tradeoffs. Auxiliary skill against frozen train-only marginal mean and zero-return features is diagnostic, never selection criterion.",
+  "metrics": "registered .report.bin only",
+  "stopping": "exact fixed endpoint, one normal-priority exclusive job per model; watchdog is failure bound, no latent-loss selection or multiple-seed sweep"
+}

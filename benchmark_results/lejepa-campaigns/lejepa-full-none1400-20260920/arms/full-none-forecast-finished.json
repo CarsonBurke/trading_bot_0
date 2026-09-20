@@ -1,0 +1,12 @@
+{
+  "evidence": null,
+  "failure": "full-none-forecast: actual scale-coupling differs from declared full-none treatment",
+  "finished_at": "2026-09-20T05:25:55.378256+00:00",
+  "idempotency_key": "lejepa-09dbe8be86f93e68fded634650f01d7f13ac76d31e45194633604d068cab4216-full-none-forecast",
+  "plan_sha256": "09dbe8be86f93e68fded634650f01d7f13ac76d31e45194633604d068cab4216",
+  "shared_identity_sha256": null,
+  "started_at": "2026-09-20T05:21:58.356126+00:00",
+  "status": "failed",
+  "task": "full-none-forecast",
+  "wall_seconds": 237.02201179500116
+}

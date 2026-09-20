@@ -1,0 +1,33 @@
+{
+  "command": [
+    "benchmark_results/accuracy-decoupled-comparison-20260920-assets/trading_bot_0",
+    "compare-timexer-accuracy",
+    "--reference-run",
+    "training/runs/lejepa-fixed1400-20260919-forecast",
+    "--data-dir",
+    "long_data/bars",
+    "--output",
+    "benchmark_results/accuracy-decoupled-comparison-20260920",
+    "--research-run",
+    "decoupled-lattice-1400=training/runs/lejepa-fixed1400-20260919-forecast",
+    "--research-run",
+    "jepa-latent-one-1400=training/runs/lejepa-fixed1400-20260919-latent-one",
+    "--research-run",
+    "jepa-latent-multi-1400=training/runs/lejepa-fixed1400-20260919-latent-multi",
+    "--research-run",
+    "jepa-anchored-1400=training/runs/lejepa-fixed1400-20260919-anchored",
+    "--research-run",
+    "jepa-no-sigreg-1400=training/runs/lejepa-fixed1400-20260919-no-sigreg",
+    "--research-run",
+    "jepa-reconstruct-1400=training/runs/lejepa-fixed1400-20260919-reconstruct",
+    "--research-run",
+    "full-none-1400=/home/marvin/Documents/repositories/trading_bot_0/training/runs/lejepa-full-none1400-20260920-full-none-forecast",
+    "--legacy-checkpoint",
+    "historical-decoupled-lattice-2500=training/runs/timexer-decoupled-lattice-2500/weights/preview-latest",
+    "--legacy-checkpoint",
+    "historical-full-none-2500=training/runs/timexer-full-none-control-2500/weights/preview-latest"
+  ],
+  "job": 8480,
+  "reason": "control post-run verifier fixed; independently authenticated endpoint, no model retraining",
+  "supersedes_skipped_job": 8478
+}

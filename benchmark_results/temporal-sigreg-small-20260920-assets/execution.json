@@ -1,0 +1,70 @@
+{
+  "accuracy_command": [
+    "benchmark_results/temporal-sigreg-small-20260920-assets/trading_bot_0",
+    "compare-timexer-accuracy",
+    "--reference-run",
+    "training/runs/lejepa-fixed1400-20260919-forecast",
+    "--data-dir",
+    "long_data/bars",
+    "--output",
+    "benchmark_results/accuracy-temporal-sigreg-final-20260920",
+    "--research-run",
+    "decoupled-lattice-1400=training/runs/lejepa-fixed1400-20260919-forecast",
+    "--research-run",
+    "jepa-latent-one-1400=training/runs/lejepa-fixed1400-20260919-latent-one",
+    "--research-run",
+    "jepa-latent-multi-1400=training/runs/lejepa-fixed1400-20260919-latent-multi",
+    "--research-run",
+    "jepa-anchored-1400=training/runs/lejepa-fixed1400-20260919-anchored",
+    "--research-run",
+    "jepa-no-sigreg-1400=training/runs/lejepa-fixed1400-20260919-no-sigreg",
+    "--research-run",
+    "jepa-reconstruct-1400=training/runs/lejepa-fixed1400-20260919-reconstruct",
+    "--research-run",
+    "full-none-1400=/home/marvin/Documents/repositories/trading_bot_0/training/runs/lejepa-full-none1400-20260920-full-none-forecast",
+    "--legacy-checkpoint",
+    "historical-decoupled-lattice-2500=training/runs/timexer-decoupled-lattice-2500/weights/preview-latest",
+    "--legacy-checkpoint",
+    "historical-full-none-2500=training/runs/timexer-full-none-control-2500/weights/preview-latest",
+    "--research-run",
+    "projected-1400=/home/marvin/Documents/repositories/trading_bot_0/training/runs/sigreg-projection1400-20260920-projected",
+    "--research-run",
+    "projected-no-sigreg-1400=/home/marvin/Documents/repositories/trading_bot_0/training/runs/sigreg-projection1400-20260920-projected-no-sigreg",
+    "--research-run",
+    "conditional-1400=/home/marvin/Documents/repositories/trading_bot_0/training/runs/temporal-conditional1400-20260920-conditional",
+    "--research-run",
+    "conditional-full-none-1400=/home/marvin/Documents/repositories/trading_bot_0/training/runs/temporal-conditional1400-20260920-conditional-full-none",
+    "--research-run",
+    "projected-small-1400=/home/marvin/Documents/repositories/trading_bot_0/training/runs/sigreg-small1400-20260920-projected-small"
+  ],
+  "accuracy_job": 8523,
+  "binary": {
+    "path": "benchmark_results/temporal-sigreg-small-20260920-assets/trading_bot_0",
+    "sha256": "b2ba5ef99067770038770e3950a1c80fe90e9f0c9e2b15aa38dc6a12a3efcf0b",
+    "source": "/home/marvin/Documents/repositories/trading_bot_0/target/release/trading_bot_0"
+  },
+  "collect_job": 8522,
+  "diagnostic_command": [
+    "benchmark_results/temporal-sigreg-small-20260920-assets/trading_bot_0",
+    "diagnose-temporal-sigreg",
+    "--run-root",
+    "/home/marvin/Documents/repositories/trading_bot_0/training/runs/sigreg-small1400-20260920-projected-small",
+    "--output",
+    "benchmark_results/temporal-sigreg-diagnosis-20260920-projected-small",
+    "--batch-size",
+    "256"
+  ],
+  "diagnostic_job": 8524,
+  "report_cli": {
+    "path": "benchmark_results/temporal-sigreg-small-20260920-assets/report_cli",
+    "sha256": "be0d5d696c0ac57cfb6ee7c6306b389316e7b746416b6bf026aabfa9fa657573",
+    "source": "/home/marvin/Documents/repositories/trading_bot_0/target/release/report_cli"
+  },
+  "test_binary": {
+    "path": "benchmark_results/temporal-sigreg-small-20260920-assets/library-tests",
+    "sha256": "acfca063d56204b7cfa0fcb7030efa96bb829584fe24aedf2e641de0063b94a6",
+    "source": "/var/tmp/cargo-build/a0/1fb30e0f0e2b3c/release/build/trading_bot_0/735888772b722b5a/out/trading_bot_0-735888772b722b5a"
+  },
+  "test_job": 8520,
+  "train_job": 8521
+}

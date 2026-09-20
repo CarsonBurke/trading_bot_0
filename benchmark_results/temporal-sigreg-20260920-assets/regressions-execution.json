@@ -1,0 +1,10 @@
+{
+  "filter": "jepa",
+  "gpu_gating": "TIMEXER_SEGMENT_GPU_TEST=1",
+  "job": 8493,
+  "test_binary": {
+    "path": "benchmark_results/temporal-sigreg-20260920-assets/jepa-tests",
+    "sha256": "cf55dcf9ac3b4c537c1793b5b42b2666c2a4aabd3c89d4b4c03a362508f8a8c0",
+    "source": "/var/tmp/cargo-build/a0/1fb30e0f0e2b3c/release/build/trading_bot_0/2ef4f6d93825495c/out/trading_bot_0-2ef4f6d93825495c"
+  }
+}

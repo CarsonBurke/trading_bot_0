@@ -1,0 +1,211 @@
+{
+  "evidence": {
+    "checkpoint": "/home/marvin/Documents/repositories/trading_bot_0/training/runs/lejepa-fixed1400-20260919-forecast/weights/jepa-manifest.json",
+    "checkpoint_sha256": "e9ce7d9fa7e34caaca9ce4f2d8d12418985fa75f0abd38006b34aa572082c61e",
+    "cross_section_sha256": "91eb1ee756b9835317316883b68ba5b0e0e97e2e8056b04f6c1b4bfea64615c3",
+    "probe_fit_origins_sha256": "5920db02a55834558982d048eb0c9549ed47d4dec1995e55941c0c92709bbf2e",
+    "reports": [
+      {
+        "path": "/home/marvin/Documents/repositories/trading_bot_0/training/runs/lejepa-fixed1400-20260919-forecast/gens/0/timexer_segment_decomposition.report.bin",
+        "sha256": "c9af12157e6887885dabd55f9f8b746a492f793bf0893051d30d5b529b8f072b"
+      },
+      {
+        "path": "/home/marvin/Documents/repositories/trading_bot_0/training/runs/lejepa-fixed1400-20260919-forecast/gens/0/timexer_segment_horizon.report.bin",
+        "sha256": "cb37b529e2c366a12fc8e8b0999a066d3218420c1a7b7f50ea204b03e6ccac4b"
+      },
+      {
+        "path": "/home/marvin/Documents/repositories/trading_bot_0/training/runs/lejepa-fixed1400-20260919-forecast/gens/0/timexer_segment_horizon_decimation.report.bin",
+        "sha256": "53b7b94ee68531cf1fb045fb8891092c7c26e82efa7d9cba17819e8c26bdb3d0"
+      },
+      {
+        "path": "/home/marvin/Documents/repositories/trading_bot_0/training/runs/lejepa-fixed1400-20260919-forecast/gens/0/timexer_segment_horizon_decimation_count.report.bin",
+        "sha256": "d9f25dc6a8c7d7b7f70af6916a6f391f3aca066935396e641baf138e4b52a55d"
+      },
+      {
+        "path": "/home/marvin/Documents/repositories/trading_bot_0/training/runs/lejepa-fixed1400-20260919-forecast/gens/0/timexer_segment_horizon_error.report.bin",
+        "sha256": "64179e4701ea2ad47815482851b2adca68bf643fba31f79fe009a3c5a6c7401e"
+      },
+      {
+        "path": "/home/marvin/Documents/repositories/trading_bot_0/training/runs/lejepa-fixed1400-20260919-forecast/gens/0/timexer_segment_horizon_rates.report.bin",
+        "sha256": "51fe4f125c2fcee5a9622d295bfa12f9ebd4462380e6112ec51e13dc0106e572"
+      },
+      {
+        "path": "/home/marvin/Documents/repositories/trading_bot_0/training/runs/lejepa-fixed1400-20260919-forecast/gens/0/timexer_segment_horizon_robust.report.bin",
+        "sha256": "fd6dbab1554422718641f4bf5c8cf7a53fa4843b7fd3c2143efbb8e6042b178c"
+      },
+      {
+        "path": "/home/marvin/Documents/repositories/trading_bot_0/training/runs/lejepa-fixed1400-20260919-forecast/gens/0/timexer_segment_jepa_forecast.report.bin",
+        "sha256": "3ec3b4dfc2402a6307f3322aed76edc71843f191a0460b9899df30b6345f9023"
+      },
+      {
+        "path": "/home/marvin/Documents/repositories/trading_bot_0/training/runs/lejepa-fixed1400-20260919-forecast/gens/0/timexer_segment_jepa_objective.report.bin",
+        "sha256": "9681f2e9b0ca20031f964b5cf627d58958b5167d5f602e5b8a412d51479206c1"
+      },
+      {
+        "path": "/home/marvin/Documents/repositories/trading_bot_0/training/runs/lejepa-fixed1400-20260919-forecast/gens/0/timexer_segment_jepa_panel.report.bin",
+        "sha256": "ddd55222da2aaf9eb673fb56ccf5da19cd22fcb346b0028994924913abf9da2b"
+      },
+      {
+        "path": "/home/marvin/Documents/repositories/trading_bot_0/training/runs/lejepa-fixed1400-20260919-forecast/gens/0/timexer_segment_jepa_probe_correlation.report.bin",
+        "sha256": "15034f90bb893424e3f542d7fe1c2b50da84bed698d7a9b13de166fa000f7bda"
+      },
+      {
+        "path": "/home/marvin/Documents/repositories/trading_bot_0/training/runs/lejepa-fixed1400-20260919-forecast/gens/0/timexer_segment_jepa_probe_count.report.bin",
+        "sha256": "b8cdb73d43062a5b6d46539b8cb3d4f7fee3f83d774800a551157f626f306c7d"
+      },
+      {
+        "path": "/home/marvin/Documents/repositories/trading_bot_0/training/runs/lejepa-fixed1400-20260919-forecast/gens/0/timexer_segment_jepa_probe_error.report.bin",
+        "sha256": "9a0d537e50a24a4f9ad8e78ba830aed33e1eed09f8172fb3b14d21d3a9ef60e1"
+      },
+      {
+        "path": "/home/marvin/Documents/repositories/trading_bot_0/training/runs/lejepa-fixed1400-20260919-forecast/gens/0/timexer_segment_jepa_probe_gap.report.bin",
+        "sha256": "17ec54f094882d0be4cf6d7a247513cf82883068e6bb58c8623233d80d20ed2c"
+      },
+      {
+        "path": "/home/marvin/Documents/repositories/trading_bot_0/training/runs/lejepa-fixed1400-20260919-forecast/gens/0/timexer_segment_jepa_probe_penalty.report.bin",
+        "sha256": "5cb1657398e946980b3e64443dedbce3922fdceb2f2a154380091b5262a382cc"
+      },
+      {
+        "path": "/home/marvin/Documents/repositories/trading_bot_0/training/runs/lejepa-fixed1400-20260919-forecast/gens/0/timexer_segment_jepa_probe_population.report.bin",
+        "sha256": "5066744eed075316e4edcac97a7029fba96505620db5aea0516a91e597aabfdf"
+      },
+      {
+        "path": "/home/marvin/Documents/repositories/trading_bot_0/training/runs/lejepa-fixed1400-20260919-forecast/gens/0/timexer_segment_jepa_probe_ratio.report.bin",
+        "sha256": "608387b6a551e3c07486904ff577391faad85a9fc00ea7d823663faa4ba384dd"
+      },
+      {
+        "path": "/home/marvin/Documents/repositories/trading_bot_0/training/runs/lejepa-fixed1400-20260919-forecast/gens/0/timexer_segment_jepa_reconstruction.report.bin",
+        "sha256": "b900e50e7926b135ebed3b9d8c7c2b92efabb3f36b29cd1ba1024f6b3fb7acaf"
+      },
+      {
+        "path": "/home/marvin/Documents/repositories/trading_bot_0/training/runs/lejepa-fixed1400-20260919-forecast/gens/0/timexer_segment_jepa_reconstruction_correlation.report.bin",
+        "sha256": "0e727519f571704078f7b627ad5a8f40f58845c2f20f8dd9bb8df2cd89e44bf8"
+      },
+      {
+        "path": "/home/marvin/Documents/repositories/trading_bot_0/training/runs/lejepa-fixed1400-20260919-forecast/gens/0/timexer_segment_jepa_reconstruction_count.report.bin",
+        "sha256": "f37574d3d834559aa958552e35e3f65b39caf7887d2e40bfcab4c07dfc516c4f"
+      },
+      {
+        "path": "/home/marvin/Documents/repositories/trading_bot_0/training/runs/lejepa-fixed1400-20260919-forecast/gens/0/timexer_segment_jepa_runtime.report.bin",
+        "sha256": "0dd486edf59fc818ebd5a2225a97331040bb7cf65a44d0d0ae8628ecae7ddeeb"
+      },
+      {
+        "path": "/home/marvin/Documents/repositories/trading_bot_0/training/runs/lejepa-fixed1400-20260919-forecast/gens/0/timexer_segment_jepa_token_variance.report.bin",
+        "sha256": "0cfdf58b3364d92149a7f7ddbbd561122dc95109e5cd4f83ac931acfd6de3365"
+      },
+      {
+        "path": "/home/marvin/Documents/repositories/trading_bot_0/training/runs/lejepa-fixed1400-20260919-forecast/gens/0/timexer_segment_offset.report.bin",
+        "sha256": "807a5024bc9ef5bebb2f2f5e0d465a328cbb5e877ead68e9579fbf0954a3181e"
+      },
+      {
+        "path": "/home/marvin/Documents/repositories/trading_bot_0/training/runs/lejepa-fixed1400-20260919-forecast/gens/0/timexer_segment_progress.report.bin",
+        "sha256": "05056b4fa9a70d5ccd2dcd00e082567368e7f673bc50f5684fe516b07829b0cf"
+      },
+      {
+        "path": "/home/marvin/Documents/repositories/trading_bot_0/training/runs/lejepa-fixed1400-20260919-forecast/gens/0/timexer_segment_signal.report.bin",
+        "sha256": "9295491e62b650a4f933544f0bb42d8f2449ebeccdf0e64d0acb15f2de27939b"
+      },
+      {
+        "path": "/home/marvin/Documents/repositories/trading_bot_0/training/runs/lejepa-fixed1400-20260919-forecast/gens/0/timexer_segment_supervision_occupancy.report.bin",
+        "sha256": "e8a2677f0e587478e80ff5b6c22acdf4cb6d35801c7e24c117747ac29e5692eb"
+      },
+      {
+        "path": "/home/marvin/Documents/repositories/trading_bot_0/training/runs/lejepa-fixed1400-20260919-forecast/gens/0/timexer_segment_tradable.report.bin",
+        "sha256": "5326dbdd2ee8a5c708bd8f9c28282ea90c76a22b1067935d39d981ac78927330"
+      },
+      {
+        "path": "/home/marvin/Documents/repositories/trading_bot_0/training/runs/lejepa-fixed1400-20260919-forecast/gens/0/timexer_segment_tradable_rates.report.bin",
+        "sha256": "14fbaf8e7327041bf2d7da68ce68978cbcdcbd7c38b25055c6af61aed935815d"
+      },
+      {
+        "path": "/home/marvin/Documents/repositories/trading_bot_0/training/runs/lejepa-fixed1400-20260919-forecast/gens/0/timexer_segment_utility_active_fraction.report.bin",
+        "sha256": "3b39d6d900c95c301b8d6038fd7751a9b2ecbe2efbb3503145b53d5925aefb51"
+      },
+      {
+        "path": "/home/marvin/Documents/repositories/trading_bot_0/training/runs/lejepa-fixed1400-20260919-forecast/gens/0/timexer_segment_utility_breakeven.report.bin",
+        "sha256": "fd15921ee13d1c0f1e3c75c5ab78de269410d138b506bc6a8bd1392ec38da823"
+      },
+      {
+        "path": "/home/marvin/Documents/repositories/trading_bot_0/training/runs/lejepa-fixed1400-20260919-forecast/gens/0/timexer_segment_utility_census.report.bin",
+        "sha256": "9b7b723de9c5b354fb07e78f556d11ba47b18d7353b96c735c3652fb1f427bb1"
+      },
+      {
+        "path": "/home/marvin/Documents/repositories/trading_bot_0/training/runs/lejepa-fixed1400-20260919-forecast/gens/0/timexer_segment_utility_gross_exposure.report.bin",
+        "sha256": "b69067071960eccdb89c84ed029b6afb1398e8a8b8cb60bfc1775a225a2d40a1"
+      },
+      {
+        "path": "/home/marvin/Documents/repositories/trading_bot_0/training/runs/lejepa-fixed1400-20260919-forecast/gens/0/timexer_segment_utility_net_exposure.report.bin",
+        "sha256": "6ff6ccbfb0332e11d2a668a756d4c837e7e637b587d2db583fb682aa931c2bc1"
+      },
+      {
+        "path": "/home/marvin/Documents/repositories/trading_bot_0/training/runs/lejepa-fixed1400-20260919-forecast/gens/0/timexer_segment_utility_payoff.report.bin",
+        "sha256": "4eac633f6e8c2d07b932ea58d1a611932c4c043d487183bfb0ea141ee3cd1494"
+      },
+      {
+        "path": "/home/marvin/Documents/repositories/trading_bot_0/training/runs/lejepa-fixed1400-20260919-forecast/gens/0/timexer_segment_utility_payoff_cost_0p5.report.bin",
+        "sha256": "fb2db7237f64b99b6c25135999b2833e00fe4ae26428932dfa4dbbc126496ea9"
+      },
+      {
+        "path": "/home/marvin/Documents/repositories/trading_bot_0/training/runs/lejepa-fixed1400-20260919-forecast/gens/0/timexer_segment_utility_payoff_cost_1.report.bin",
+        "sha256": "86464b8a928ec30198f15e2a193a8ca9efabb95a4540c40f3267d0015d30bce8"
+      },
+      {
+        "path": "/home/marvin/Documents/repositories/trading_bot_0/training/runs/lejepa-fixed1400-20260919-forecast/gens/0/timexer_segment_utility_payoff_cost_10.report.bin",
+        "sha256": "18f3753f103c5d2354268adf8452eb794592e2ef7a6b0d613f544f9b06d02e48"
+      },
+      {
+        "path": "/home/marvin/Documents/repositories/trading_bot_0/training/runs/lejepa-fixed1400-20260919-forecast/gens/0/timexer_segment_utility_payoff_cost_2.report.bin",
+        "sha256": "1ed9a359e013ed6f64df1fbb817ef0e0d5c21711bb9e9302e3f7e16933b3896c"
+      },
+      {
+        "path": "/home/marvin/Documents/repositories/trading_bot_0/training/runs/lejepa-fixed1400-20260919-forecast/gens/0/timexer_segment_utility_payoff_cost_5.report.bin",
+        "sha256": "c9ed8689b522a74ea5b57d31cf4b9d9dca8543f4406ff55dfe7e27597c04f37a"
+      },
+      {
+        "path": "/home/marvin/Documents/repositories/trading_bot_0/training/runs/lejepa-fixed1400-20260919-forecast/gens/0/timexer_segment_utility_payoff_std.report.bin",
+        "sha256": "bac920f116725a621da4a390e54ac250159f039b32c49c30e596565605a92322"
+      },
+      {
+        "path": "/home/marvin/Documents/repositories/trading_bot_0/training/runs/lejepa-fixed1400-20260919-forecast/gens/0/timexer_segment_utility_rate.report.bin",
+        "sha256": "b7b91e02a7fd7c508e6fca10dd4fff1f565ce184ec47c1c18c6d67ca8ae87ce3"
+      },
+      {
+        "path": "/home/marvin/Documents/repositories/trading_bot_0/training/runs/lejepa-fixed1400-20260919-forecast/gens/0/timexer_segment_utility_rate_cost_0p5.report.bin",
+        "sha256": "6f62bf958f34ffdb97c732674cf96cfa18a94754e6ed882ef24ba67e511ec882"
+      },
+      {
+        "path": "/home/marvin/Documents/repositories/trading_bot_0/training/runs/lejepa-fixed1400-20260919-forecast/gens/0/timexer_segment_utility_rate_cost_1.report.bin",
+        "sha256": "fcb3b18afbe4df8673589b6ef3fd7befb8e040cb57afe7c03a7297f419bd82a6"
+      },
+      {
+        "path": "/home/marvin/Documents/repositories/trading_bot_0/training/runs/lejepa-fixed1400-20260919-forecast/gens/0/timexer_segment_utility_rate_cost_10.report.bin",
+        "sha256": "28deb2ab6d26893798e46b819c6e0de19abeabad6a0bbdc850b9dd8f4f1607d8"
+      },
+      {
+        "path": "/home/marvin/Documents/repositories/trading_bot_0/training/runs/lejepa-fixed1400-20260919-forecast/gens/0/timexer_segment_utility_rate_cost_2.report.bin",
+        "sha256": "d8b0bfdd2a07e64e53702ad6e046e2b2c5def2a66c61a0a7790a5035a3f665ca"
+      },
+      {
+        "path": "/home/marvin/Documents/repositories/trading_bot_0/training/runs/lejepa-fixed1400-20260919-forecast/gens/0/timexer_segment_utility_rate_cost_5.report.bin",
+        "sha256": "f6e436d1e17e3871264f5fcaba259b9c4fd93c118ff3a13b247a0929b31cb5b5"
+      },
+      {
+        "path": "/home/marvin/Documents/repositories/trading_bot_0/training/runs/lejepa-fixed1400-20260919-forecast/gens/0/timexer_segment_utility_turnover.report.bin",
+        "sha256": "ab6aea31e3976c82f81f484dff0260f91cc049caea2bb2b04a30e9a6a4f25bf0"
+      },
+      {
+        "path": "/home/marvin/Documents/repositories/trading_bot_0/training/runs/lejepa-fixed1400-20260919-forecast/gens/0/timexer_segment_utility_worst_payoff.report.bin",
+        "sha256": "6539d5ec4b6abf6e376b87550cdaa7d926cb83e89b16b5a67cbe81b299f6bab7"
+      }
+    ],
+    "sample_plan_sha256": "0786d2f617ab5d91585456fbd906748aa2d5c05e0bd79bab62205c1abfcb4f93",
+    "training_origins_sha256": "0f2375c8af73ffdf4915ced389900fd1616ea27b4f419a8735ca5c394c475594",
+    "validation_origins_sha256": "fbe7ebacd6fe79dd424786ce050e9bf17a59e1bbb5fb7d720f8c1bfc76c08046",
+    "weights_sha256": "61e3edb16025b7567543ddbd1df4fa46cfbcd1d89e118a444c96805706bccc20"
+  },
+  "failure": null,
+  "finished_at": "2026-09-20T03:55:50.517292+00:00",
+  "started_at": "2026-09-20T03:51:57.918285+00:00",
+  "status": "complete",
+  "wall_seconds": 232.59897621100026
+}

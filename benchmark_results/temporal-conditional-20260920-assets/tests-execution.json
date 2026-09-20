@@ -1,0 +1,13 @@
+{
+  "binary": {
+    "path": "benchmark_results/temporal-conditional-20260920-assets/library-tests",
+    "sha256": "c58c53035995a6cd384671e9245c7353c387740b8213ea27527986537700e4a8",
+    "source": "/var/tmp/cargo-build/a0/1fb30e0f0e2b3c/release/build/trading_bot_0/735888772b722b5a/out/trading_bot_0-735888772b722b5a"
+  },
+  "filters": [
+    "torch::timexer_segment::jepa",
+    "torch::timexer_segment::model::tests::cuda_jepa"
+  ],
+  "gpu_enabled": true,
+  "job": 8511
+}
