@@ -8,9 +8,12 @@ use super::{
     calibration::FrozenGain,
     corpus::Batch,
     features::{Feature, FeatureSet},
-    jepa::{JepaConfig, JepaHeads, JepaMode, JepaRandom, RepresentationViews, CONDITIONAL_FEATURES},
+    jepa::{
+        JepaConfig, JepaHeads, JepaMode, JepaRandom, RepresentationViews, CONDITIONAL_FEATURES,
+    },
     supervision::HorizonDecimation,
     target_basis::{self, BasisTransform, BasisWeight, TargetBasis},
+    temporal_moments::TemporalMoments,
 };
 use crate::torch::model::rope::RotaryEmbedding;
 
@@ -397,9 +400,8 @@ impl HorizonMean {
             let column: Vec<f64> = (1..=restricted)
                 .map(|step| (-(step as f64) / tau).exp())
                 .collect();
-            let rms = (column.iter().map(|value| value * value).sum::<f64>()
-                / restricted as f64)
-                .sqrt();
+            let rms =
+                (column.iter().map(|value| value * value).sum::<f64>() / restricted as f64).sqrt();
             for (step, value) in column.into_iter().enumerate() {
                 matrix[step * functions as usize + index] = value / rms;
             }
@@ -523,9 +525,9 @@ impl FromStr for HorizonMean {
             return Ok(Self::Free);
         }
         if let Some(scales) = spec.strip_prefix("increment:") {
-            let scales: i64 = scales.parse().map_err(|_| {
-                anyhow::anyhow!("increment:K needs an integer K, got {scales:?}")
-            })?;
+            let scales: i64 = scales
+                .parse()
+                .map_err(|_| anyhow::anyhow!("increment:K needs an integer K, got {scales:?}"))?;
             ensure!(
                 scales >= 1,
                 "increment:{scales} leaves the log scale no state dependence at all, not even a \
@@ -534,7 +536,9 @@ impl FromStr for HorizonMean {
             return Ok(Self::Increment { scales });
         }
         let restricted = spec.strip_prefix("basis:").ok_or_else(|| {
-            anyhow::anyhow!("unknown horizon mean {spec:?}; expected free, basis:S:B or increment:K")
+            anyhow::anyhow!(
+                "unknown horizon mean {spec:?}; expected free, basis:S:B or increment:K"
+            )
         })?;
         let (free, functions) = restricted
             .split_once(':')
@@ -603,7 +607,10 @@ pub struct ModelConfig {
     /// Condition on calendars of the actual future observed bars (legacy production path).
     /// Disable for causal research panels: next-print times are not known at the origin.
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
-    #[serde(default = "calendar_enabled", skip_serializing_if = "is_calendar_enabled")]
+    #[serde(
+        default = "calendar_enabled",
+        skip_serializing_if = "is_calendar_enabled"
+    )]
     pub future_calendar: bool,
     /// Whether the per-layer embedding re-injection exists; `disabled` removes the parameters
     /// and the kernel, and changes the checkpoint FORMAT stamp.
@@ -637,6 +644,14 @@ pub struct ModelConfig {
     #[arg(long, default_value_t = 0.0)]
     #[serde(default, skip_serializing_if = "no_amplitude_prior")]
     pub amplitude_prior: f64,
+    /// Diagonal-free causal conditional-close moment penalty; zero preserves legacy contracts.
+    #[arg(long, default_value_t = 0.0)]
+    #[serde(default, skip_serializing_if = "no_amplitude_prior")]
+    pub temporal_moment_weight: f64,
+    /// Matched direct close-MSE control at the seven temporal-moment decision horizons.
+    #[arg(long, default_value_t = 0.0)]
+    #[serde(default, skip_serializing_if = "no_amplitude_prior")]
+    pub decision_mse_weight: f64,
     /// Which orthonormal map the objective measures horizon error in: `cumulative` (the
     /// identity, and the control), `haar` or `dct`.
     ///
@@ -702,8 +717,12 @@ fn no_amplitude_prior(lambda: &f64) -> bool {
     *lambda == 0.
 }
 
-fn calendar_enabled() -> bool { true }
-fn is_calendar_enabled(enabled: &bool) -> bool { *enabled }
+fn calendar_enabled() -> bool {
+    true
+}
+fn is_calendar_enabled(enabled: &bool) -> bool {
+    *enabled
+}
 
 /// The control basis, skipped from the manifest for the same reason `--amplitude-prior 0` is:
 /// a control checkpoint must serialize, and therefore digest, exactly as it did before the knob.
@@ -743,6 +762,8 @@ impl Default for ModelConfig {
             horizon_loss: HorizonLoss::Uniform,
             horizon_mean: HorizonMean::Free,
             amplitude_prior: 0.0,
+            temporal_moment_weight: 0.0,
+            decision_mse_weight: 0.0,
             target_basis: TargetBasis::Cumulative,
             basis_weight: BasisWeight::Uniform,
             basis_stats: None,
@@ -802,6 +823,35 @@ impl ModelConfig {
              REWARDS forecast energy and diverges",
             self.amplitude_prior
         );
+        ensure!(
+            self.temporal_moment_weight.is_finite()
+                && self.temporal_moment_weight >= 0.
+                && self.decision_mse_weight.is_finite()
+                && self.decision_mse_weight >= 0.,
+            "--temporal-moment-weight and --decision-mse-weight must be finite and non-negative"
+        );
+        if self.temporal_moments_enabled() {
+            ensure!(
+                !self.jepa_mode.enabled(),
+                "temporal moments require --jepa-mode off"
+            );
+            ensure!(
+                self.target_basis.is_identity(),
+                "temporal moments require cumulative targets"
+            );
+            ensure!(
+                !matches!(self.horizon_mean, HorizonMean::Increment { .. }),
+                "temporal moments do not support increment means"
+            );
+            ensure!(
+                !self.future_calendar,
+                "temporal moments require --future-calendar false"
+            );
+            ensure!(
+                self.pred_len >= *super::temporal_moments::HORIZONS.last().unwrap(),
+                "temporal moments require all seven decision horizons through 192"
+            );
+        }
         ensure!(
             (2..=self.seq_len).contains(&self.min_history),
             "min_history must lie in [2, seq_len]"
@@ -914,6 +964,10 @@ impl ModelConfig {
         self.seq_len / self.patch_len
     }
 
+    pub fn temporal_moments_enabled(&self) -> bool {
+        self.temporal_moment_weight > 0. || self.decision_mse_weight > 0.
+    }
+
     /// Complete optional objective/parameter contract for authenticated research manifests.
     pub fn jepa_contract(&self) -> Option<String> {
         self.jepa_mode.enabled().then(|| {
@@ -949,7 +1003,11 @@ impl ModelConfig {
     }
 
     pub fn jepa_horizons(&self) -> Vec<i64> {
-        self.jepa_mode.offsets().iter().map(|k| k * self.patch_len).collect()
+        self.jepa_mode
+            .offsets()
+            .iter()
+            .map(|k| k * self.patch_len)
+            .collect()
     }
 
     /// `(encoder source, decoder destination)` for every U-net skip, deepest encoder layer
@@ -975,7 +1033,11 @@ impl ModelConfig {
             .iter()
             .filter(|known| self.future_calendar && **known)
             .count() as f64;
-        let covariate_width = if known > 0. { COVARIATE_WIDTH as f64 } else { 0. };
+        let covariate_width = if known > 0. {
+            COVARIATE_WIDTH as f64
+        } else {
+            0.
+        };
         let head_input = width + covariate_width;
         // What the head EMITS, in both modes: the expansion is folded onto the output weight,
         // so the token-space GEMM and every activation below are shape-identical under
@@ -1030,12 +1092,7 @@ impl ModelConfig {
         bytes += self.layers as f64
             * bf16(
                 tokens
-                    * (2. * width
-                        + 3. * width
-                        + 2. * width
-                        + 6. * width
-                        + x0_injection
-                        + 2. * ffn),
+                    * (2. * width + 3. * width + 2. * width + 6. * width + x0_injection + 2. * ffn),
             );
         // The patch embedding's own norm: `x0 = rms_norm(patch(tokens))`, once per step.
         bytes += bf16(tokens * width);
@@ -1094,8 +1151,7 @@ impl ModelConfig {
         // value gradient, three passes each. Counted here rather than folded into the per-layer
         // width units because the mix is not a plain write-once-read-once materialization.
         let decoders = (self.layers - 1).max(0) as f64;
-        let value_residual =
-            bf16(tokens * width) * (10. * decoders + 3. * (decoders - 1.).max(0.));
+        let value_residual = bf16(tokens * width) * (10. * decoders + 3. * (decoders - 1.).max(0.));
         // The structured mean's own arithmetic and traffic, and the honest side of the trade.
         //
         // `CausalPatchModel::head` expands the parameters in WEIGHT space: one
@@ -1147,11 +1203,16 @@ impl ModelConfig {
             let offsets = self.jepa_mode.offsets();
             let sources = rows * (self.origins() - offsets.last().unwrap()) as f64;
             let hidden = self.jepa.predictor_width as f64;
-            let output_dim = if self.jepa_mode.conditional() { CONDITIONAL_FEATURES as f64 } else { self.jepa_mode.target_width(self.d_model) as f64 };
+            let output_dim = if self.jepa_mode.conditional() {
+                CONDITIONAL_FEATURES as f64
+            } else {
+                self.jepa_mode.target_width(self.d_model) as f64
+            };
             let predicted = output_dim * offsets.len() as f64;
-            let mut arithmetic = 3. * (gemm(sources, width, hidden) + gemm(sources, hidden, predicted));
-            let mut traffic = 6. * bf16(sources * (hidden + predicted))
-                + 8. * fp32(sources * predicted);
+            let mut arithmetic =
+                3. * (gemm(sources, width, hidden) + gemm(sources, hidden, predicted));
+            let mut traffic =
+                6. * bf16(sources * (hidden + predicted)) + 8. * fp32(sources * predicted);
             if self.jepa_mode.conditional() {
                 // Selected close/market endpoints, interval prefix counts and fixed CF phases;
                 // no second dense forecast target and no random sphere projection.
@@ -1175,15 +1236,43 @@ impl ModelConfig {
                 traffic += 6. * bf16(tokens * features) + 8. * fp32(tokens * features);
             }
             (arithmetic, traffic)
-        } else { (0., 0.) };
+        } else {
+            (0., 0.)
+        };
+        let (moment_flops, moment_bytes) = if self.temporal_moments_enabled() {
+            let instruments = super::temporal_moments::INSTRUMENT_WIDTH as f64;
+            let decisions = super::temporal_moments::HORIZONS.len() as f64;
+            // One fixed Fourier projection, one summed-moment BMM and one diagonal BMM.
+            // Fixed instruments have no gradient; only moment-enabled arms differentiate BMMs.
+            let passes = if self.temporal_moment_weight > 0. {
+                2.
+            } else {
+                1.
+            };
+            let arithmetic = gemm(tokens, 32., 64.)
+                + passes
+                    * origins
+                    * (gemm(decisions, rows, instruments) + gemm(decisions, rows, 1.));
+            // Lower bound: read/write causal prefix arrays, bounded summaries, Fourier phases,
+            // instruments, and selected prediction/target/residual (no dense fp32 decoder).
+            let traffic = 2.
+                * fp32(
+                    2. * rows * self.seq_len as f64
+                        + tokens * (32. + 64. + instruments + 3. * decisions),
+                );
+            (arithmetic, traffic)
+        } else {
+            (0., 0.)
+        };
         StepCost {
-            matmul_flops: 3. * flops + expansion + jepa_flops,
+            matmul_flops: 3. * flops + expansion + jepa_flops + moment_flops,
             traffic_bytes: 3. * 2. * bytes
                 + head_loss
                 + value_residual
                 + expansion_bytes
                 + amplitude_prior
-                + jepa_bytes,
+                + jepa_bytes
+                + moment_bytes,
         }
     }
 }
@@ -1448,8 +1537,8 @@ impl Block {
         // them; `split_with_sizes` records one node that scatters both gradients into a single
         // buffer. Forward is views either way, and `q‖k` stays one tensor so the rotation can
         // run as full-width products over it.
-        let packed = linear(&rms_norm(input), &self.qkv)
-            .split_with_sizes([2 * self.width, self.width], -1);
+        let packed =
+            linear(&rms_norm(input), &self.qkv).split_with_sizes([2 * self.width, self.width], -1);
         // QK-norm BEFORE the rotation, which is the reference's order:
         // `train_gpt.py:1106` `q, k = norm(q), norm(k)  # QK norm @Grad62304977` and only then
         // `:1109` `q, k = yarn.rotary(q), yarn.rotary(k)`; identically
@@ -1471,8 +1560,7 @@ impl Block {
         // materialized and no `rstd` is written or read back - the backward recomputes the
         // normalization from the raw block, which is the cheap half of a memory-bound kernel.
         // Bit-identical to `_fused_rms_norm`-then-`fused_kernels::rope` in both directions.
-        let rotated =
-            qk_norm_rope(&packed[0], rotation.0, rotation.1, self.heads).split(1, 2);
+        let rotated = qk_norm_rope(&packed[0], rotation.0, rotation.1, self.heads).split(1, 2);
         // Value residual. `packed[1]` is the layer's own value, head-shaped by a VIEW (splitting
         // the last dimension is always expressible as a stride, so this costs nothing); the mix
         // is one `lerp` - a single read of each operand and one write - rather than the
@@ -1769,6 +1857,8 @@ pub struct CausalPatchModel {
     /// the fused loss call below is reached by exactly the code it was reached by before.
     basis: Option<BasisTransform>,
     jepa: Option<JepaHeads>,
+    /// Fixed, parameter-free geometry; the zero-weight path allocates and computes nothing.
+    temporal_moments: Option<TemporalMoments>,
 }
 
 /// A frozen amplitude calibration, resident: the two curves as the decode's operands, beside
@@ -1790,23 +1880,22 @@ impl CausalPatchModel {
         // Loading and authenticating the statistics artifact belongs here, beside the config
         // validation it completes: a mispaired artifact is a different objective, and
         // discovering that after the first optimizer step would waste the lease.
-        let basis = (!config.target_basis.is_identity())
-            .then(|| {
-                let statistics = config
-                    .basis_stats
-                    .as_deref()
-                    .map(target_basis::BasisStatistics::load)
-                    .transpose()
-                    .expect("unreadable --basis-stats artifact");
-                BasisTransform::new(
-                    config.target_basis,
-                    config.basis_weight,
-                    config.pred_len,
-                    statistics.as_ref(),
-                    path.device(),
-                )
-                .expect("invalid target basis")
-            });
+        let basis = (!config.target_basis.is_identity()).then(|| {
+            let statistics = config
+                .basis_stats
+                .as_deref()
+                .map(target_basis::BasisStatistics::load)
+                .transpose()
+                .expect("unreadable --basis-stats artifact");
+            BasisTransform::new(
+                config.target_basis,
+                config.basis_weight,
+                config.pred_len,
+                statistics.as_ref(),
+                path.device(),
+            )
+            .expect("invalid target basis")
+        });
         let device = path.device();
         let head_dim = config.d_model / config.heads;
         let aux_channels = config.features.channels() as i64;
@@ -1832,8 +1921,12 @@ impl CausalPatchModel {
             )
         });
         let head_input = config.d_model + covariates.as_ref().map_or(0, |_| COVARIATE_WIDTH);
-        let horizon = (Tensor::arange(config.pred_len, (Kind::Float, device)) + 1.0)
-            .reshape([1, 1, 1, config.pred_len]);
+        let horizon = (Tensor::arange(config.pred_len, (Kind::Float, device)) + 1.0).reshape([
+            1,
+            1,
+            1,
+            config.pred_len,
+        ]);
         let sigma_scale = Tensor::from_slice(&sigma_scale).to_device(device);
         // The dense causal-patch model attends over a FIXED position grid, so the rotation rows
         // are constant: building them once removes four small kernels per attention tensor per
@@ -1913,38 +2006,47 @@ impl CausalPatchModel {
             )
             .reshape([1, 1, 1, config.pred_len])
             .to_device(device),
-            mean_expansion: config.horizon_mean.expansion(config.pred_len).map(|values| {
-                Tensor::from_slice(&values)
-                    .reshape([
-                        OUTPUTS_PER_BAR * config.pred_len,
-                        config.horizon_mean.head_outputs(config.pred_len),
-                    ])
-                    .to_device(device)
-            }),
-            scale_expansion: config.horizon_mean.scale_basis(config.pred_len).map(|values| {
-                let values: Vec<f32> = values.into_iter().map(|value| value as f32).collect();
-                Tensor::from_slice(&values)
-                    .reshape([-1, config.pred_len])
-                    .to_device(device)
-            }),
-            increment_geometry: matches!(config.horizon_mean, HorizonMean::Increment { .. })
-                .then(|| {
+            mean_expansion: config
+                .horizon_mean
+                .expansion(config.pred_len)
+                .map(|values| {
+                    Tensor::from_slice(&values)
+                        .reshape([
+                            OUTPUTS_PER_BAR * config.pred_len,
+                            config.horizon_mean.head_outputs(config.pred_len),
+                        ])
+                        .to_device(device)
+                }),
+            scale_expansion: config
+                .horizon_mean
+                .scale_basis(config.pred_len)
+                .map(|values| {
+                    let values: Vec<f32> = values.into_iter().map(|value| value as f32).collect();
+                    Tensor::from_slice(&values)
+                        .reshape([-1, config.pred_len])
+                        .to_device(device)
+                }),
+            increment_geometry: matches!(config.horizon_mean, HorizonMean::Increment { .. }).then(
+                || {
                     let shape = [1, 1, 1, config.pred_len];
                     (
                         Tensor::ones(shape, (Kind::Float, device)),
                         Tensor::zeros(shape, (Kind::Float, device)),
                         Tensor::ones(shape, (Kind::Float, device)),
                     )
-                }),
-            log_scale_gain: Tensor::full(
-                [1, 1, 1, 1],
-                1.0 / LOG_SCALE_CAP,
-                (Kind::Float, device),
+                },
             ),
+            log_scale_gain: Tensor::full([1, 1, 1, 1], 1.0 / LOG_SCALE_CAP, (Kind::Float, device)),
             mean_gain: None,
             basis,
             // Last random initialization: optional heads never perturb shared parameters.
-            jepa: config.jepa_mode.enabled().then(|| JepaHeads::new(path / "jepa", config)),
+            jepa: config
+                .jepa_mode
+                .enabled()
+                .then(|| JepaHeads::new(path / "jepa", config)),
+            temporal_moments: config
+                .temporal_moments_enabled()
+                .then(|| TemporalMoments::new(config, device)),
             config: config.clone(),
         }
     }
@@ -2003,9 +2105,14 @@ impl CausalPatchModel {
         gain.validate(pred_len as usize)?;
         let device = self.horizon_scale.device();
         let curve = |values: &[f64]| {
-            Tensor::from_slice(&values.iter().map(|value| *value as f32).collect::<Vec<f32>>())
-                .reshape([1, pred_len])
-                .to_device(device)
+            Tensor::from_slice(
+                &values
+                    .iter()
+                    .map(|value| *value as f32)
+                    .collect::<Vec<f32>>(),
+            )
+            .reshape([1, pred_len])
+            .to_device(device)
         };
         self.mean_gain = Some(MeanGain {
             anchor: curve(&gain.anchor),
@@ -2060,10 +2167,10 @@ impl CausalPatchModel {
         let pair = valid.narrow(1, 1, context - 1) * valid.narrow(1, 0, context - 1);
         let returns = (close.narrow(1, 1, context - 1) - close.narrow(1, 0, context - 1)) * &pair;
         let lead = Tensor::zeros([rows, 1], (Kind::Float, log_prices.device()));
-        let at_origin = |series: &Tensor| series.reshape([rows, origins, patch]).select(2, patch - 1);
-        let cumulative = |series: &Tensor| {
-            at_origin(&Tensor::cat(&[&lead, series], 1).cumsum(1, Kind::Float))
-        };
+        let at_origin =
+            |series: &Tensor| series.reshape([rows, origins, patch]).select(2, patch - 1);
+        let cumulative =
+            |series: &Tensor| at_origin(&Tensor::cat(&[&lead, series], 1).cumsum(1, Kind::Float));
         let pairs = cumulative(&pair).clamp_min(1.0);
         let mean = cumulative(&returns) / &pairs;
         let variance = cumulative(&returns.square()) / &pairs - mean.square();
@@ -2108,7 +2215,11 @@ impl CausalPatchModel {
 
     /// `stats` must be the full statistics; `last_only` restricts the head to the final origin.
     pub fn forward(&self, batch: &Batch, stats: &Statistics, train: bool, last_only: bool) -> Head {
-        self.head(batch, &self.backbone(batch, stats, train, last_only), last_only)
+        self.head(
+            batch,
+            &self.backbone(batch, stats, train, last_only),
+            last_only,
+        )
     }
 
     /// The σ-normalised patch tokens the backbone embeds, bf16
@@ -2126,7 +2237,10 @@ impl CausalPatchModel {
         let rows = batch.log_prices.size()[0];
         let length = self.config.seq_len + self.config.pred_len;
         assert_eq!(batch.log_prices.size(), [rows, length, CHANNELS]);
-        assert_eq!(batch.aux.size(), [rows, length, self.config.features.channels() as i64]);
+        assert_eq!(
+            batch.aux.size(),
+            [rows, length, self.config.features.channels() as i64]
+        );
         self.tokens_range(batch, stats, 0, self.config.seq_len)
     }
 
@@ -2144,17 +2258,14 @@ impl CausalPatchModel {
             - per_bar(&stats.log_close))
             * &inv_sigma)
             .to_kind(Kind::BFloat16);
-        let aux = (batch
-            .aux
-            .narrow(1, start, context)
-            .reshape([rows, origins, patch, aux_channels])
-            * (&self.sigma_scale * inv_sigma + &self.unit_scale))
-            .to_kind(Kind::BFloat16);
-        Tensor::cat(&[prices, aux], 3).reshape([
-            rows,
-            origins,
-            patch * (CHANNELS + aux_channels),
-        ])
+        let aux =
+            (batch
+                .aux
+                .narrow(1, start, context)
+                .reshape([rows, origins, patch, aux_channels])
+                * (&self.sigma_scale * inv_sigma + &self.unit_scale))
+                .to_kind(Kind::BFloat16);
+        Tensor::cat(&[prices, aux], 3).reshape([rows, origins, patch * (CHANNELS + aux_channels)])
     }
 
     /// Patch embedding, the causal transformer stack and the final norm, narrowed to the scored
@@ -2182,10 +2293,12 @@ impl CausalPatchModel {
     }
 
     fn trunk(&self, x0: &Tensor, train: bool, last_only: bool, origins: i64) -> Tensor {
-        let shortened = (origins != self.config.origins()).then(|| (
-            self.rotation.0.narrow(0, 0, origins),
-            self.rotation.1.narrow(0, 0, origins),
-        ));
+        let shortened = (origins != self.config.origins()).then(|| {
+            (
+                self.rotation.0.narrow(0, 0, origins),
+                self.rotation.1.narrow(0, 0, origins),
+            )
+        });
         let rotation = shortened.as_ref().unwrap_or(&self.rotation);
         // ONE cast and ONE `unbind` for the whole stack, as the reference does
         // (`train_gpt.py:1509-1512`, `self.resid_lambdas[:, 0].bfloat16().unbind(0)`). The cast
@@ -2215,9 +2328,7 @@ impl CausalPatchModel {
                 let lambdas = BlockLambdas {
                     resid: [&resid[2 * index], &resid[2 * index + 1]],
                     post: [&post[2 * index], &post[2 * index + 1]],
-                    x0: x0_lambdas
-                        .as_ref()
-                        .map(|lambdas| (x0, &lambdas[index])),
+                    x0: x0_lambdas.as_ref().map(|lambdas| (x0, &lambdas[index])),
                 };
                 let (next, published) = self.blocks[index].forward(
                     state,
@@ -2249,7 +2360,10 @@ impl CausalPatchModel {
     /// Recompute a genuinely short causal history ending at `source_index`, including its
     /// normalization statistics. No full-prefix tensor or contextual state enters this path.
     pub fn representation_state_at_recent(
-        &self, batch: &Batch, source_index: i64, recent_patches: i64,
+        &self,
+        batch: &Batch,
+        source_index: i64,
+        recent_patches: i64,
     ) -> Tensor {
         assert!((0..self.config.origins()).contains(&source_index));
         assert!((1..=source_index + 1).contains(&recent_patches));
@@ -2258,10 +2372,16 @@ impl CausalPatchModel {
         let stats = self.statistics_range(batch, start, context);
         let tokens = self.tokens_range(batch, &stats, start, context);
         let embedding = rms_norm(&linear(&tokens, &self.patch));
-        self.trunk(&embedding, false, true, recent_patches).squeeze_dim(1)
+        self.trunk(&embedding, false, true, recent_patches)
+            .squeeze_dim(1)
     }
 
-    fn views_with_statistics(&self, batch: &Batch, stats: &Statistics, train: bool) -> RepresentationViews {
+    fn views_with_statistics(
+        &self,
+        batch: &Batch,
+        stats: &Statistics,
+        train: bool,
+    ) -> RepresentationViews {
         let c = &self.config;
         let tokens = self.tokens(batch, stats);
         let embedding = linear(&tokens, &self.patch);
@@ -2274,16 +2394,38 @@ impl CausalPatchModel {
         );
         let prediction = self.jepa.as_ref().map(|heads| heads.prediction(&state));
         // Exactly the bf16-rounded price features used by the patch embedding, without aux.
-        let reconstruction_target = tokens.reshape([
-            tokens.size()[0], c.origins(), c.patch_len, CHANNELS + c.features.channels() as i64,
-        ]).narrow(-1, 0, CHANNELS).flatten(2, 3).to_kind(Kind::Float);
-        let conditional = self.jepa.as_ref().and_then(|heads| heads.conditional_targets(c, batch, stats));
-        RepresentationViews { observation, target, state, prediction, reconstruction_target, conditional, horizons: c.jepa_horizons() }
+        let reconstruction_target = tokens
+            .reshape([
+                tokens.size()[0],
+                c.origins(),
+                c.patch_len,
+                CHANNELS + c.features.channels() as i64,
+            ])
+            .narrow(-1, 0, CHANNELS)
+            .flatten(2, 3)
+            .to_kind(Kind::Float);
+        let conditional = self
+            .jepa
+            .as_ref()
+            .and_then(|heads| heads.conditional_targets(c, batch, stats));
+        RepresentationViews {
+            observation,
+            target,
+            state,
+            prediction,
+            reconstruction_target,
+            conditional,
+            horizons: c.jepa_horizons(),
+        }
     }
 
     /// One backbone pass for forecast and temporal objectives; conditional targets are fixed data.
     pub(super) fn jepa_losses(
-        &self, batch: &Batch, train: bool, keep: Option<&Tensor>, random: Option<&JepaRandom>,
+        &self,
+        batch: &Batch,
+        train: bool,
+        keep: Option<&Tensor>,
+        random: Option<&JepaRandom>,
     ) -> Losses {
         let stats = self.statistics(batch);
         let views = self.views_with_statistics(batch, &stats, train);
@@ -2294,21 +2436,54 @@ impl CausalPatchModel {
         };
         let head = self.head(batch, &head_state, false);
         let (targets, mask) = self.targets(batch, &stats, false);
-        let mask = match keep { Some(keep) => mask * keep, None => mask };
+        let mask = match keep {
+            Some(keep) => mask * keep,
+            None => mask,
+        };
         let mut losses = self.losses(&head, &stats, &targets, &mask);
         let c = &self.config;
         let heads = self.jepa.as_ref().expect("enabled JEPA heads");
         let (auxiliary, diagnostics) = if let Some(targets) = &views.conditional {
             heads.conditional_objective(c, &views, targets)
         } else {
-            let valid = batch.valid.narrow(1, 0, c.seq_len)
-                .reshape([-1, c.origins(), c.patch_len]).amin([-1i64].as_slice(), false);
+            let valid = batch
+                .valid
+                .narrow(1, 0, c.seq_len)
+                .reshape([-1, c.origins(), c.patch_len])
+                .amin([-1i64].as_slice(), false);
             let source_valid = &valid * &stats.mask;
             heads.objective(c, &views, &valid, &source_valid, random)
         };
         losses.objective = &losses.objective + auxiliary;
         losses.jepa = Some(diagnostics);
         losses
+    }
+
+    /// Reuse the forecast head and undecimated labels; no second backbone or decoder.
+    pub(super) fn add_temporal_moments(
+        &self,
+        losses: &mut Losses,
+        batch: &Batch,
+        stats: &Statistics,
+        head: &Head,
+        targets: &Tensor,
+        mask: &Tensor,
+    ) {
+        let Some(geometry) = &self.temporal_moments else {
+            return;
+        };
+        let decision = geometry.select(self, head, targets, mask);
+        let instruments = geometry.instruments(batch, stats);
+        let output = geometry.objective(&decision, &instruments);
+        if self.config.temporal_moment_weight > 0. {
+            losses.objective =
+                &losses.objective + output.moment_loss * self.config.temporal_moment_weight;
+        }
+        if self.config.decision_mse_weight > 0. {
+            losses.objective =
+                &losses.objective + output.decision_mse * self.config.decision_mse_weight;
+        }
+        losses.moments = Some(output.diagnostics);
     }
 
     /// Every learned mixing scalar the backbone holds, as `(label, post-parameterization
@@ -2510,9 +2685,7 @@ impl CausalPatchModel {
                 // The post-lambda is folded onto the weight COPY the cast already makes, so
                 // the extra traffic is one 512×512 bf16 read plus one write - 1/96 000 of the
                 // activation it would otherwise scale (see [`scaled_linear`]).
-                forward_bytes: 2. * state
-                    + cast(width * width)
-                    + bf16(2. * (width * width) as f64),
+                forward_bytes: 2. * state + cast(width * width) + bf16(2. * (width * width) as f64),
                 forward_flops: gemm(width, width),
                 parameters: projected(&block.output),
                 run: Box::new(move |input| {
@@ -2533,7 +2706,10 @@ impl CausalPatchModel {
                 forward_flops: 2. * tokens * width as f64,
                 parameters: Vec::new(),
                 run: Box::new(move |input| {
-                    input[0].addcmul(&input[1], &self.resid_lambdas.get(0).to_kind(input[0].kind()))
+                    input[0].addcmul(
+                        &input[1],
+                        &self.resid_lambdas.get(0).to_kind(input[0].kind()),
+                    )
                 }),
             },
             KernelClass {
@@ -2587,7 +2763,11 @@ impl CausalPatchModel {
         };
         let (norm_bytes, norm_flops) = charged("RMSNorm");
         let (addcmul_bytes, addcmul_flops) = charged("residual addcmul");
-        let x0_addcmuls = if self.config.x0_lambdas.enabled() { 1. } else { 0. };
+        let x0_addcmuls = if self.config.x0_lambdas.enabled() {
+            1.
+        } else {
+            0.
+        };
         let layer_bytes: f64 = classes.iter().map(|class| class.forward_bytes).sum::<f64>()
             + norm_bytes
             + (1. + x0_addcmuls) * addcmul_bytes;
@@ -2656,10 +2836,8 @@ impl CausalPatchModel {
                 run: Box::new(move |input| {
                     let head_shaped =
                         |value: &Tensor| value.reshape([rows, origins, heads, head_dim]);
-                    head_shaped(&input[0]).lerp_tensor(
-                        &head_shaped(&input[1]),
-                        &lambda.to_kind(input[0].kind()),
-                    )
+                    head_shaped(&input[0])
+                        .lerp_tensor(&head_shaped(&input[1]), &lambda.to_kind(input[0].kind()))
                 }),
             });
         }
@@ -2683,7 +2861,9 @@ impl CausalPatchModel {
                     + (prices + auxiliaries)
             },
             parameters: Vec::new(),
-            forward_flops: tokens * c.patch_len as f64 * (2. * CHANNELS as f64 + c.features.channels() as f64),
+            forward_flops: tokens
+                * c.patch_len as f64
+                * (2. * CHANNELS as f64 + c.features.channels() as f64),
             run: Box::new(move |_| self.tokens(batch, stats)),
         });
         // The two forms this work replaced, measured in the SAME process against the same
@@ -2704,7 +2884,8 @@ impl CausalPatchModel {
             run: Box::new(move |input| {
                 let parts = input[0].split(width, -1);
                 let heads_of = |part: &Tensor| {
-                    part.reshape([rows, origins, heads, head_dim]).transpose(1, 2)
+                    part.reshape([rows, origins, heads, head_dim])
+                        .transpose(1, 2)
                 };
                 let query = rope.apply_cached(&heads_of(&parts[0]), &cosine, &sine);
                 let key = rope.apply_cached(&heads_of(&parts[1]), &cosine, &sine);
@@ -2727,11 +2908,12 @@ impl CausalPatchModel {
                     .reshape([rows, origins, patch, CHANNELS])
                     - per_bar(&stats.log_close))
                     * &inv_sigma;
-                let auxiliaries = batch
-                    .aux
-                    .narrow(1, 0, context)
-                    .reshape([rows, origins, patch, aux_channels])
-                    * (&self.sigma_scale * inv_sigma + &self.unit_scale);
+                let auxiliaries =
+                    batch
+                        .aux
+                        .narrow(1, 0, context)
+                        .reshape([rows, origins, patch, aux_channels])
+                        * (&self.sigma_scale * inv_sigma + &self.unit_scale);
                 Tensor::cat(&[prices, auxiliaries], 3)
                     .reshape([rows, origins, patch * (CHANNELS + aux_channels)])
                     .to_kind(Kind::BFloat16)
@@ -2790,9 +2972,12 @@ impl CausalPatchModel {
             },
             run: Box::new(move |input| {
                 let (weight, bias) = self.head_output_weights(input[0].kind());
-                input[0]
-                    .linear(&weight, bias.as_ref())
-                    .reshape([rows, -1, OUTPUTS_PER_BAR, horizon])
+                input[0].linear(&weight, bias.as_ref()).reshape([
+                    rows,
+                    -1,
+                    OUTPUTS_PER_BAR,
+                    horizon,
+                ])
             }),
         });
         // Registered only when the prior actually runs, so an unpenalized arm's class list and
@@ -2837,7 +3022,10 @@ impl CausalPatchModel {
                 false => "fused loss geometry and NLL",
                 true => "composed decoupled loss geometry and NLL",
             },
-            inputs: vec![(vec![rows, origins, OUTPUTS_PER_BAR, horizon], Kind::BFloat16)],
+            inputs: vec![(
+                vec![rows, origins, OUTPUTS_PER_BAR, horizon],
+                Kind::BFloat16,
+            )],
             // ENUMERATED, not a floor, because after the fusion there is nothing left to
             // guess: one mask fold (read the mask, write `mask·w`), the fused kernel's reads
             // (the whole bf16 head space, the fp32 targets, the folded mask) and writes (the
@@ -2925,7 +3113,9 @@ impl CausalPatchModel {
             .reshape([rows, -1, CHANNELS, expansion.size()[0]]);
         Head(Tensor::cat(
             &[
-                emitted.narrow(-1, 0, means).reshape([rows, -1, CHANNELS, horizon]),
+                emitted
+                    .narrow(-1, 0, means)
+                    .reshape([rows, -1, CHANNELS, horizon]),
                 coefficients
                     .to_kind(expansion.kind())
                     .matmul(expansion)
@@ -3000,10 +3190,9 @@ impl CausalPatchModel {
             // stated here rather than hidden because the alternative is a frozen `A_h`, and a
             // frozen first-moment-like multiplier biases every interval by an amount nobody
             // bounded, where this one is wrong in a named direction by a measured factor.
-            let per_bar_log = (head.0.narrow(2, CHANNELS, CHANNELS).to_kind(Kind::Float)
-                / LOG_SCALE_CAP)
-                .tanh()
-                * LOG_SCALE_CAP;
+            let per_bar_log =
+                (head.0.narrow(2, CHANNELS, CHANNELS).to_kind(Kind::Float) / LOG_SCALE_CAP).tanh()
+                    * LOG_SCALE_CAP;
             return Output {
                 coordinates: head.0.narrow(2, 0, CHANNELS).to_kind(Kind::Float),
                 log_scale: (per_bar_log * 2.).exp().cumsum(-1, Kind::Float).log() * 0.5,
@@ -3018,6 +3207,25 @@ impl CausalPatchModel {
                 None => capped(&self.half_log_horizon),
                 Some(basis) => basis.horizon_log_scale(&capped(basis.half_log_prior())),
             },
+        }
+    }
+
+    /// Actual selected close forecasts in sigma*sqrt(h) units, without dense OHLC decoding.
+    /// The zero-offset close is coordinate zero; selecting BEFORE fp32 conversion keeps the
+    /// auxiliary activation at seven values per source, not four full forecast channels.
+    pub(super) fn selected_normalized_close(&self, head: &Head, horizons: &Tensor) -> Tensor {
+        assert!(
+            self.basis.is_none() && self.increment_geometry.is_none(),
+            "selected close geometry requires cumulative, non-increment means"
+        );
+        let close = head
+            .0
+            .select(2, 0)
+            .index_select(-1, horizons)
+            .to_kind(Kind::Float);
+        match &self.mean_gain {
+            Some(gain) => close * gain.anchor.index_select(-1, horizons),
+            None => close,
         }
     }
 
@@ -3084,10 +3292,7 @@ impl CausalPatchModel {
             -1,
         );
         self.gained(Tensor::cat(
-            &[
-                increments.narrow(-2, 0, CHANNELS - 1) + previous,
-                close,
-            ],
+            &[increments.narrow(-2, 0, CHANNELS - 1) + previous, close],
             -2,
         ))
     }
@@ -3437,8 +3642,7 @@ impl CausalPatchModel {
         let nll = match &geometry.nll_terms {
             None => objective.shallow_clone(),
             Some(terms) => {
-                let value =
-                    tch::no_grad(|| (terms.sum(Kind::Float) + &prior) / &objective_count);
+                let value = tch::no_grad(|| (terms.sum(Kind::Float) + &prior) / &objective_count);
                 (&objective - objective.detach()) + value
             }
         };
@@ -3451,30 +3655,31 @@ impl CausalPatchModel {
             objective,
             mse: geometry.squares.sum(Kind::Float) / count,
             jepa: None,
+            moments: None,
         }
     }
 
-/// Per-BAR targets and their validity, from the cumulative pair. `targets` is
-/// `[rows, origins', CHANNELS, pred_len]` relative to the ORIGIN close; the increment at bar `j`
-/// is the same four coordinates relative to bar `j-1`'s CLOSE, which is `decode_joint`'s fourth
-/// channel and the only one that is a level rather than an extreme of its own bar.
-///
-/// Bar 0 needs no shift: its previous close IS the origin close, which is exactly zero in these
-/// σ-scaled targets. Its validity is `stats.mask`, already folded into `mask`.
-///
-/// A bar is valid as an increment only if it AND its predecessor were observed, so the mask is
-/// the pointwise product of the two - one bar of validity is lost at every gap, and that is a
-/// real cost of the parameterization rather than an accounting choice.
-fn increment_pair(targets: &Tensor, mask: &Tensor) -> (Tensor, Tensor) {
-    let horizon = targets.size()[targets.dim() - 1];
-    let shift = |source: &Tensor, first: Tensor| {
-        Tensor::cat(&[first, source.narrow(-1, 0, horizon - 1)], -1)
-    };
-    let close = targets.narrow(-2, CHANNELS - 1, 1);
-    let previous = shift(&close, close.narrow(-1, 0, 1).zeros_like());
-    let carried = shift(mask, mask.narrow(-1, 0, 1).ones_like());
-    (targets - previous, mask * carried)
-}
+    /// Per-BAR targets and their validity, from the cumulative pair. `targets` is
+    /// `[rows, origins', CHANNELS, pred_len]` relative to the ORIGIN close; the increment at bar `j`
+    /// is the same four coordinates relative to bar `j-1`'s CLOSE, which is `decode_joint`'s fourth
+    /// channel and the only one that is a level rather than an extreme of its own bar.
+    ///
+    /// Bar 0 needs no shift: its previous close IS the origin close, which is exactly zero in these
+    /// σ-scaled targets. Its validity is `stats.mask`, already folded into `mask`.
+    ///
+    /// A bar is valid as an increment only if it AND its predecessor were observed, so the mask is
+    /// the pointwise product of the two - one bar of validity is lost at every gap, and that is a
+    /// real cost of the parameterization rather than an accounting choice.
+    fn increment_pair(targets: &Tensor, mask: &Tensor) -> (Tensor, Tensor) {
+        let horizon = targets.size()[targets.dim() - 1];
+        let shift = |source: &Tensor, first: Tensor| {
+            Tensor::cat(&[first, source.narrow(-1, 0, horizon - 1)], -1)
+        };
+        let close = targets.narrow(-2, CHANNELS - 1, 1);
+        let previous = shift(&close, close.narrow(-1, 0, 1).zeros_like());
+        let carried = shift(mask, mask.narrow(-1, 0, 1).ones_like());
+        (targets - previous, mask * carried)
+    }
 
     /// The objective in COEFFICIENT space: [`Self::losses`] under a non-identity
     /// [`TargetBasis`].
@@ -3535,8 +3740,7 @@ fn increment_pair(targets: &Tensor, mask: &Tensor) -> (Tensor, Tensor) {
         );
         // The same expression [`Self::output`] uses, so the two cannot drift and the identity
         // basis reproduces the evaluation path's log scale on the bits.
-        let log_scale = (head.0.narrow(2, CHANNELS, CHANNELS).to_kind(Kind::Float)
-            / LOG_SCALE_CAP)
+        let log_scale = (head.0.narrow(2, CHANNELS, CHANNELS).to_kind(Kind::Float) / LOG_SCALE_CAP)
             .tanh()
             * LOG_SCALE_CAP
             + basis.half_log_prior();
@@ -3576,9 +3780,8 @@ fn increment_pair(targets: &Tensor, mask: &Tensor) -> (Tensor, Tensor) {
         let nll = match reported {
             None => objective.shallow_clone(),
             Some(elements) => {
-                let value = tch::no_grad(|| {
-                    (elements * &weighted).sum(Kind::Float) / &objective_count
-                });
+                let value =
+                    tch::no_grad(|| (elements * &weighted).sum(Kind::Float) / &objective_count);
                 (&objective - objective.detach()) + value
             }
         };
@@ -3594,6 +3797,7 @@ fn increment_pair(targets: &Tensor, mask: &Tensor) -> (Tensor, Tensor) {
             objective,
             mse: tch::no_grad(|| (error.square() * mask).sum(Kind::Float) / count),
             jepa: None,
+            moments: None,
         }
     }
 }
@@ -3612,8 +3816,8 @@ pub fn decode_joint(
     let smallest = f64::from(f32::MIN_POSITIVE);
     let sigma = sigma.clamp_min(smallest);
     let close = coordinates.narrow(-2, 0, 1) * horizon_scale;
-    let relative_range =
-        range.clamp_min(smallest) * coordinates.narrow(-2, 1, 1).softplus() / std::f64::consts::LN_2;
+    let relative_range = range.clamp_min(smallest) * coordinates.narrow(-2, 1, 1).softplus()
+        / std::f64::consts::LN_2;
     let close_offset = (coordinates.narrow(-2, 2, 1).sigmoid() * &relative_range).log1p();
     let open_offset = (coordinates.narrow(-2, 3, 1).sigmoid() * &relative_range).log1p();
     let full = relative_range.log1p();
@@ -3647,22 +3851,40 @@ pub struct Losses {
     pub objective: Tensor,
     /// Detached diagnostics in `jepa::diagnostic_labels` order; absent on the off path.
     pub jepa: Option<Tensor>,
+    /// Detached [diagnostic, horizon] temporal-moment values; absent when both weights are zero.
+    pub moments: Option<Tensor>,
 }
 
 impl Losses {
     pub fn forecast(nll: Tensor, mse: Tensor) -> Self {
-        Self { objective: nll.shallow_clone(), nll, mse, jepa: None }
+        Self {
+            objective: nll.shallow_clone(),
+            nll,
+            mse,
+            jepa: None,
+            moments: None,
+        }
     }
 
     pub fn detached(&self) -> Self {
-        Self { nll: self.nll.detach(), mse: self.mse.detach(), objective: self.objective.detach(),
-            jepa: self.jepa.as_ref().map(Tensor::detach) }
+        Self {
+            nll: self.nll.detach(),
+            mse: self.mse.detach(),
+            objective: self.objective.detach(),
+            jepa: self.jepa.as_ref().map(Tensor::detach),
+            moments: self.moments.as_ref().map(Tensor::detach),
+        }
     }
 
     /// All outputs leave the shared graph pool before the optimizer can overwrite its storage.
     pub fn copied(&self) -> Self {
-        Self { nll: self.nll.detach().copy(), mse: self.mse.detach().copy(),
-            objective: self.objective.detach().copy(), jepa: self.jepa.as_ref().map(|x| x.detach().copy()) }
+        Self {
+            nll: self.nll.detach().copy(),
+            mse: self.mse.detach().copy(),
+            objective: self.objective.detach().copy(),
+            jepa: self.jepa.as_ref().map(|x| x.detach().copy()),
+            moments: self.moments.as_ref().map(|x| x.detach().copy()),
+        }
     }
 }
 
@@ -3715,6 +3937,8 @@ mod tests {
             horizon_loss: HorizonLoss::Uniform,
             horizon_mean: HorizonMean::Free,
             amplitude_prior: 0.0,
+            temporal_moment_weight: 0.0,
+            decision_mse_weight: 0.0,
             target_basis: TargetBasis::Cumulative,
             basis_weight: BasisWeight::Uniform,
             basis_stats: None,
@@ -3730,11 +3954,15 @@ mod tests {
         let rows = valid_future.len() as i64;
         let length = config.seq_len + config.pred_len;
         let aux_channels = config.features.channels() as i64;
-        let close = Tensor::randn([rows, length, 1], (Kind::Float, Device::Cpu)).cumsum(1, Kind::Float) * 0.002;
+        let close = Tensor::randn([rows, length, 1], (Kind::Float, Device::Cpu))
+            .cumsum(1, Kind::Float)
+            * 0.002;
         let close = &close - close.narrow(1, config.seq_len - 1, 1);
         let open = &close + Tensor::randn([rows, length, 1], (Kind::Float, Device::Cpu)) * 0.0005;
-        let high = close.maximum(&open) + Tensor::rand([rows, length, 1], (Kind::Float, Device::Cpu)) * 0.001;
-        let low = close.minimum(&open) - Tensor::rand([rows, length, 1], (Kind::Float, Device::Cpu)) * 0.001;
+        let high = close.maximum(&open)
+            + Tensor::rand([rows, length, 1], (Kind::Float, Device::Cpu)) * 0.001;
+        let low = close.minimum(&open)
+            - Tensor::rand([rows, length, 1], (Kind::Float, Device::Cpu)) * 0.001;
         let log_prices = Tensor::cat(&[open, high, low, close], 2);
         let valid = Tensor::ones([rows, length], (Kind::Float, Device::Cpu));
         for (row, &count) in valid_future.iter().enumerate() {
@@ -3744,7 +3972,9 @@ mod tests {
                 .fill_(0.0);
         }
         let aux = Tensor::randn([rows, length, aux_channels], (Kind::Float, Device::Cpu));
-        let market = Tensor::randn([rows, length], (Kind::Float, Device::Cpu)).cumsum(1, Kind::Float) * 0.001;
+        let market = Tensor::randn([rows, length], (Kind::Float, Device::Cpu))
+            .cumsum(1, Kind::Float)
+            * 0.001;
         let market = &market - market.narrow(1, config.seq_len - 1, 1);
         let anchor = Tensor::arange(rows, (Kind::Float, Device::Cpu)) + 100.0;
         let packed = Tensor::cat(
@@ -3855,7 +4085,11 @@ mod tests {
             .reshape([1, 4, 1])
             .expand([1, 4, 4], true);
         let scaled = decode_joint(&coordinates, &sigma, &range, &horizon(4));
-        let prices = decode_prices(&scaled, &Tensor::from_slice(&[50.0f32]).reshape([1, 1, 1]), &sigma);
+        let prices = decode_prices(
+            &scaled,
+            &Tensor::from_slice(&[50.0f32]).reshape([1, 1, 1]),
+            &sigma,
+        );
         for step in 0..4 {
             let steps = (step + 1) as f64;
             assert!((scaled.double_value(&[0, 3, step]) - steps.sqrt()).abs() < 1e-6);
@@ -3906,7 +4140,12 @@ mod tests {
             let coordinates = Tensor::from_slice(&[0.0f32, 100.0, -100.0, 0.0])
                 .reshape([1, 4, 1])
                 .set_requires_grad(true);
-            let scaled = decode_joint(&coordinates, &sigma, &Tensor::from_slice(&[1.0f32]).reshape([1, 1, 1]), &horizon(1));
+            let scaled = decode_joint(
+                &coordinates,
+                &sigma,
+                &Tensor::from_slice(&[1.0f32]).reshape([1, 1, 1]),
+                &horizon(1),
+            );
             let prices = decode_prices(&scaled, &anchor, &sigma);
             assert_valid_candles(&prices);
             assert_eq!(prices.double_value(&[0, 3, 0]), f64::from(extreme));
@@ -3949,7 +4188,10 @@ mod tests {
                     returns.iter().map(|r| (r - mean).powi(2)).sum::<f64>() / returns.len() as f64;
                 let expected = (variance + RETURN_VARIANCE_FLOOR).sqrt();
                 let actual = stats.sigma.double_value(&[row as i64, origin as i64]);
-                assert!((actual - expected).abs() <= 1e-5 * expected, "{actual} vs {expected}");
+                assert!(
+                    (actual - expected).abs() <= 1e-5 * expected,
+                    "{actual} vs {expected}"
+                );
                 assert_eq!(
                     stats.mask.double_value(&[row as i64, origin as i64]),
                     f64::from(u8::from(bars >= 16))
@@ -3990,7 +4232,10 @@ mod tests {
                 for channel in 0..4 {
                     let expected = (step + 1) as f64 * 1e-3 / sigma;
                     let actual = targets.double_value(&[0, origin, channel, step]);
-                    assert!((actual - expected).abs() <= 1e-3 * expected, "{actual} vs {expected}");
+                    assert!(
+                        (actual - expected).abs() <= 1e-3 * expected,
+                        "{actual} vs {expected}"
+                    );
                 }
                 let bar = 16 * (origin + 1) + step;
                 let expected_mask = if bar < config.seq_len + 5 { 1.0 } else { 0.0 };
@@ -4035,7 +4280,11 @@ mod tests {
             assert_eq!(stats.market.double_value(&[0, origin]), expected);
         }
         let (targets, _) = model.targets(&batch, &stats, false);
-        assert!(targets.abs().max().double_value(&[]) < 1e-3, "{}", targets.abs().max());
+        assert!(
+            targets.abs().max().double_value(&[]) < 1e-3,
+            "{}",
+            targets.abs().max()
+        );
         let drift = model.market_drift(&batch, &stats, false);
         assert_eq!(drift.size(), [2, 4, 1, 8]);
         assert!(drift.abs().max().double_value(&[]) > 0.0);
@@ -4061,9 +4310,11 @@ mod tests {
             .cumsum(1, Kind::Float);
         let market = &market - market.narrow(1, config.seq_len - 1, 1);
         batch.market_cum.copy_(&market);
-        batch
-            .log_prices
-            .copy_(&(&market * 0.5).unsqueeze(-1).expand([1, length, CHANNELS], true));
+        batch.log_prices.copy_(
+            &(&market * 0.5)
+                .unsqueeze(-1)
+                .expand([1, length, CHANNELS], true),
+        );
         let store = nn::VarStore::new(Device::Cpu);
         let model = CausalPatchModel::new(&store.root(), &config);
         let stats = model.statistics(&batch);
@@ -4072,7 +4323,10 @@ mod tests {
             let pairs = (16 * (origin + 1) - 1) as f64;
             let expected = (0.5 * pairs + BETA_PRIOR_BARS) / (pairs + BETA_PRIOR_BARS);
             let beta = stats.beta.double_value(&[0, origin]);
-            assert!((beta - expected).abs() < 1e-4, "origin {origin}: {beta} vs {expected}");
+            assert!(
+                (beta - expected).abs() < 1e-4,
+                "origin {origin}: {beta} vs {expected}"
+            );
         }
         assert!(stats.beta.double_value(&[0, 0]) > 0.97);
         let raw = (model.future_windows(&batch.log_prices, false) - per_bar(&stats.log_close))
@@ -4207,13 +4461,14 @@ mod tests {
         // so nothing a `VarStore::save` would write has moved.
         assert!(saved == weights(&store), "the gain changed a saved tensor");
         let calibrated = decode(&model);
-        let after = decode_prices(&calibrated, &anchored(&batch.anchor), &anchored(&last.sigma));
+        let after = decode_prices(
+            &calibrated,
+            &anchored(&batch.anchor),
+            &anchored(&last.sigma),
+        );
         assert_valid_candles(&after);
         for bar in 0..config.pred_len {
-            let (anchor, offset) = (
-                frozen.anchor[bar as usize],
-                frozen.offset[bar as usize],
-            );
+            let (anchor, offset) = (frozen.anchor[bar as usize], frozen.offset[bar as usize]);
             let close = baseline.narrow(-2, CHANNELS - 1, 1).narrow(-1, bar, 1);
             let scaled_close = calibrated.narrow(-2, CHANNELS - 1, 1).narrow(-1, bar, 1);
             let tolerance = 1e-5 * (1. + close.abs().max().double_value(&[]));
@@ -4228,8 +4483,7 @@ mod tests {
             );
             // Each channel is `anchor·close + offset·(channel - close)`, which is the whole
             // transform: the offsets keep their sign, so the geometry above survives.
-            let expected = &close * anchor
-                + (baseline.narrow(-1, bar, 1) - &close) * offset;
+            let expected = &close * anchor + (baseline.narrow(-1, bar, 1) - &close) * offset;
             assert!(
                 (calibrated.narrow(-1, bar, 1) - expected)
                     .abs()
@@ -4339,12 +4593,12 @@ mod tests {
             for row in 0..rows as usize {
                 let index = row * width + bar;
                 let deviation = values[index] - mean;
-                expected += config.amplitude_prior * weights[bar] * flags[index] * deviation
-                    * deviation
-                    / (2. * width as f64 * scale);
-                expected_gradient[index] = config.amplitude_prior * weights[bar] * flags[index]
-                    * deviation
-                    / (width as f64 * scale);
+                expected +=
+                    config.amplitude_prior * weights[bar] * flags[index] * deviation * deviation
+                        / (2. * width as f64 * scale);
+                expected_gradient[index] =
+                    config.amplitude_prior * weights[bar] * flags[index] * deviation
+                        / (width as f64 * scale);
             }
         }
         let measured = penalty.double_value(&[]);
@@ -4386,6 +4640,9 @@ mod tests {
         const PRE_KNOB: &str = r#"{"seq_len":6000,"pred_len":192,"patch_len":16,"layers":8,"d_model":512,"heads":8,"ffn":2048,"dropout":0.0,"min_history":256,"features":{"time_of_day":true,"day_of_week":true,"session_gap":true,"volume":true,"market":true,"spy":true},"x0_lambdas":"disabled","horizon_loss":"uniform","horizon_mean":"free"}"#;
         let control: ModelConfig = serde_json::from_str(PRE_KNOB).unwrap();
         assert_eq!(control.amplitude_prior, 0.);
+        assert!(!control.temporal_moments_enabled());
+        assert_eq!(control.temporal_moment_weight, 0.);
+        assert_eq!(control.decision_mse_weight, 0.);
         assert_eq!(serde_json::to_string(&control).unwrap(), PRE_KNOB);
         // And a penalized arm is a DIFFERENT config that says so in its own manifest, rather
         // than an arm that looks like the control with a hidden objective term.
@@ -4425,9 +4682,16 @@ mod tests {
         assert_eq!(scaled.narrow(2, 0, 1).abs().max().double_value(&[]), 0.0);
         let expected_scale = model.half_log_horizon().expand_as(&output.log_scale);
         assert!(output.log_scale.equal(&expected_scale));
-        let anchor = batch.anchor.reshape([2, 1, 1, 1]) * stats.log_close.unsqueeze(-1).unsqueeze(-1).exp();
+        let anchor =
+            batch.anchor.reshape([2, 1, 1, 1]) * stats.log_close.unsqueeze(-1).unsqueeze(-1).exp();
         let prices = decode_prices(&scaled, &anchor, &per_bar(&stats.sigma));
-        assert!((prices.narrow(2, 3, 1) - &anchor).abs().max().double_value(&[]) < 1e-3);
+        assert!(
+            (prices.narrow(2, 3, 1) - &anchor)
+                .abs()
+                .max()
+                .double_value(&[])
+                < 1e-3
+        );
         let (targets, mask) = model.targets(&batch, &stats, false);
         let losses = gaussian_nll(
             &scaled,
@@ -4456,7 +4720,8 @@ mod tests {
                         squared += weight * residual * residual;
                         count += weight;
                         assert!(
-                            (scaled.double_value(&[row, origin, channel as i64, step]) - reference).abs()
+                            (scaled.double_value(&[row, origin, channel as i64, step]) - reference)
+                                .abs()
                                 < 1e-5,
                             "persistence candle mismatch at channel {channel}"
                         );
@@ -4464,7 +4729,11 @@ mod tests {
                 }
             }
         }
-        assert!((nll - by_hand / count).abs() < 1e-5, "{nll} vs {}", by_hand / count);
+        assert!(
+            (nll - by_hand / count).abs() < 1e-5,
+            "{nll} vs {}",
+            by_hand / count
+        );
         assert!((losses.mse.double_value(&[]) - squared / count).abs() < 1e-5);
         assert!(mask.sum(Kind::Float).double_value(&[]) < 2.0 * 4.0 * 8.0);
         // The fused training loss must reproduce the reference chain it replaced.
@@ -4474,9 +4743,7 @@ mod tests {
             "fused {} vs reference {nll}",
             fused.nll.double_value(&[])
         );
-        assert!(
-            (fused.mse.double_value(&[]) - losses.mse.double_value(&[])).abs() < 1e-6
-        );
+        assert!((fused.mse.double_value(&[]) - losses.mse.double_value(&[])).abs() < 1e-6);
     }
 
     /// The fused training loss against the decode+NLL chain it replaced, with a NONZERO head so
@@ -4543,9 +4810,16 @@ mod tests {
             }
             let error = (left - right).abs().max().double_value(&[]) / scale.max(1e-8);
             worst = f64::max(worst, error);
-            assert!(error <= 1e-4, "parameter {index} gradient relative error {error}");
+            assert!(
+                error <= 1e-4,
+                "parameter {index} gradient relative error {error}"
+            );
         }
-        assert_eq!(touched, parameters.len(), "a parameter received no gradient");
+        assert_eq!(
+            touched,
+            parameters.len(),
+            "a parameter received no gradient"
+        );
         println!(
             "fused vs reference at {horizon_loss}: NLL {relative:.3e} relative, MSE {:.3e} \
              relative, worst parameter gradient {worst:.3e} relative over {touched} parameters",
@@ -4652,7 +4926,9 @@ mod tests {
         // Far apart on the `tanh` - `-1.5` and `+1.5` land at |tanh| ≈ 0.905, so the two
         // precisions differ by `exp(4·CAP·0.905)` ≈ 3e6. An invariance that survives that is
         // not a numerically invisible dependency.
-        let scales = |value: f64| Tensor::full(&shape, value, (Kind::Float, Device::Cpu)).narrow(2, CHANNELS, CHANNELS);
+        let scales = |value: f64| {
+            Tensor::full(&shape, value, (Kind::Float, Device::Cpu)).narrow(2, CHANNELS, CHANNELS)
+        };
         let run = |coupling: ScaleCoupling, basis: TargetBasis, log_scale: &Tensor| {
             let config = ModelConfig {
                 scale_coupling: coupling,
@@ -4682,7 +4958,10 @@ mod tests {
                 decoupled_low.equal(&decoupled_high),
                 "the decoupled mean gradient moved with the log scale under {basis} by up to \
                  {}",
-                (&decoupled_low - &decoupled_high).abs().max().double_value(&[])
+                (&decoupled_low - &decoupled_high)
+                    .abs()
+                    .max()
+                    .double_value(&[])
             );
             assert!(
                 decoupled_low.abs().max().double_value(&[]) > 0.,
@@ -4693,7 +4972,11 @@ mod tests {
             // size of it. `tanh(∓1.5)·CAP` differ by 7.24 nats of log scale, so the weights
             // differ by `exp(2·7.24)`; the gradients cannot be within a factor of two.
             let separation = full_high.abs().max().double_value(&[])
-                / full_low.abs().max().double_value(&[]).max(f64::MIN_POSITIVE);
+                / full_low
+                    .abs()
+                    .max()
+                    .double_value(&[])
+                    .max(f64::MIN_POSITIVE);
             assert!(
                 !full_low.equal(&full_high) && (separation < 0.5 || separation > 2.0),
                 "the full coupling's mean gradient barely moved with the log scale under \
@@ -4847,7 +5130,9 @@ mod tests {
         assert_eq!(plan.first_active, 0);
         assert_eq!(
             plan.factors,
-            (0..32).map(|j| (j + 1usize).div_ceil(8)).collect::<Vec<_>>()
+            (0..32)
+                .map(|j| (j + 1usize).div_ceil(8))
+                .collect::<Vec<_>>()
         );
 
         let weight = model.horizon_weight_buffer();
@@ -4898,10 +5183,9 @@ mod tests {
                 parts(&(&mask * keep.gt(0.).to_kind(Kind::Float)));
             raw_numerator += drawn_raw_numerator;
             raw_denominator += drawn_raw_denominator;
-            objective +=
-                gaussian_nll(&prediction, &output.log_scale, &targets, &decimated, weight)
-                    .nll
-                    .double_value(&[]);
+            objective += gaussian_nll(&prediction, &output.log_scale, &targets, &decimated, weight)
+                .nll
+                .double_value(&[]);
             // A thinning that kept everything would make the whole test vacuous.
             assert!(
                 decimated.count_nonzero(None).int64_value(&[])
@@ -5079,15 +5363,15 @@ mod tests {
         // And the value against the pre-knob expression written out verbatim.
         let head = model.forward(&batch, &stats, false, false);
         let output = model.output(&head);
-        let previous = ((nll_elements(
-            &model.decode(&output, &stats),
-            &output.log_scale,
-            &targets,
-        ) * &mask)
-            .sum(Kind::Float)
-            / count)
+        let previous =
+            ((nll_elements(&model.decode(&output, &stats), &output.log_scale, &targets) * &mask)
+                .sum(Kind::Float)
+                / count)
+                .double_value(&[]);
+        let fused = model
+            .losses(&head, &stats, &targets, &mask)
+            .nll
             .double_value(&[]);
-        let fused = model.losses(&head, &stats, &targets, &mask).nll.double_value(&[]);
         assert!(previous.is_finite() && previous.abs() > 1e-3, "{previous}");
         let relative = (fused - previous).abs() / previous.abs();
         // The fused reassociation's own documented tolerance against the reference chain, not
@@ -5178,8 +5462,10 @@ mod tests {
         );
         // And the scalar, once the reference's strides are taken out of the comparison.
         let count = (weighted_mask.sum(Kind::Float) * CHANNELS).clamp_min(1.0);
-        let contiguous_reference =
-            (&reference_terms * &weighted_mask).contiguous().sum(Kind::Float) / &count;
+        let contiguous_reference = (&reference_terms * &weighted_mask)
+            .contiguous()
+            .sum(Kind::Float)
+            / &count;
         let rotated = model.basis_losses(&identity, &head, &stats, &targets, &mask);
         assert!(
             rotated.nll.equal(&contiguous_reference),
@@ -5222,15 +5508,20 @@ mod tests {
         let _rng = crate::torch::test_rng::exclusive();
         tch::manual_seed(37);
         let residual = Tensor::randn([16, 4, 192], (Kind::Float, Device::Cpu)) * 3.0;
-        let energy = residual.square().sum_dim_intlist([-1i64].as_slice(), false, Kind::Double);
+        let energy = residual
+            .square()
+            .sum_dim_intlist([-1i64].as_slice(), false, Kind::Double);
         for basis in [TargetBasis::Cumulative, TargetBasis::Haar, TargetBasis::Dct] {
             let transform =
                 BasisTransform::new(basis, BasisWeight::Uniform, 192, None, Device::Cpu).unwrap();
-            let rotated = transform
-                .rotate(&residual)
-                .square()
-                .sum_dim_intlist([-1i64].as_slice(), false, Kind::Double);
-            let worst = ((&rotated - &energy).abs() / &energy).max().double_value(&[]);
+            let rotated = transform.rotate(&residual).square().sum_dim_intlist(
+                [-1i64].as_slice(),
+                false,
+                Kind::Double,
+            );
+            let worst = ((&rotated - &energy).abs() / &energy)
+                .max()
+                .double_value(&[]);
             assert!(
                 worst < 1e-5,
                 "{basis} moved the residual energy by {worst:e} relative; the map is not a \
@@ -5265,13 +5556,9 @@ mod tests {
                 losses.nll.double_value(&[]).is_finite(),
                 "{basis} produced a nonfinite NLL"
             );
-            let gradient = Tensor::run_backward(
-                &[&losses.nll],
-                &[&model.head_output.ws],
-                false,
-                false,
-            )
-            .remove(0);
+            let gradient =
+                Tensor::run_backward(&[&losses.nll], &[&model.head_output.ws], false, false)
+                    .remove(0);
             let dead = gradient
                 .abs()
                 .reshape([gradient.size()[0], -1])
@@ -5280,7 +5567,8 @@ mod tests {
                 .sum(Kind::Int64)
                 .int64_value(&[]);
             assert_eq!(
-                dead, 0,
+                dead,
+                0,
                 "{basis} left {dead} of {} head rows with exactly zero gradient",
                 gradient.size()[0]
             );
@@ -5460,17 +5748,25 @@ mod tests {
             let rows = gradient.size()[0];
             assert_eq!(rows, pred_len * OUTPUTS_PER_BAR);
             let horizon = Tensor::arange(rows, (Kind::Int64, Device::Cpu)).remainder(pred_len);
-            let magnitude = gradient
-                .abs()
-                .reshape([rows, -1])
-                .sum_dim_intlist([1i64].as_slice(), false, Kind::Double);
+            let magnitude = gradient.abs().reshape([rows, -1]).sum_dim_intlist(
+                [1i64].as_slice(),
+                false,
+                Kind::Double,
+            );
             assert_eq!(
-                magnitude.masked_select(&horizon.ge(cut)).max().double_value(&[]),
+                magnitude
+                    .masked_select(&horizon.ge(cut))
+                    .max()
+                    .double_value(&[]),
                 0.0,
                 "head {name} rows above cutoff:{cut} received gradient"
             );
             assert!(
-                magnitude.masked_select(&horizon.lt(cut)).min().double_value(&[]) > 0.0,
+                magnitude
+                    .masked_select(&horizon.lt(cut))
+                    .min()
+                    .double_value(&[])
+                    > 0.0,
                 "head {name} rows at or below cutoff:{cut} received no gradient"
             );
         }
@@ -5499,7 +5795,10 @@ mod tests {
                 mode
             );
         }
-        assert_eq!("cutoff:32".parse::<HorizonLoss>().unwrap(), HorizonLoss::Cutoff(32));
+        assert_eq!(
+            "cutoff:32".parse::<HorizonLoss>().unwrap(),
+            HorizonLoss::Cutoff(32)
+        );
         for garbage in [
             "cutoff:0",
             "cutoff:-4",
@@ -5790,7 +6089,9 @@ mod tests {
                     .ws
                     .narrow(0, channel * per_channel + free, functions)
                     .fill_(0.0);
-                let _ = bias.narrow(0, channel * per_channel + free, functions).fill_(0.0);
+                let _ = bias
+                    .narrow(0, channel * per_channel + free, functions)
+                    .fill_(0.0);
             }
         });
         let batch = synthetic(&config, &[8, 8]);
@@ -5888,12 +6189,17 @@ mod tests {
                 .reshape([restricted])
                 .to_kind(Kind::Double)
         };
-        let steps = (Tensor::arange(restricted, (Kind::Double, Device::Cpu)) + 1.0).reshape([restricted]);
+        let steps =
+            (Tensor::arange(restricted, (Kind::Double, Device::Cpu)) + 1.0).reshape([restricted]);
         let cases = [
             // A term structure: signal-to-noise decaying hyperbolically over 24 bars. Bernstein
             // says a completely monotone decay is a positive mixture of exponentials, so the
             // geometric timescale grid should reach it closely.
-            ("hyperbolic term structure", (&steps / 24.0 + 1.0).reciprocal() * 0.8, 0.05),
+            (
+                "hyperbolic term structure",
+                (&steps / 24.0 + 1.0).reciprocal() * 0.8,
+                0.05,
+            ),
             // Per-horizon idiosyncrasy: one sign change per horizon.
             (
                 "per-horizon alternating",
@@ -5922,7 +6228,9 @@ mod tests {
             // emitting nothing at all.
             let span = relative(&basis.matmul(&coefficients), &target);
             let head = relative(&emit(&coefficients), &target);
-            println!("{name}: best relative L2 residual, span {span:.4}, through the head {head:.4}");
+            println!(
+                "{name}: best relative L2 residual, span {span:.4}, through the head {head:.4}"
+            );
             if bound < 0.5 {
                 assert!(
                     span < bound,
@@ -5951,7 +6259,8 @@ mod tests {
         let column = |index: i64| basis.narrow(1, index, 1).reshape([restricted]);
         for index in 0..functions {
             let values = column(index);
-            let difference = values.narrow(0, 1, restricted - 1) - values.narrow(0, 0, restricted - 1);
+            let difference =
+                values.narrow(0, 1, restricted - 1) - values.narrow(0, 0, restricted - 1);
             assert_eq!(values.gt(0.0).all().int64_value(&[]), 1);
             assert_eq!(difference.lt(0.0).all().int64_value(&[]), 1);
         }
@@ -5960,7 +6269,10 @@ mod tests {
         assert!((timescales[0] - free as f64).abs() < 1e-9);
         assert!((timescales[functions as usize - 1] - config.pred_len as f64).abs() < 1e-9);
         for pair in timescales.windows(2) {
-            assert!(pair[1] > pair[0], "the timescale grid must be strictly increasing");
+            assert!(
+                pair[1] > pair[0],
+                "the timescale grid must be strictly increasing"
+            );
         }
     }
 
@@ -6101,7 +6413,11 @@ mod tests {
             let gradient = parameter.grad();
             assert!(gradient.defined(), "missing gradient: {name}");
             assert_eq!(parameter.kind(), Kind::Float, "master dtype: {name}");
-            assert_eq!(gradient.isfinite().all().int64_value(&[]), 1, "nonfinite gradient: {name}");
+            assert_eq!(
+                gradient.isfinite().all().int64_value(&[]),
+                1,
+                "nonfinite gradient: {name}"
+            );
             assert!(
                 gradient.abs().sum(Kind::Float).double_value(&[]) > 0.0,
                 "a branch received no gradient: {name}"
@@ -6162,8 +6478,7 @@ mod tests {
             post.copy_(&Tensor::from_slice(&[0.8_f32, 1.3]));
             x0_lambda.copy_(&Tensor::from_slice(&[0.25_f32]));
             for weight in [&mut block.output.ws, &mut block.second.ws] {
-                let noise =
-                    Tensor::randn(weight.size(), (Kind::Float, Device::Cpu)) * 0.05;
+                let noise = Tensor::randn(weight.size(), (Kind::Float, Device::Cpu)) * 0.05;
                 weight.copy_(&noise);
             }
         });
@@ -6224,7 +6539,11 @@ mod tests {
         // Rotation is not the identity: the kernel must actually rotate, or the test above
         // would pass on a pair of untouched projections.
         assert!(
-            (&reference[0] - per_head(&parts[0])).abs().max().double_value(&[]) > 0.0,
+            (&reference[0] - per_head(&parts[0]))
+                .abs()
+                .max()
+                .double_value(&[])
+                > 0.0,
             "the rotary rows left the query unchanged"
         );
         let attended = Tensor::scaled_dot_product_attention(
@@ -6253,7 +6572,10 @@ mod tests {
         // The SOURCE layer publishes exactly its own value, and mixes nothing into it.
         assert!(block.value_lambda.is_none(), "layer 0 owns no lambda");
         assert_eq!(
-            (published.expect("layer 0 publishes its value").transpose(1, 2) - &fused[2])
+            (published
+                .expect("layer 0 publishes its value")
+                .transpose(1, 2)
+                - &fused[2])
                 .abs()
                 .max()
                 .double_value(&[]),
@@ -6306,11 +6628,12 @@ mod tests {
             .reshape([rows, origins, patch, CHANNELS])
             - per_bar(&stats.log_close))
             * &inv_sigma;
-        let auxiliaries = batch
-            .aux
-            .narrow(1, 0, context)
-            .reshape([rows, origins, patch, aux_channels])
-            * (&model.sigma_scale * inv_sigma + &model.unit_scale);
+        let auxiliaries =
+            batch
+                .aux
+                .narrow(1, 0, context)
+                .reshape([rows, origins, patch, aux_channels])
+                * (&model.sigma_scale * inv_sigma + &model.unit_scale);
         let expected = Tensor::cat(&[prices, auxiliaries], 3)
             .reshape([rows, origins, patch * (CHANNELS + aux_channels)])
             .to_kind(Kind::BFloat16);
@@ -6417,8 +6740,8 @@ mod tests {
         let packed_rows: [f64; 8] = [3.0, 4.0, 1.0, 0.0, -2.0, 0.0, 0.5, 0.5];
         let flat: Vec<f32> = packed_rows.iter().map(|&value| value as f32).collect();
         let packed = Tensor::from_slice(&flat).reshape([1, 1, 2 * width]);
-        let normed = rms_norm(&packed.reshape([1, 1, 2 * heads, head_dim]))
-            .reshape([1, 1, 2 * width]);
+        let normed =
+            rms_norm(&packed.reshape([1, 1, 2 * heads, head_dim])).reshape([1, 1, 2 * width]);
         for head in 0..4_i64 {
             let pair = [
                 packed_rows[(head * head_dim) as usize],
@@ -6463,16 +6786,21 @@ mod tests {
         );
         let projection = Tensor::randn([1, length, 2 * width], (Kind::Float, Device::Cpu));
         let norm_then_rotate = fused_rope(
-            &rms_norm(&projection.reshape([1, length, 2 * heads, head_dim]))
-                .reshape([1, length, 2 * width]),
+            &rms_norm(&projection.reshape([1, length, 2 * heads, head_dim])).reshape([
+                1,
+                length,
+                2 * width,
+            ]),
             &cosine,
             &sine,
             heads,
         );
-        let rotate_then_norm = rms_norm(
-            &fused_rope(&projection, &cosine, &sine, heads)
-                .reshape([1, length, 2 * heads, head_dim]),
-        )
+        let rotate_then_norm = rms_norm(&fused_rope(&projection, &cosine, &sine, heads).reshape([
+            1,
+            length,
+            2 * heads,
+            head_dim,
+        ]))
         .reshape([1, length, 2, heads, head_dim]);
         // RoPE preserves each head's norm, so in exact arithmetic the two orders agree; the
         // point of the assertion is that they agree to fp32 rounding and NOT further, which is
@@ -6554,7 +6882,9 @@ mod tests {
         assert!(scalars
             .iter()
             .any(|(label, _)| label == "residual lambda L7 ffn"));
-        assert!(scalars.iter().any(|(label, _)| label == "post lambda L3 attn"));
+        assert!(scalars
+            .iter()
+            .any(|(label, _)| label == "post lambda L3 attn"));
         assert!(scalars.iter().any(|(label, _)| label == "x0 lambda L0"));
         // What the identity map returns: `x0 = rms_norm(embed)` through the final `rms_norm`.
         let x0 = rms_norm(&linear(&model.tokens(&batch, &stats), &model.patch));
@@ -6691,7 +7021,9 @@ mod tests {
             "one x0 series per layer must disappear"
         );
         assert!(
-            !none_labels.iter().any(|label| label.starts_with("x0 lambda"))
+            !none_labels
+                .iter()
+                .any(|label| label.starts_with("x0 lambda"))
                 && learned_labels
                     .iter()
                     .filter(|label| label.starts_with("x0 lambda"))
@@ -6719,7 +7051,10 @@ mod tests {
             "a zero backbone would make the comparison vacuous"
         );
         assert_eq!(
-            (&learned_output - &none_output).abs().max().double_value(&[]),
+            (&learned_output - &none_output)
+                .abs()
+                .max()
+                .double_value(&[]),
             0.0,
             "at `λ0 = 0` the two modes must agree bit for bit: the disabled path has to be the \
              same model with the shortcut removed, not a different one"
@@ -7034,10 +7369,8 @@ mod tests {
         let input = (Tensor::randn([rows, length, width], (Kind::Float, Device::Cpu)) * 0.5)
             .to_kind(Kind::BFloat16)
             .set_requires_grad(true);
-        let first = (Tensor::randn(
-            [rows, length, heads, head_dim],
-            (Kind::Float, Device::Cpu),
-        ) * 0.5)
+        let first = (Tensor::randn([rows, length, heads, head_dim], (Kind::Float, Device::Cpu))
+            * 0.5)
             .to_kind(Kind::BFloat16);
         let x0 = (Tensor::randn([rows, length, width], (Kind::Float, Device::Cpu)) * 0.5)
             .to_kind(Kind::BFloat16);
@@ -7093,8 +7426,7 @@ mod tests {
         };
         let own_value = {
             let projection = linear(&rms_norm(&input), &block.qkv);
-            projection
-                .split_with_sizes([2 * width, width], -1)[1]
+            projection.split_with_sizes([2 * width, width], -1)[1]
                 .reshape([rows, length, heads, head_dim])
         };
         assert!(
@@ -7225,9 +7557,8 @@ mod tests {
                 .backbone(&batch, &stats, false, false)
                 .to_kind(Kind::Float)
         };
-        let moved = |before: &Tensor, after: &Tensor| {
-            (before - after).abs().max().double_value(&[]) > 0.0
-        };
+        let moved =
+            |before: &Tensor, after: &Tensor| (before - after).abs().max().double_value(&[]) > 0.0;
         set_lambdas(1.0);
         let reference = output();
         assert!(reference.abs().max().double_value(&[]) > 0.0);
@@ -7263,57 +7594,116 @@ mod tests {
     }
 
     fn jepa_gpu_config(mode: JepaMode) -> ModelConfig {
-        ModelConfig { seq_len: 256, pred_len: 16, min_history: 32, jepa_mode: mode, future_calendar: false, ..small_config() }
+        ModelConfig {
+            seq_len: 256,
+            pred_len: 16,
+            min_history: 32,
+            jepa_mode: mode,
+            future_calendar: false,
+            ..small_config()
+        }
     }
 
     #[test]
     fn cuda_jepa_future_observations_cannot_change_earlier_states_or_predictions() {
         let _rng = crate::torch::test_rng::exclusive();
-        if std::env::var("TIMEXER_SEGMENT_GPU_TEST").as_deref() != Ok("1") { return; }
+        if std::env::var("TIMEXER_SEGMENT_GPU_TEST").as_deref() != Ok("1") {
+            return;
+        }
         assert!(tch::Cuda::is_available());
         crate::torch::cuda::cfg::configure_cuda();
         let _backward = crate::torch::cuda::cfg::disable_autograd_multithreading();
-        for mode in [JepaMode::Anchored, JepaMode::AnchoredProjected, JepaMode::AnchoredProjectedSmall, JepaMode::AnchoredConditional] {
+        for mode in [
+            JepaMode::Anchored,
+            JepaMode::AnchoredProjected,
+            JepaMode::AnchoredProjectedSmall,
+            JepaMode::AnchoredConditional,
+        ] {
             let config = jepa_gpu_config(mode);
             let store = nn::VarStore::new(Device::Cuda(0));
             let model = CausalPatchModel::new(&store.root(), &config);
             live_head(&model);
             let batch = synthetic(&config, &[16, 16, 16, 16]).to_device(Device::Cuda(0));
             let before = tch::no_grad(|| model.representation_views(&batch, false));
-            let forecast_before = tch::no_grad(|| model.forward(&batch, &model.statistics(&batch), false, false).0);
+            let forecast_before = tch::no_grad(|| {
+                model
+                    .forward(&batch, &model.statistics(&batch), false, false)
+                    .0
+            });
             let _ = batch.log_prices.narrow(1, 48, 32).fill_(2.);
             let _ = batch.aux.narrow(1, 48, 32).fill_(-7.);
             let after = tch::no_grad(|| model.representation_views(&batch, false));
-            let forecast_after = tch::no_grad(|| model.forward(&batch, &model.statistics(&batch), false, false).0);
-            assert!(forecast_before.narrow(1, 0, 3).equal(&forecast_after.narrow(1, 0, 3)),
-                "forecast read future observed-calendar features despite future_calendar=false");
-            assert!(before.observation.narrow(1, 0, 3).equal(&after.observation.narrow(1, 0, 3)));
-            assert!(before.target.narrow(1, 0, 3).equal(&after.target.narrow(1, 0, 3)));
-            assert!(before.state.narrow(1, 0, 3).equal(&after.state.narrow(1, 0, 3)));
+            let forecast_after = tch::no_grad(|| {
+                model
+                    .forward(&batch, &model.statistics(&batch), false, false)
+                    .0
+            });
+            assert!(
+                forecast_before
+                    .narrow(1, 0, 3)
+                    .equal(&forecast_after.narrow(1, 0, 3)),
+                "forecast read future observed-calendar features despite future_calendar=false"
+            );
+            assert!(before
+                .observation
+                .narrow(1, 0, 3)
+                .equal(&after.observation.narrow(1, 0, 3)));
+            assert!(before
+                .target
+                .narrow(1, 0, 3)
+                .equal(&after.target.narrow(1, 0, 3)));
+            assert!(before
+                .state
+                .narrow(1, 0, 3)
+                .equal(&after.state.narrow(1, 0, 3)));
             if let (Some(a), Some(b)) = (&before.conditional, &after.conditional) {
-                assert!(a.values.narrow(1, 1, 1).narrow(2, 0, 1)
-                    .equal(&b.values.narrow(1, 1, 1).narrow(2, 0, 1)),
-                    "h=16 target read beyond its endpoint at bar47");
-                assert!(!a.values.narrow(1, 1, 1).narrow(2, 1, 1)
-                    .equal(&b.values.narrow(1, 1, 1).narrow(2, 1, 1)),
-                    "h=32 fixed target ignored its intervened endpoint at bar63");
+                assert!(
+                    a.values
+                        .narrow(1, 1, 1)
+                        .narrow(2, 0, 1)
+                        .equal(&b.values.narrow(1, 1, 1).narrow(2, 0, 1)),
+                    "h=16 target read beyond its endpoint at bar47"
+                );
+                assert!(
+                    !a.values
+                        .narrow(1, 1, 1)
+                        .narrow(2, 1, 1)
+                        .equal(&b.values.narrow(1, 1, 1).narrow(2, 1, 1)),
+                    "h=32 fixed target ignored its intervened endpoint at bar63"
+                );
             }
-            assert!(before.prediction.unwrap().narrow(1, 0, 3).equal(&after.prediction.unwrap().narrow(1, 0, 3)));
-            assert!(!before.observation.narrow(1, 3, 2).equal(&after.observation.narrow(1, 3, 2)));
-            assert!(!before.target.narrow(1, 3, 2).equal(&after.target.narrow(1, 3, 2)));
+            assert!(before
+                .prediction
+                .unwrap()
+                .narrow(1, 0, 3)
+                .equal(&after.prediction.unwrap().narrow(1, 0, 3)));
+            assert!(!before
+                .observation
+                .narrow(1, 3, 2)
+                .equal(&after.observation.narrow(1, 3, 2)));
+            assert!(!before
+                .target
+                .narrow(1, 3, 2)
+                .equal(&after.target.narrow(1, 3, 2)));
             // Recomputing a suffix must also forget old normalization information.
             let recent = tch::no_grad(|| model.representation_state_at_recent(&batch, 10, 3));
             let _ = batch.log_prices.narrow(1, 0, 64).fill_(9.);
             let _ = batch.aux.narrow(1, 0, 64).fill_(4.);
             let changed = tch::no_grad(|| model.representation_state_at_recent(&batch, 10, 3));
-            assert!(recent.equal(&changed), "recent path inherited old prices or normalization");
+            assert!(
+                recent.equal(&changed),
+                "recent path inherited old prices or normalization"
+            );
         }
     }
 
     #[test]
-    fn cuda_jepa_conditional_targets_use_source_statistics_complete_intervals_and_no_target_gradient() {
+    fn cuda_jepa_conditional_targets_use_source_statistics_complete_intervals_and_no_target_gradient(
+    ) {
         let _rng = crate::torch::test_rng::exclusive();
-        if std::env::var("TIMEXER_SEGMENT_GPU_TEST").as_deref() != Ok("1") { return; }
+        if std::env::var("TIMEXER_SEGMENT_GPU_TEST").as_deref() != Ok("1") {
+            return;
+        }
         assert!(tch::Cuda::is_available());
         crate::torch::cuda::cfg::configure_cuda();
         let _backward = crate::torch::cuda::cfg::disable_autograd_multithreading();
@@ -7329,7 +7719,10 @@ mod tests {
         let stats = model.statistics(&batch);
         let views = model.representation_views(&batch, false);
         let targets = views.conditional.as_ref().unwrap();
-        assert!(!targets.values.requires_grad(), "fixed labels acquired a learned target path");
+        assert!(
+            !targets.values.requires_grad(),
+            "fixed labels acquired a learned target path"
+        );
         assert_eq!(views.prediction.as_ref().unwrap().kind(), Kind::BFloat16);
         let frequencies = [0.25, 0.5, 1., 2., 4.];
         let is_valid = |row: i64, bar: i64| match row {
@@ -7344,11 +7737,15 @@ mod tests {
             for source in 0..4 {
                 let t = (source + 1) * config.patch_len - 1;
                 let source_valid = (source * config.patch_len..=t).all(|bar| is_valid(row, bar))
-                    && (0..=t).filter(|&bar| is_valid(row, bar)).count() as i64 >= config.min_history;
+                    && (0..=t).filter(|&bar| is_valid(row, bar)).count() as i64
+                        >= config.min_history;
                 for (k, h) in config.jepa_horizons().into_iter().enumerate() {
-                    let expected_mask = source_valid && (t + 1..=t + h).all(|bar| is_valid(row, bar));
-                    assert_eq!(targets.mask.double_value(&[row, source, k as i64]),
-                        if expected_mask { 1. } else { 0. });
+                    let expected_mask =
+                        source_valid && (t + 1..=t + h).all(|bar| is_valid(row, bar));
+                    assert_eq!(
+                        targets.mask.double_value(&[row, source, k as i64]),
+                        if expected_mask { 1. } else { 0. }
+                    );
                     let y = (batch.log_prices.double_value(&[row, t + h, 3])
                         - stats.log_close.double_value(&[row, source])
                         - stats.beta.double_value(&[row, source])
@@ -7359,8 +7756,17 @@ mod tests {
                     for (f, w) in frequencies.into_iter().enumerate() {
                         let (sin, cos) = (w * y).sin_cos();
                         for (coordinate, expected) in [(2 * f, cos), (2 * f + 1, sin)] {
-                            assert!((targets.values.double_value(&[row, source, k as i64, coordinate as i64])
-                                - expected).abs() < 2e-5, "conditional target used future normalization or wrong endpoint");
+                            assert!(
+                                (targets.values.double_value(&[
+                                    row,
+                                    source,
+                                    k as i64,
+                                    coordinate as i64
+                                ]) - expected)
+                                    .abs()
+                                    < 2e-5,
+                                "conditional target used future normalization or wrong endpoint"
+                            );
                         }
                         baseline += (cos - 1.).powi(2) + sin.powi(2);
                     }
@@ -7371,40 +7777,66 @@ mod tests {
                 }
             }
         }
-        let (objective, diagnostics) = model.jepa.as_ref().unwrap()
+        let (objective, diagnostics) = model
+            .jepa
+            .as_ref()
+            .unwrap()
             .conditional_objective(&config, &views, targets);
         assert_eq!(diagnostics.double_value(&[4]), pairs);
-        assert!((diagnostics.double_value(&[3]) - persistence / pairs).abs() < 2e-6,
-            "persistence must be psi(0), not a learned/previous observation");
+        assert!(
+            (diagnostics.double_value(&[3]) - persistence / pairs).abs() < 2e-6,
+            "persistence must be psi(0), not a learned/previous observation"
+        );
         let prediction = views.prediction.as_ref().unwrap();
         let gradients = Tensor::run_backward(
-            &[&objective], &[&views.observation, prediction, &model.patch.ws], false, false,
+            &[&objective],
+            &[&views.observation, prediction, &model.patch.ws],
+            false,
+            false,
         );
-        assert_eq!(gradients[0].narrow(1, 4, 12).abs().max().double_value(&[]), 0.,
-            "conditional loss sent gradients to future observation targets");
-        assert!(gradients[2].abs().sum(Kind::Float).double_value(&[]) > 0.,
-            "source encoder did not receive conditional prediction gradients");
-        assert_eq!((&gradients[1] * targets.mask.eq(0.).unsqueeze(-1))
-            .abs().max().double_value(&[]), 0., "invalid intervals trained the predictor");
+        assert_eq!(
+            gradients[0].narrow(1, 4, 12).abs().max().double_value(&[]),
+            0.,
+            "conditional loss sent gradients to future observation targets"
+        );
+        assert!(
+            gradients[2].abs().sum(Kind::Float).double_value(&[]) > 0.,
+            "source encoder did not receive conditional prediction gradients"
+        );
+        assert_eq!(
+            (&gradients[1] * targets.mask.eq(0.).unsqueeze(-1))
+                .abs()
+                .max()
+                .double_value(&[]),
+            0.,
+            "invalid intervals trained the predictor"
+        );
         tch::no_grad(|| {
             for (_, mut parameter) in store.variables() {
                 let _ = parameter.fill_(0.);
             }
         });
         let after = model.representation_views(&batch, false);
-        assert!(targets.values.equal(&after.conditional.unwrap().values),
-            "parameter intervention moved fixed conditional labels");
+        assert!(
+            targets.values.equal(&after.conditional.unwrap().values),
+            "parameter intervention moved fixed conditional labels"
+        );
     }
 
     #[test]
     fn cuda_jepa_optional_heads_preserve_off_initialization_and_forecasting() {
         let _rng = crate::torch::test_rng::exclusive();
-        if std::env::var("TIMEXER_SEGMENT_GPU_TEST").as_deref() != Ok("1") { return; }
+        if std::env::var("TIMEXER_SEGMENT_GPU_TEST").as_deref() != Ok("1") {
+            return;
+        }
         assert!(tch::Cuda::is_available());
         crate::torch::cuda::cfg::configure_cuda();
         for mode in [JepaMode::Anchored, JepaMode::AnchoredConditional] {
             let off = jepa_gpu_config(JepaMode::Off);
-            let enabled = ModelConfig { jepa_mode: mode, ..off.clone() };
+            let enabled = ModelConfig {
+                jepa_mode: mode,
+                ..off.clone()
+            };
             tch::manual_seed(941);
             let off_store = nn::VarStore::new(Device::Cuda(0));
             let off_model = CausalPatchModel::new(&off_store.root(), &off);
@@ -7416,13 +7848,17 @@ mod tests {
                 let a = off_model.representation_views(&batch, false);
                 let b = enabled_model.representation_views(&batch, false);
                 assert!(a.observation.equal(&b.observation));
-                assert!(a.state.equal(&b.state), "optional initialization perturbed shared weights");
+                assert!(
+                    a.state.equal(&b.state),
+                    "optional initialization perturbed shared weights"
+                );
                 let stats = off_model.statistics(&batch);
                 let direct = off_model.forward(&batch, &stats, false, false);
                 assert!(direct.0.equal(&off_model.head(&batch, &a.state, false).0));
                 let (targets, mask) = off_model.targets(&batch, &stats, false);
                 let old = off_model.losses(&direct, &stats, &targets, &mask);
-                let new = super::super::compute::Engine::forward_loss(&off_model, &batch, false, None);
+                let new =
+                    super::super::compute::Engine::forward_loss(&off_model, &batch, false, None);
                 assert!(old.nll.equal(&new.nll));
                 assert!(old.mse.equal(&new.mse));
                 assert!(old.objective.equal(&new.objective));
@@ -7434,7 +7870,9 @@ mod tests {
     #[test]
     fn cuda_jepa_target_projector_never_enters_forecasting_or_changes_shared_initialization() {
         let _rng = crate::torch::test_rng::exclusive();
-        if std::env::var("TIMEXER_SEGMENT_GPU_TEST").as_deref() != Ok("1") { return; }
+        if std::env::var("TIMEXER_SEGMENT_GPU_TEST").as_deref() != Ok("1") {
+            return;
+        }
         assert!(tch::Cuda::is_available());
         crate::torch::cuda::cfg::configure_cuda();
         let config = jepa_gpu_config(JepaMode::Anchored);
@@ -7443,23 +7881,33 @@ mod tests {
         let baseline = CausalPatchModel::new(&baseline_store.root(), &config);
         tch::manual_seed(941);
         let projected_store = nn::VarStore::new(Device::Cuda(0));
-        let projected = CausalPatchModel::new(&projected_store.root(), &ModelConfig {
-            jepa_mode: JepaMode::AnchoredProjected,
-            ..config.clone()
-        });
+        let projected = CausalPatchModel::new(
+            &projected_store.root(),
+            &ModelConfig {
+                jepa_mode: JepaMode::AnchoredProjected,
+                ..config.clone()
+            },
+        );
         let batch = synthetic(&config, &[16, 16]).to_device(Device::Cuda(0));
         tch::no_grad(|| {
             let original = baseline.representation_views(&batch, false);
             let before = projected.representation_views(&batch, false);
             assert!(original.observation.equal(&before.observation));
             assert!(original.state.equal(&before.state));
-            assert!(original.prediction.unwrap().equal(before.prediction.as_ref().unwrap()),
-                "projector initialization perturbed the existing predictor");
+            assert!(
+                original
+                    .prediction
+                    .unwrap()
+                    .equal(before.prediction.as_ref().unwrap()),
+                "projector initialization perturbed the existing predictor"
+            );
             live_head(&projected);
             let before = projected.representation_views(&batch, false);
             let stats = projected.statistics(&batch);
             let forecast = projected.forward(&batch, &stats, false, false);
-            assert!(forecast.0.equal(&projected.head(&batch, &before.state, false).0));
+            assert!(forecast
+                .0
+                .equal(&projected.head(&batch, &before.state, false).0));
             let recent = projected.representation_state_at_recent(&batch, 10, 3);
             for (name, mut parameter) in projected_store.variables() {
                 if name.starts_with("jepa.target_") {
@@ -7467,12 +7915,22 @@ mod tests {
                 }
             }
             let after = projected.representation_views(&batch, false);
-            assert!(!before.target.equal(&after.target), "projector intervention was ineffective");
+            assert!(
+                !before.target.equal(&after.target),
+                "projector intervention was ineffective"
+            );
             assert!(before.observation.equal(&after.observation));
-            assert!(before.state.equal(&after.state), "auxiliary q entered the training trunk");
+            assert!(
+                before.state.equal(&after.state),
+                "auxiliary q entered the training trunk"
+            );
             assert!(before.prediction.unwrap().equal(&after.prediction.unwrap()));
-            assert!(forecast.0.equal(&projected.forward(&batch, &stats, false, false).0),
-                "auxiliary q entered the inference trunk");
+            assert!(
+                forecast
+                    .0
+                    .equal(&projected.forward(&batch, &stats, false, false).0),
+                "auxiliary q entered the inference trunk"
+            );
             assert!(recent.equal(&projected.representation_state_at_recent(&batch, 10, 3)));
         });
     }
@@ -7480,11 +7938,17 @@ mod tests {
     #[test]
     fn cuda_jepa_latent_only_forecast_trains_readout_without_anchor_gradient() {
         let _rng = crate::torch::test_rng::exclusive();
-        if std::env::var("TIMEXER_SEGMENT_GPU_TEST").as_deref() != Ok("1") { return; }
+        if std::env::var("TIMEXER_SEGMENT_GPU_TEST").as_deref() != Ok("1") {
+            return;
+        }
         assert!(tch::Cuda::is_available());
         crate::torch::cuda::cfg::configure_cuda();
         let _backward = crate::torch::cuda::cfg::disable_autograd_multithreading();
-        for mode in [JepaMode::LatentOne, JepaMode::AnchoredNoSigreg, JepaMode::AnchoredConditional] {
+        for mode in [
+            JepaMode::LatentOne,
+            JepaMode::AnchoredNoSigreg,
+            JepaMode::AnchoredConditional,
+        ] {
             let config = jepa_gpu_config(mode);
             let store = nn::VarStore::new(Device::Cuda(0));
             let model = CausalPatchModel::new(&store.root(), &config);
@@ -7492,10 +7956,22 @@ mod tests {
             let batch = synthetic(&config, &[16, 16]).to_device(Device::Cuda(0));
             let losses = super::super::compute::Engine::forward_loss(&model, &batch, true, None);
             losses.nll.backward();
-            assert!(model.head_output.ws.grad().abs().sum(Kind::Float).double_value(&[]) > 0.);
+            assert!(
+                model
+                    .head_output
+                    .ws
+                    .grad()
+                    .abs()
+                    .sum(Kind::Float)
+                    .double_value(&[])
+                    > 0.
+            );
             let gradient = model.patch.ws.grad();
             if mode.detached_forecast() {
-                assert!(!gradient.defined(), "forecast anchor reached the latent-only encoder");
+                assert!(
+                    !gradient.defined(),
+                    "forecast anchor reached the latent-only encoder"
+                );
             } else {
                 assert!(gradient.abs().sum(Kind::Float).double_value(&[]) > 0.);
             }
@@ -7506,16 +7982,29 @@ mod tests {
     fn cuda_jepa_capture_keeps_metrics_uncontaminated_and_outside_optimizer_pool() {
         use super::super::compute::{Engine, OptimizerKind, RecipeKnobs, CAPTURE_AFTER_STEPS};
         let _rng = crate::torch::test_rng::exclusive();
-        if std::env::var("TIMEXER_SEGMENT_GPU_TEST").as_deref() != Ok("1") { return; }
+        if std::env::var("TIMEXER_SEGMENT_GPU_TEST").as_deref() != Ok("1") {
+            return;
+        }
         assert!(tch::Cuda::is_available());
         crate::torch::cuda::cfg::configure_cuda();
         let _backward = crate::torch::cuda::cfg::disable_autograd_multithreading();
-        for mode in [JepaMode::AnchoredReconstruct, JepaMode::AnchoredProjectedSmall, JepaMode::AnchoredConditional] {
+        for mode in [
+            JepaMode::AnchoredReconstruct,
+            JepaMode::AnchoredProjectedSmall,
+            JepaMode::AnchoredConditional,
+        ] {
             let config = jepa_gpu_config(mode);
             let store = nn::VarStore::new(Device::Cuda(0));
             let model = CausalPatchModel::new(&store.root(), &config);
             let batch = synthetic(&config, &[16, 16, 16, 16]).to_device(Device::Cuda(0));
-            let mut engine = Engine::new(&store, 0.001, RecipeKnobs::reference(config.x0_lambdas), false, OptimizerKind::PolarExpress).unwrap();
+            let mut engine = Engine::new(
+                &store,
+                0.001,
+                RecipeKnobs::reference(config.x0_lambdas),
+                false,
+                OptimizerKind::PolarExpress,
+            )
+            .unwrap();
             for _ in 0..CAPTURE_AFTER_STEPS {
                 let reference = tch::no_grad(|| {
                     let stats = model.statistics(&batch);
@@ -7524,7 +8013,10 @@ mod tests {
                     model.losses(&head, &stats, &targets, &mask)
                 });
                 let trained = engine.step(&model, &batch).unwrap();
-                assert!(trained.nll.equal(&reference.nll), "an auxiliary term contaminated forecast NLL");
+                assert!(
+                    trained.nll.equal(&reference.nll),
+                    "an auxiliary term contaminated forecast NLL"
+                );
                 assert!(trained.mse.equal(&reference.mse));
                 assert!(trained.objective.double_value(&[]) > trained.nll.double_value(&[]));
             }
@@ -7542,19 +8034,340 @@ mod tests {
                 let replay = engine.step(&model, &batch).unwrap();
                 let persistence = replay.jepa.as_ref().unwrap().double_value(&[3]);
                 assert!((persistence - reference.jepa.unwrap().double_value(&[3])).abs() < 1e-6);
-                assert!((persistence - diagnostic.double_value(&[3])).abs() > 1e-5,
-                    "captured CF targets did not follow the resident batch intervention");
+                assert!(
+                    (persistence - diagnostic.double_value(&[3])).abs() > 1e-5,
+                    "captured CF targets did not follow the resident batch intervention"
+                );
             } else if mode == JepaMode::AnchoredReconstruct {
                 assert!(diagnostic.double_value(&[2]) > 0.);
             } else {
                 assert!(diagnostic.double_value(&[1]) > 0.);
             }
-            for _ in 0..3 { engine.step(&model, &batch).unwrap(); }
+            for _ in 0..3 {
+                engine.step(&model, &batch).unwrap();
+            }
             assert!(captured.nll.equal(&saved.nll));
             assert!(captured.mse.equal(&saved.mse));
             assert!(captured.objective.equal(&saved.objective));
-            assert!(captured.jepa.unwrap().equal(&saved.jepa.unwrap()),
-                "optimizer/next replay overwrote a retained diagnostic tensor");
+            assert!(
+                captured.jepa.unwrap().equal(&saved.jepa.unwrap()),
+                "optimizer/next replay overwrote a retained diagnostic tensor"
+            );
         }
+    }
+
+    #[test]
+    fn temporal_moments_reject_noncausal_or_incompatible_geometry_and_invalid_weights() {
+        let enabled = ModelConfig {
+            temporal_moment_weight: 0.125,
+            future_calendar: false,
+            ..ModelConfig::default()
+        };
+        enabled.validate().unwrap();
+        for invalid in [
+            ModelConfig {
+                temporal_moment_weight: f64::NAN,
+                ..enabled.clone()
+            },
+            ModelConfig {
+                decision_mse_weight: -0.1,
+                ..enabled.clone()
+            },
+            ModelConfig {
+                decision_mse_weight: f64::INFINITY,
+                ..enabled.clone()
+            },
+            ModelConfig {
+                future_calendar: true,
+                ..enabled.clone()
+            },
+            ModelConfig {
+                jepa_mode: JepaMode::Anchored,
+                ..enabled.clone()
+            },
+            ModelConfig {
+                target_basis: TargetBasis::Haar,
+                ..enabled.clone()
+            },
+            ModelConfig {
+                horizon_mean: HorizonMean::Increment { scales: 8 },
+                ..enabled.clone()
+            },
+            ModelConfig {
+                pred_len: 128,
+                ..enabled.clone()
+            },
+        ] {
+            assert!(invalid.validate().is_err());
+        }
+        let control = ModelConfig {
+            temporal_moment_weight: 0.,
+            decision_mse_weight: 0.125,
+            ..enabled
+        };
+        assert!(control.temporal_moments_enabled());
+        control.validate().unwrap();
+        let roundtrip: ModelConfig =
+            serde_json::from_str(&serde_json::to_string(&control).unwrap()).unwrap();
+        assert_eq!(
+            roundtrip, control,
+            "authenticated model contract lost the MSE treatment"
+        );
+    }
+
+    #[test]
+    fn temporal_moments_preserve_shared_parameters_and_torch_random_stream() {
+        let _rng = crate::torch::test_rng::exclusive();
+        let config = ModelConfig {
+            pred_len: 192,
+            future_calendar: false,
+            ..small_config()
+        };
+        tch::manual_seed(849);
+        let baseline_store = nn::VarStore::new(Device::Cpu);
+        let baseline = CausalPatchModel::new(&baseline_store.root(), &config);
+        let baseline_draw = Tensor::randn([8], (Kind::Float, Device::Cpu));
+        tch::manual_seed(849);
+        let enabled_store = nn::VarStore::new(Device::Cpu);
+        let enabled = CausalPatchModel::new(
+            &enabled_store.root(),
+            &ModelConfig {
+                temporal_moment_weight: 0.125,
+                ..config
+            },
+        );
+        let enabled_draw = Tensor::randn([8], (Kind::Float, Device::Cpu));
+        assert!(
+            baseline_draw.equal(&enabled_draw),
+            "fixed instruments consumed Torch RNG"
+        );
+        let before = baseline_store.variables();
+        let after = enabled_store.variables();
+        assert_eq!(
+            before.len(),
+            after.len(),
+            "auxiliary objective added learned parameters"
+        );
+        for (name, parameter) in before {
+            assert!(
+                parameter.equal(&after[&name]),
+                "initialization changed for {name}"
+            );
+        }
+        assert!(baseline.temporal_moments.is_none());
+        assert!(enabled.temporal_moments.is_some());
+    }
+
+    #[test]
+    fn selected_temporal_close_matches_dense_decoder_mse_and_preserves_observable_mask() {
+        use super::super::temporal_moments::HORIZONS;
+        let _rng = crate::torch::test_rng::exclusive();
+        tch::manual_seed(442);
+        let config = ModelConfig {
+            pred_len: 192,
+            future_calendar: false,
+            decision_mse_weight: 0.125,
+            ..small_config()
+        };
+        let store = nn::VarStore::new(Device::Cpu);
+        let model = CausalPatchModel::new(&store.root(), &config);
+        let geometry = model.temporal_moments.as_ref().unwrap();
+        let batch = synthetic(&config, &[192, 64, 8]);
+        // An interior hole is NOT a new complete-interval exclusion for close-score labels.
+        let _ = batch.valid.narrow(0, 0, 1).narrow(1, 65, 1).fill_(0.);
+        let stats = model.statistics(&batch);
+        let (targets, mask) = model.targets(&batch, &stats, false);
+        let values = Tensor::randn(
+            [3, config.origins(), OUTPUTS_PER_BAR, config.pred_len],
+            (Kind::Float, Device::Cpu),
+        )
+        .to_kind(Kind::BFloat16)
+        .set_requires_grad(true);
+        let head = Head(values.shallow_clone());
+        let selected = geometry.select(&model, &head, &targets, &mask);
+        let index = Tensor::from_slice(&HORIZONS.map(|h| h - 1));
+        let scale = Tensor::from_slice(&HORIZONS.map(|h| (h as f32).sqrt()));
+        let decoded = model
+            .decode(&model.output(&head), &stats)
+            .select(2, 3)
+            .index_select(-1, &index)
+            / scale;
+        assert!(
+            (&decoded - &selected.prediction)
+                .abs()
+                .max()
+                .double_value(&[])
+                < 2e-6
+        );
+        assert!(selected
+            .mask
+            .equal(&mask.select(2, 0).index_select(-1, &index)));
+        assert_eq!(selected.mask.double_value(&[0, 3, 1]), 1.);
+        let dimensions = [0i64, 1];
+        let direct = (((&selected.target - decoded).square() * &selected.mask).sum_dim_intlist(
+            dimensions.as_slice(),
+            false,
+            Kind::Float,
+        ) / selected
+            .mask
+            .sum_dim_intlist(dimensions.as_slice(), false, Kind::Float)
+            .clamp_min(1.))
+        .mean(Kind::Float);
+        let output = geometry.objective(&selected, &geometry.instruments(&batch, &stats));
+        assert!((direct.double_value(&[]) - output.decision_mse.double_value(&[])).abs() < 2e-6);
+        output.decision_mse.backward();
+        let gradient = values.grad();
+        assert!(gradient.select(2, 0).abs().max().double_value(&[]) > 0.);
+        assert_eq!(
+            gradient
+                .narrow(2, 1, OUTPUTS_PER_BAR - 1)
+                .abs()
+                .max()
+                .double_value(&[]),
+            0.,
+            "direct close objective trained range, position or uncertainty coordinates"
+        );
+        assert_eq!(
+            gradient
+                .select(2, 0)
+                .select(-1, 1)
+                .abs()
+                .max()
+                .double_value(&[]),
+            0.,
+            "unselected horizon received an auxiliary gradient"
+        );
+    }
+
+    #[test]
+    fn temporal_instruments_do_not_read_later_prices_market_or_validity() {
+        let _rng = crate::torch::test_rng::exclusive();
+        tch::manual_seed(186);
+        let config = ModelConfig {
+            seq_len: 128,
+            pred_len: 192,
+            future_calendar: false,
+            ..small_config()
+        };
+        let store = nn::VarStore::new(Device::Cpu);
+        let model = CausalPatchModel::new(&store.root(), &config);
+        let geometry = TemporalMoments::new(&config, Device::Cpu);
+        let batch = synthetic(&config, &[192, 64]);
+        let before = geometry.instruments(&batch, &model.statistics(&batch));
+        let _ = batch.log_prices.narrow(1, 64, 256).fill_(2.);
+        let _ = batch.market_cum.narrow(1, 64, 256).fill_(-1.);
+        let _ = batch.valid.narrow(1, 64, 256).fill_(0.);
+        let after = geometry.instruments(&batch, &model.statistics(&batch));
+        assert!(
+            before.narrow(1, 0, 4).equal(&after.narrow(1, 0, 4)),
+            "causal summaries read beyond their source"
+        );
+        assert!(
+            !before.narrow(1, 4, 4).equal(&after.narrow(1, 4, 4)),
+            "instrument intervention never reached eligible later sources"
+        );
+        let energy = before
+            .square()
+            .sum_dim_intlist([-1i64].as_slice(), false, Kind::Float);
+        assert!(energy.max().double_value(&[]) <= 1.000001);
+        assert!(energy.min().double_value(&[]) >= 2. / 3. - 1e-6);
+    }
+
+    #[test]
+    fn cuda_temporal_moments_replay_follows_labels_and_retained_reports_survive_pool_reuse() {
+        use super::super::compute::{Engine, OptimizerKind, RecipeKnobs, CAPTURE_AFTER_STEPS};
+        let _rng = crate::torch::test_rng::exclusive();
+        if std::env::var("TIMEXER_SEGMENT_GPU_TEST").as_deref() != Ok("1") {
+            return;
+        }
+        assert!(tch::Cuda::is_available());
+        crate::torch::cuda::cfg::configure_cuda();
+        let _backward = crate::torch::cuda::cfg::disable_autograd_multithreading();
+        let config = ModelConfig {
+            pred_len: 192,
+            future_calendar: false,
+            temporal_moment_weight: 0.125,
+            decision_mse_weight: 0.125,
+            ..small_config()
+        };
+        let store = nn::VarStore::new(Device::Cuda(0));
+        let model = CausalPatchModel::new(&store.root(), &config);
+        let batch = synthetic(&config, &[192, 192, 128, 64]).to_device(Device::Cuda(0));
+        tch::no_grad(|| {
+            let full = Engine::forward_loss(&model, &batch, false, None);
+            let keep = Tensor::zeros(
+                [1, config.origins(), 1, config.pred_len],
+                (Kind::Float, Device::Cuda(0)),
+            );
+            let decimated = Engine::forward_loss(&model, &batch, false, Some(&keep));
+            assert_eq!(
+                decimated.nll.double_value(&[]),
+                0.,
+                "zero keep did not remove forecast supervision"
+            );
+            assert!(
+                full.moments
+                    .as_ref()
+                    .unwrap()
+                    .equal(decimated.moments.as_ref().unwrap()),
+                "forecast decimation altered the auxiliary's original close-score populations"
+            );
+        });
+        let mut engine = Engine::new(
+            &store,
+            0.001,
+            RecipeKnobs::reference(config.x0_lambdas),
+            false,
+            OptimizerKind::PolarExpress,
+        )
+        .unwrap();
+        engine.timed_step(&model, &batch).unwrap();
+        for _ in 1..CAPTURE_AFTER_STEPS {
+            engine.step(&model, &batch).unwrap();
+        }
+        let captured = engine.arm_step_graph(&model, &batch).unwrap();
+        assert!(engine.step_graph_captured());
+        let saved = captured.copied();
+        let _ = batch
+            .log_prices
+            .select(2, 3)
+            .narrow(1, config.seq_len, config.pred_len)
+            .fill_(0.04);
+        let reference = tch::no_grad(|| Engine::forward_loss(&model, &batch, false, None));
+        let replay = engine.step(&model, &batch).unwrap();
+        assert!((replay.nll.double_value(&[]) - reference.nll.double_value(&[])).abs() < 1e-5);
+        assert!(
+            (replay.objective.double_value(&[]) - reference.objective.double_value(&[])).abs()
+                < 1e-5
+        );
+        assert!(
+            (replay.moments.as_ref().unwrap() - reference.moments.as_ref().unwrap())
+                .abs()
+                .max()
+                .double_value(&[])
+                < 1e-5
+        );
+        assert!(
+            !replay
+                .moments
+                .as_ref()
+                .unwrap()
+                .equal(captured.moments.as_ref().unwrap()),
+            "captured targets ignored the resident-label intervention"
+        );
+        for _ in 0..3 {
+            engine.step(&model, &batch).unwrap();
+        }
+        assert!(captured.nll.equal(&saved.nll));
+        assert!(captured.objective.equal(&saved.objective));
+        assert!(
+            captured
+                .moments
+                .as_ref()
+                .unwrap()
+                .equal(saved.moments.as_ref().unwrap()),
+            "optimizer/next replay overwrote retained temporal diagnostics"
+        );
+        assert!(!captured.moments.as_ref().unwrap().requires_grad());
     }
 }

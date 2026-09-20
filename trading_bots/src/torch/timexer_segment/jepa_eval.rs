@@ -107,13 +107,13 @@ pub(super) fn validate_panel(
 }
 
 #[derive(Clone, Copy, Debug)]
-struct Dated {
-    reference: WindowRef,
-    origin: i64,
-    reach: i64,
+pub(super) struct Dated {
+    pub reference: WindowRef,
+    pub origin: i64,
+    pub reach: i64,
 }
 
-fn chronological_split(rows: &[Dated]) -> Result<(Vec<Dated>, Vec<Dated>, usize)> {
+pub(super) fn chronological_split(rows: &[Dated]) -> Result<(Vec<Dated>, Vec<Dated>, usize)> {
     ensure!(
         rows.len() >= 10,
         "probe fit panel needs at least ten dated rows"
@@ -139,7 +139,11 @@ fn chronological_split(rows: &[Dated]) -> Result<(Vec<Dated>, Vec<Dated>, usize)
     Ok((inner, holdout, purged))
 }
 
-fn verify_membership(refs: &[WindowRef], population: &[WindowRef], label: &str) -> Result<()> {
+pub(super) fn verify_membership(
+    refs: &[WindowRef],
+    population: &[WindowRef],
+    label: &str,
+) -> Result<()> {
     let mut owed: HashSet<_> = refs.iter().map(|r| (r.ticker, r.origin)).collect();
     ensure!(
         owed.len() == refs.len(),
@@ -155,7 +159,7 @@ fn verify_membership(refs: &[WindowRef], population: &[WindowRef], label: &str) 
     Ok(())
 }
 
-fn dated(
+pub(super) fn dated(
     corpus: &Corpus,
     refs: &[WindowRef],
     source: i64,
@@ -245,16 +249,17 @@ fn conditional_score(cache: &ConditionalCache, mean: &Tensor) -> Tensor {
     let mask = cache.mask.to_kind(Kind::Double);
     let count = mask.sum_dim_intlist([0i64].as_slice(), false, Kind::Double);
     let mse = |prediction: &Tensor| {
-        let error = (prediction - &target)
-            .square()
-            .mean_dim([-1i64].as_slice(), false, Kind::Double);
+        let error =
+            (prediction - &target)
+                .square()
+                .mean_dim([-1i64].as_slice(), false, Kind::Double);
         error
             .where_self(&mask.gt(0.5), &error.zeros_like())
             .sum_dim_intlist([0i64].as_slice(), false, Kind::Double)
             / &count
     };
-    let zero_return = Tensor::from_slice(&[1f64, 0., 1., 0., 1., 0., 1., 0., 1., 0.])
-        .to_device(target.device());
+    let zero_return =
+        Tensor::from_slice(&[1f64, 0., 1., 0., 1., 0., 1., 0., 1., 0.]).to_device(target.device());
     let actual = mse(&prediction);
     let baseline = mse(mean);
     Tensor::stack(
@@ -546,6 +551,30 @@ impl Moments {
             yy: &self.yy + &rhs.yy,
         }
     }
+    /// Uncentered feature second moment, reusing the FP64 normal equations. The constant
+    /// mode is intentionally retained; ridge's centered covariance cannot diagnose it.
+    fn spectrum(&self) -> Tensor {
+        let count = if self.xx.size()[0] == 1 {
+            self.count.narrow(0, 0, 1)
+        } else {
+            self.count.shallow_clone()
+        };
+        let eigenvalues = (&self.xx / count.reshape([-1, 1, 1]))
+            .linalg_eigvalsh("L")
+            .clamp_min(0.);
+        let trace = eigenvalues.sum_dim_intlist([-1i64].as_slice(), false, Kind::Double);
+        let top = eigenvalues.max_dim(-1, false).0;
+        let rank = trace.square()
+            / eigenvalues
+                .square()
+                .sum_dim_intlist([-1i64].as_slice(), false, Kind::Double);
+        let mean_energy = (&self.x / count.unsqueeze(-1)).square().sum_dim_intlist(
+            [-1i64].as_slice(),
+            false,
+            Kind::Double,
+        );
+        Tensor::stack(&[trace, top, rank, mean_energy], 0).expand([4, self.count.size()[0]], true)
+    }
     fn system(&self) -> Result<System> {
         let width = self.x.size()[1];
         ensure!(
@@ -633,10 +662,19 @@ impl System {
     }
 }
 
+pub(super) struct RidgeDiagnostics {
+    /// Rows: inner achieved, later-training selection achieved, all-training refit achieved.
+    /// Each is the fraction of original target second moment removed by the fitted correction.
+    pub gains: Tensor,
+    /// Rows: uncentered trace, top eigenvalue, participation rank, mean-feature energy.
+    pub spectrum: Tensor,
+}
+
 pub(super) struct Fit {
     pub weight: Tensor,
     pub bias: Tensor,
     pub penalty: Tensor,
+    pub diagnostics: Option<RidgeDiagnostics>,
 }
 impl Fit {
     pub fn predict(&self, x: &Tensor) -> Tensor {
@@ -651,6 +689,28 @@ fn ridge(
     holdout_x: &Tensor,
     holdout_y: &Tensor,
     holdout_mask: &Tensor,
+) -> Result<Fit> {
+    ridge_with_refit(
+        inner_x,
+        inner_y,
+        inner_mask,
+        holdout_x,
+        holdout_y,
+        holdout_mask,
+        None,
+    )
+}
+
+/// Select exclusively on the later training split, optionally refitting all eligible
+/// training rows (including the inner-split purge gap) after the penalty is frozen.
+pub(super) fn ridge_with_refit(
+    inner_x: &Tensor,
+    inner_y: &Tensor,
+    inner_mask: &Tensor,
+    holdout_x: &Tensor,
+    holdout_y: &Tensor,
+    holdout_mask: &Tensor,
+    refit: Option<(&Tensor, &Tensor, &Tensor)>,
 ) -> Result<Fit> {
     ensure!(
         inner_x.device().is_cuda() && holdout_x.device().is_cuda(),
@@ -680,12 +740,42 @@ fn ridge(
         errors.isfinite().all().int64_value(&[]) == 1,
         "nonfinite ridge penalty score"
     );
-    let penalty = grid.index_select(0, &errors.argmin(0, false));
-    let (weight, bias) = inner.merge(&holdout).system()?.fit(&penalty);
+    let selected = errors.argmin(0, false);
+    let penalty = grid.index_select(0, &selected);
+    let diagnose = refit.is_some();
+    let refit = match refit {
+        Some((x, y, mask)) => {
+            ensure!(
+                x.device() == inner_x.device() && x.isfinite().all().int64_value(&[]) == 1,
+                "nonfinite or nonresident ridge refit features"
+            );
+            Moments::new(x, y, mask)
+        }
+        None => inner.merge(&holdout),
+    };
+    let (weight, bias) = refit.system()?.fit(&penalty);
+    let diagnostics = diagnose.then(|| {
+        let selection_mse = errors
+            .gather(0, &selected.unsqueeze(0), false)
+            .squeeze_dim(0);
+        let (inner_weight, inner_bias) = system.fit(&penalty);
+        RidgeDiagnostics {
+            gains: Tensor::stack(
+                &[
+                    1. - inner.error(&inner_weight, &inner_bias) / (&inner.yy / &inner.count),
+                    1. - selection_mse / (&holdout.yy / &holdout.count),
+                    1. - refit.error(&weight, &bias) / (&refit.yy / &refit.count),
+                ],
+                0,
+            ),
+            spectrum: refit.spectrum(),
+        }
+    });
     Ok(Fit {
         weight,
         bias,
         penalty,
+        diagnostics,
     })
 }
 
@@ -817,14 +907,21 @@ pub fn evaluate(
     } else {
         "predicted-latent"
     };
-    let (coefficient_description, prediction_description) = if model.config().jepa_mode.conditional() {
+    let (coefficient_description, prediction_description) = if model
+        .config()
+        .jepa_mode
+        .conditional()
+    {
         (
             format!("full {width}+1 coefficients/output in observation/state; 10+1 in predicted-characteristic"),
             "predicted characteristic",
         )
     } else if model.config().jepa_mode.target_width(width) != width {
         (
-            format!("full {width}+1 coefficients/output in observation/state; {}+1 in predicted-latent", model.config().jepa_mode.target_width(width)),
+            format!(
+                "full {width}+1 coefficients/output in observation/state; {}+1 in predicted-latent",
+                model.config().jepa_mode.target_width(width)
+            ),
             "predicted latent",
         )
     } else {
@@ -839,8 +936,14 @@ pub fn evaluate(
             output,
             &title,
             &horizons,
-            inner_cache.conditional.as_ref().context("missing inner conditional cache")?,
-            holdout_cache.conditional.as_ref().context("missing holdout conditional cache")?,
+            inner_cache
+                .conditional
+                .as_ref()
+                .context("missing inner conditional cache")?,
+            holdout_cache
+                .conditional
+                .as_ref()
+                .context("missing holdout conditional cache")?,
             validation,
         )?;
     }
@@ -1242,5 +1345,77 @@ mod tests {
         let expected = residual.sum_dim_intlist([0i64].as_slice(), false, Kind::Double)
             / mask.sum_dim_intlist([0i64].as_slice(), false, Kind::Double);
         assert!((error - expected).abs().max().double_value(&[]) < 1e-12);
+    }
+
+    #[test]
+    fn feature_second_moment_spectrum_retains_constant_energy() {
+        let x = Tensor::from_slice(&[1f64, -1., 1., 1.]).reshape([2, 2]);
+        let target = Tensor::zeros([2, 1], (Kind::Double, Device::Cpu));
+        let mask = Tensor::ones([2, 1], (Kind::Double, Device::Cpu));
+        let spectrum = Moments::new(&x, &target, &mask).spectrum();
+        assert_eq!(spectrum.double_value(&[0, 0]), 2.);
+        assert_eq!(spectrum.double_value(&[1, 0]), 1.);
+        assert_eq!(spectrum.double_value(&[2, 0]), 2.);
+        assert_eq!(spectrum.double_value(&[3, 0]), 1.);
+    }
+
+    #[test]
+    fn cuda_ridge_refit_uses_extra_training_rows_without_retuning_penalty() {
+        let _rng = crate::torch::test_rng::shared();
+        if std::env::var("TIMEXER_SEGMENT_GPU_TEST").as_deref() != Ok("1") {
+            return;
+        }
+        assert!(tch::Cuda::is_available());
+        let device = Device::Cuda(0);
+        let inner_x = (Tensor::arange(16, (Kind::Double, device)) - 7.5).reshape([16, 1]);
+        let holdout_x = (Tensor::arange(8, (Kind::Double, device)) - 3.5).reshape([8, 1]);
+        let inner_y = &inner_x * 2. + 1.;
+        let holdout_y = &holdout_x * 2. + 1.;
+        let inner_mask = Tensor::ones([16, 1], (Kind::Double, device));
+        let holdout_mask = Tensor::ones([8, 1], (Kind::Double, device));
+        let selected = ridge(
+            &inner_x,
+            &inner_y,
+            &inner_mask,
+            &holdout_x,
+            &holdout_y,
+            &holdout_mask,
+        )
+        .unwrap();
+        let gap_x = Tensor::zeros([4, 1], (Kind::Double, device));
+        let gap_y = Tensor::full([4, 1], 10., (Kind::Double, device));
+        let all_x = Tensor::cat(&[&inner_x, &holdout_x, &gap_x], 0);
+        let all_y = Tensor::cat(&[&inner_y, &holdout_y, &gap_y], 0);
+        let all_mask = Tensor::ones([28, 1], (Kind::Double, device));
+        let refitted = ridge_with_refit(
+            &inner_x,
+            &inner_y,
+            &inner_mask,
+            &holdout_x,
+            &holdout_y,
+            &holdout_mask,
+            Some((&all_x, &all_y, &all_mask)),
+        )
+        .unwrap();
+        assert_eq!(
+            (&refitted.penalty - &selected.penalty)
+                .abs()
+                .max()
+                .double_value(&[]),
+            0.
+        );
+        let origin = Tensor::zeros([1, 1], (Kind::Double, device));
+        assert!((selected.predict(&origin).double_value(&[0, 0]) - 1.).abs() < 1e-10);
+        assert!((refitted.predict(&origin).double_value(&[0, 0]) - 64. / 28.).abs() < 1e-10);
+        let before = (&all_y * &all_y).mean(Kind::Double).double_value(&[]);
+        let after = (refitted.predict(&all_x) - &all_y)
+            .square()
+            .mean(Kind::Double)
+            .double_value(&[]);
+        assert!(
+            (refitted.diagnostics.unwrap().gains.double_value(&[2, 0]) - (1. - after / before))
+                .abs()
+                < 1e-10
+        );
     }
 }

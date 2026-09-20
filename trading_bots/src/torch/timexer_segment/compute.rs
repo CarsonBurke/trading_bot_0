@@ -298,12 +298,15 @@ impl LrSchedule {
         if self.budget_steps == 0 {
             return NANOGPT_MOMENTUM_MAX;
         }
-        let cooldown_start = self.budget_steps.saturating_sub(NANOGPT_MUON_COOLDOWN_STEPS);
+        let cooldown_start = self
+            .budget_steps
+            .saturating_sub(NANOGPT_MUON_COOLDOWN_STEPS);
         if step < NANOGPT_MUON_WARMUP_STEPS {
             let frac = step as f64 / NANOGPT_MUON_WARMUP_STEPS as f64;
             NANOGPT_MOMENTUM_MIN + frac * (NANOGPT_MOMENTUM_MAX - NANOGPT_MOMENTUM_MIN)
         } else if step > cooldown_start {
-            let frac = ((step - cooldown_start) as f64 / NANOGPT_MUON_COOLDOWN_STEPS as f64).min(1.0);
+            let frac =
+                ((step - cooldown_start) as f64 / NANOGPT_MUON_COOLDOWN_STEPS as f64).min(1.0);
             NANOGPT_MOMENTUM_MAX - frac * (NANOGPT_MOMENTUM_MAX - NANOGPT_MOMENTUM_MIN)
         } else {
             NANOGPT_MOMENTUM_MAX
@@ -609,7 +612,13 @@ struct StepGraph {
 impl StepGraph {
     /// One forward and backward: the replay once captured, the same body eagerly on the
     /// capture stream until then.
-    fn run(&self, model: &CausalPatchModel, batch: &Batch, keep: Option<&Tensor>, random: Option<&JepaRandom>) -> Result<Losses> {
+    fn run(
+        &self,
+        model: &CausalPatchModel,
+        batch: &Batch,
+        keep: Option<&Tensor>,
+        random: Option<&JepaRandom>,
+    ) -> Result<Losses> {
         match &self.outputs {
             Some(outputs) => {
                 self.graph
@@ -990,17 +999,25 @@ impl Engine {
         train: bool,
         keep: Option<&Tensor>,
     ) -> Losses {
-        let mut random = model.config().jepa_mode.needs_random()
+        let mut random = model
+            .config()
+            .jepa_mode
+            .needs_random()
             .then(|| JepaRandom::new(model.config(), batch.log_prices.device()));
         if let Some(random) = &mut random {
-            random.refresh().expect("uploading the standalone JEPA draw");
+            random
+                .refresh()
+                .expect("uploading the standalone JEPA draw");
         }
         Self::forward_loss_with_random(model, batch, train, keep, random.as_ref())
     }
 
     fn forward_loss_with_random(
-        model: &CausalPatchModel, batch: &Batch, train: bool,
-        keep: Option<&Tensor>, random: Option<&JepaRandom>,
+        model: &CausalPatchModel,
+        batch: &Batch,
+        train: bool,
+        keep: Option<&Tensor>,
+        random: Option<&JepaRandom>,
     ) -> Losses {
         if model.config().jepa_mode.enabled() {
             return model.jepa_losses(batch, train, keep, random);
@@ -1008,6 +1025,17 @@ impl Engine {
         let stats = model.statistics(batch);
         let head = model.forward(batch, &stats, train, false);
         let (targets, mask) = model.targets(batch, &stats, false);
+        if model.config().temporal_moments_enabled() {
+            let forecast_mask = keep.map(|keep| &mask * keep);
+            let mut losses = model.losses(
+                &head,
+                &stats,
+                &targets,
+                forecast_mask.as_ref().unwrap_or(&mask),
+            );
+            model.add_temporal_moments(&mut losses, batch, &stats, &head, &targets, &mask);
+            return losses;
+        }
         let mask = decimate(mask, keep);
         model.losses(&head, &stats, &targets, &mask)
     }
@@ -1035,7 +1063,10 @@ impl Engine {
             if self.jepa_random.is_none() {
                 self.jepa_random = Some(JepaRandom::new(model.config(), self.device));
             }
-            self.jepa_random.as_mut().expect("created above").refresh()?;
+            self.jepa_random
+                .as_mut()
+                .expect("created above")
+                .refresh()?;
         }
         Ok(())
     }
@@ -1055,7 +1086,13 @@ impl Engine {
         match &self.step_graph {
             Some(graph) => graph.run(model, batch, keep, self.jepa_random.as_ref()),
             None => {
-                let losses = Self::forward_loss_with_random(model, batch, true, keep, self.jepa_random.as_ref());
+                let losses = Self::forward_loss_with_random(
+                    model,
+                    batch,
+                    true,
+                    keep,
+                    self.jepa_random.as_ref(),
+                );
                 losses.objective.backward();
                 Ok(losses.detached())
             }
@@ -1145,7 +1182,13 @@ impl Engine {
             graph
                 .with_stream_scope(|graph| {
                     graph.capture(|| {
-                        let losses = Self::forward_loss_with_random(model, batch, true, keep, self.jepa_random.as_ref());
+                        let losses = Self::forward_loss_with_random(
+                            model,
+                            batch,
+                            true,
+                            keep,
+                            self.jepa_random.as_ref(),
+                        );
                         losses.objective.backward();
                         captured = Some(losses);
                     })?;
@@ -1180,10 +1223,7 @@ impl Engine {
             budget.device_total_mib
         );
         let out = losses.copied();
-        self.step_graph
-            .as_mut()
-            .expect("checked above")
-            .outputs = Some(losses);
+        self.step_graph.as_mut().expect("checked above").outputs = Some(losses);
         self.capture_budget = Some(budget);
         self.optimizer_step()?;
         Ok(out)
@@ -1250,15 +1290,24 @@ impl Engine {
             // Split into phases, and on the capture stream wherever one exists, so that a
             // sampled step before the capture still warms the stream the capture will use.
             let body = || {
-                if model.config().jepa_mode.enabled() {
+                if model.config().jepa_mode.enabled() || model.config().temporal_moments_enabled() {
                     let started = Instant::now();
-                    let losses = Self::forward_loss_with_random(model, resident, true, keep, self.jepa_random.as_ref());
+                    let losses = Self::forward_loss_with_random(
+                        model,
+                        resident,
+                        true,
+                        keep,
+                        self.jepa_random.as_ref(),
+                    );
                     let forward_ms = phase(started);
                     let started = Instant::now();
                     losses.objective.backward();
                     let backward_ms = phase(started);
-                    // Shared forward cannot be split without a second backbone pass.
-                    return (losses.detached(), [forward_ms, f64::NAN, backward_ms, f64::NAN]);
+                    // Keep the shared auxiliary forward identical to warmup/capture/replay.
+                    return (
+                        losses.detached(),
+                        [forward_ms, f64::NAN, backward_ms, f64::NAN],
+                    );
                 }
                 let started = Instant::now();
                 let stats = model.statistics(resident);
@@ -1481,7 +1530,10 @@ pub fn audit_step_capture(
     kind: OptimizerKind,
     compared: usize,
 ) -> Result<CaptureAudit> {
-    ensure!(compared >= 20, "the capture audit compares at least 20 steps");
+    ensure!(
+        compared >= 20,
+        "the capture audit compares at least 20 steps"
+    );
     ensure!(
         batch.log_prices.device().is_cuda(),
         "the capture audit needs a CUDA device"
@@ -1620,7 +1672,9 @@ mod tests {
         }
         // Root-level, 1-D: the U-net skip gate logits, whose whole routing story is that they
         // are outside the `block_*` allowlist and so cannot reach NorMuon.
-        let _ = store.root().var("skip_weights", &[4], nn::Init::Const(-1.5));
+        let _ = store
+            .root()
+            .var("skip_weights", &[4], nn::Init::Const(-1.5));
         let named = named_trainable_variables(&store);
         let reference = RecipeKnobs::reference(X0Lambdas::Enabled);
         let optimizer = polar_express(&named, NANOGPT_ADAMW_LR, reference);
@@ -1829,7 +1883,8 @@ mod tests {
     /// two configurations that train differently must not stamp the same string.
     #[test]
     fn the_optimizer_recipe_records_the_scalar_multiplier_and_the_x0_mode() {
-        let reference = OptimizerKind::PolarExpress.recipe(RecipeKnobs::reference(X0Lambdas::Enabled));
+        let reference =
+            OptimizerKind::PolarExpress.recipe(RecipeKnobs::reference(X0Lambdas::Enabled));
         assert!(
             reference.contains("x0-lambdas=enabled")
                 && reference.contains("lambdas.resid+lambdas.x0+skip_weights-lrmul=5"),
@@ -1860,7 +1915,8 @@ mod tests {
     /// move the endpoint, and must not have moved the curve drawn against one.
     #[test]
     fn the_schedule_reproduces_the_ported_shape_at_the_budget_it_is_given() {
-        let upstream = LrSchedule::new(1270, NANOGPT_COOLDOWN_FRAC, NANOGPT_COOLDOWN_FLOOR).unwrap();
+        let upstream =
+            LrSchedule::new(1270, NANOGPT_COOLDOWN_FRAC, NANOGPT_COOLDOWN_FLOOR).unwrap();
         let start = upstream.cooldown_start().unwrap();
         assert_eq!(start, 508);
         assert!((upstream.scale(0) - 1.0).abs() < 1e-12);
@@ -1912,7 +1968,8 @@ mod tests {
 
     #[test]
     fn the_muon_momentum_cooldown_follows_the_same_budget() {
-        let upstream = LrSchedule::new(1270, NANOGPT_COOLDOWN_FRAC, NANOGPT_COOLDOWN_FLOOR).unwrap();
+        let upstream =
+            LrSchedule::new(1270, NANOGPT_COOLDOWN_FRAC, NANOGPT_COOLDOWN_FLOOR).unwrap();
         assert!((upstream.muon_momentum(0) - 0.85).abs() < 1e-12);
         assert!((upstream.muon_momentum(150) - 0.90).abs() < 1e-12);
         assert!((upstream.muon_momentum(300) - 0.95).abs() < 1e-12);
@@ -2002,7 +2059,9 @@ mod tests {
                 (applied("lambdas.resid") - NANOGPT_ADAMW_LR * NANOGPT_SCALAR_LR_MULTIPLIER).abs()
                     < 1e-15
             );
-            assert!(optimizer.applied_learning_rate("no.such.parameter").is_none());
+            assert!(optimizer
+                .applied_learning_rate("no.such.parameter")
+                .is_none());
         }
     }
 
@@ -2066,7 +2125,11 @@ mod tests {
         ];
         for (family, expected) in expected.into_iter().enumerate() {
             let recorded: Vec<f64> = trajectory.series(family).collect();
-            assert_eq!(recorded.len(), 2, "family {family} must have one rate per step");
+            assert_eq!(
+                recorded.len(),
+                2,
+                "family {family} must have one rate per step"
+            );
             assert!(
                 (recorded[0] - expected).abs() < 1e-15,
                 "family {family} recorded {} at the base rate, expected {expected}",
@@ -2078,5 +2141,4 @@ mod tests {
         }
         assert!((engine.learning_rate() - NANOGPT_ADAMW_LR / 2.0).abs() < 1e-15);
     }
-
 }

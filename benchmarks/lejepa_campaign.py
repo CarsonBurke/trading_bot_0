@@ -31,6 +31,14 @@ MODES = ("off", "latent-one", "latent-multi", "anchored", "anchored-no-sigreg", 
 OBJECTIVE_NAMES = (BASELINE, "latent-one", "latent-multi", "anchored", "no-sigreg", "reconstruct")
 PROJECTED_NAMES = ("projected", "projected-no-sigreg")
 CONDITIONAL_NAMES = ("conditional", "conditional-full-none")
+MOMENT_FIELDS = ("decision_mse_weight", "temporal_moment_weight")
+MOMENT_WEIGHTS = {
+    "decision-mse": (0.125, 0.0),
+    "moment": (0.0, 0.125),
+    "moment-strong": (0.0, 0.5),
+    "moment-plus-mse": (0.125, 0.125),
+}
+MODEL_TREATMENTS = ("jepa_mode", "scale_coupling", "horizon_decimation", *MOMENT_FIELDS)
 SUITES = {
     "objective-comparison": OBJECTIVE_NAMES,
     "forecasting-controls": (BASELINE, "full-none-forecast"),
@@ -38,6 +46,7 @@ SUITES = {
     "sigreg-placement": (BASELINE, "anchored", "no-sigreg", *PROJECTED_NAMES),
     "temporal-conditional": (BASELINE, "full-none-forecast", *CONDITIONAL_NAMES),
     "sigreg-dimensionality": (BASELINE, "projected", "projected-small"),
+    "temporal-moments": (BASELINE, "full-none-forecast", *MOMENT_WEIGHTS),
 }
 RECIPES = {
     "decoupled-lattice": {"scale-coupling": "decoupled", "horizon-decimation": "lattice"},
@@ -144,19 +153,37 @@ def arm_specs(suite, selected):
     modes["projected-small"] = "anchored-projected-small"
     return [
         {"name": label, "jepa_mode": modes.get(label, "off"),
-         "recipe": "full-none" if label in ("full-none-forecast", "conditional-full-none") else "decoupled-lattice"}
+         "recipe": "full-none" if label in ("full-none-forecast", "conditional-full-none", *MOMENT_WEIGHTS) else "decoupled-lattice",
+         **dict(zip(MOMENT_FIELDS, MOMENT_WEIGHTS.get(label, (0.0, 0.0))))}
         for label in SUITES[suite] if label in names
     ]
+
+
+def moment_weights(arm):
+    """Legacy omissions are zero; named treatments have exact, authenticated weights."""
+    values = tuple(arm.get(field, 0.0) for field in MOMENT_FIELDS)
+    if (any(not isinstance(value, (int, float)) or isinstance(value, bool)
+            or not math.isfinite(value) or value < 0 for value in values)
+            or values != MOMENT_WEIGHTS.get(arm["name"], (0.0, 0.0))):
+        raise ValueError(f"{arm['name']}: weights differ from the declared temporal moment treatment")
+    return dict(zip(MOMENT_FIELDS, values))
 
 
 def recipe_for(plan, arm):
     recipe = arm.get("recipe", "decoupled-lattice")
     if recipe not in RECIPES or (recipe != "decoupled-lattice" and arm["jepa_mode"] not in ("off", "anchored-conditional")):
         raise ValueError(f"{arm['name']}: unsupported objective/recipe treatment")
+    if any(moment_weights(arm).values()) and (arm["jepa_mode"] != "off" or recipe != "full-none"):
+        raise ValueError(f"{arm['name']}: temporal moments require forecast-only full-none")
     if plan["schema"] == LEGACY_SCHEMA and any(
             plan["common_config"].get(key) != value for key, value in RECIPES[recipe].items()):
         raise ValueError("legacy reference is not the declared decoupled+lattice baseline")
     return recipe
+
+
+def treatment_key(plan, arm):
+    return (arm["jepa_mode"], recipe_for(plan, arm),
+            *(arm.get(field, 0.0) for field in MOMENT_FIELDS))
 
 
 def load_plan(path, expected_digest=None):
@@ -172,6 +199,51 @@ def load_plan(path, expected_digest=None):
         if sha256(asset["path"]) != asset["sha256"]:
             raise ValueError(f"pinned asset changed: {asset['path']}")
     return path, manifest, digest
+
+
+def recovered_reference(path, repository):
+    """Authenticate a saved endpoint without changing its failed validator lifecycle."""
+    path = Path(path).resolve(strict=True)
+    certificate = read_json(path)
+    repository = Path(repository)
+    if not repository.is_absolute():
+        raise ValueError("recovered reference repository must be absolute")
+    source_path = Path(certificate["source_plan"])
+    if not source_path.is_absolute():
+        source_path = repository / source_path
+    source_path, source, digest = load_plan(source_path)
+    if digest != certificate["source_plan_sha256"]:
+        raise ValueError("recovered reference source plan changed")
+    checkpoint = Path(certificate["evidence"]["checkpoint"]).resolve()
+    arms = [arm for arm in source["arms"]
+            if (Path(arm["run_root"]) / "weights/jepa-manifest.json").resolve() == checkpoint]
+    if len(arms) != 1:
+        raise ValueError("recovered reference must identify one declared source arm")
+    arm = arms[0]
+    failed_path = source_path.parent / "arms" / f"{arm['name']}-finished.json"
+    failed = read_json(failed_path)
+    if (sha256(failed_path) != certificate["original_failed_receipt_sha256"]
+            or failed.get("status") != "failed" or failed.get("plan_sha256") != digest
+            or failed.get("task") != arm["name"]):
+        raise ValueError("recovered reference original failure provenance changed")
+    identity, evidence = endpoint_evidence(source, arm)
+    if (evidence != certificate["evidence"]
+            or identity_digest(identity) != certificate["shared_identity_sha256"]):
+        raise ValueError("recovered reference endpoint differs from its revalidation certificate")
+    record = {"path": str(path), "sha256": sha256(path), "source_plan": str(source_path),
+              "source_plan_sha256": digest, "arm": arm["name"],
+              "original_failed_receipt_sha256": sha256(failed_path)}
+    return record, source, arm, identity, evidence
+
+
+def authenticated_recoveries(records, repository):
+    recovered = []
+    for recorded in records:
+        actual = recovered_reference(recorded["path"], repository)
+        if actual[0] != recorded:
+            raise ValueError("recovered reference certificate or source provenance changed")
+        recovered.append(actual)
+    return recovered
 
 
 def completed_reference(path):
@@ -277,11 +349,13 @@ def plan(args):
         "queue": {"max_parallel_runs": 1, "max_attempts": 1, "priority": 0},
         "suite": args.suite, "protocol_baseline": BASELINE, "arms": arms,
         "reference": reference_record,
-        "allowed_model_differences": ["jepa_mode", "scale_coupling", "horizon_decimation"],
+        "allowed_model_differences": list(MODEL_TREATMENTS),
         "sampling": "trainer-authenticated full eligible training pool; deterministic bounded ticker/date panel; train-only frozen probe fit; final common source after all training labels",
         "completion": "every selected arm independently exits zero, completes exactly N steps, writes authenticated endpoint and readable binary forecast report; collection validates selected and reused identities; no early stopping, test split or latent-loss winner selection",
         "data_identity_at_plan": "supplied authenticated contract; actual corpus and sample identities must match at execution; planning does not scan bars",
     }
+    inherited_sources = []
+    existing = set()
     if reference:
         for key in PROTOCOL_KEYS:
             if manifest[key] != reference[key]:
@@ -289,15 +363,39 @@ def plan(args):
         if expected != read_json(reference["assets"]["data_contract"]["path"]):
             raise ValueError("reference complete corpus/data contract differs")
         inherited_sources = reference_sources(reference_record)
-        existing = {(arm["jepa_mode"], recipe_for(source, arm))
+        existing = {treatment_key(source, arm)
                     for _, source, _ in inherited_sources for arm in source["arms"]}
-        if any((arm["jepa_mode"], arm["recipe"]) in existing for arm in arms):
-            raise ValueError("selected model already exists in reference; use --select for only missing treatments")
-    baseline_present = any(arm["jepa_mode"] == "off" and arm["recipe"] == "decoupled-lattice" for arm in arms)
-    if reference:
-        baseline_present |= ("off", "decoupled-lattice") in existing
-    if not baseline_present:
+    inherited_recoveries = [actual for _, source, _ in inherited_sources
+                            for actual in authenticated_recoveries(source.get("recovered_references", []), ROOT)]
+    requested_recoveries = [recovered_reference(path, ROOT) for path in args.recovered_reference]
+    recoveries = []
+    seen_recoveries = set()
+    for recovered in inherited_recoveries + requested_recoveries:
+        record, source, arm, _, _ = recovered
+        if record["sha256"] in seen_recoveries:
+            continue
+        for key in PROTOCOL_KEYS:
+            if manifest[key] != source[key]:
+                raise ValueError(f"recovered reference differs in shared {key}")
+        if expected != read_json(source["assets"]["data_contract"]["path"]):
+            raise ValueError("recovered reference complete corpus/data contract differs")
+        if source["environment"] != environment:
+            raise ValueError("recovered reference runtime environment differs")
+        key = treatment_key(source, arm)
+        if key in existing:
+            raise ValueError("recovered reference duplicates an inherited treatment")
+        existing.add(key)
+        seen_recoveries.add(record["sha256"])
+        recoveries.append(record)
+    manifest["recovered_references"] = recoveries
+    selected = {treatment_key(manifest, arm) for arm in arms}
+    if selected & existing:
+        raise ValueError("selected model already exists in reference; use --select for only missing treatments")
+    available = selected | existing
+    if ("off", "decoupled-lattice", 0.0, 0.0) not in available:
         raise ValueError(f"include {BASELINE}, or --reference-plan containing its completed matched endpoint")
+    if args.suite == "temporal-moments" and ("off", "full-none", 0.0, 0.0) not in available:
+        raise ValueError("temporal-moments requires its matched full-none-forecast control, selected or inherited")
     for arm in arms:
         arm["run_name"] = f"{args.campaign}-{arm['name']}"
         arm["run_root"] = str(ROOT / "training/runs" / arm["run_name"])
@@ -326,6 +424,8 @@ def plan(args):
                    "--row-stride-multiple", "1", "--row-fraction", "1", "--patch-phase", "fixed"]
         for key, value in sorted((common | RECIPES[arm["recipe"]]).items()):
             command += [f"--{key}", str(value)]
+        for field, value in moment_weights(arm).items():
+            command += [f"--{field.replace('_', '-')}", str(value)]
         arm["command"] = command
     path = root / "plan.json"
     write_new(path, manifest)
@@ -335,7 +435,7 @@ def plan(args):
     print(f"Planned only, no training submitted: {path}\nPlan SHA-256: {digest}")
     print(f"Suite={args.suite}; protocol baseline={BASELINE}; N=schedule={args.max_steps}, batch={args.batch_size}, seed={args.seed}, cadence={args.eval_every}")
     for arm in arms:
-        print(f"Model job: {arm['name']}; objective={arm['jepa_mode']}; recipe={arm['recipe']}; watchdog={args.arm_timeout_seconds}s (+30s queue grace)")
+        print(f"Model job: {arm['name']}; objective={arm['jepa_mode']}; recipe={arm['recipe']}; weights={moment_weights(arm)}; watchdog={args.arm_timeout_seconds}s (+30s queue grace)")
     if reference:
         print(f"Reuse {sum(len(source['arms']) for _, source, _ in inherited_sources)} completed reference endpoints, no retraining: {reference_record['path']}")
     print(f"Collection job: after-success all {len(arms)} model jobs; watchdog={args.collect_timeout_seconds}s; all jobs exclusive, normal priority, max-attempts=1")
@@ -469,6 +569,11 @@ def endpoint_evidence(plan, arm):
     if model.get("jepa_mode", "off") != arm["jepa_mode"]:
         raise ValueError(f"{arm['name']}: objective arm differs")
     recipe = recipe_for(plan, arm)
+    for field, value in moment_weights(arm).items():
+        actual = model.get(field, 0.0)
+        if (not isinstance(actual, (int, float)) or isinstance(actual, bool)
+                or not math.isfinite(actual) or actual != value):
+            raise ValueError(f"{arm['name']}: actual {field} differs from its declared treatment")
     for key, value in RECIPES[recipe].items():
         if model.get(key.replace("-", "_"), {"scale-coupling": "full", "horizon-decimation": "none"}[key]) != value:
             raise ValueError(f"{arm['name']}: actual {key} differs from declared {recipe} treatment")
@@ -524,7 +629,7 @@ def endpoint_evidence(plan, arm):
     if not reports:
         raise ValueError(f"{arm['name']}: missing generation-zero binary reports")
     shared_model = {key: value for key, value in model.items()
-                    if key not in ("jepa_mode", "scale_coupling", "horizon_decimation")}
+                    if key not in MODEL_TREATMENTS}
     identity = {"model_without_declared_treatments": shared_model,
                 "data_sha256": identity_digest(checkpoint["data"]),
                 "sample_plan_sha256": checkpoint["sample_plan_sha256"],
@@ -614,6 +719,80 @@ def run_arm(args):
     return 0
 
 
+def collection_evidence(path, manifest, digest):
+    """Authenticate the same completed endpoints for queued and explicit collection."""
+    sources = reference_sources(manifest["reference"]) if manifest["reference"] else []
+    for _, reference, _ in sources:
+        check_matched_reference(manifest, reference)
+    sources.append((path, manifest, digest))
+    shared_identity = None
+    endpoints = []
+    baseline = None
+    for source_path, source, source_digest in sources:
+        for arm in source["arms"]:
+            finished_path = source_path.parent / "arms" / f"{arm['name']}-finished.json"
+            finished = read_json(finished_path)
+            if finished["status"] != "complete":
+                raise ValueError(f"{arm['name']}: no successful independent lifecycle receipt")
+            if source["schema"] == SCHEMA and (
+                    finished.get("plan_sha256") != source_digest
+                    or finished.get("task") != arm["name"]
+                    or finished.get("idempotency_key") != job_key(source_digest, arm["name"])):
+                raise ValueError(f"{arm['name']}: lifecycle plan or task identity differs")
+            identity, evidence = endpoint_evidence(source, arm)
+            if evidence != finished["evidence"]:
+                raise ValueError(f"{arm['name']}: endpoint changed after its completed lifecycle receipt")
+            if source["schema"] == SCHEMA and identity_digest(identity) != finished["shared_identity_sha256"]:
+                raise ValueError(f"{arm['name']}: recorded shared identity changed")
+            if shared_identity is not None and identity != shared_identity:
+                raise ValueError(f"{arm['name']}: undeclared backbone/data/sample/schedule difference; only named objective and recipe treatments may differ")
+            shared_identity = identity
+            recipe = recipe_for(source, arm)
+            endpoint = {"name": arm["name"], "jepa_mode": arm["jepa_mode"], "recipe": recipe,
+                        **moment_weights(arm),
+                        "run_root": arm["run_root"], "source_plan": str(source_path),
+                        "source_plan_sha256": source_digest,
+                        "trainer_sha256": source["assets"]["executable"]["sha256"],
+                        "reused": source_digest != digest, "finished_receipt_sha256": sha256(finished_path),
+                        "evidence": evidence}
+            endpoints.append(endpoint)
+            if treatment_key(source, arm) == ("off", "decoupled-lattice", 0.0, 0.0):
+                baseline = {"name": BASELINE, "source_arm": arm["name"], "run_root": arm["run_root"]}
+    for record, source, arm, identity, evidence in authenticated_recoveries(
+            manifest.get("recovered_references", []), manifest["repository"]):
+        check_matched_reference(manifest, source)
+        if shared_identity is not None and identity != shared_identity:
+            raise ValueError(f"{arm['name']}: recovered endpoint has undeclared shared differences")
+        shared_identity = identity
+        endpoints.append({
+            "name": arm["name"], "jepa_mode": arm["jepa_mode"], "recipe": recipe_for(source, arm),
+            **moment_weights(arm), "run_root": arm["run_root"],
+            "source_plan": record["source_plan"], "source_plan_sha256": record["source_plan_sha256"],
+            "trainer_sha256": source["assets"]["executable"]["sha256"], "reused": True,
+            "recovered_after_validator_failure": True,
+            "original_lifecycle_status": "failed", "revalidation_certificate": record["path"],
+            "revalidation_certificate_sha256": record["sha256"],
+            "finished_receipt_sha256": record["original_failed_receipt_sha256"], "evidence": evidence,
+        })
+        if treatment_key(source, arm) == ("off", "decoupled-lattice", 0.0, 0.0):
+            baseline = {
+                "name": BASELINE, "source_arm": arm["name"], "run_root": arm["run_root"],
+                "recovered_after_validator_failure": True, "original_lifecycle_status": "failed",
+                "revalidation_certificate": record["path"],
+                "revalidation_certificate_sha256": record["sha256"],
+                "original_failed_receipt_sha256": record["original_failed_receipt_sha256"],
+            }
+    if baseline is None:
+        raise ValueError("collection lacks the declared decoupled+lattice forecasting baseline")
+    return {
+        "schema": "lejepa-matched-comparison-complete-v2", "plan_sha256": digest,
+        "finished_at": utc_now(), "arms": [arm["name"] for arm in manifest["arms"]],
+        "protocol_baseline": baseline, "shared_identity_sha256": identity_digest(shared_identity),
+        "allowed_model_differences": manifest["allowed_model_differences"], "endpoints": endpoints,
+        "interpretation": "matched causal uncalibrated forecast endpoints; objective and recipe contrasts are declared separately; latent losses are diagnostic only; no automatic winner",
+    }
+
+
 def collect(args):
     path, manifest, digest = queued_plan(args, "collect")
     state_dir = path.parent / "arms"
@@ -624,48 +803,7 @@ def collect(args):
     signal.signal(signal.SIGINT, interrupted)
     failure = None
     try:
-        sources = reference_sources(manifest["reference"]) if manifest["reference"] else []
-        for _, reference, _ in sources:
-            check_matched_reference(manifest, reference)
-        sources.append((path, manifest, digest))
-        shared_identity = None
-        endpoints = []
-        baseline = None
-        for source_path, source, source_digest in sources:
-            for arm in source["arms"]:
-                finished_path = source_path.parent / "arms" / f"{arm['name']}-finished.json"
-                finished = read_json(finished_path)
-                if finished["status"] != "complete":
-                    raise ValueError(f"{arm['name']}: no successful independent lifecycle receipt")
-                if source["schema"] == SCHEMA and finished["plan_sha256"] != source_digest:
-                    raise ValueError(f"{arm['name']}: lifecycle plan identity differs")
-                identity, evidence = endpoint_evidence(source, arm)
-                if evidence != finished["evidence"]:
-                    raise ValueError(f"{arm['name']}: endpoint changed after its completed lifecycle receipt")
-                if source["schema"] == SCHEMA and identity_digest(identity) != finished["shared_identity_sha256"]:
-                    raise ValueError(f"{arm['name']}: recorded shared identity changed")
-                if shared_identity is not None and identity != shared_identity:
-                    raise ValueError(f"{arm['name']}: undeclared backbone/data/sample/schedule difference; only named objective and recipe treatments may differ")
-                shared_identity = identity
-                recipe = recipe_for(source, arm)
-                endpoint = {"name": arm["name"], "jepa_mode": arm["jepa_mode"], "recipe": recipe,
-                            "run_root": arm["run_root"], "source_plan": str(source_path),
-                            "source_plan_sha256": source_digest,
-                            "trainer_sha256": source["assets"]["executable"]["sha256"],
-                            "reused": source_digest != digest, "finished_receipt_sha256": sha256(finished_path),
-                            "evidence": evidence}
-                endpoints.append(endpoint)
-                if arm["jepa_mode"] == "off" and recipe == "decoupled-lattice":
-                    baseline = {"name": BASELINE, "source_arm": arm["name"], "run_root": arm["run_root"]}
-        if baseline is None:
-            raise ValueError("collection lacks the declared decoupled+lattice forecasting baseline")
-        write_new(path.parent / "complete.json", {
-            "schema": "lejepa-matched-comparison-complete-v2", "plan_sha256": digest,
-            "finished_at": utc_now(), "arms": [arm["name"] for arm in manifest["arms"]],
-            "protocol_baseline": baseline, "shared_identity_sha256": identity_digest(shared_identity),
-            "allowed_model_differences": manifest["allowed_model_differences"], "endpoints": endpoints,
-            "interpretation": "matched causal uncalibrated forecast endpoints; objective and recipe contrasts are declared separately; latent losses are diagnostic only; no automatic winner",
-        })
+        write_new(path.parent / "complete.json", collection_evidence(path, manifest, digest))
     except (Exception, KeyboardInterrupt) as error:
         failure = str(error)
     finally:
@@ -676,6 +814,49 @@ def collect(args):
     if failure:
         raise ValueError(failure)
     print(f"Complete matched collection: {path.parent / 'complete.json'}", flush=True)
+    return 0
+
+
+def revalidate_collection(args):
+    """Recover collection only; preserve every original training and collector receipt."""
+    validator_path = Path(__file__).resolve(strict=True)
+    validator_digest = sha256(validator_path)
+    if validator_digest != args.validator_sha256:
+        raise ValueError("current collection validator source authentication failed")
+    path, manifest, digest = load_plan(args.plan, args.plan_sha256)
+    if manifest["schema"] != SCHEMA:
+        raise ValueError("collection revalidation requires a v2 per-model plan")
+    complete_path = path.parent / "complete.json"
+    revalidated_path = path.parent / "arms" / "collect-revalidated.json"
+    for destination in (complete_path, revalidated_path):
+        if destination.exists():
+            raise ValueError(f"refusing to overwrite existing collection: {destination}")
+    failed_path = path.parent / "arms" / "collect-finished.json"
+    failed = read_json(failed_path)
+    failed_digest = sha256(failed_path)
+    if (failed_digest != args.failed_receipt_sha256
+            or failed.get("status") != "failed" or failed.get("plan_sha256") != digest):
+        raise ValueError("original failed collector receipt authentication failed")
+    started = utc_now()
+    complete = collection_evidence(path, manifest, digest)
+    if sha256(validator_path) != validator_digest or sha256(failed_path) != failed_digest:
+        raise ValueError("validator or original failed collector receipt changed during revalidation")
+    provenance = {
+        "recovered_after_validator_failure": True, "original_lifecycle_status": "failed",
+        "original_failed_receipt": str(failed_path), "original_failed_receipt_sha256": failed_digest,
+        "validator_source": str(validator_path), "validator_sha256": validator_digest,
+        "pinned_validator_sha256": manifest["assets"]["driver"]["sha256"],
+    }
+    complete.update(provenance)
+    complete["revalidation_receipt"] = str(revalidated_path)
+    write_new(revalidated_path, {
+        "schema": "lejepa-collection-revalidation-v1", "plan_sha256": digest,
+        "task": "collect", "status": "complete", "started_at": started,
+        "finished_at": complete["finished_at"], **provenance,
+        "complete": str(complete_path), "complete_sha256": identity_digest(complete),
+    })
+    write_new(complete_path, complete)
+    print(f"Revalidated matched collection: {complete_path}\nRecovery receipt: {revalidated_path}", flush=True)
     return 0
 
 
@@ -702,12 +883,20 @@ def main():
     planning.add_argument("--suite", choices=SUITES, default="objective-comparison")
     planning.add_argument("--select", action="append", choices=sorted({name for suite in SUITES.values() for name in suite}), help="repeat to submit only selected suite members")
     planning.add_argument("--reference-plan", type=Path, help="reuse completed matched arms and their pinned runtime environment without modifying or retraining them")
+    planning.add_argument("--recovered-reference", type=Path, action="append", default=[],
+                          help="authenticate an existing endpoint revalidation certificate while preserving its original failed lifecycle")
     planning.add_argument("--env", action="append", default=[], help="pin nonsecret runtime NAME=VALUE; defaults to captured runtime allowlist or reference environment")
     submitting = commands.add_parser("submit", help="idempotently queue/recover one exclusive job per model and an after-success collector")
     submitting.add_argument("--plan", type=Path, required=True)
     following = commands.add_parser("follow", help="observe existing model/collection jobs; never submit or retry")
     following.add_argument("--plan", type=Path, required=True)
     following.add_argument("--timeout", default="55m", help="observation timeout per job; a timeout never cancels or resubmits")
+    revalidating = commands.add_parser(
+        "revalidate-collection", help="authenticate completed arms after collector failure without retraining or replacing receipts")
+    revalidating.add_argument("--plan", type=Path, required=True)
+    revalidating.add_argument("--plan-sha256", required=True)
+    revalidating.add_argument("--failed-receipt-sha256", required=True)
+    revalidating.add_argument("--validator-sha256", required=True, help="SHA-256 of this current validator source, not the pinned failed driver")
     running = commands.add_parser("_run-arm", help=argparse.SUPPRESS)
     running.add_argument("--plan", type=Path, required=True)
     running.add_argument("--plan-sha256", required=True)
@@ -718,7 +907,9 @@ def main():
     args = parser.parse_args()
     if args.action == "plan" and not 0 <= args.seed < 2**64:
         parser.error("seed must fit an unsigned 64-bit integer")
-    return {"plan": plan, "submit": submit, "follow": follow, "_run-arm": run_arm, "_collect": collect}[args.action](args)
+    return {"plan": plan, "submit": submit, "follow": follow,
+            "revalidate-collection": revalidate_collection,
+            "_run-arm": run_arm, "_collect": collect}[args.action](args)
 
 
 if __name__ == "__main__":

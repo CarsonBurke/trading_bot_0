@@ -10,6 +10,7 @@ use super::{
     reports::{self, HorizonSplit, TradingSplit, DECISION_HORIZONS},
     runner::{cross_section_origins, score, Evaluation, Prefetcher, TrainArgs},
     supervision::{self, DecimationPlan, SupervisionGeometry},
+    temporal_moments,
 };
 use crate::torch::{hashing::file_sha256, single_ticker_timexer::runner::cuda_device};
 use anyhow::{ensure, Result};
@@ -67,7 +68,10 @@ impl Checkpoint {
     pub(super) fn read(run_root: &Path) -> Result<Self> {
         let checkpoint: Self =
             serde_json::from_slice(&fs::read(run_root.join("weights/jepa-manifest.json"))?)?;
-        ensure!(checkpoint.schema == SCHEMA, "unsupported research checkpoint schema");
+        ensure!(
+            checkpoint.schema == SCHEMA,
+            "unsupported research checkpoint schema"
+        );
         ensure!(
             checkpoint.manifest_sha256 == checkpoint.digest()?,
             "research manifest digest mismatch"
@@ -407,6 +411,7 @@ pub fn train(args: TrainArgs, learning_rate: f64) -> Result<()> {
     let mut runtime = Curves::default();
     let mut population = Curves::default();
     let mut geometry_curve = Curves::default();
+    let mut moment_curves: [Curves; 6] = std::array::from_fn(|_| Curves::default());
     let startup_ms = process_elapsed_ms().unwrap_or(wall.elapsed().as_secs_f64() * 1000.);
     population.put(0, "eligible tickers", corpus.contract.tickers.len() as f64);
     population.put(0, "training rows", origins.len() as f64);
@@ -438,6 +443,7 @@ pub fn train(args: TrainArgs, learning_rate: f64) -> Result<()> {
     let mut rng = ChaCha8Rng::seed_from_u64(args.seed);
     let mut step = 0usize;
     let mut sums: Option<Tensor> = None;
+    let mut moment_sums: Option<Tensor> = None;
     let mut interval_steps = 0usize;
     let mut train_ms = 0.;
     let mut eval_ms = 0.;
@@ -470,6 +476,13 @@ pub fn train(args: TrainArgs, learning_rate: f64) -> Result<()> {
                 Some(total) => total + scalars,
                 None => scalars,
             });
+            if let Some(diagnostics) = losses.moments {
+                let diagnostics = diagnostics.to_kind(Kind::Double);
+                moment_sums = Some(match moment_sums {
+                    Some(total) => total + diagnostics,
+                    None => diagnostics,
+                });
+            }
             if step < args.max_steps && index + 1 < batches_per_pass {
                 let next = (index + 1) * args.batch_size;
                 loader.request(&used[next..next + args.batch_size])?;
@@ -500,7 +513,70 @@ pub fn train(args: TrainArgs, learning_rate: f64) -> Result<()> {
                         6 | 7 => &mut geometry_curve,
                         _ => &mut objective,
                     };
-                    destination.put(step, super::jepa::diagnostic_labels(args.model.jepa_mode)[index], *value);
+                    destination.put(
+                        step,
+                        super::jepa::diagnostic_labels(args.model.jepa_mode)[index],
+                        *value,
+                    );
+                }
+                if let Some(total) = moment_sums.take() {
+                    let values = Vec::<f64>::try_from((total / interval_steps as f64).view([-1]))?;
+                    ensure!(
+                        values.len()
+                            == temporal_moments::DIAGNOSTIC_LABELS.len()
+                                * temporal_moments::HORIZONS.len()
+                            && values.iter().all(|v| v.is_finite()),
+                        "invalid temporal moment diagnostics at step {step}"
+                    );
+                    for (index, (label, row)) in temporal_moments::DIAGNOSTIC_LABELS
+                        .iter()
+                        .zip(values.chunks_exact(temporal_moments::HORIZONS.len()))
+                        .enumerate()
+                    {
+                        let chart = match index {
+                            0..=2 => 0,
+                            3 => 1,
+                            4 => 2,
+                            5 => 3,
+                            6 => 4,
+                            _ => unreachable!(),
+                        };
+                        for (&horizon, &value) in temporal_moments::HORIZONS.iter().zip(row) {
+                            moment_curves[chart].put(
+                                step,
+                                format!("{label}; horizon {horizon}"),
+                                value,
+                            );
+                        }
+                    }
+                    moment_curves[5].put(
+                        step,
+                        "applied temporal moment weight",
+                        args.model.temporal_moment_weight,
+                    );
+                    moment_curves[5].put(
+                        step,
+                        "applied decision MSE weight",
+                        args.model.decision_mse_weight,
+                    );
+                    for (curve, (suffix, units)) in moment_curves.iter().zip([
+                        ("train", "squared normalized close moments"),
+                        ("train_error", "normalized close MSE"),
+                        ("train_bias", "normalized close residual"),
+                        ("train_rows", "valid rows summed over dense sources"),
+                        (
+                            "train_pairs",
+                            "ordered distinct row pairs summed over dense sources",
+                        ),
+                        ("train_weights", "objective coefficient"),
+                    ]) {
+                        curve.write(
+                            &output,
+                            &format!("timexer_segment_temporal_moment_{suffix}"),
+                            "Training-only close conditional moments; interval means, distinct batch-row pairs (not IID evidence)",
+                            units,
+                        )?;
+                    }
                 }
                 let evaluation_started = Instant::now();
                 let measured = score(
@@ -539,7 +615,9 @@ pub fn train(args: TrainArgs, learning_rate: f64) -> Result<()> {
                     "forecast score",
                 )?;
                 objective.write(&output, "timexer_segment_jepa_objective",
-                    if args.model.jepa_mode.conditional() {
+                    if args.model.temporal_moments_enabled() {
+                        "Forecast and close conditional moment objectives are distinct; no auxiliary-loss checkpoint selection"
+                    } else if args.model.jepa_mode.conditional() {
                         "Forecast and fixed conditional CF objectives are distinct; no auxiliary-loss checkpoint selection"
                     } else {
                         "Forecast and latent objectives are distinct; no latent-loss checkpoint selection"
@@ -701,7 +779,10 @@ pub(super) fn load_panel(
         checkpoint.data.market_min_cross_section,
         checkpoint.data.in_period_sections,
     )?;
-    ensure!(corpus.contract == checkpoint.data, "research checkpoint corpus changed");
+    ensure!(
+        corpus.contract == checkpoint.data,
+        "research checkpoint corpus changed"
+    );
     let plan = corpus.research_sample_plan(
         checkpoint.seed,
         checkpoint.validation_rows,
@@ -741,8 +822,7 @@ pub fn evaluate(args: EvaluateArgs) -> Result<()> {
         "evaluation requires positive batch size and a fresh output path"
     );
     let device = cuda_device()?;
-    let (checkpoint, corpus, plan, cross) =
-        load_panel(&args.run_root, &args.data_dir, device)?;
+    let (checkpoint, corpus, plan, cross) = load_panel(&args.run_root, &args.data_dir, device)?;
     let (_store, model) = checkpoint.load_model(&args.run_root, device)?;
     let measured = score(
         &corpus,

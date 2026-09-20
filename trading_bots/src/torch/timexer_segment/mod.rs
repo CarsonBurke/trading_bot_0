@@ -25,3 +25,5 @@ pub mod jepa_diagnostics;
 pub mod jepa_memory;
 pub mod jepa_runner;
 pub mod accuracy;
+pub mod temporal_moments;
+pub mod temporal_moment_eval;

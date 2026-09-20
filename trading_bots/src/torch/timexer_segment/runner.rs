@@ -19,10 +19,9 @@ use super::{
         self, CandleWindow, EvalTiming, HorizonCurve, HorizonSplit, Metrics, PortfolioCurve,
         StepPhases, TradingCurve, TradingSplit,
     },
-    teacher,
     supervision::{self, DecimationPlan, PatchPhase, RowSelection, SupervisionGeometry},
     target_basis::{self, TargetBasis},
-    utility,
+    teacher, utility,
 };
 use crate::torch::{hashing::file_sha256, single_ticker_timexer::runner::cuda_device};
 use anyhow::{ensure, Context, Result};
@@ -436,7 +435,9 @@ pub fn evaluate_portfolio(args: PortfolioEvaluateArgs) -> Result<()> {
         &args,
     )?;
     result.summary.insert("load_ms".into(), load_ms);
-    result.summary.insert("total_ms".into(), started.elapsed().as_secs_f64() * 1000.);
+    result
+        .summary
+        .insert("total_ms".into(), started.elapsed().as_secs_f64() * 1000.);
     reports::write_account(&args.output, manifest.epoch, manifest.step, &result)?;
     Ok(())
 }
@@ -791,8 +792,10 @@ impl Manifest {
         manifest
             .mean_gain
             .validate(manifest.data.pred_len)
-            .context("the checkpoint's authenticated mean gain is not applicable to its own \
-                      forecast horizon")?;
+            .context(
+                "the checkpoint's authenticated mean gain is not applicable to its own \
+                      forecast horizon",
+            )?;
         Ok(manifest)
     }
     /// Everything a frozen post-hoc calibration has to be pinned to. The digests are the
@@ -1009,7 +1012,10 @@ fn fixed_origins<T: Copy>(origins: &[T], count: usize) -> Result<Vec<T>> {
 ///
 /// The host cost is one memory-mapped bar header per candidate window, the same lookup
 /// [`score`] already does for its own grouping.
-pub(super) fn cross_section_origins(corpus: &Corpus, origins: &[WindowRef]) -> Result<Vec<WindowRef>> {
+pub(super) fn cross_section_origins(
+    corpus: &Corpus,
+    origins: &[WindowRef],
+) -> Result<Vec<WindowRef>> {
     let stamped: Vec<(i64, WindowRef)> = origins
         .iter()
         .map(|reference| {
@@ -1223,7 +1229,11 @@ fn scale_free_objective(weight: &[f64], best_scale: &[f64]) -> f64 {
             total += share * ratio;
         }
     }
-    if mass > 0. { total / mass } else { f64::NAN }
+    if mass > 0. {
+        total / mass
+    } else {
+        f64::NAN
+    }
 }
 fn invalid_candles(prices: &Tensor) -> Tensor {
     let open = prices.select(-1, 0);
@@ -1369,10 +1379,7 @@ impl Scorer {
             .to_device(device),
             sums: Tensor::zeros([14], (Kind::Double, device)),
             horizon_sums: Tensor::zeros([15, pred_len], (Kind::Double, device)),
-            amplitude: Tensor::zeros(
-                [AMPLITUDE_ROWS, pred_len, CHANNELS],
-                (Kind::Double, device),
-            ),
+            amplitude: Tensor::zeros([AMPLITUDE_ROWS, pred_len, CHANNELS], (Kind::Double, device)),
             bar_squared: bars(Kind::Float),
             bar_persistence: bars(Kind::Float),
             bar_forecast: bars(Kind::Float),
@@ -1537,9 +1544,11 @@ impl Scorer {
         let anchor = forecast.scaled.select(-1, close).unsqueeze(-1);
         let offsets = &forecast.scaled - &anchor;
         let column = |values: Tensor| {
-            values
-                .expand_as(&forecast.scaled)
-                .sum_dim_intlist([0i64].as_slice(), false, Kind::Double)
+            values.expand_as(&forecast.scaled).sum_dim_intlist(
+                [0i64].as_slice(),
+                false,
+                Kind::Double,
+            )
         };
         self.amplitude += Tensor::stack(
             &[
@@ -1568,12 +1577,12 @@ impl Scorer {
         // Window ratios and the per-horizon trimmed sums finish on device; the top-1% |close|
         // thresholds use k_h = ⌈n_h / 100⌉ ≤ n_h and invalid bars sit at -1 below every valid
         // magnitude, so the k_h-th largest is always a valid bar.
-        let window_squared = self
-            .bar_squared
-            .sum_dim_intlist([1i64].as_slice(), false, Kind::Double);
-        let window_persistence = self
-            .bar_persistence
-            .sum_dim_intlist([1i64].as_slice(), false, Kind::Double);
+        let window_squared =
+            self.bar_squared
+                .sum_dim_intlist([1i64].as_slice(), false, Kind::Double);
+        let window_persistence =
+            self.bar_persistence
+                .sum_dim_intlist([1i64].as_slice(), false, Kind::Double);
         let scored = window_persistence.gt(0.);
         let median_window_ratio = if scored.sum(Kind::Int64).int64_value(&[]) > 0 {
             (window_squared.masked_select(&scored) / window_persistence.masked_select(&scored))
@@ -1613,7 +1622,8 @@ impl Scorer {
         let trimmed = Tensor::stack(&trimmed_rows, 1);
         let horizon_sums = Tensor::cat(&[&self.horizon_sums, &trimmed], 0);
         let sums = Vec::<f64>::try_from(self.sums.to_device(Device::Cpu))?;
-        let horizon_sums = Vec::<f64>::try_from(horizon_sums.to_device(Device::Cpu).flatten(0, -1))?;
+        let horizon_sums =
+            Vec::<f64>::try_from(horizon_sums.to_device(Device::Cpu).flatten(0, -1))?;
         ensure!(
             sums.iter().chain(&horizon_sums).all(|x| x.is_finite()) && bars > 0,
             "nonfinite universe validation outputs"
@@ -1812,8 +1822,7 @@ impl Scorer {
             let delay_mask = &m * &entry_valid;
             let delayed_target = (&y - &entry_target) * &delay_mask;
             let delayed_forecast = (&f - &entry_forecast) * &delay_mask;
-            let (delayed_hit, delayed_bet) =
-                rate(&delayed_forecast, &delayed_target, &delay_mask);
+            let (delayed_hit, delayed_bet) = rate(&delayed_forecast, &delayed_target, &delay_mask);
             // Ordinal ranks for Spearman. Invalid bars are pushed past every valid one by the
             // sentinel, so a column's valid entries hold exactly the ranks 0..n_h-1 among
             // themselves and the masked Pearson over the ranks is the rank correlation.
@@ -1844,8 +1853,11 @@ impl Scorer {
             };
             // This horizon's per-timestamp cross-sections. One scatter per moment.
             let group = |source: &Tensor| {
-                Tensor::zeros([self.group_count], (Kind::Float, device))
-                    .index_add(0, &self.groups, source)
+                Tensor::zeros([self.group_count], (Kind::Float, device)).index_add(
+                    0,
+                    &self.groups,
+                    source,
+                )
             };
             let (gn, gf, gy) = (group(&m), group(&f), group(&y));
             let (gff, gyy, gfy) = (group(&f.square()), group(&y.square()), group(&(&f * &y)));
@@ -1955,8 +1967,8 @@ impl Scorer {
             let signal_square = at(3, j) / count - mean_forecast * mean_forecast;
             let signal_target = at(5, j) / count - mean_forecast * mean_target;
             let target_variance = persistence - mean_target * mean_target;
-            let offset = (2. * mean_forecast * mean_target - mean_forecast * mean_forecast)
-                / persistence;
+            let offset =
+                (2. * mean_forecast * mean_target - mean_forecast * mean_forecast) / persistence;
             let demeaned = if signal_square > 0. {
                 signal_target * signal_target / signal_square / persistence
             } else {
@@ -2012,11 +2024,9 @@ impl Scorer {
             let ic_mean = at(24, j) / moments.max(1.);
             let ic_variance = (at(25, j) / moments.max(1.) - ic_mean * ic_mean).max(0.);
             curve.cross_sectional_ic_moments.push(moments);
-            curve.cross_sectional_ic.push(if moments > 0. {
-                ic_mean
-            } else {
-                f64::NAN
-            });
+            curve
+                .cross_sectional_ic
+                .push(if moments > 0. { ic_mean } else { f64::NAN });
             // A single contributing cross-section has no dispersion to estimate and none at
             // all has no mean: both must read NaN. A 0 here would render as a zero-width
             // band around an IC that was never measured, which is the strongest possible
@@ -2105,7 +2115,8 @@ pub(super) fn score(
         .map(|stamp| {
             distinct
                 .binary_search(stamp)
-                .expect("every origin timestamp is one of the distinct timestamps") as i64
+                .expect("every origin timestamp is one of the distinct timestamps")
+                as i64
         })
         .collect();
     let mut scorer = Scorer::new(
@@ -2247,8 +2258,10 @@ pub fn train(args: TrainArgs) -> Result<()> {
         return super::jepa_runner::train(args, base_learning_rate);
     }
     ensure!(
-        !args.model.jepa_mode.enabled() && args.model.future_calendar,
-        "LeJEPA and disabled future-calendar modes require --research-panel"
+        !args.model.jepa_mode.enabled()
+            && !args.model.temporal_moments_enabled()
+            && args.model.future_calendar,
+        "LeJEPA, temporal moment objectives and disabled future-calendar modes require --research-panel"
     );
     if let Some(name) = &args.run {
         RunDir::ensure_creatable(RUNS_PATH, name)?;
@@ -2465,7 +2478,11 @@ pub fn train(args: TrainArgs) -> Result<()> {
     // The schedule's endpoint, resolved: `--schedule-budget` where stated, `--max-steps` where
     // a cap is set without one, the whole planned run otherwise. See [`schedule_budget`].
     let resolved_budget = schedule_budget(&args, steps_per_epoch);
-    let schedule = LrSchedule::new(resolved_budget, NANOGPT_COOLDOWN_FRAC, NANOGPT_COOLDOWN_FLOOR)?;
+    let schedule = LrSchedule::new(
+        resolved_budget,
+        NANOGPT_COOLDOWN_FRAC,
+        NANOGPT_COOLDOWN_FLOOR,
+    )?;
     // Unconditional, and before the first step: the schedule SHAPE is the one run parameter
     // that is invisible in every curve the run writes and is the difference between an annealed
     // final weight state and one frozen at the peak rate. A log line that only appeared on
@@ -2682,8 +2699,13 @@ pub fn train(args: TrainArgs) -> Result<()> {
             // reaches `best_*`, `preview_curve`, `full_curve` or `points`, so selection and
             // every step-matched curve are exactly what they were before this pass existed.
             let cross_started = Instant::now();
-            let cross_evaluation =
-                score(&corpus, &model, &cross_section, args.eval_batch_size, device)?;
+            let cross_evaluation = score(
+                &corpus,
+                &model,
+                &cross_section,
+                args.eval_batch_size,
+                device,
+            )?;
             let cross_section_ms = cross_started.elapsed().as_secs_f64() * 1000.;
             benchmark::cuda_memory(true)?;
             // The in-period pass, scored at every interval beside the out-of-period one so the
@@ -2693,7 +2715,13 @@ pub fn train(args: TrainArgs) -> Result<()> {
             let in_period_evaluation = if in_period.is_empty() {
                 None
             } else {
-                Some(score(&corpus, &model, &in_period, args.eval_batch_size, device)?)
+                Some(score(
+                    &corpus,
+                    &model,
+                    &in_period,
+                    args.eval_batch_size,
+                    device,
+                )?)
             };
             let in_period_ms = in_period_started.elapsed().as_secs_f64() * 1000.;
             benchmark::cuda_memory(true)?;
@@ -2702,10 +2730,20 @@ pub fn train(args: TrainArgs) -> Result<()> {
             // emission, and because the selection scalar above is the un-gained model's NLL.
             // Nothing here touches `best_*`, `points`, or either curve slot.
             let amplitude_started = Instant::now();
-            let calibration_pass =
-                score(&corpus, &model, &calibration_draw, args.eval_batch_size, device)?;
-            let training_pass =
-                score(&corpus, &model, &training_draw, args.eval_batch_size, device)?;
+            let calibration_pass = score(
+                &corpus,
+                &model,
+                &calibration_draw,
+                args.eval_batch_size,
+                device,
+            )?;
+            let training_pass = score(
+                &corpus,
+                &model,
+                &training_draw,
+                args.eval_batch_size,
+                device,
+            )?;
             let amplitude_ms = amplitude_started.elapsed().as_secs_f64() * 1000.;
             benchmark::cuda_memory(true)?;
             // FATAL on a refusal, by design: the alternative is a gain of 1, which is
@@ -3080,13 +3118,7 @@ pub fn train(args: TrainArgs) -> Result<()> {
                 "CausalPatch production training (evaluation excluded)",
                 &hardware_history,
             )?;
-            reports::write_lr_trajectory(
-                &output,
-                epoch,
-                step,
-                engine.schedule(),
-                &lr_trajectory,
-            )?;
+            reports::write_lr_trajectory(&output, epoch, step, engine.schedule(), &lr_trajectory)?;
             reports::write_supervision_occupancy(&output, epoch, step, args.batch_size, &census)?;
             if let Some(decimation) = engine.drain_horizon_decimation() {
                 reports::write_horizon_decimation(
@@ -3148,7 +3180,13 @@ pub fn train(args: TrainArgs) -> Result<()> {
 pub(super) fn load_checkpoint(
     checkpoint: &Path,
     data_dir: &Path,
-) -> Result<(Manifest, Arc<Corpus>, nn::VarStore, CausalPatchModel, Device)> {
+) -> Result<(
+    Manifest,
+    Arc<Corpus>,
+    nn::VarStore,
+    CausalPatchModel,
+    Device,
+)> {
     let manifest = Manifest::read(checkpoint)?;
     let mut corpus = Corpus::load(
         data_dir,
@@ -3448,7 +3486,9 @@ mod tests {
         let _ = scaled.select(0, 1).select(-1, CHANNELS - 1).zero_();
         let targets = Tensor::randn(shape, cpu) * 1.5;
         let _ = targets.select(0, 2).select(-1, CHANNELS - 1).zero_();
-        let mask = Tensor::rand([windows, pred_len], cpu).lt(0.8).to_kind(Kind::Float);
+        let mask = Tensor::rand([windows, pred_len], cpu)
+            .lt(0.8)
+            .to_kind(Kind::Float);
         let _ = mask.select(0, 3).zero_();
         let drift = Tensor::randn([windows, pred_len, 1], cpu) * 0.5;
         let prices = (&scaled * 0.01).exp() * 100.;
@@ -3535,19 +3575,27 @@ mod tests {
         let index = (&k - 1).reshape([1, h]);
         let high = &magnitude * m + (m - 1.);
         let (top, _) = high.topk(widest, 0, true, true);
-        let top_mask = high.ge_tensor(&top.gather(0, &index, false)).to_kind(Kind::Float) * m;
+        let top_mask = high
+            .ge_tensor(&top.gather(0, &index, false))
+            .to_kind(Kind::Float)
+            * m;
         let low = &magnitude * m + (1.0_f64 - m) * SENTINEL;
         let (bottom, _) = low.topk(widest, 0, false, true);
-        let bottom_mask =
-            low.le_tensor(&bottom.gather(0, &index, false)).to_kind(Kind::Float) * m;
+        let bottom_mask = low
+            .le_tensor(&bottom.gather(0, &index, false))
+            .to_kind(Kind::Float)
+            * m;
         let side = g.sign() * y;
         let decile = |selected: &Tensor| {
             let (hit, bet) = rate(&g, y, selected);
             [col(selected), col(&(&side * selected)), hit, bet]
         };
         let group = |source: &Tensor| {
-            Tensor::zeros([scorer.group_count, h], (Kind::Float, device))
-                .index_add(0, &scorer.groups, source)
+            Tensor::zeros([scorer.group_count, h], (Kind::Float, device)).index_add(
+                0,
+                &scorer.groups,
+                source,
+            )
         };
         let (gn, gf, gy) = (group(m), group(f), group(y));
         let (gff, gyy, gfy) = (group(&f.square()), group(&y.square()), group(&(f * y)));
@@ -3611,13 +3659,13 @@ mod tests {
         let (top, _) = bar_close.topk(widest, 0, true, true);
         let thresholds = top.gather(0, &(tail_counts - 1).reshape([1, pred_len]), false);
         let keep = bar_close.lt_tensor(&thresholds).to_kind(Kind::Float);
-        let squared = (&scorer.bar_squared * &keep).sum_dim_intlist(
+        let squared =
+            (&scorer.bar_squared * &keep).sum_dim_intlist([0i64].as_slice(), false, Kind::Double);
+        let persistence = (&scorer.bar_persistence * keep).sum_dim_intlist(
             [0i64].as_slice(),
             false,
             Kind::Double,
         );
-        let persistence =
-            (&scorer.bar_persistence * keep).sum_dim_intlist([0i64].as_slice(), false, Kind::Double);
         host(&squared)
             .iter()
             .zip(host(&persistence))
@@ -3636,9 +3684,9 @@ mod tests {
         let (windows, pred_len, per_group) = (384i64, 6i64, 24i64);
         let forecast = synthetic_forecast(windows, pred_len);
         let ids: Vec<i64> = (0..windows).map(|row| row / per_group).collect();
-        let half_log_horizon =
-            ((Tensor::arange(pred_len, (Kind::Float, Device::Cpu)) + 1.).log() * 0.5)
-                .reshape([1, 1, pred_len, 1]);
+        let half_log_horizon = ((Tensor::arange(pred_len, (Kind::Float, Device::Cpu)) + 1.).log()
+            * 0.5)
+            .reshape([1, 1, pred_len, 1]);
         let mut scorer = Scorer::new(
             &half_log_horizon,
             &vec![1.0; pred_len as usize],
@@ -3681,7 +3729,11 @@ mod tests {
                 &actual.demeaned_gain,
                 &reference.demeaned_gain,
             ),
-            ("scaling gain", &actual.scaling_gain, &reference.scaling_gain),
+            (
+                "scaling gain",
+                &actual.scaling_gain,
+                &reference.scaling_gain,
+            ),
             (
                 "mean forecast",
                 &actual.mean_forecast,
@@ -3755,7 +3807,11 @@ mod tests {
                 &actual.conviction_spread_return,
                 &reference.conviction_spread_return,
             ),
-            ("optimal gain", &actual.optimal_gain, &reference.optimal_gain),
+            (
+                "optimal gain",
+                &actual.optimal_gain,
+                &reference.optimal_gain,
+            ),
             (
                 "forecast variance",
                 &actual.forecast_variance,
@@ -3810,7 +3866,8 @@ mod tests {
         let _rng = crate::torch::test_rng::exclusive();
         let (w, h, c) = (13usize, 7usize, CHANNELS as usize);
         let forecast = synthetic_forecast(w as i64, h as i64);
-        let half_log_horizon = ((Tensor::arange(h as i64, (Kind::Float, Device::Cpu)) + 1.).log() * 0.5)
+        let half_log_horizon = ((Tensor::arange(h as i64, (Kind::Float, Device::Cpu)) + 1.).log()
+            * 0.5)
             .reshape([1, 1, h as i64, 1]);
         let mut scorer = Scorer::new(
             &half_log_horizon,
@@ -3825,7 +3882,10 @@ mod tests {
             mask[start * h..(start + rows) * h].iter().sum::<f64>() as usize
         };
         for (start, rows) in [(0usize, 5usize), (5, 5), (10, 3)] {
-            scorer.accumulate(&slice(&forecast, start as i64, rows as i64), bars_in(start, rows));
+            scorer.accumulate(
+                &slice(&forecast, start as i64, rows as i64),
+                bars_in(start, rows),
+            );
         }
         let evaluation = scorer.finish(EvalTiming::default()).unwrap();
 
@@ -3888,19 +3948,42 @@ mod tests {
         assert!((evaluation.within_1_sigma - within_1 / elements).abs() < 1e-5);
         let horizon = &evaluation.horizon;
         let ratio = |a: &[f64], b: &[f64]| a.iter().zip(b).map(|(a, b)| a / b).collect::<Vec<_>>();
-        let per_bar = |a: &[f64]| a.iter().zip(&counts).map(|(a, n)| a / n).collect::<Vec<_>>();
-        close(&horizon.mse, &ratio(&mse, &counts.iter().map(|n| n * c as f64).collect::<Vec<_>>()));
-        close(&horizon.persistence_mse, &ratio(&pmse, &counts.iter().map(|n| n * c as f64).collect::<Vec<_>>()));
+        let per_bar = |a: &[f64]| {
+            a.iter()
+                .zip(&counts)
+                .map(|(a, n)| a / n)
+                .collect::<Vec<_>>()
+        };
+        close(
+            &horizon.mse,
+            &ratio(
+                &mse,
+                &counts.iter().map(|n| n * c as f64).collect::<Vec<_>>(),
+            ),
+        );
+        close(
+            &horizon.persistence_mse,
+            &ratio(
+                &pmse,
+                &counts.iter().map(|n| n * c as f64).collect::<Vec<_>>(),
+            ),
+        );
         close(&horizon.mae_ratio, &ratio(&abs_err, &abs_target));
         close(&horizon.win_rate, &per_bar(&wins));
         close(&horizon.hit_rate, &ratio(&hits, &predicted));
         close(&horizon.up_fraction, &per_bar(&ups));
-        assert!(predicted.iter().zip(&counts).any(|(p, n)| p < n), "flat forecasts must be excluded from hit rate");
+        assert!(
+            predicted.iter().zip(&counts).any(|(p, n)| p < n),
+            "flat forecasts must be excluded from hit rate"
+        );
         // Trimmed ratio: drop the top ⌈n_h/100⌉ = 1 valid |close target| per horizon.
         let mut trimmed = vec![0.; h];
         for j in 0..h {
             let magnitude = |i: usize| t[at(i, j, c - 1)].abs();
-            let threshold = (0..w).filter(|&i| m(i, j) > 0.).map(magnitude).fold(f64::MIN, f64::max);
+            let threshold = (0..w)
+                .filter(|&i| m(i, j) > 0.)
+                .map(magnitude)
+                .fold(f64::MIN, f64::max);
             let (mut num, mut den) = (0., 0.);
             for i in (0..w).filter(|&i| m(i, j) > 0. && magnitude(i) < threshold) {
                 num += bar_sq[i * h + j];
@@ -3909,7 +3992,10 @@ mod tests {
             trimmed[j] = num / den;
         }
         close(&horizon.trimmed_mse_ratio, &trimmed);
-        let mut ratios: Vec<f64> = (0..w).filter(|&i| window_pers[i] > 0.).map(|i| window_sq[i] / window_pers[i]).collect();
+        let mut ratios: Vec<f64> = (0..w)
+            .filter(|&i| window_pers[i] > 0.)
+            .map(|i| window_sq[i] / window_pers[i])
+            .collect();
         assert_eq!(ratios.len(), w - 1, "the empty window is not scored");
         ratios.sort_by(f64::total_cmp);
         assert!((evaluation.median_window_ratio - ratios[(ratios.len() - 1) / 2]).abs() < 1e-5);
@@ -3928,7 +4014,10 @@ mod tests {
                 tail += (t[e] - s[e]).powi(2);
             }
         }
-        assert!(widest > 1, "the reference must exercise a multi-element tail");
+        assert!(
+            widest > 1,
+            "the reference must exercise a multi-element tail"
+        );
         assert!((evaluation.tail_loss_share - tail / sq).abs() < 1e-5);
     }
     /// The reported objective-weighted held-out NLL is `Σ w·mask·nll / Σ w·mask·CHANNELS` and
@@ -3988,8 +4077,8 @@ mod tests {
                     denominator += weights[step] * c as f64;
                     for channel in 0..c {
                         let e = (row * h + step) * c + channel;
-                        numerator += weights[step]
-                            * (0.5 * ((t[e] - s[e]) / ls[e].exp()).powi(2) + ls[e]);
+                        numerator +=
+                            weights[step] * (0.5 * ((t[e] - s[e]) / ls[e].exp()).powi(2) + ls[e]);
                     }
                 }
             }
@@ -4028,8 +4117,7 @@ mod tests {
     /// achieved close ratio - move enormously and across parity, which is exactly the failure
     /// this change exists to remove.
     #[test]
-    fn the_scale_free_selection_objective_is_the_weighted_best_scale_ratio_and_ignores_amplitude()
-    {
+    fn the_scale_free_selection_objective_is_the_weighted_best_scale_ratio_and_ignores_amplitude() {
         let (w, h) = (8usize, 4usize);
         let channels = CHANNELS as usize;
         let cpu = (Kind::Float, Device::Cpu);
@@ -4237,7 +4325,11 @@ mod tests {
             tight(curve.mean_forecast[j], mu, "mean forecast");
             tight(curve.mean_target[j], ybar, "mean target");
             tight(curve.close_mse_ratio[j], error / persistence, "MSE ratio");
-            let all_error = sum(&|i| (0..c).map(|k| (t[at(i, j, k)] - s[at(i, j, k)]).powi(2)).sum());
+            let all_error = sum(&|i| {
+                (0..c)
+                    .map(|k| (t[at(i, j, k)] - s[at(i, j, k)]).powi(2))
+                    .sum()
+            });
             let all_persistence = sum(&|i| (0..c).map(|k| t[at(i, j, k)].powi(2)).sum());
             tight(
                 curve.all_channel_gain[j],
@@ -4285,16 +4377,18 @@ mod tests {
                 }
                 hit / bet
             };
-            tight(curve.mid_anchor_hit_rate[j], mid_hit, "mid-anchored hit rate");
+            tight(
+                curve.mid_anchor_hit_rate[j],
+                mid_hit,
+                "mid-anchored hit rate",
+            );
             tight(
                 curve.close_hit_rate[j],
                 hit_rate(&valid, j, &|i| fc(i, j)),
                 "close hit rate",
             );
             // Delayed neutral-coordinate quality, not execution P&L.
-            let delayed: Vec<usize> = (0..w)
-                .filter(|&i| m(i, j) > 0. && m(i, 0) > 0.)
-                .collect();
+            let delayed: Vec<usize> = (0..w).filter(|&i| m(i, j) > 0. && m(i, 0) > 0.).collect();
             let (mut delay_error, mut delay_persistence) = (0., 0.);
             let (mut delay_hit, mut delay_bet) = (0., 0.);
             for &i in &delayed {
@@ -4331,8 +4425,16 @@ mod tests {
             let mut sorted: Vec<f64> = valid.iter().map(|&i| magnitude(i)).collect();
             sorted.sort_by(f64::total_cmp);
             let (low, high) = (sorted[k - 1], sorted[sorted.len() - k]);
-            let top: Vec<usize> = valid.iter().copied().filter(|&i| magnitude(i) >= high).collect();
-            let bottom: Vec<usize> = valid.iter().copied().filter(|&i| magnitude(i) <= low).collect();
+            let top: Vec<usize> = valid
+                .iter()
+                .copied()
+                .filter(|&i| magnitude(i) >= high)
+                .collect();
+            let bottom: Vec<usize> = valid
+                .iter()
+                .copied()
+                .filter(|&i| magnitude(i) <= low)
+                .collect();
             let side = |members: &[usize]| {
                 members
                     .iter()
@@ -4487,7 +4589,11 @@ mod tests {
                 -(b - 1.) * (b - 1.) / persistence,
                 "mis-scaling cross term",
             );
-            tight(curve.offset_gain[j], 0., "offset gain of a mean-zero forecast");
+            tight(
+                curve.offset_gain[j],
+                0.,
+                "offset gain of a mean-zero forecast",
+            );
             tight(
                 curve.total_gain[j],
                 curve.offset_gain[j] + curve.demeaned_gain[j] + curve.scaling_gain[j],
@@ -4738,7 +4844,10 @@ mod tests {
         previous_objective.manifest_sha256 = previous_objective.digest().unwrap();
         write(&previous_objective);
         let error = Manifest::read(&directory.0).unwrap_err().to_string();
-        assert!(error.contains("objective") && error.contains(OBJECTIVE), "{error}");
+        assert!(
+            error.contains("objective") && error.contains(OBJECTIVE),
+            "{error}"
+        );
         // The pre-channel-major stamp specifically: `causal-patch-ohlc-universe-v5` names a
         // head whose weight rows are horizon-major, and every tensor name and shape in it still
         // matches the current model, so nothing but this string stands between a stale
@@ -5067,7 +5176,12 @@ mod tests {
     }
     /// One accumulate over the whole fixture, with `windows / per_group` evaluation timestamps
     /// of `per_group` tickers each.
-    fn score_fixture(forecast: &FinalOrigin, windows: i64, pred_len: i64, per_group: i64) -> Evaluation {
+    fn score_fixture(
+        forecast: &FinalOrigin,
+        windows: i64,
+        pred_len: i64,
+        per_group: i64,
+    ) -> Evaluation {
         let ids: Vec<i64> = (0..windows).map(|i| i / per_group).collect();
         let half_log_horizon = ((Tensor::arange(pred_len, (Kind::Float, Device::Cpu)) + 1.).log()
             * 0.5)
@@ -5123,13 +5237,18 @@ mod tests {
         // The shared scorer omits the model-independent half-log(2*pi) constant.
         let expected = [0.125, 2_f64.ln() + 0.03125];
         let persistence = [0.5, 0.5 * 2_f64.ln() + 1.];
-        for (actual, expected) in measured.horizon_nll.iter().zip(expected)
+        for (actual, expected) in measured
+            .horizon_nll
+            .iter()
+            .zip(expected)
             .chain(measured.horizon_persistence_nll.iter().zip(persistence))
         {
             assert!((actual - expected).abs() < 1e-6);
         }
         assert!((measured.nll - (2. * expected[0] + expected[1]) / 3.).abs() < 1e-6);
-        assert!((measured.persistence_nll - (2. * persistence[0] + persistence[1]) / 3.).abs() < 1e-6);
+        assert!(
+            (measured.persistence_nll - (2. * persistence[0] + persistence[1]) / 3.).abs() < 1e-6
+        );
     }
     /// Payoffs restore raw market drift and enter at the next observed OPEN, while decisions
     /// consume the close predictive scale. Missing entry/endpoint data drops whole cohorts.
@@ -5190,7 +5309,11 @@ mod tests {
         ];
         // The positive means clear only the CLOSE predictive scale.
         for label in ["equal long", "one-sigma gated sign"] {
-            let policy = portfolio.policies.iter().find(|policy| policy.label == label).unwrap();
+            let policy = portfolio
+                .policies
+                .iter()
+                .find(|policy| policy.label == label)
+                .unwrap();
             close(&policy.gross_bps, &expected);
             close(&policy.gross_exposure, &[1., 1.]);
         }
@@ -5306,7 +5429,10 @@ mod tests {
         let populated = score_fixture(&fixture, windows, pred_len, 50).portfolio;
         for index in 0..populated.horizons.len() {
             assert!(populated.cross_sections[index] > 0);
-            assert!(populated.policies.iter().all(|policy| policy.gross_bps[index].is_finite()));
+            assert!(populated
+                .policies
+                .iter()
+                .all(|policy| policy.gross_bps[index].is_finite()));
             assert_eq!(populated.tickers_per_timestamp[index], 50.);
             assert_eq!(populated.narrowest_timestamp[index], 50.);
         }
@@ -5606,17 +5732,45 @@ mod tests {
         let (before, after) = (curves(&forecast), curves(&calibrated));
         for bar in 0..h as usize {
             let invariant = [
-                ("within-timestamp IC", before.cross_sectional_ic[bar], after.cross_sectional_ic[bar]),
+                (
+                    "within-timestamp IC",
+                    before.cross_sectional_ic[bar],
+                    after.cross_sectional_ic[bar],
+                ),
                 ("pooled Pearson", before.pearson[bar], after.pearson[bar]),
                 ("pooled Spearman", before.spearman[bar], after.spearman[bar]),
-                ("close hit rate", before.close_hit_rate[bar], after.close_hit_rate[bar]),
-                ("top-decile hit rate", before.top_decile_hit_rate[bar], after.top_decile_hit_rate[bar]),
-                ("top-decile return", before.top_decile_return[bar], after.top_decile_return[bar]),
-                ("conviction spread", before.conviction_spread_return[bar], after.conviction_spread_return[bar]),
-                ("optimal gain", before.optimal_gain[bar] / f64::from(curve[bar]), after.optimal_gain[bar]),
+                (
+                    "close hit rate",
+                    before.close_hit_rate[bar],
+                    after.close_hit_rate[bar],
+                ),
+                (
+                    "top-decile hit rate",
+                    before.top_decile_hit_rate[bar],
+                    after.top_decile_hit_rate[bar],
+                ),
+                (
+                    "top-decile return",
+                    before.top_decile_return[bar],
+                    after.top_decile_return[bar],
+                ),
+                (
+                    "conviction spread",
+                    before.conviction_spread_return[bar],
+                    after.conviction_spread_return[bar],
+                ),
+                (
+                    "optimal gain",
+                    before.optimal_gain[bar] / f64::from(curve[bar]),
+                    after.optimal_gain[bar],
+                ),
                 // `D = Cov²/(Var·mean(y²))` is scale-free; the best-scale ratio it feeds is
                 // NOT, because the offset term carries `μ` and a gain moves `μ` to `g·μ`.
-                ("demeaned gain", before.demeaned_gain[bar], after.demeaned_gain[bar]),
+                (
+                    "demeaned gain",
+                    before.demeaned_gain[bar],
+                    after.demeaned_gain[bar],
+                ),
             ];
             for (quantity, was, now) in invariant {
                 assert!(
@@ -5815,7 +5969,10 @@ pub fn probe(args: ProbeArgs) -> Result<()> {
     // used rather than on a superset of them.
     let fit_refs = match args.fit_origins {
         0 => corpus.calibration_refs.clone(),
-        count => fixed_origins(&corpus.calibration_refs, count.min(corpus.calibration_refs.len()))?,
+        count => fixed_origins(
+            &corpus.calibration_refs,
+            count.min(corpus.calibration_refs.len()),
+        )?,
     };
     let partitions = probe::Partitions::split(&dated(&fit_refs), &dated(&corpus.validation_refs))?;
     println!(
@@ -5832,10 +5989,9 @@ pub fn probe(args: ProbeArgs) -> Result<()> {
         partitions.outer.purge_gap_ms
     );
     let width = manifest.model.d_model;
-    let horizon_index = Tensor::from_slice(
-        &horizons.iter().map(|h| *h as i64 - 1).collect::<Vec<i64>>(),
-    )
-    .to_device(device);
+    let horizon_index =
+        Tensor::from_slice(&horizons.iter().map(|h| *h as i64 - 1).collect::<Vec<i64>>())
+            .to_device(device);
     let count = horizons.len() as i64;
     let accumulate = |refs: &[WindowRef]| -> Result<probe::HostMoments> {
         let mut moments = probe::Moments::new(width, count, device);
@@ -5873,7 +6029,9 @@ pub fn probe(args: ProbeArgs) -> Result<()> {
     let mut shells: Vec<probe::Moments> = shell_of
         .as_ref()
         .map(|(_, rungs)| {
-            (0..rungs.len()).map(|_| probe::Moments::new(width, count, device)).collect()
+            (0..rungs.len())
+                .map(|_| probe::Moments::new(width, count, device))
+                .collect()
         })
         .unwrap_or_default();
     probe_pass(
@@ -5934,7 +6092,10 @@ pub fn probe(args: ProbeArgs) -> Result<()> {
                     .collect();
                 distinct.sort_unstable();
                 distinct.dedup();
-                counts.push((owners.iter().filter(|owner| **owner <= shell).count(), distinct.len()));
+                counts.push((
+                    owners.iter().filter(|owner| **owner <= shell).count(),
+                    distinct.len(),
+                ));
                 ladder_moments.push(cumulative.as_ref().expect("just assigned").clone());
             }
             Some((ladder_moments, counts))
@@ -5965,8 +6126,12 @@ pub fn probe(args: ProbeArgs) -> Result<()> {
                 intercepts.push(fit.intercept);
                 ridges.push(fit.ridge);
             }
-            let weight = Tensor::stack(&weights, 1).to_kind(Kind::Double).to_device(device);
-            let intercept = Tensor::from_slice(&intercepts).to_device(device).reshape([1, -1]);
+            let weight = Tensor::stack(&weights, 1)
+                .to_kind(Kind::Double)
+                .to_device(device);
+            let intercept = Tensor::from_slice(&intercepts)
+                .to_device(device)
+                .reshape([1, -1]);
             Ok((weight, intercept, ridges, counts.clone()))
         })
         .transpose()?;
@@ -5991,15 +6156,20 @@ pub fn probe(args: ProbeArgs) -> Result<()> {
             .filter(|(owner, _)| **owner == slot)
             .map(|(_, stamp)| *stamp)
             .collect();
-        ensure!(!picked.is_empty(), "chronological tranche {slot} holds no fit origins");
+        ensure!(
+            !picked.is_empty(),
+            "chronological tranche {slot} holds no fit origins"
+        );
         let mean = picked.iter().map(|stamp| *stamp as f64).sum::<f64>() / picked.len() as f64;
         tranche_spans.push((picked.len(), mean as i64));
     }
     // Column order is tranche-major then horizon, matching what `PairedScorer` assumes.
-    let tranche_weight =
-        Tensor::stack(&tranche_weights, 1).to_kind(Kind::Double).to_device(device);
-    let tranche_intercept =
-        Tensor::from_slice(&tranche_intercepts).to_device(device).reshape([1, -1]);
+    let tranche_weight = Tensor::stack(&tranche_weights, 1)
+        .to_kind(Kind::Double)
+        .to_device(device);
+    let tranche_intercept = Tensor::from_slice(&tranche_intercepts)
+        .to_device(device)
+        .reshape([1, -1]);
     // Dense timestamp ranks over the scored origins, identical to [`score`]'s: the probe's IC
     // has to be the same statistic on the same grouping as the head's, or the paired difference
     // is a difference of two conventions.
@@ -6012,7 +6182,8 @@ pub fn probe(args: ProbeArgs) -> Result<()> {
         .map(|stamp| {
             distinct
                 .binary_search(stamp)
-                .expect("every scored origin timestamp is one of the distinct timestamps") as i64
+                .expect("every scored origin timestamp is one of the distinct timestamps")
+                as i64
         })
         .collect();
     let groups = Tensor::from_slice(&ranked).to_device(device);
@@ -6080,7 +6251,11 @@ pub fn probe(args: ProbeArgs) -> Result<()> {
     let head_last_target_ms = corpus
         .train_refs
         .iter()
-        .map(|reference| corpus.ticker(*reference).timestamp(reference.origin + pred_len))
+        .map(|reference| {
+            corpus
+                .ticker(*reference)
+                .timestamp(reference.origin + pred_len)
+        })
         .max()
         .context("the training population is empty")?;
     let tranche_labels: Vec<String> = tranche_spans
@@ -6099,8 +6274,12 @@ pub fn probe(args: ProbeArgs) -> Result<()> {
                 .collect()
         })
         .collect();
-    let recency =
-        probe::Recency::fit(tranche_spans.clone(), &horizons, tranche_ic, head_last_target_ms)?;
+    let recency = probe::Recency::fit(
+        tranche_spans.clone(),
+        &horizons,
+        tranche_ic,
+        head_last_target_ms,
+    )?;
     let world = probe::verdict(&report, Some(&recency));
     let context = reports::LatentProbeContext {
         fit_origins: partitions.inner.len(),
@@ -6114,7 +6293,13 @@ pub fn probe(args: ProbeArgs) -> Result<()> {
         width,
         verdict: world.label().to_owned(),
     };
-    reports::write_latent_probe(&args.output, manifest.epoch, manifest.step, &report, &context)?;
+    reports::write_latent_probe(
+        &args.output,
+        manifest.epoch,
+        manifest.step,
+        &report,
+        &context,
+    )?;
     reports::write_latent_probe_ratio(
         &args.output,
         manifest.epoch,
@@ -6150,21 +6335,25 @@ pub fn probe(args: ProbeArgs) -> Result<()> {
         );
     }
     if let (Some(rung_scorer), Some((_, _, ridges, counts))) = (rung_scorer, rung_fits.as_ref()) {
-        let labels: Vec<String> =
-            counts.iter().map(|(origins, _)| format!("ridge on {origins} fit origins")).collect();
+        let labels: Vec<String> = counts
+            .iter()
+            .map(|(origins, _)| format!("ridge on {origins} fit origins"))
+            .collect();
         let ladder_report = rung_scorer.finish(&labels, &[1])?;
         let rungs: Vec<probe::ScalingRung> = ladder_report
             .forecasters
             .iter()
             .zip(counts)
             .zip(ridges)
-            .map(|((forecaster, (origins, timestamps)), ridge)| probe::ScalingRung {
-                origins: *origins,
-                timestamps: *timestamps,
-                ridge: *ridge,
-                ic: forecaster.per_horizon[0].ic,
-                ic_se: forecaster.per_horizon[0].ic_se,
-            })
+            .map(
+                |((forecaster, (origins, timestamps)), ridge)| probe::ScalingRung {
+                    origins: *origins,
+                    timestamps: *timestamps,
+                    ridge: *ridge,
+                    ic: forecaster.per_horizon[0].ic,
+                    ic_se: forecaster.per_horizon[0].ic_se,
+                },
+            )
             .collect();
         let curve = probe::fit_scaling(&rungs)?;
         for rung in &curve.rungs {
@@ -6467,7 +6656,12 @@ fn ceiling_placement(
     // admissible c₁, since a realized forecast cannot beat its own bound), the shipped default
     // at twice it, and a fourth point above. The old sweep bracketed 0.0833, a strided-draw
     // number the same run now measures at 0.16208.
-    for candidate in [0., teacher::MEASURED_ONE_BAR_IC, teacher::DEFAULT_ONE_BAR_CEILING_IC, 0.5] {
+    for candidate in [
+        0.,
+        teacher::MEASURED_ONE_BAR_IC,
+        teacher::DEFAULT_ONE_BAR_CEILING_IC,
+        0.5,
+    ] {
         let leak = 1. - candidate * candidate;
         let at = |horizon: usize| {
             curve
@@ -6822,7 +7016,11 @@ fn throughput_sweep(
                 let (targets, model) = curve.max_statistic_difference(expected);
                 // The student error bar this is judged against: the standard error the curve
                 // itself reports at h = 1, which is what any reader of the gap already uses.
-                let error = expected.student_ic_error.first().copied().unwrap_or(f64::NAN);
+                let error = expected
+                    .student_ic_error
+                    .first()
+                    .copied()
+                    .unwrap_or(f64::NAN);
                 println!(
                     "  point {index} at {rows} rows against the {first}-row curve over all {} horizons: TARGET-ONLY series (ceiling, variance ratio) differ by {targets:.3e} = {:.4} of the {PRINTED_STATISTIC_TOLERANCE:.0e} print resolution - {}; MODEL series (student IC, gap) differ by {model:.3e} = {:.5} of the curve's own h=1 standard error {error:.5}",
                     expected.ceiling.len(),
@@ -6876,8 +7074,18 @@ fn throughput_sweep(
     }
     println!(
         "{:>6} {:>10} {:>12} {:>10} {:>9} {:>9} {:>8} {:>8} {:>8} {:>8} {:>9} {:>9}",
-        "rows", "ms/batch", "origins/s", "s/1e6 orig", "alloc MiB", "board MiB", "mean W", "peak W",
-        "<=TFLOPS", "peak TF", "fwd ms", "build ms"
+        "rows",
+        "ms/batch",
+        "origins/s",
+        "s/1e6 orig",
+        "alloc MiB",
+        "board MiB",
+        "mean W",
+        "peak W",
+        "<=TFLOPS",
+        "peak TF",
+        "fwd ms",
+        "build ms"
     );
     for (allocated, point) in &points {
         println!(
@@ -6952,7 +7160,8 @@ fn ceiling_pass(
             .map(|stamp| {
                 distinct
                     .binary_search(stamp)
-                    .expect("every origin timestamp is one of the distinct timestamps") as i64
+                    .expect("every origin timestamp is one of the distinct timestamps")
+                    as i64
             })
             .collect()
     };
