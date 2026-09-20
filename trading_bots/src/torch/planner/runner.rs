@@ -53,6 +53,8 @@ use super::{
 };
 
 pub const DEFAULT_PLANNER_HORIZON: usize = 100;
+const SPENT_TEST_ERROR: &str = "current Test is spent; a future bounded chronological generation \
+    and campaign-final permit are required";
 pub const DEFAULT_PLANNER_ROLLOUT_LENGTH: usize = 100;
 // Batch many environments through the world-model forecast per decision step.
 // The forecast is a small-batch autoregressive decode (the dominant GPU cost);
@@ -157,7 +159,7 @@ impl Default for InferPlannerArgs {
             rollout_length: DEFAULT_PLANNER_ROLLOUT_LENGTH,
             context_bars: None,
             tickers: None,
-            split: PlannerDataSplit::Test,
+            split: PlannerDataSplit::Validation,
             report_root: None,
         }
     }
@@ -510,7 +512,14 @@ pub fn train_planner(mut args: TrainPlannerArgs) -> Result<()> {
     Ok(())
 }
 
+fn ensure_development_inference_split(split: PlannerDataSplit) -> Result<()> {
+    if split == PlannerDataSplit::Test {
+        bail!("{SPENT_TEST_ERROR}");
+    }
+    Ok(())
+}
 pub fn infer_planner(args: InferPlannerArgs) -> Result<PlannerInferenceSummary> {
+    ensure_development_inference_split(args.split)?;
     if args.episodes == 0 || args.rollout_length == 0 {
         bail!("planner inference episodes and rollout length must be positive");
     }
@@ -1900,6 +1909,16 @@ mod tests {
         assert_eq!(args.environments, 128);
         assert_eq!(args.minibatch_size, 1280);
         validate_train_args(&args).unwrap();
+    }
+
+    #[test]
+    fn inference_defaults_to_validation_and_rejects_spent_test() {
+        let args = InferPlannerArgs::default();
+        assert_eq!(args.split, PlannerDataSplit::Validation);
+        ensure_development_inference_split(args.split).expect("validation is available");
+        let error = ensure_development_inference_split(PlannerDataSplit::Test)
+            .expect_err("ordinary planner inference must reject Test");
+        assert!(error.to_string().contains(SPENT_TEST_ERROR));
     }
 
     #[test]

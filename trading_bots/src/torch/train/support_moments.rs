@@ -887,13 +887,9 @@ mod tests {
         BarSupports::fit(&samples)
     }
 
-    /// The writer named in `pretrain_reports::CYCLE_EXEMPT` for both of this module's bases.
-    ///
-    /// The exemption is honest only if something executes the writer: a stated reason is not
-    /// coverage, and this tree has already shipped a base registered with a reason and no writer
-    /// at all. Both bases need a support carrying MEASURED moments plus an upgraded artifact on
-    /// disk, neither of which an in-run reporter cycle over step metrics has, which is why they
-    /// are exempt and why this test is the exemption's entire justification.
+    /// Executes the writer for both bases owned by `PretrainReportOwner::SupportDecode`.
+    /// They need measured support moments plus an upgraded artifact on disk, neither of which
+    /// exists in an optimizer-step report cycle.
     #[test]
     fn the_support_decode_writes_both_registered_bases() {
         let rows = 40_000usize;
@@ -907,9 +903,10 @@ mod tests {
         let dir = scratch_dir("decode");
         write_support_decode(&dir, &decode).expect("both charts write");
         for base in ["support_decode_moments", "support_decode_bins"] {
-            assert!(
-                shared::report::PRETRAIN_REPORT_BASES.contains(&base),
-                "{base} must be registered or the TUI never scans for it"
+            assert_eq!(
+                shared::report::pretrain_report_owner(base),
+                Some(shared::report::PretrainReportOwner::SupportDecode),
+                "{base} must remain owned by the support-decode writer"
             );
             let path = dir.join(format!("{base}.report.bin"));
             assert!(path.exists(), "{base} was not written");

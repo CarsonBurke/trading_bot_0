@@ -78,6 +78,537 @@ pub fn calendar_month(ts_ms: i64) -> i32 {
         .map(|stamp| stamp.year() * 12 + stamp.month0() as i32)
         .unwrap_or(i32::MIN)
 }
+// ---------------------------------------------------------------------------
+// Generic deterministic statistics
+// ---------------------------------------------------------------------------
+
+/// Product moments of a stream of finite `(x, y)` pairs.
+///
+/// The six stored values are additive sufficient statistics: callers can accumulate one
+/// instance per block or shard and [`Self::absorb`] them without retaining any observations.
+/// Non-finite pairs are deliberately ignored, matching the Skill diagnostic's historical
+/// convention.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct ProductMoments {
+    n: f64,
+    x: f64,
+    y: f64,
+    xx: f64,
+    yy: f64,
+    xy: f64,
+}
+
+impl ProductMoments {
+    pub fn push(&mut self, x: f64, y: f64) {
+        if !x.is_finite() || !y.is_finite() {
+            return;
+        }
+        self.n += 1.0;
+        self.x += x;
+        self.y += y;
+        self.xx += x * x;
+        self.yy += y * y;
+        self.xy += x * y;
+    }
+
+    pub fn absorb(&mut self, other: &Self) {
+        self.n += other.n;
+        self.x += other.x;
+        self.y += other.y;
+        self.xx += other.xx;
+        self.yy += other.yy;
+        self.xy += other.xy;
+    }
+
+    pub fn count(&self) -> f64 {
+        self.n
+    }
+
+    pub fn mean_x(&self) -> f64 {
+        if self.n > 0.0 {
+            self.x / self.n
+        } else {
+            f64::NAN
+        }
+    }
+
+    /// Pearson `corr(x, y)`, or NaN when fewer than two pairs were seen or either side is
+    /// constant.
+    pub fn corr(&self) -> f64 {
+        if self.n < 2.0 {
+            return f64::NAN;
+        }
+        let sxx = self.n * self.xx - self.x * self.x;
+        let syy = self.n * self.yy - self.y * self.y;
+        let sxy = self.n * self.xy - self.x * self.y;
+        if !(sxx > 0.0) || !(syy > 0.0) {
+            return f64::NAN;
+        }
+        sxy / (sxx * syy).sqrt()
+    }
+}
+
+/// Additive sufficient statistics that can be resampled block by block.
+pub trait BlockSums: Copy + Default {
+    fn absorb(&mut self, other: &Self);
+    /// Number of observations represented by this accumulator.
+    fn count(&self) -> f64;
+}
+
+impl BlockSums for ProductMoments {
+    fn absorb(&mut self, other: &Self) {
+        ProductMoments::absorb(self, other);
+    }
+
+    fn count(&self) -> f64 {
+        ProductMoments::count(self)
+    }
+}
+
+/// Pooled mid-ranks of `values`, `1..=n`, with tied values sharing their mean rank.
+///
+/// Ordering uses [`f64::total_cmp`], while ties use floating-point equality. This preserves
+/// the established Skill behavior, including one common rank for an all-tied input.
+pub fn mid_ranks(values: &[f64]) -> Vec<f64> {
+    let mut order: Vec<usize> = (0..values.len()).collect();
+    order.sort_by(|a, b| values[*a].total_cmp(&values[*b]));
+    let mut ranks = vec![f64::NAN; values.len()];
+    let mut start = 0usize;
+    while start < order.len() {
+        let mut end = start + 1;
+        while end < order.len() && values[order[end]] == values[order[start]] {
+            end += 1;
+        }
+        let mean = 0.5 * ((start + 1) + end) as f64;
+        for slot in &order[start..end] {
+            ranks[*slot] = mean;
+        }
+        start = end;
+    }
+    ranks
+}
+
+/// Ascending interior percentile cutpoints for `buckets` groups.
+///
+/// Non-finite values are excluded. Assignment against these population cutpoints is performed
+/// by [`bucket_of`]; tied observations at a boundary stay together in the lower bucket, which
+/// is the Skill diagnostic's existing convention.
+pub fn percentile_cutpoints(values: &[f64], buckets: usize) -> Vec<f64> {
+    if buckets < 2 {
+        return Vec::new();
+    }
+    let mut sorted: Vec<f64> = values
+        .iter()
+        .copied()
+        .filter(|value| value.is_finite())
+        .collect();
+    sorted.sort_by(f64::total_cmp);
+    (1..buckets)
+        .map(|k| sorted_percentile(&sorted, k as f64 / buckets as f64))
+        .collect()
+}
+
+/// Bucket index against ascending interior `cutpoints`.
+///
+/// A value equal to a boundary remains in the lower bucket. With `k` cutpoints the result is
+/// always in `0..=k`.
+pub fn bucket_of(cutpoints: &[f64], value: f64) -> usize {
+    cutpoints.partition_point(|cut| *cut < value)
+}
+
+/// Exact equal-count bucket assignment without arbitrary tie breaking.
+///
+/// Every finite observation receives the bucket implied by its sorted position and bucket
+/// sizes differ by at most one. If a required boundary splits equal values, including every
+/// boundary of an all-tied sample, the assignment is rejected instead of using input or symbol
+/// order to manufacture a ranking that the data do not contain.
+pub fn equal_count_buckets(values: &[f64], buckets: usize) -> Result<Vec<usize>> {
+    ensure!(
+        buckets >= 2,
+        "equal-count bucketing needs at least two buckets"
+    );
+    ensure!(
+        values.len() >= buckets,
+        "cannot divide {} observations into {buckets} non-empty buckets",
+        values.len()
+    );
+    ensure!(
+        values.iter().all(|value| value.is_finite()),
+        "equal-count bucketing requires finite values"
+    );
+
+    let mut order: Vec<usize> = (0..values.len()).collect();
+    order.sort_by(|a, b| values[*a].total_cmp(&values[*b]));
+    if values[order[0]] == values[*order.last().expect("values is non-empty")] {
+        bail!(
+            "all {} observations are tied at {}; exact {buckets}-bucket coverage is ambiguous",
+            values.len(),
+            values[order[0]]
+        );
+    }
+    for bucket in 1..buckets {
+        let boundary = (bucket * values.len()).div_ceil(buckets);
+        if values[order[boundary - 1]] == values[order[boundary]] {
+            bail!(
+                "equal-count bucket boundary {bucket}/{buckets} splits tied value {}; \
+                 exact coverage is ambiguous",
+                values[order[boundary]]
+            );
+        }
+    }
+
+    let mut assignment = vec![0usize; values.len()];
+    for (rank, slot) in order.into_iter().enumerate() {
+        assignment[slot] = rank * buckets / values.len();
+    }
+    Ok(assignment)
+}
+
+/// Resample additive statistics block by block and refit `stat` on each deterministic draw.
+///
+/// Non-finite draw results are omitted rather than imputed. This is the generic form of the
+/// paired block-statistic convention used by Skill: fixed bootstrap constants, block order,
+/// RNG, sample standard deviation, and linear-interpolated interval percentiles.
+pub fn paired_block_statistic<S: BlockSums>(blocks: &[S], stat: impl Fn(&S) -> f64) -> Dispersion {
+    let mut pooled = S::default();
+    for block in blocks {
+        pooled.absorb(block);
+    }
+    let mut out = Dispersion {
+        mean: stat(&pooled),
+        se: f64::NAN,
+        ci_low: f64::NAN,
+        ci_high: f64::NAN,
+        blocks: blocks.len(),
+        samples: pooled.count() as usize,
+    };
+    if blocks.len() < 2 {
+        return out;
+    }
+
+    let mut rng = ChaCha12Rng::seed_from_u64(BOOTSTRAP_SEED);
+    let mut draws = Vec::with_capacity(BOOTSTRAP_DRAWS);
+    for _ in 0..BOOTSTRAP_DRAWS {
+        let mut draw = S::default();
+        for _ in 0..blocks.len() {
+            draw.absorb(blocks.choose(&mut rng).expect("blocks is non-empty"));
+        }
+        let value = stat(&draw);
+        if value.is_finite() {
+            draws.push(value);
+        }
+    }
+    if draws.len() < 2 {
+        return out;
+    }
+    draws.sort_by(f64::total_cmp);
+    out.se = sample_standard_deviation(&draws);
+    let tail = (1.0 - CI_MASS) / 2.0;
+    out.ci_low = sorted_percentile(&draws, tail);
+    out.ci_high = sorted_percentile(&draws, 1.0 - tail);
+    out
+}
+
+/// Sample standard deviation with Bessel's correction, or NaN for fewer than two values.
+pub fn sample_standard_deviation(values: &[f64]) -> f64 {
+    if values.len() < 2 {
+        return f64::NAN;
+    }
+    let mean = values.iter().sum::<f64>() / values.len() as f64;
+    let variance = values
+        .iter()
+        .map(|value| (value - mean) * (value - mean))
+        .sum::<f64>()
+        / (values.len() - 1) as f64;
+    variance.sqrt()
+}
+
+/// Streaming f64 sufficient statistics for a ridge regression with an intercept.
+///
+/// Memory is `O(p²)` regardless of row count. The intercept is represented as the first
+/// normal-equation column and is never penalized.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RidgeSums {
+    features: usize,
+    rows: u64,
+    xtx: Vec<f64>,
+    xty: Vec<f64>,
+}
+
+impl RidgeSums {
+    pub fn new(features: usize) -> Result<Self> {
+        let dimension = features
+            .checked_add(1)
+            .context("ridge feature dimension overflow")?;
+        let matrix_len = dimension
+            .checked_mul(dimension)
+            .context("ridge normal-matrix dimension overflow")?;
+        Ok(Self {
+            features,
+            rows: 0,
+            xtx: vec![0.0; matrix_len],
+            xty: vec![0.0; dimension],
+        })
+    }
+
+    pub fn feature_count(&self) -> usize {
+        self.features
+    }
+
+    pub fn row_count(&self) -> u64 {
+        self.rows
+    }
+
+    /// Add one row. Dimension and finiteness are validated before any statistic is changed.
+    pub fn push(&mut self, features: &[f64], target: f64) -> Result<()> {
+        ensure!(
+            features.len() == self.features,
+            "ridge row has {} features, expected {}",
+            features.len(),
+            self.features
+        );
+        ensure!(target.is_finite(), "ridge target must be finite");
+        ensure!(
+            features.iter().all(|value| value.is_finite()),
+            "ridge features must all be finite"
+        );
+        let next_rows = self
+            .rows
+            .checked_add(1)
+            .context("ridge row count overflow")?;
+        let dimension = self.features + 1;
+        for i in 0..dimension {
+            let xi = if i == 0 { 1.0 } else { features[i - 1] };
+            let target_increment = xi * target;
+            ensure!(
+                target_increment.is_finite() && (self.xty[i] + target_increment).is_finite(),
+                "ridge target cross-product overflowed at feature column {i}"
+            );
+            for j in 0..dimension {
+                let xj = if j == 0 { 1.0 } else { features[j - 1] };
+                let matrix_increment = xi * xj;
+                ensure!(
+                    matrix_increment.is_finite()
+                        && (self.xtx[i * dimension + j] + matrix_increment).is_finite(),
+                    "ridge feature cross-product overflowed at matrix entry ({i}, {j})"
+                );
+            }
+        }
+        for i in 0..dimension {
+            let xi = if i == 0 { 1.0 } else { features[i - 1] };
+            self.xty[i] += xi * target;
+            for j in 0..dimension {
+                let xj = if j == 0 { 1.0 } else { features[j - 1] };
+                self.xtx[i * dimension + j] += xi * xj;
+            }
+        }
+        self.rows = next_rows;
+        Ok(())
+    }
+
+    /// Merge another accumulator in a fixed, deterministic element order.
+    pub fn absorb(&mut self, other: &Self) -> Result<()> {
+        ensure!(
+            self.features == other.features,
+            "cannot merge ridge statistics with {} and {} features",
+            self.features,
+            other.features
+        );
+        let rows = self
+            .rows
+            .checked_add(other.rows)
+            .context("ridge row count overflow while merging")?;
+        ensure!(
+            self.xtx
+                .iter()
+                .chain(&self.xty)
+                .chain(&other.xtx)
+                .chain(&other.xty)
+                .all(|value| value.is_finite()),
+            "cannot merge non-finite ridge sufficient statistics"
+        );
+        ensure!(
+            self.xtx
+                .iter()
+                .zip(&other.xtx)
+                .all(|(left, right)| (left + right).is_finite())
+                && self
+                    .xty
+                    .iter()
+                    .zip(&other.xty)
+                    .all(|(left, right)| (left + right).is_finite()),
+            "ridge sufficient statistics overflow while merging"
+        );
+        for (left, right) in self.xtx.iter_mut().zip(&other.xtx) {
+            *left += right;
+        }
+        for (left, right) in self.xty.iter_mut().zip(&other.xty) {
+            *left += right;
+        }
+        self.rows = rows;
+        Ok(())
+    }
+
+    /// Solve the regularized normal equations with a deterministic Cholesky factorization.
+    ///
+    /// `lambda` is added to feature diagonals only. Empty, non-finite, asymmetric, singular,
+    /// or numerically non-positive systems return an actionable error.
+    pub fn fit(&self, lambda: f64) -> Result<RidgeFit> {
+        ensure!(
+            lambda.is_finite() && lambda >= 0.0,
+            "ridge lambda must be finite and non-negative, got {lambda}"
+        );
+        ensure!(self.rows > 0, "cannot fit ridge regression without rows");
+        ensure!(
+            self.xtx
+                .iter()
+                .chain(&self.xty)
+                .all(|value| value.is_finite()),
+            "ridge sufficient statistics contain a non-finite value"
+        );
+
+        let dimension = self.features + 1;
+        let scale = self
+            .xtx
+            .iter()
+            .map(|value| value.abs())
+            .fold(0.0f64, f64::max)
+            .max(1.0);
+        let symmetry_tolerance = 32.0 * f64::EPSILON * scale;
+        for i in 0..dimension {
+            for j in 0..i {
+                let difference = (self.xtx[i * dimension + j] - self.xtx[j * dimension + i]).abs();
+                ensure!(
+                    difference <= symmetry_tolerance,
+                    "ridge normal matrix is asymmetric at ({i}, {j}): difference \
+                     {difference:e} exceeds tolerance {symmetry_tolerance:e}"
+                );
+            }
+        }
+
+        let mut matrix = self.xtx.clone();
+        for diagonal in 1..dimension {
+            matrix[diagonal * dimension + diagonal] += lambda;
+        }
+        ensure!(
+            matrix.iter().all(|value| value.is_finite()),
+            "ridge regularization overflowed the normal matrix at lambda {lambda}"
+        );
+
+        let pivot_floor = f64::EPSILON * dimension as f64 * scale;
+        let mut lower = vec![0.0; dimension * dimension];
+        for i in 0..dimension {
+            for j in 0..=i {
+                let mut value = matrix[i * dimension + j];
+                for k in 0..j {
+                    value -= lower[i * dimension + k] * lower[j * dimension + k];
+                }
+                ensure!(
+                    value.is_finite(),
+                    "ridge Cholesky produced a non-finite value at ({i}, {j})"
+                );
+                if i == j {
+                    ensure!(
+                        value > pivot_floor,
+                        "ridge normal matrix is singular or ill-conditioned at pivot {i}: \
+                         {value:e} <= {pivot_floor:e}; increase lambda or remove a degenerate \
+                         feature"
+                    );
+                    lower[i * dimension + j] = value.sqrt();
+                } else {
+                    lower[i * dimension + j] = value / lower[j * dimension + j];
+                }
+            }
+        }
+
+        let mut intermediate = vec![0.0; dimension];
+        for i in 0..dimension {
+            let mut value = self.xty[i];
+            for j in 0..i {
+                value -= lower[i * dimension + j] * intermediate[j];
+            }
+            intermediate[i] = value / lower[i * dimension + i];
+        }
+        let mut solution = vec![0.0; dimension];
+        for i in (0..dimension).rev() {
+            let mut value = intermediate[i];
+            for j in i + 1..dimension {
+                value -= lower[j * dimension + i] * solution[j];
+            }
+            solution[i] = value / lower[i * dimension + i];
+        }
+        ensure!(
+            solution.iter().all(|value| value.is_finite()),
+            "ridge solve produced non-finite coefficients"
+        );
+
+        Ok(RidgeFit {
+            intercept: solution[0],
+            coefficients: solution[1..].to_vec(),
+            lambda,
+        })
+    }
+}
+
+/// A solved ridge model. `coefficients` excludes the intercept.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RidgeFit {
+    pub intercept: f64,
+    pub coefficients: Vec<f64>,
+    pub lambda: f64,
+}
+
+impl RidgeFit {
+    pub fn predict(&self, features: &[f64]) -> Result<f64> {
+        ensure!(
+            features.len() == self.coefficients.len(),
+            "ridge prediction has {} features, expected {}",
+            features.len(),
+            self.coefficients.len()
+        );
+        ensure!(
+            features.iter().all(|value| value.is_finite()),
+            "ridge prediction features must all be finite"
+        );
+        let prediction = self
+            .coefficients
+            .iter()
+            .zip(features)
+            .fold(self.intercept, |sum, (coefficient, feature)| {
+                sum + coefficient * feature
+            });
+        ensure!(prediction.is_finite(), "ridge prediction is non-finite");
+        Ok(prediction)
+    }
+
+    pub fn predict_all<T: AsRef<[f64]>>(&self, rows: &[T]) -> Result<Vec<f64>> {
+        rows.iter().map(|row| self.predict(row.as_ref())).collect()
+    }
+}
+
+/// Positive geometric ridge candidates: `first * ratio.powi(index)`.
+pub fn geometric_lambdas(first: f64, ratio: f64, count: usize) -> Result<Vec<f64>> {
+    ensure!(
+        first.is_finite() && first > 0.0,
+        "first geometric ridge lambda must be finite and positive"
+    );
+    ensure!(
+        ratio.is_finite() && ratio > 1.0,
+        "geometric ridge lambda ratio must be finite and greater than one"
+    );
+    ensure!(count > 0, "geometric ridge lambda count must be positive");
+    let mut candidates = Vec::with_capacity(count);
+    let mut candidate = first;
+    for index in 0..count {
+        ensure!(
+            candidate.is_finite(),
+            "geometric ridge lambda overflowed at candidate {index}"
+        );
+        candidates.push(candidate);
+        candidate *= ratio;
+    }
+    Ok(candidates)
+}
 
 // ---------------------------------------------------------------------------
 // Block bootstrap
@@ -237,8 +768,8 @@ pub fn moving_block_bootstrap(
     Dispersion {
         mean,
         se: variance.sqrt(),
-        ci_low: percentile(&means, tail),
-        ci_high: percentile(&means, 1.0 - tail),
+        ci_low: sorted_percentile(&means, tail),
+        ci_high: sorted_percentile(&means, 1.0 - tail),
         blocks: resampling_blocks,
         samples,
     }
@@ -322,15 +853,15 @@ pub fn block_bootstrap_conditional_difference(
     Dispersion {
         mean: point,
         se: variance.sqrt(),
-        ci_low: percentile(&differences, tail),
-        ci_high: percentile(&differences, 1.0 - tail),
+        ci_low: sorted_percentile(&differences, tail),
+        ci_high: sorted_percentile(&differences, 1.0 - tail),
         blocks: totals.len(),
         samples: candidate.len(),
     }
 }
 
 /// Linear-interpolated percentile of an ascending slice.
-fn percentile(sorted: &[f64], q: f64) -> f64 {
+pub fn sorted_percentile(sorted: &[f64], q: f64) -> f64 {
     if sorted.is_empty() {
         return f64::NAN;
     }
@@ -1566,5 +2097,182 @@ mod tests {
             window_scores_path(Path::new("runs/x/weights/pretrain_best.ot")),
             PathBuf::from("runs/x/weights/pretrain_best.windows.json")
         );
+    }
+
+    #[test]
+    fn shared_mid_ranks_preserve_ties_and_all_tied_inputs() {
+        assert_eq!(
+            mid_ranks(&[30.0, 10.0, 20.0, 10.0]),
+            vec![4.0, 1.5, 3.0, 1.5]
+        );
+        assert_eq!(mid_ranks(&[7.0, 7.0, 7.0, 7.0]), vec![2.5; 4]);
+        assert!(mid_ranks(&[]).is_empty());
+    }
+
+    #[test]
+    fn product_moments_matches_centered_pearson_and_is_block_additive() {
+        let x = [1.0, 2.0, 4.0, 8.0, 16.0];
+        let y = [-2.0, 3.0, 1.0, 9.0, 7.0];
+        let mean_x = x.iter().sum::<f64>() / x.len() as f64;
+        let mean_y = y.iter().sum::<f64>() / y.len() as f64;
+        let covariance = x
+            .iter()
+            .zip(y)
+            .map(|(x, y)| (x - mean_x) * (y - mean_y))
+            .sum::<f64>();
+        let variance_x = x.iter().map(|x| (x - mean_x).powi(2)).sum::<f64>();
+        let variance_y = y.iter().map(|y| (y - mean_y).powi(2)).sum::<f64>();
+        let expected = covariance / (variance_x * variance_y).sqrt();
+
+        let mut left = ProductMoments::default();
+        let mut right = ProductMoments::default();
+        for (&x, &y) in x[..2].iter().zip(&y[..2]) {
+            left.push(x, y);
+        }
+        for (&x, &y) in x[2..].iter().zip(&y[2..]) {
+            right.push(x, y);
+        }
+        left.absorb(&right);
+        assert!((left.corr() - expected).abs() < 1e-14);
+        assert_eq!(left.count(), x.len() as f64);
+
+        let mut all_tied = ProductMoments::default();
+        all_tied.push(1.0, 2.0);
+        all_tied.push(1.0, 3.0);
+        assert!(all_tied.corr().is_nan());
+    }
+
+    #[test]
+    fn exact_deciles_cover_every_row_and_refuse_ambiguous_ties() {
+        let values: Vec<f64> = (0..100).map(|value| value as f64).collect();
+        let assignment = equal_count_buckets(&values, 10).expect("distinct exact deciles");
+        let mut counts = [0usize; 10];
+        for bucket in assignment {
+            counts[bucket] += 1;
+        }
+        assert_eq!(counts, [10; 10]);
+
+        let cuts = percentile_cutpoints(&values, 10);
+        assert_eq!(cuts.len(), 9);
+        assert_eq!(bucket_of(&cuts, 0.0), 0);
+        assert_eq!(bucket_of(&cuts, 99.0), 9);
+
+        let tied = equal_count_buckets(&[0.0, 1.0, 1.0, 2.0], 2)
+            .expect_err("a boundary must not split equal observations")
+            .to_string();
+        assert!(tied.contains("splits tied value"), "{tied}");
+        let all_tied = equal_count_buckets(&[3.0; 10], 10)
+            .expect_err("all-tied deciles are undefined")
+            .to_string();
+        assert!(all_tied.contains("ambiguous"), "{all_tied}");
+    }
+
+    #[test]
+    fn streaming_ridge_recovers_multivariate_coefficients_and_predicts() {
+        let rows = [[-2.0, 4.0], [-1.0, 1.0], [0.0, 0.0], [1.0, 1.0], [2.0, 4.0]];
+        let mut sums = RidgeSums::new(2).expect("dimensions");
+        for row in rows {
+            sums.push(&row, 4.0 + 2.0 * row[0] - 0.5 * row[1])
+                .expect("finite row");
+        }
+        let fit = sums.fit(0.0).expect("full-rank exact solve");
+        assert!((fit.intercept - 4.0).abs() < 1e-12);
+        assert!((fit.coefficients[0] - 2.0).abs() < 1e-12);
+        assert!((fit.coefficients[1] + 0.5).abs() < 1e-12);
+        assert!((fit.predict(&[3.0, 2.0]).expect("prediction") - 9.0).abs() < 1e-12);
+        assert_eq!(
+            fit.predict_all(&[[0.0, 0.0], [1.0, 1.0]])
+                .expect("batch prediction")
+                .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn ridge_regularizes_slopes_but_never_the_intercept() {
+        let mut line = RidgeSums::new(1).expect("dimensions");
+        for x in -5..=5 {
+            line.push(&[x as f64], 5.0 + 3.0 * x as f64)
+                .expect("finite row");
+        }
+        let unregularized = line.fit(0.0).expect("ordinary least squares");
+        let regularized = line.fit(1_000.0).expect("ridge");
+        assert!((unregularized.intercept - 5.0).abs() < 1e-12);
+        assert!((unregularized.coefficients[0] - 3.0).abs() < 1e-12);
+        assert!((regularized.intercept - 5.0).abs() < 1e-12);
+        assert!(regularized.coefficients[0].abs() < unregularized.coefficients[0].abs());
+
+        let mut intercept_only = RidgeSums::new(0).expect("intercept-only dimensions");
+        for target in [7.0, 7.0, 7.0] {
+            intercept_only.push(&[], target).expect("finite target");
+        }
+        let intercept = intercept_only
+            .fit(1.0e12)
+            .expect("unpenalized intercept")
+            .intercept;
+        assert!((intercept - 7.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn merged_ridge_sufficient_statistics_match_one_pass_accumulation() {
+        let rows = [
+            ([1.0, -1.0], 2.0),
+            ([2.0, 0.5], 4.0),
+            ([-3.0, 2.0], -1.0),
+            ([0.25, 4.0], 3.0),
+            ([5.0, -2.0], 8.0),
+        ];
+        let mut whole = RidgeSums::new(2).expect("dimensions");
+        let mut left = RidgeSums::new(2).expect("dimensions");
+        let mut right = RidgeSums::new(2).expect("dimensions");
+        for (index, (features, target)) in rows.iter().enumerate() {
+            whole.push(features, *target).expect("whole row");
+            if index < 2 {
+                left.push(features, *target).expect("left row");
+            } else {
+                right.push(features, *target).expect("right row");
+            }
+        }
+        left.absorb(&right).expect("compatible merge");
+        assert_eq!(left.row_count(), whole.row_count());
+        let merged = left.fit(0.25).expect("merged fit");
+        let direct = whole.fit(0.25).expect("direct fit");
+        assert!((merged.intercept - direct.intercept).abs() < 1e-14);
+        for (merged, direct) in merged.coefficients.iter().zip(direct.coefficients) {
+            assert!((merged - direct).abs() < 1e-14);
+        }
+    }
+
+    #[test]
+    fn ridge_rejects_nonfinite_asymmetric_and_degenerate_inputs() {
+        let mut finite = RidgeSums::new(2).expect("dimensions");
+        assert!(finite.push(&[f64::NAN, 1.0], 2.0).is_err());
+        assert!(finite.push(&[1.0, 2.0], f64::INFINITY).is_err());
+        assert!(finite.push(&[f64::MAX, 1.0], 2.0).is_err());
+        assert_eq!(
+            finite.row_count(),
+            0,
+            "rejected rows must not partially mutate sums"
+        );
+        assert!(finite.fit(0.0).is_err());
+        assert!(geometric_lambdas(1e-6, 10.0, 4).is_ok());
+        assert!(geometric_lambdas(0.0, 10.0, 4).is_err());
+
+        let mut degenerate = RidgeSums::new(2).expect("dimensions");
+        for x in 0..4 {
+            degenerate
+                .push(&[x as f64, x as f64], x as f64)
+                .expect("finite row");
+        }
+        assert!(degenerate.fit(0.0).is_err());
+        assert!(degenerate.fit(1.0).is_ok());
+
+        let mut asymmetric = degenerate.clone();
+        asymmetric.xtx[1] += 1.0;
+        let error = asymmetric
+            .fit(1.0)
+            .expect_err("asymmetric normal matrix")
+            .to_string();
+        assert!(error.contains("asymmetric"), "{error}");
     }
 }

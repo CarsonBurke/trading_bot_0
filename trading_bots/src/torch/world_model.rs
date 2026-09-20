@@ -4,7 +4,9 @@
 //! five bin embeddings, a raw-DOF projection and exogenous clock embeddings;
 //! same-instant observed market ids are masked before every token path. The
 //! resulting belief and a separate shared target-clock/current-market embedding
-//! condition [`BarEmissionHead`]'s five categoricals.
+//! condition [`BarEmissionHead`]'s five categoricals. [`DirectReturnHead`] reads
+//! that belief plus the point-in-time last-completed adjusted-daily context and
+//! independently predicts six cumulative-return laws.
 //!
 //! [`BarDynamics`] is the NextLat one-step latent predictor: given the belief
 //! after bar `t` and the exact shared trunk token of bar `t+1`, it predicts the
@@ -12,7 +14,7 @@
 //! exactly the state the cached trunk computes, which makes it a strictly cheaper
 //! but drifting substitute at rollout time — see [`RolloutMode`].
 //!
-//! [`BarWorldModel`] is the frozen inference bundle: trunk + emission head +
+//! [`BarWorldModel`] is the frozen inference bundle: trunk + both emission heads +
 //! dynamics + supports + [`BarWorldModelMetadata`], loaded with
 //! `require_complete()` and `VarStore::freeze()` so a planner can never silently
 //! run against a partially-matched or still-trainable checkpoint.
@@ -30,6 +32,7 @@ use serde::{Deserialize, Serialize};
 use tch::{autocast, nn, nn::Init, Device, Kind, Tensor};
 
 use crate::torch::{
+    adjusted_daily::{ADJUSTED_DAILY_CONTEXT_CONTRACT, ADJUSTED_DAILY_CONTEXT_FEATURES},
     bar_dist::{
         BarEmissionHead, BarSupports, BAR_CHAIN, BAR_DOF, BAR_DOF_NAMES, BAR_LABEL_SIGMA_RATIO,
         BAR_PREFIX_EMBED_DIM, BAR_VOLUME_EMA_SPAN, NUM_BAR_BINS,
@@ -37,6 +40,10 @@ use crate::torch::{
     dataset::{
         resolution_class, time_ids_without_market, BAR_TIME_CARDINALITY, BAR_TIME_CONDITIONING,
         BAR_TIME_FEATURES, BAR_TIME_MARKET, TIME_RESOLUTION,
+    },
+    direct_return::{
+        DirectReturnContextMode, DirectReturnHead, DirectReturnSupports,
+        DIRECT_RETURN_HEAD_INPUT_DIM,
     },
     fa4::{pope_flash_attention_decode_q1, pope_flash_attention_prefill},
     hashing::file_sha256,
@@ -70,10 +77,13 @@ pub const BAR_MAX_CONTEXT: i64 = 2048;
 /// token forecast-safe by masking its same-instant market ids, gives the emission
 /// readout an explicit target-clock/current-market conditioning vector, and makes
 /// dynamics consume the trunk's exact shared token embedding rather than private
-/// DOF and clock encoders. Each transition changes VarStore shapes or semantics,
-/// so checkpoints cannot be cross-loaded.
+/// DOF and clock encoders. `v6` -> `v7` adds the zero-initialized six-horizon
+/// cumulative-return categorical projection. `v7` -> `v8` conditions that projection on
+/// the causal last-fully-completed adjusted-daily vector. That is a semantic and VarStore
+/// shape cutover: earlier checkpoints must fail rather than partially load. Each transition
+/// changes VarStore shapes or semantics, so checkpoints cannot be cross-loaded.
 pub const BAR_ARCHITECTURE: &str =
-    "bardist-causal-ar-pope64-fa4-time9market-binprefix-dynrms-x0shortcut-forecastcond-sharedtoken-v6";
+    "bardist-causal-ar-pope64-fa4-time9market-binprefix-dynrms-x0shortcut-forecastcond-sharedtoken-directreturn-dailyctx-v8";
 
 /// KV-cache layout contract. Any change to the cache geometry, the position
 /// bookkeeping or the eviction rule must bump this, because it feeds the lineage
@@ -91,12 +101,10 @@ pub const BAR_POST_LAMBDA_INIT: f64 = 1.0;
 pub const BAR_DYNAMICS_HIDDEN: i64 = 1664;
 
 /// Metadata schema version. v5 and below are LeJEPA-era and unreadable here. v7 adds
-/// [`BarTrainingProvenance`], so a checkpoint states which corpus and which selection rule
-/// produced it instead of leaving both to a run log nobody kept. v8 adds the three CONTEXT
-/// lengths of that selection: a checkpoint promoted at the ramp's starting context because
-/// the run never reached the deployed one is a legitimate artifact but not the same artifact,
-/// and the difference has to be readable off the file rather than inferred from a log.
-pub const BAR_METADATA_VERSION: u32 = 8;
+/// [`BarTrainingProvenance`], v8 adds the exact selection contexts, v9 makes the six-horizon
+/// direct-return support hash mandatory, v10 records the adjusted-daily input geometry and
+/// semantic contract, and v11 makes the enabled-versus-masked context semantics immutable.
+pub const BAR_METADATA_VERSION: u32 = 11;
 
 /// ET minutes at which the session channel changes value, re-exported from the
 /// producer. Folded into the lineage because the cardinality alone does not pin
@@ -187,8 +195,15 @@ pub struct BarWorldModelMetadata {
     pub ff_dim: i64,
     pub max_context_bars: i64,
     pub num_bins: i64,
+    pub direct_return_input_dim: i64,
+    pub direct_return_context: String,
+    pub direct_return_context_mode: DirectReturnContextMode,
     pub res_secs: u32,
     pub supports_sha256: BTreeMap<u32, String>,
+    /// SHA-256 of the canonical six-horizon direct-return support sidecar.
+    ///
+    /// v7 has a deployable direct-return head only when this exact geometry is present.
+    pub direct_return_supports_sha256: String,
     /// SHA-256 of the weight FILE, which pins this sidecar to the exact bytes it was written
     /// beside. It is not a fingerprint of the weights: a `.ot` is a torch zip whose internal
     /// record names derive from the file stem, so re-saving identical tensors under a different
@@ -226,6 +241,9 @@ pub struct BarWorldModelMetadata {
 /// over five factors with wildly unequal headroom (`r` 0.110, `s` 0.192, `u` 1.092, `v`
 /// 1.174, `w` 0.000 nats below uniform on the live supports). Whatever we promote on, the
 /// artifact should say so.
+pub const ALPHA_EVALUATION_POLICY: &str =
+    "validation-only-v1; historical-terminal-test=spent; future-test=bounded-campaign-final-permit";
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct BarTrainingProvenance {
     /// `BarCorpus::identity_fingerprint()` of the corpus this run trained and scored on.
@@ -234,6 +252,21 @@ pub struct BarTrainingProvenance {
     pub split_bounds: (i64, i64),
     /// True when the instants came from `--split-bounds` rather than from the live
     /// percentiles. A pinned run is comparable to another pinned run at the same instants.
+    /// Canonical rolling-origin plan identity and selected fold chronology.
+    #[serde(default)]
+    pub rolling_plan_sha256: String,
+    #[serde(default)]
+    pub rolling_fold_index: u32,
+    #[serde(default)]
+    pub rolling_fit_range_ms: [i64; 2],
+    #[serde(default)]
+    pub rolling_validation_range_ms: [i64; 2],
+    #[serde(default)]
+    pub rolling_embargo_steps: usize,
+    #[serde(default)]
+    pub terminal_test_spent: bool,
+    #[serde(default)]
+    pub support_sample_seed: u64,
     pub split_bounds_pinned: bool,
     /// Seed of the pinned evaluation windows. Campaign-constant by design; deliberately NOT
     /// the training seed, or a seed replicate would resample the whole bench.
@@ -262,6 +295,24 @@ pub struct BarTrainingProvenance {
     pub min_dollar_volume: f64,
     /// Symbols the corpus actually held after every filter.
     pub symbols: usize,
+    /// Point-in-time corpus admission rule. Absent on legacy v8 metadata.
+    #[serde(default)]
+    pub universe_admission_rule: Option<String>,
+    /// Resolved `train_end` cutoff used by that rule.
+    #[serde(default)]
+    pub universe_admission_cutoff_ms: Option<i64>,
+    /// Required number of bars strictly before `universe_admission_cutoff_ms`.
+    #[serde(default)]
+    pub minimum_training_bars: Option<usize>,
+    /// Domain-separated digest of `admitted_symbols`.
+    #[serde(default)]
+    pub admitted_symbols_digest: Option<String>,
+    /// Exact ordered admitted list, sufficient to reconstruct corpus membership.
+    #[serde(default)]
+    pub admitted_symbols: Option<Vec<String>>,
+    /// Alpha-development evaluation policy. Absent on legacy v8 metadata.
+    #[serde(default)]
+    pub evaluation_policy: Option<String>,
     /// True when the supports were reused under `--freeze-supports` despite provenance that
     /// does not match this corpus. Comparability bought deliberately, and recorded.
     pub supports_frozen: bool,
@@ -283,10 +334,6 @@ pub struct BarTrainingProvenance {
     /// reason: a checkpoint cannot be relabelled with a mode it was not trained under, and
     /// `pretrain-compare` refuses to pair two runs that disagree.
     pub scoring: String,
-    /// Opt-in categorical beta-NLL training objective. `None` is proper Hard categorical
-    /// NLL and contributes no lineage suffix, preserving legacy hashes.
-    #[serde(default)]
-    pub beta_nll: Option<BarBetaNllProvenance>,
     /// Context length, in bars, of the held-out set the promotion decision was actually
     /// taken on.
     ///
@@ -332,8 +379,8 @@ pub struct BarTrainingProvenance {
     pub selection_edge_bps: Option<f64>,
     #[serde(default)]
     pub selection_edge_se_bps: Option<f64>,
-    /// Conditional held-out NLL of the same pass, in nats per bar: the GUARDED quantity, not
-    /// the selected one.
+    /// Conditional held-out NLL of the same pass, in nats per bar. This is the aggregate
+    /// predictive regression guard used by the provisional validation selection.
     #[serde(default)]
     pub selection_nll_conditional: Option<f64>,
     /// Batch size, in WINDOWS, the run actually used at each ramp stage.
@@ -401,12 +448,6 @@ pub struct BarOptimizerAblationProvenance {
     #[serde(default)]
     pub beta_update_clip: Option<f64>,
 }
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct BarBetaNllProvenance {
-    pub exponent: f64,
-    pub variance_normalization: String,
-    pub variance_floor_ratio: f64,
-}
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct BarPretrainRecovery {
@@ -425,9 +466,6 @@ pub struct BarPretrainRecovery {
     pub dyn_horizon: usize,
     pub lambda_dyn: f64,
     pub lambda_kl: f64,
-    /// Opt-in categorical beta-NLL exponent. `None` is the production proper-NLL objective.
-    #[serde(default)]
-    pub beta_nll: Option<f64>,
     #[serde(default)]
     pub auxiliary_resolutions: Vec<u32>,
     pub checkpoint_every: usize,
@@ -458,7 +496,13 @@ impl BarWorldModelMetadata {
         resolutions: &[u32],
         res_secs: u32,
     ) -> Result<Self> {
-        Self::for_checkpoint_with(checkpoint, resolutions, res_secs, None)
+        Self::for_checkpoint_with(
+            checkpoint,
+            resolutions,
+            res_secs,
+            DirectReturnContextMode::Enabled,
+            None,
+        )
     }
 
     /// As [`Self::for_checkpoint`], recording which corpus and which selection rule
@@ -468,6 +512,7 @@ impl BarWorldModelMetadata {
         checkpoint: impl AsRef<Path>,
         resolutions: &[u32],
         res_secs: u32,
+        direct_return_context_mode: DirectReturnContextMode,
         training: Option<BarTrainingProvenance>,
     ) -> Result<Self> {
         let checkpoint = checkpoint.as_ref();
@@ -490,6 +535,8 @@ impl BarWorldModelMetadata {
                 bail!("resolution {resolution}s listed twice");
             }
         }
+        let direct_return_supports_sha256 =
+            file_sha256(&world_model_direct_return_supports_path(checkpoint))?;
         let mut metadata = Self {
             format_version: BAR_METADATA_VERSION,
             architecture: BAR_ARCHITECTURE.to_owned(),
@@ -500,8 +547,12 @@ impl BarWorldModelMetadata {
             ff_dim: BAR_FF_DIM,
             max_context_bars: BAR_MAX_CONTEXT,
             num_bins: NUM_BAR_BINS,
+            direct_return_input_dim: DIRECT_RETURN_HEAD_INPUT_DIM,
+            direct_return_context: ADJUSTED_DAILY_CONTEXT_CONTRACT.to_owned(),
+            direct_return_context_mode,
             res_secs,
             supports_sha256,
+            direct_return_supports_sha256,
             checkpoint_sha256: file_sha256(checkpoint)?,
             lineage_sha256: String::new(),
             training,
@@ -520,7 +571,13 @@ impl BarWorldModelMetadata {
         resolutions: &[u32],
         res_secs: u32,
     ) -> Result<PathBuf> {
-        Self::save_for_checkpoint_with(checkpoint, resolutions, res_secs, None)
+        Self::save_for_checkpoint_with(
+            checkpoint,
+            resolutions,
+            res_secs,
+            DirectReturnContextMode::Enabled,
+            None,
+        )
     }
 
     /// As [`Self::save_for_checkpoint`], with the run's data and selection provenance.
@@ -528,11 +585,19 @@ impl BarWorldModelMetadata {
         checkpoint: impl AsRef<Path>,
         resolutions: &[u32],
         res_secs: u32,
+        direct_return_context_mode: DirectReturnContextMode,
         training: Option<BarTrainingProvenance>,
     ) -> Result<PathBuf> {
         let checkpoint = checkpoint.as_ref();
         let path = world_model_metadata_path(checkpoint);
-        Self::for_checkpoint_with(checkpoint, resolutions, res_secs, training)?.save(&path)?;
+        Self::for_checkpoint_with(
+            checkpoint,
+            resolutions,
+            res_secs,
+            direct_return_context_mode,
+            training,
+        )?
+        .save(&path)?;
         Ok(path)
     }
 
@@ -603,6 +668,15 @@ impl BarWorldModelMetadata {
                 );
             }
         }
+        let direct_path = world_model_direct_return_supports_path(checkpoint);
+        let actual = file_sha256(&direct_path)?;
+        if actual != self.direct_return_supports_sha256 {
+            bail!(
+                "world-model direct-return supports hash mismatch at {}: metadata={}, actual={actual}",
+                direct_path.display(),
+                self.direct_return_supports_sha256
+            );
+        }
         Ok(())
     }
 
@@ -627,11 +701,26 @@ impl BarWorldModelMetadata {
             ("ff_dim", self.ff_dim, BAR_FF_DIM),
             ("max_context_bars", self.max_context_bars, BAR_MAX_CONTEXT),
             ("num_bins", self.num_bins, NUM_BAR_BINS),
+            (
+                "direct_return_input_dim",
+                self.direct_return_input_dim,
+                DIRECT_RETURN_HEAD_INPUT_DIM,
+            ),
         ] {
             if actual != expected {
                 bail!("incompatible world-model {name} {actual}, expected {expected}");
             }
         }
+        ensure!(
+            self.direct_return_context == ADJUSTED_DAILY_CONTEXT_CONTRACT,
+            "incompatible direct-return context {}, expected {}",
+            self.direct_return_context,
+            ADJUSTED_DAILY_CONTEXT_CONTRACT
+        );
+        ensure!(
+            self.direct_return_input_dim == BAR_MODEL_DIM + ADJUSTED_DAILY_CONTEXT_FEATURES as i64,
+            "direct-return input dimension is not belief plus adjusted-daily context"
+        );
         if self.res_secs == 0 {
             bail!("world-model bar resolution must be positive");
         }
@@ -673,6 +762,51 @@ impl BarWorldModelMetadata {
                     && self.optimizer_initialized_adamw.is_empty(),
                 "optimizer recovery fields are present without a recovery contract"
             );
+        }
+        if let Some(training) = &self.training {
+            let universe_fields = [
+                training.universe_admission_rule.is_some(),
+                training.universe_admission_cutoff_ms.is_some(),
+                training.minimum_training_bars.is_some(),
+                training.admitted_symbols_digest.is_some(),
+                training.admitted_symbols.is_some(),
+            ];
+            let recorded = universe_fields.iter().filter(|present| **present).count();
+            ensure!(
+                recorded == 0 || recorded == universe_fields.len(),
+                "checkpoint carries partial corpus-universe provenance"
+            );
+            if recorded != 0 {
+                ensure!(
+                    training.universe_admission_rule.as_deref()
+                        == Some(crate::torch::dataset::CORPUS_UNIVERSE_RULE),
+                    "checkpoint carries an unknown corpus-universe admission rule"
+                );
+                ensure!(
+                    training.universe_admission_cutoff_ms == Some(training.split_bounds.0),
+                    "corpus-universe cutoff disagrees with the train boundary"
+                );
+                ensure!(
+                    training
+                        .admitted_symbols_digest
+                        .as_ref()
+                        .is_some_and(|digest| !digest.is_empty()),
+                    "corpus-universe admitted-symbol digest is empty"
+                );
+                ensure!(
+                    training
+                        .admitted_symbols
+                        .as_ref()
+                        .is_some_and(|symbols| symbols.len() == training.symbols),
+                    "corpus-universe admitted-symbol list does not match the recorded symbol count"
+                );
+            }
+            if let Some(policy) = &training.evaluation_policy {
+                ensure!(
+                    policy == ALPHA_EVALUATION_POLICY,
+                    "checkpoint carries an unknown alpha-evaluation policy"
+                );
+            }
         }
         if self.supports_sha256.is_empty() {
             bail!("world-model metadata has no supports hash");
@@ -746,22 +880,60 @@ impl BarWorldModelMetadata {
                 optimizer.name
             )
         });
-        let beta_nll_suffix = training
-            .beta_nll
-            .as_ref()
-            .map_or_else(String::new, |beta_nll| {
-                format!(
-                ";beta_nll=exponent:{:016x},variance_normalization:{},variance_floor_ratio:{:016x}",
-                beta_nll.exponent.to_bits(),
-                beta_nll.variance_normalization,
-                beta_nll.variance_floor_ratio.to_bits(),
+        let universe_suffix = if training.universe_admission_rule.is_none()
+            && training.universe_admission_cutoff_ms.is_none()
+            && training.minimum_training_bars.is_none()
+            && training.admitted_symbols_digest.is_none()
+            && training.admitted_symbols.is_none()
+        {
+            String::new()
+        } else {
+            let symbols = training.admitted_symbols.as_ref().map_or_else(
+                || "none".to_owned(),
+                |symbols| {
+                    symbols
+                        .iter()
+                        .map(|symbol| format!("{}:{symbol}", symbol.len()))
+                        .collect::<Vec<_>>()
+                        .join(",")
+                },
+            );
+            format!(
+                ";universe_admission_rule={};universe_admission_cutoff={};minimum_training_bars={};\
+                 admitted_symbols_digest={};admitted_symbols={symbols}",
+                training.universe_admission_rule.as_deref().unwrap_or("none"),
+                training
+                    .universe_admission_cutoff_ms
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "none".to_owned()),
+                training
+                    .minimum_training_bars
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "none".to_owned()),
+                training.admitted_symbols_digest.as_deref().unwrap_or("none"),
             )
-            });
+        };
+        let evaluation_policy_suffix = training
+            .evaluation_policy
+            .as_ref()
+            .map_or_else(String::new, |policy| format!(";evaluation_policy={policy}"));
+        let rolling_suffix = format!(
+            ";rolling_plan={};fold={};fit={}:{};validation={}:{};embargo={};terminal_test_spent={};support_sample_seed={:016x}",
+            training.rolling_plan_sha256,
+            training.rolling_fold_index,
+            training.rolling_fit_range_ms[0],
+            training.rolling_fit_range_ms[1],
+            training.rolling_validation_range_ms[0],
+            training.rolling_validation_range_ms[1],
+            training.rolling_embargo_steps,
+            training.terminal_test_spent,
+            training.support_sample_seed,
+        );
         format!(
             "corpus={};bounds={}:{};pinned={};eval_seed={:016x};train_seed={:016x};\
              metric={};weights={};guard={}@{:016x};min_dollar_volume_bits={:016x};symbols={};\
              supports_frozen={};supports_corpus={};universe={};universe_train_end={};\
-             scoring={};context={}@{}/{};batch_ramp={}{}{}{}",
+             scoring={};context={}@{}/{};batch_ramp={}{}{}{}{}{}",
             training.corpus_fingerprint,
             training.split_bounds.0,
             training.split_bounds.1,
@@ -803,6 +975,7 @@ impl BarWorldModelMetadata {
                     .collect::<Vec<_>>()
                     .join(",")
             },
+            universe_suffix,
             // Absent — `0.0`, which the flag refuses — renders NOTHING, so every sidecar
             // written before the fraction was recorded still validates against its own hash.
             if training.lr_plateau_fraction == 0.0 {
@@ -814,7 +987,8 @@ impl BarWorldModelMetadata {
                 )
             },
             optimizer_suffix,
-            beta_nll_suffix,
+            evaluation_policy_suffix,
+            rolling_suffix,
         )
     }
 
@@ -835,11 +1009,8 @@ impl BarWorldModelMetadata {
                     .join(",")
             )
         };
-        let beta_nll_suffix = recovery.beta_nll.map_or_else(String::new, |beta| {
-            format!(",beta_nll={:016x}", beta.to_bits())
-        });
         format!(
-            ";optimizer_checkpoint_sha256={};optimizer_initialized_adamw={};recovery=total_steps={},stage_steps={}{},base_batch={},requested_batch={},exact_batch={},epochs={},steps_override={},dyn_horizon={},lambda_dyn={:016x},lambda_kl={:016x},auxiliary_resolutions={},checkpoint_every={},validate_every={},ablation_lr={:016x},smd_meta_lr={:016x}{}",
+            ";optimizer_checkpoint_sha256={};optimizer_initialized_adamw={};recovery=total_steps={},stage_steps={}{},base_batch={},requested_batch={},exact_batch={},epochs={},steps_override={},dyn_horizon={},lambda_dyn={:016x},lambda_kl={:016x},auxiliary_resolutions={},checkpoint_every={},validate_every={},ablation_lr={:016x},smd_meta_lr={:016x}",
             self.optimizer_checkpoint_sha256.as_deref().unwrap_or("none"),
             self.optimizer_initialized_adamw.join(","),
             recovery.total_steps,
@@ -870,7 +1041,6 @@ impl BarWorldModelMetadata {
             recovery.validate_every,
             recovery.ablation_lr.to_bits(),
             recovery.smd_meta_lr.to_bits(),
-            beta_nll_suffix,
         )
     }
 
@@ -889,8 +1059,9 @@ impl BarWorldModelMetadata {
             .join(",");
         let canonical = format!(
             "format_version={};architecture={};model_dim={};layers={};heads={};head_dim={};\
-             ff_dim={};max_context_bars={};num_bins={};res_secs={};dof={};dof_names={};chain={};supports_sha256={};\
-             weights_sha256={};norm=rmsnorm-no-gain;norm_eps_bits={:016x};qk_norm=head-dim-rmsnorm;\
+             ff_dim={};max_context_bars={};num_bins={};direct_return_input_dim={};direct_return_context={};\
+             direct_return_context_mode={};res_secs={};dof={};dof_names={};chain={};supports_sha256={};\
+             direct_return_supports_sha256={};weights_sha256={};norm=rmsnorm-no-gain;norm_eps_bits={:016x};qk_norm=head-dim-rmsnorm;\
              mlp=relu-squared;resid_lambda_init_bits={:016x};post_lambda_init_bits={:016x};\
              weight_scalars=qkv-and-out;zero_init=attn-out,ff-out,dyn-fc3,x0-lambda;\
              shortcut=embedding-x0-per-layer-attn-residual;dynamics_hidden={};\
@@ -910,6 +1081,9 @@ impl BarWorldModelMetadata {
             self.ff_dim,
             self.max_context_bars,
             self.num_bins,
+            self.direct_return_input_dim,
+            self.direct_return_context,
+            self.direct_return_context_mode.as_str(),
             self.res_secs,
             BAR_DOF,
             BAR_DOF_NAMES.join(","),
@@ -923,6 +1097,7 @@ impl BarWorldModelMetadata {
                 .map(|(res, sha)| format!("{res}:{sha}"))
                 .collect::<Vec<_>>()
                 .join(","),
+            self.direct_return_supports_sha256,
             self.checkpoint_sha256,
             BAR_NORM_EPS.to_bits(),
             BAR_RESID_LAMBDA_INIT.to_bits(),
@@ -980,6 +1155,12 @@ pub fn world_model_optimizer_path(checkpoint: impl AsRef<Path>) -> PathBuf {
 /// 128-bin equal-mass support discretizes one resolution's distribution.
 pub fn world_model_supports_path(checkpoint: impl AsRef<Path>, res_secs: u32) -> PathBuf {
     sidecar_path(checkpoint.as_ref(), &format!("supports.{res_secs}.json"))
+}
+
+/// Canonical six-horizon cumulative-return supports:
+/// `foo.ot` -> `foo.direct-return-supports.json`.
+pub fn world_model_direct_return_supports_path(checkpoint: impl AsRef<Path>) -> PathBuf {
+    sidecar_path(checkpoint.as_ref(), "direct-return-supports.json")
 }
 
 // ---------------------------------------------------------------------------
@@ -2254,13 +2435,15 @@ pub struct BarForecast {
     pub rollout: BarRollout,
 }
 
-/// Trunk, emission head and dynamics under one `VarStore` path.
+/// Trunk, joint bar emission head, direct-return head and dynamics under one
+/// `VarStore` path.
 ///
 /// Training and inference both go through this constructor, so checkpoint tensor
 /// names cannot drift between the two.
 pub struct BarModules {
     pub trunk: BarTrunk,
     pub head: BarEmissionHead,
+    pub direct_return_head: DirectReturnHead,
     pub dynamics: BarDynamics,
 }
 
@@ -2269,6 +2452,7 @@ impl BarModules {
         Self {
             trunk: BarTrunk::new(vs),
             head: BarEmissionHead::new(vs, BAR_MODEL_DIM),
+            direct_return_head: DirectReturnHead::new(vs),
             dynamics: BarDynamics::new(vs, BAR_MODEL_DIM),
         }
     }
@@ -2351,6 +2535,7 @@ pub struct BarWorldModel {
     var_store: nn::VarStore,
     modules: BarModules,
     supports: BarSupportSet,
+    direct_return_supports: DirectReturnSupports,
     metadata: BarWorldModelMetadata,
 }
 
@@ -2363,6 +2548,10 @@ impl BarWorldModel {
         let metadata = BarWorldModelMetadata::load(metadata)?;
         metadata.validate_checkpoint(weights)?;
         metadata.validate_supports(weights)?;
+        let direct_path = world_model_direct_return_supports_path(weights);
+        let direct_return_supports = DirectReturnSupports::load(&direct_path)
+            .with_context(|| format!("loading {}", direct_path.display()))?
+            .to_device(device);
         let mut loaded = Vec::with_capacity(metadata.supports_sha256.len());
         for resolution in metadata.resolutions() {
             let path = world_model_supports_path(weights, resolution);
@@ -2393,6 +2582,7 @@ impl BarWorldModel {
             var_store,
             modules,
             supports,
+            direct_return_supports,
             metadata,
         })
     }
@@ -2412,6 +2602,16 @@ impl BarWorldModel {
     /// Every resolution's supports, device-resident.
     pub fn supports(&self) -> &BarSupportSet {
         &self.supports
+    }
+
+    /// Canonical six-horizon cumulative-return support geometry.
+    pub fn direct_return_supports(&self) -> &DirectReturnSupports {
+        &self.direct_return_supports
+    }
+
+    /// Immutable direct-return adjusted-daily semantics restored from checkpoint metadata.
+    pub fn direct_return_context_mode(&self) -> DirectReturnContextMode {
+        self.metadata.direct_return_context_mode
     }
 
     /// The support of the deployment resolution: the one held-out selection and
@@ -2917,6 +3117,10 @@ mod tests {
         dataset::{
             BAR_TIME_MARKET, TIME_DAY_EDGE, TIME_ELAPSED, TIME_MINUTE, TIME_SESSION, TIME_WEEKDAY,
         },
+        direct_return::{
+            direct_return_ce_from_logits, DirectReturnSupportsProvenance, DIRECT_RETURN_COUNT,
+            DIRECT_RETURN_HEAD_NAME,
+        },
         test_rng,
     };
 
@@ -3067,6 +3271,26 @@ mod tests {
         let weights = dir.join("bar_world_model.ot");
         let supports_path = world_model_supports_path(&weights, 300);
         supports.save(&supports_path).expect("save supports");
+        let rows = (0..256)
+            .map(|row| std::array::from_fn(|horizon| row as f64 * 1e-5 + horizon as f64 * 1e-4))
+            .collect::<Vec<_>>();
+        let direct = DirectReturnSupports::fit(
+            &rows,
+            DirectReturnSupportsProvenance {
+                corpus_fingerprint: "fixture-corpus".to_owned(),
+                fit: crate::torch::dataset::TimeRange::new(1, 10_000),
+                fold_plan_hash: "fixture-plan".to_owned(),
+                fold_index: 0,
+                admitted_universe_digest: "fixture-universe".to_owned(),
+                train_seed: 1,
+                support_sample_seed: 2,
+                row_count: rows.len(),
+            },
+        )
+        .expect("fit direct supports");
+        direct
+            .save(world_model_direct_return_supports_path(&weights))
+            .expect("save direct supports");
         let vs = nn::VarStore::new(Device::Cpu);
         let _ = BarModules::new(&vs.root());
         wake_projections(&vs, 7);
@@ -3084,6 +3308,7 @@ mod tests {
             BAR_DYNAMICS_HIDDEN,
             (1.6 * 1024.0f64 / 128.0).round() as i64 * 128
         );
+        assert!(BAR_ARCHITECTURE.ends_with("-directreturn-dailyctx-v8"));
         assert_eq!(BAR_HEADS * BAR_HEAD_DIM, BAR_MODEL_DIM);
     }
 
@@ -3115,11 +3340,26 @@ mod tests {
         }
         let mut total = 0i64;
         let mut trunk_and_dynamics = 0i64;
+        let mut direct_return_parameters = 0usize;
         let mut seen = HashSet::new();
         for (name, tensor) in vs.variables() {
             let emission = BAR_EMISSION_ADAMW_NAME_SUBSTRINGS
                 .iter()
                 .any(|s| name.contains(s));
+            if name.contains(DIRECT_RETURN_HEAD_NAME) {
+                direct_return_parameters += 1;
+                assert!(
+                    emission,
+                    "{name} must inherit the existing bar-emission AdamW group"
+                );
+                if tensor.dim() == 2 {
+                    assert_eq!(
+                        tensor.size()[1],
+                        DIRECT_RETURN_HEAD_INPUT_DIM,
+                        "the direct-return projection input must be belief plus daily context"
+                    );
+                }
+            }
             let groups = [
                 muon.iter().any(|s| name.contains(s)),
                 bar_adamw_embedding_substrings()
@@ -3149,6 +3389,58 @@ mod tests {
             (30_000_000..45_000_000).contains(&trunk_and_dynamics),
             "trunk+dynamics parameter count {trunk_and_dynamics} left the ~32M design point"
         );
+        assert_eq!(
+            direct_return_parameters, 2,
+            "the direct-return projection must own exactly weight and bias"
+        );
+    }
+
+    #[test]
+    fn direct_return_loss_reaches_its_projection_and_the_trunk() {
+        let _torch_rng_guard = test_rng::exclusive();
+        let supports = synthetic_supports();
+        let vs = nn::VarStore::new(Device::Cpu);
+        let modules = BarModules::new(&vs.root());
+        wake_projections(&vs, 0x5eed);
+        let (dof, ids, time_ids) = synthetic_inputs(&supports, 2, 8, 0xd1ce);
+        let beliefs = modules.trunk.forward(&dof, &ids, &time_ids, 0, true);
+        let adjusted_daily = Tensor::zeros(
+            [2, 8, ADJUSTED_DAILY_CONTEXT_FEATURES as i64],
+            (Kind::Float, Device::Cpu),
+        );
+        let logits = modules.direct_return_head.logits(
+            &beliefs,
+            &adjusted_daily,
+            DirectReturnContextMode::Enabled,
+        );
+        let targets = Tensor::zeros(
+            [2, 8, DIRECT_RETURN_COUNT as i64],
+            (Kind::Int64, Device::Cpu),
+        );
+        let (loss, _) = direct_return_ce_from_logits(&logits, &targets);
+        loss.backward();
+
+        let mut direct_grads = 0usize;
+        let mut trunk_reached = false;
+        for (name, tensor) in vs.variables() {
+            let grad = tensor.grad();
+            let has_gradient =
+                grad.defined() && grad.abs().sum(Kind::Float).double_value(&[]) > 0.0;
+            if name.contains(DIRECT_RETURN_HEAD_NAME) && has_gradient {
+                direct_grads += 1;
+            }
+            if name.contains("bar_dof_embed") {
+                trunk_reached |= has_gradient;
+            }
+        }
+        assert_eq!(
+            direct_grads, 2,
+            "both direct-return weight and bias need categorical gradients"
+        );
+        assert!(
+            trunk_reached,
+            "a nonzero direct-return readout must carry loss into the shared trunk"
+        );
     }
 
     #[test]
@@ -3163,6 +3455,18 @@ mod tests {
         assert_eq!(metadata.architecture, BAR_ARCHITECTURE);
         assert_eq!(metadata.model_dim, BAR_MODEL_DIM);
         assert_eq!(metadata.num_bins, NUM_BAR_BINS);
+        assert_eq!(
+            metadata.direct_return_input_dim,
+            DIRECT_RETURN_HEAD_INPUT_DIM
+        );
+        assert_eq!(
+            metadata.direct_return_context,
+            ADJUSTED_DAILY_CONTEXT_CONTRACT
+        );
+        assert_eq!(
+            metadata.direct_return_context_mode,
+            DirectReturnContextMode::Enabled
+        );
         assert_eq!(metadata.res_secs, 300);
         assert_eq!(metadata.lineage_sha256.len(), 64);
         assert!(!metadata.supports_sha256.is_empty());
@@ -3174,10 +3478,56 @@ mod tests {
             BarWorldModelMetadata::for_checkpoint(&weights, &[300], 300).expect("recompute");
         assert_eq!(again, metadata);
 
+        let masked = BarWorldModelMetadata::for_checkpoint_with(
+            &weights,
+            &[300],
+            300,
+            DirectReturnContextMode::Masked,
+            None,
+        )
+        .expect("masked metadata");
+        assert_ne!(
+            masked.lineage_sha256, metadata.lineage_sha256,
+            "context semantics must be lineage-sensitive even for identical weights"
+        );
+        let masked_round_trip: BarWorldModelMetadata = serde_json::from_value(
+            serde_json::to_value(&masked).expect("serialize masked metadata"),
+        )
+        .expect("deserialize masked metadata");
+        assert_eq!(
+            masked_round_trip.direct_return_context_mode,
+            DirectReturnContextMode::Masked
+        );
+        masked_round_trip
+            .validate_schema()
+            .expect("round-tripped masked metadata validates");
+        masked_round_trip
+            .save(&metadata_path)
+            .expect("persist masked metadata");
+        let reloaded = BarWorldModel::load(&weights, &metadata_path, Device::Cpu)
+            .expect("reload masked model");
+        assert_eq!(
+            reloaded.direct_return_context_mode(),
+            DirectReturnContextMode::Masked,
+            "inference must recover masking from the checkpoint rather than a caller default"
+        );
+        let mut semantic_drift = metadata.clone();
+        semantic_drift.direct_return_context_mode = DirectReturnContextMode::Masked;
+        assert!(
+            semantic_drift.validate_schema().is_err(),
+            "changing context semantics without replacing lineage must be rejected"
+        );
+
         // The lineage is a function of the supports, not just the weights.
         let mut swapped = metadata.clone();
         swapped.supports_sha256.insert(300, "0".repeat(64));
         assert!(swapped.validate_schema().is_err());
+        let mut direct_swapped = metadata.clone();
+        direct_swapped.direct_return_supports_sha256 = "0".repeat(64);
+        assert!(
+            direct_swapped.validate_schema().is_err(),
+            "direct-return support geometry must be lineage-bound"
+        );
 
         // A deployment resolution with no fitted support is rejected outright.
         assert!(BarWorldModelMetadata::for_checkpoint(&weights, &[300], 86_400).is_err());
@@ -3187,6 +3537,7 @@ mod tests {
             (|m: &mut BarWorldModelMetadata| m.model_dim *= 2) as fn(&mut BarWorldModelMetadata),
             |m: &mut BarWorldModelMetadata| m.layers += 1,
             |m: &mut BarWorldModelMetadata| m.res_secs = 60,
+            |m: &mut BarWorldModelMetadata| m.direct_return_input_dim += 1,
             |m: &mut BarWorldModelMetadata| m.format_version = 5,
         ] {
             let mut tampered = metadata.clone();
@@ -3196,6 +3547,12 @@ mod tests {
                 "a tampered sidecar must not validate"
             );
         }
+        let mut changed_context = metadata.clone();
+        changed_context.direct_return_context.push_str("-changed");
+        assert!(
+            changed_context.validate_schema().is_err(),
+            "the adjusted-daily semantic contract must be checkpoint-lineage bound"
+        );
 
         // Recovery fields were added to metadata v8. Their serde defaults and empty canonical
         // rendering keep every older v8 deployment sidecar byte-for-byte lineage compatible.
@@ -3219,6 +3576,13 @@ mod tests {
         BarTrainingProvenance {
             corpus_fingerprint: "c0ffee".to_owned(),
             split_bounds: (1_759_839_000_000, 1_773_427_500_000),
+            rolling_plan_sha256: "ab".repeat(32),
+            rolling_fold_index: 0,
+            rolling_fit_range_ms: [1_700_000_000_000, 1_759_839_000_000],
+            rolling_validation_range_ms: [1_760_000_000_000, 1_773_427_500_000],
+            rolling_embargo_steps: 100,
+            terminal_test_spent: true,
+            support_sample_seed: 7,
             split_bounds_pinned: true,
 
             eval_window_seed: 0xE7A1_5E7D_0001,
@@ -3228,13 +3592,12 @@ mod tests {
             selection_guard_dof: "r".to_owned(),
             selection_guard_se_multiple: 1.0,
             min_dollar_volume: 0.0,
-            symbols: 3000,
+            symbols: 2,
             supports_frozen: false,
             supports_corpus_fingerprint: None,
             universe_fingerprint: None,
             universe_train_end_ms: None,
             scoring: scoring.to_string(),
-            beta_nll: None,
             selection_context: BAR_MAX_CONTEXT,
             deployed_context: BAR_MAX_CONTEXT,
             reached_context: BAR_MAX_CONTEXT,
@@ -3246,52 +3609,76 @@ mod tests {
             batch_ramp: vec![1, 2, 3],
             lr_plateau_fraction: 0.40,
             optimizer: None,
+            universe_admission_rule: Some(crate::torch::dataset::CORPUS_UNIVERSE_RULE.to_owned()),
+            universe_admission_cutoff_ms: Some(1_759_839_000_000),
+            minimum_training_bars: Some(20_480),
+            admitted_symbols_digest: Some("admitted-deadbeef".to_owned()),
+            admitted_symbols: Some(vec!["AAA".to_owned(), "BBB".to_owned()]),
+            evaluation_policy: Some(ALPHA_EVALUATION_POLICY.to_owned()),
         }
     }
+
     #[test]
-    fn beta_nll_objective_is_lineage_bound_and_legacy_absence_is_stable() {
+    fn universe_provenance_round_trips_is_lineage_sensitive_and_legacy_compatible() {
         let _torch_rng_guard = test_rng::exclusive();
-        let dir = temp_dir("beta_nll_lineage");
+        let dir = temp_dir("universe_provenance");
         let supports = synthetic_supports();
         let (weights, _metadata_path, _vs) = write_fixture(&dir, &supports);
-        let baseline = BarWorldModelMetadata::for_checkpoint_with(
+        let current = BarWorldModelMetadata::for_checkpoint_with(
             &weights,
             &[300],
             300,
+            DirectReturnContextMode::Enabled,
             Some(training_fixture(BarScoring::Hard)),
         )
-        .expect("baseline metadata");
-        baseline
-            .validate_schema()
-            .expect("legacy absent beta-NLL field remains valid");
+        .expect("current metadata");
+        let encoded = serde_json::to_value(&current).expect("serialize current metadata");
+        let decoded: BarWorldModelMetadata =
+            serde_json::from_value(encoded).expect("deserialize current metadata");
+        assert_eq!(decoded.training, current.training);
+        decoded.validate_schema().expect("round-tripped lineage");
 
-        let mut training = training_fixture(BarScoring::Hard);
-        training.beta_nll = Some(BarBetaNllProvenance {
-            exponent: 0.5,
-            variance_normalization:
-                "fitted categorical predictive variance / train-marginal variance".to_owned(),
-            variance_floor_ratio: 1.0e-6,
-        });
-        let beta =
-            BarWorldModelMetadata::for_checkpoint_with(&weights, &[300], 300, Some(training))
-                .expect("beta-NLL metadata");
-        beta.validate_schema().expect("beta-NLL metadata validates");
-        assert_ne!(
-            baseline.lineage_sha256, beta.lineage_sha256,
-            "changing the training objective must change model lineage"
-        );
-
-        let mut tampered = beta;
+        let mut tampered = current.clone();
         tampered
             .training
             .as_mut()
-            .and_then(|training| training.beta_nll.as_mut())
-            .expect("beta-NLL provenance")
-            .exponent = 0.75;
+            .expect("training")
+            .admitted_symbols_digest = Some("different".to_owned());
         assert!(
             tampered.validate_schema().is_err(),
-            "editing the beta exponent after writing must invalidate lineage"
+            "admitted membership must be lineage-bound"
         );
+
+        let mut legacy = current;
+        let training = legacy.training.as_mut().expect("training");
+        training.universe_admission_rule = None;
+        training.universe_admission_cutoff_ms = None;
+        training.minimum_training_bars = None;
+        training.admitted_symbols_digest = None;
+        training.admitted_symbols = None;
+        training.evaluation_policy = None;
+        legacy.lineage_sha256 = legacy.compute_lineage_sha256();
+        let legacy_hash = legacy.lineage_sha256.clone();
+        let mut legacy_json = serde_json::to_value(&legacy).expect("serialize legacy metadata");
+        let training = legacy_json["training"]
+            .as_object_mut()
+            .expect("training object");
+        for field in [
+            "universe_admission_rule",
+            "universe_admission_cutoff_ms",
+            "minimum_training_bars",
+            "admitted_symbols_digest",
+            "admitted_symbols",
+            "evaluation_policy",
+        ] {
+            training.remove(field);
+        }
+        let decoded_legacy: BarWorldModelMetadata =
+            serde_json::from_value(legacy_json).expect("deserialize legacy v8 metadata");
+        assert_eq!(decoded_legacy.lineage_sha256, legacy_hash);
+        decoded_legacy
+            .validate_schema()
+            .expect("legacy v8 lineage remains hash-compatible");
         fs::remove_dir_all(&dir).ok();
     }
 
@@ -3305,6 +3692,7 @@ mod tests {
             &weights,
             &[300],
             300,
+            DirectReturnContextMode::Enabled,
             Some(training_fixture(BarScoring::Hard)),
         )
         .expect("metadata");
@@ -3323,7 +3711,6 @@ mod tests {
                 dyn_horizon: 1,
                 lambda_dyn: 1.0,
                 lambda_kl: 1.0,
-                beta_nll: None,
                 auxiliary_resolutions: Vec::new(),
                 checkpoint_every: 32,
                 validate_every: 64,
@@ -3388,6 +3775,7 @@ mod tests {
                 &weights,
                 &[300],
                 300,
+                DirectReturnContextMode::Enabled,
                 Some(training_fixture(scoring)),
             )
             .expect("metadata")
@@ -3480,12 +3868,22 @@ mod tests {
             evidence_clip: 3.0,
             evidence: "-mean(g_raw * delta_previous)".to_owned(),
         });
-        let off_metadata =
-            BarWorldModelMetadata::for_checkpoint_with(&weights, &[300], 300, Some(off_recipe))
-                .expect("off optimizer provenance");
-        let on_metadata =
-            BarWorldModelMetadata::for_checkpoint_with(&weights, &[300], 300, Some(on_recipe))
-                .expect("enabled optimizer provenance");
+        let off_metadata = BarWorldModelMetadata::for_checkpoint_with(
+            &weights,
+            &[300],
+            300,
+            DirectReturnContextMode::Enabled,
+            Some(off_recipe),
+        )
+        .expect("off optimizer provenance");
+        let on_metadata = BarWorldModelMetadata::for_checkpoint_with(
+            &weights,
+            &[300],
+            300,
+            DirectReturnContextMode::Enabled,
+            Some(on_recipe),
+        )
+        .expect("enabled optimizer provenance");
         assert_ne!(off_metadata.lineage_sha256, on_metadata.lineage_sha256);
         let sidecar = serde_json::to_value(on_metadata).expect("serialize controller provenance");
         assert_eq!(sidecar["training"]["optimizer"]["row_learned_lr"]["c"], 1.0);
@@ -3520,9 +3918,14 @@ mod tests {
                 beta_update_clip: Some(2.0),
             }),
         });
-        let smd_metadata =
-            BarWorldModelMetadata::for_checkpoint_with(&weights, &[300], 300, Some(smd_recipe))
-                .expect("SMD optimizer provenance");
+        let smd_metadata = BarWorldModelMetadata::for_checkpoint_with(
+            &weights,
+            &[300],
+            300,
+            DirectReturnContextMode::Enabled,
+            Some(smd_recipe),
+        )
+        .expect("SMD optimizer provenance");
         assert_ne!(smd_metadata.lineage_sha256, off_metadata.lineage_sha256);
         let canonical = smd_metadata.training_canonical();
         assert!(canonical.contains(";ablation=smd-idbd"));

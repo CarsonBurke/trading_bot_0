@@ -31,6 +31,9 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 
+use crate::torch::adjusted_daily::{
+    AdjustedDailyContextStore, AdjustedDailyFeatures, ADJUSTED_DAILY_CONTEXT_FEATURES,
+};
 use anyhow::{bail, ensure, Context, Result};
 use chrono::{Datelike, Duration, NaiveDate, TimeZone, Timelike, Weekday};
 use chrono_tz::America::New_York;
@@ -39,8 +42,11 @@ use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha12Rng;
 use rayon::prelude::*;
 use ring::digest::{Context as DigestContext, SHA256};
+use serde::{Deserialize, Serialize};
 use shared::bars::{parse_bar_file_name, BarFile, PackedBar, FILE_EXTENSION};
-use shared::report::{Report, ReportKind, ReportSeries, ScaleKind};
+use shared::report::{
+    Report, ReportKind, ReportSeries, ScaleKind, PRETRAIN_UNIVERSE_INTEGRITY_REPORT_BASE,
+};
 use tch::{Device, Kind, Tensor};
 
 use crate::torch::bar_dist::{
@@ -59,6 +65,15 @@ pub const DOF_WARMUP_BARS: usize = 256;
 pub const TRAIN_FRACTION: f64 = 0.80;
 pub const VAL_FRACTION: f64 = 0.10;
 
+/// Canonical cumulative-return target horizons, in scheduled bars.
+///
+/// This is the single chronology shared by model-free labels, feature screens, and model
+/// evaluation. The maximum is also the rolling-origin embargo: adding another horizon therefore
+/// cannot silently leave the development split under-embargoed.
+pub const DIRECT_RETURN_HORIZONS: [usize; 6] = [1, 4, 16, 39, 78, 100];
+pub const DIRECT_RETURN_MAX_HORIZON: usize =
+    DIRECT_RETURN_HORIZONS[DIRECT_RETURN_HORIZONS.len() - 1];
+
 /// Longest training context in bars.
 ///
 /// Duplicated from [`crate::torch::world_model::BAR_MAX_CONTEXT`] rather than imported:
@@ -67,40 +82,24 @@ pub const VAL_FRACTION: f64 = 0.10;
 /// agree, so the duplicate cannot drift.
 pub const MAX_CONTEXT_BARS: usize = 2_048;
 
-/// Bars a symbol needs to enter the DEPLOYMENT corpus, and so to count toward the split
-/// percentiles.
+/// Training-prefix bars a symbol needs to enter the DEPLOYMENT corpus.
 ///
-/// `10 * MAX_CONTEXT_BARS`, because the smallest split share is [`VAL_FRACTION`] = 0.10 of the
-/// global trading-time axis: a symbol spread over that axis holding `N` bars puts about `N / 10`
-/// of them in the val and test regions, so this is the floor that guarantees every admitted
-/// symbol contributes at least one full-context window to EACH split. It lives here rather than
-/// in the pretrain CLI because corpus ingestion must derive the `train | val` instant from the
-/// same eligibility rule the pretrainer applies: dropping a file moves the trading-time
-/// percentile, so a mismatch would put the universe and the split at odds.
+/// Admission is evaluated only after `train_end` is resolved and counts bars whose timestamp is
+/// STRICTLY before it. A bar exactly on the boundary does not count, and validation/test appends
+/// cannot rescue a name. The floor is shared with ingestion so both paths resolve membership from
+/// the same causal prefix.
 pub const DEFAULT_MIN_BARS: usize = 10 * MAX_CONTEXT_BARS;
 
-/// Bars a symbol needs to enter an AUXILIARY corpus.
+/// Training-prefix bars a symbol needs to enter an AUXILIARY corpus.
 ///
-/// A different rule from [`DEFAULT_MIN_BARS`], because an auxiliary resolution is used for a
-/// different thing, and reusing the deployment floor here is the specific bug that would make a
-/// multi-resolution run look like it worked while loading nothing. The 4,748 daily files hold a
-/// MEDIAN of 3,540 bars and a MAXIMUM of 14,276 — 56 years of daily sessions is fewer bars than
-/// five days of five-minute extended-hours trading — so a 20,480 floor rejects every one of them,
-/// and `open_files` then fails the whole run rather than quietly training on nothing.
+/// Auxiliary admission uses the deployment corpus's resolved `train_end` and the same strict
+/// point-in-time rule, but a different minimum. Reusing [`DEFAULT_MIN_BARS`] would reject the
+/// daily corpus because even decades of daily history contain fewer bars than a few months of
+/// five-minute history.
 ///
-/// This floor means "not a stub", not "long enough to tile". The eligibility question an
-/// auxiliary resolution actually poses is answered by its ramp contexts, not by a bar count: a
-/// symbol shorter than the shortest auxiliary context is ADMITTED and lands in the coverage
-/// audit's short-symbol remainder with its bar count against it, where it is visible in
-/// `pretrain_pass_remainder`. A symbol dropped here disappears from `split_bars` entirely and is
-/// invisible in the coverage accounting, which is the worse failure.
-///
-/// So 64, from the measured distribution rather than a round number: it drops the 42 daily files
-/// holding fewer than 64 bars, admits 4,706, and keeps all 20,498,862 usable train bars. The
-/// residual shortfall is then small and explicable — against the auxiliary ramp's shortest
-/// context of 256, exactly 349 admitted symbols cannot tile one window and they carry 36,414
-/// bars, 0.18% of the auxiliary train region. Every one of the 2,018 symbols with 2007-10..2009-03
-/// history and all 1,410 with 2000-03..2002-10 history survives.
+/// This floor means "not a training-period stub", not "long enough to tile". Ramp contexts decide
+/// whether an admitted series can form a window; short admitted names remain visible in the
+/// coverage audit rather than disappearing from `split_bars`.
 pub const AUXILIARY_MIN_BARS: usize = 64;
 
 /// Consecutive DOF drawn per support-fitting block. Sampling in blocks amortizes the
@@ -118,6 +117,8 @@ const SUPPORT_ORDER_STREAM: u64 = 0xE7A1_0000_0000_0003;
 /// and with the epoch second, so a pass and a [`BarSampler`] epoch shuffle can never share a
 /// stream for any `(seed, epoch)`.
 const PASS_STREAM: u64 = 0xE7A1_0000_0000_0004;
+/// Keys row-uniform direct-return support sampling independently of every other corpus draw.
+const DIRECT_RETURN_SAMPLE_STREAM: u64 = 0xE7A1_0000_0000_0005;
 
 // ---------------------------------------------------------------------------
 // Bar conditioning ids
@@ -248,18 +249,22 @@ pub const SESSION_BOUNDARY_MINUTES: [i64; 4] = [240, 570, 960, 1200];
 pub const RESOLUTION_CLASS_SECS: [u32; 7] = [60, 300, 900, 1800, 3600, 14_400, 86_400];
 pub const RESOLUTION_CLASS_OTHER: i64 = 7;
 
-/// Bar tensors that must never be handed out separately: the DOF the model predicts and the
-/// conditioning ids it conditions on, drawn from the same bars in the same order.
+/// Bar tensors that must never be handed out separately: the DOF the model predicts, the
+/// conditioning ids, and causal adjusted-daily context, drawn for the same bars in the same order.
 #[derive(Debug)]
 pub struct BarBatch {
     /// `[N, L, BAR_DOF]` f32.
     pub dof: Tensor,
     /// `[N, L, BAR_TIME_FEATURES]` i64.
     pub time_ids: Tensor,
+    /// `[N, L, ADJUSTED_DAILY_CONTEXT_FEATURES]` f32, point-in-time at each input bar.
+    pub adjusted_daily: Tensor,
     /// Bars in this batch whose [`BAR_TIME_MARKET`] channels are [`MARKET_MISSING`], out of
     /// `N * L`. Reported as `pretrain_market_coverage`: a market channel that is absent for
     /// most rows is a data problem, and it is not visible in any loss.
     pub market_missing: usize,
+    /// Bars whose adjusted-daily vector is neutral with availability mask 0, out of `N * L`.
+    pub adjusted_daily_missing_bars: usize,
 }
 
 pub fn resolution_class(res_secs: u32) -> i64 {
@@ -1136,6 +1141,298 @@ fn et_offset_secs(utc_secs: i64) -> i32 {
     offsets[index.saturating_sub(1)]
 }
 
+/// A half-open wall-clock interval `[start_ms, end_ms)`.
+///
+/// Every range consumer maps both endpoints with [`BarFile::index_at_or_after`]. Keeping the
+/// interval in time space prevents staggered listings from inventing a second per-symbol split.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TimeRange {
+    pub start_ms: i64,
+    pub end_ms: i64,
+}
+
+impl TimeRange {
+    pub const fn new(start_ms: i64, end_ms: i64) -> Self {
+        Self { start_ms, end_ms }
+    }
+
+    pub fn validate(self) -> Result<()> {
+        ensure!(
+            self.start_ms < self.end_ms,
+            "time range must be non-empty and increasing, got [{}, {})",
+            self.start_ms,
+            self.end_ms
+        );
+        Ok(())
+    }
+
+    pub fn contains(self, ts_ms: i64) -> bool {
+        self.start_ms <= ts_ms && ts_ms < self.end_ms
+    }
+}
+
+/// Schema version of [`RollingOriginPlan`]'s persisted chronology contract.
+pub const ROLLING_ORIGIN_PLAN_FORMAT_VERSION: u32 = 1;
+
+/// One expanding-prefix fit and its disjoint forward validation interval.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RollingOriginFold {
+    pub id: u32,
+    pub fit: TimeRange,
+    pub validation: TimeRange,
+    pub windows: usize,
+}
+
+/// Status of the bounded terminal evaluation.
+///
+/// This deliberately has no `Test` range variant. `Spent` records the current campaign's
+/// already-consumed terminal split without making it addressable as development data.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TerminalTestStatus {
+    Spent,
+    Generated,
+}
+
+/// Bounded terminal-evaluation provenance, without a development-visible terminal range.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TerminalTestGeneration {
+    pub status: TerminalTestStatus,
+    pub max_windows: usize,
+    pub generated_windows: usize,
+    pub generation_seed: Option<u64>,
+    pub artifact_sha256: Option<String>,
+}
+
+impl TerminalTestGeneration {
+    fn spent() -> Self {
+        Self {
+            status: TerminalTestStatus::Spent,
+            max_windows: 0,
+            generated_windows: 0,
+            generation_seed: None,
+            artifact_sha256: None,
+        }
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        ensure!(
+            self.generated_windows <= self.max_windows,
+            "terminal evaluation generated {} windows above its bound {}",
+            self.generated_windows,
+            self.max_windows
+        );
+        match self.status {
+            TerminalTestStatus::Spent => ensure!(
+                self.max_windows == 0
+                    && self.generated_windows == 0
+                    && self.generation_seed.is_none()
+                    && self.artifact_sha256.is_none(),
+                "an already-spent terminal evaluation cannot be generated again"
+            ),
+            TerminalTestStatus::Generated => {
+                ensure!(
+                    self.generated_windows > 0 && self.generation_seed.is_some(),
+                    "a generated terminal evaluation needs windows and a generation seed"
+                );
+                ensure!(
+                    self.artifact_sha256.as_deref().is_some_and(is_sha256_hex),
+                    "a generated terminal evaluation needs a lower-case SHA-256 artifact digest"
+                );
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Serializable rolling-origin development chronology.
+/// `development` is the original pinned validation interval. The already-spent terminal split is
+/// intentionally absent; only bounded generation provenance is serializable. Every fit uses the
+/// same earliest-origin universe, then expands through completed validation intervals.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RollingOriginPlan {
+    pub format_version: u32,
+    pub resolution_secs: u32,
+    pub development: TimeRange,
+    pub folds: Vec<RollingOriginFold>,
+    pub embargo_steps: usize,
+    pub target_horizons: [usize; 6],
+    pub eval_seed: u64,
+    pub earliest_origin_universe_digest: String,
+    pub earliest_origin_universe_cutoff_ms: i64,
+    pub terminal_test: TerminalTestGeneration,
+}
+
+impl RollingOriginPlan {
+    /// Enforce the complete chronology contract after construction or deserialization.
+    pub fn validate(&self) -> Result<()> {
+        ensure!(
+            self.format_version == ROLLING_ORIGIN_PLAN_FORMAT_VERSION,
+            "rolling-origin format version {} is not supported",
+            self.format_version
+        );
+        ensure!(
+            self.resolution_secs > 0,
+            "rolling-origin resolution must be positive"
+        );
+        self.development.validate()?;
+        ensure!(
+            !self.folds.is_empty(),
+            "rolling-origin plan needs at least one fold"
+        );
+        ensure!(
+            self.target_horizons == DIRECT_RETURN_HORIZONS,
+            "rolling-origin targets {:?} differ from canonical {:?}",
+            self.target_horizons,
+            DIRECT_RETURN_HORIZONS
+        );
+        ensure!(
+            self.embargo_steps == DIRECT_RETURN_MAX_HORIZON,
+            "rolling-origin embargo {} must equal maximum direct horizon {}",
+            self.embargo_steps,
+            DIRECT_RETURN_MAX_HORIZON
+        );
+        ensure!(
+            self.earliest_origin_universe_cutoff_ms == self.development.start_ms,
+            "earliest-origin universe cutoff must equal the pinned train/validation boundary"
+        );
+        ensure!(
+            is_sha256_hex(&self.earliest_origin_universe_digest),
+            "earliest-origin universe digest must be 64 lower-case hexadecimal characters"
+        );
+
+        let fit_start = self.folds[0].fit.start_ms;
+        ensure!(
+            fit_start < self.development.start_ms,
+            "the earliest fit must begin before development"
+        );
+        let mut previous_validation_end = self.development.start_ms;
+        for (index, fold) in self.folds.iter().enumerate() {
+            fold.fit.validate()?;
+            fold.validation.validate()?;
+            ensure!(
+                fold.id as usize == index,
+                "fold ids must be contiguous from zero"
+            );
+            ensure!(
+                fold.windows > 0,
+                "fold {index} must request at least one window"
+            );
+            ensure!(
+                fold.fit.start_ms == fit_start && fold.fit.end_ms == previous_validation_end,
+                "fold {index} fit is not the expanding prefix through prior validation"
+            );
+            ensure!(
+                self.development.start_ms <= fold.validation.start_ms
+                    && fold.validation.end_ms <= self.development.end_ms,
+                "fold {index} validation escapes the pinned development interval"
+            );
+            let expected_start = forecast_schedule_after(
+                fold.fit.end_ms,
+                self.embargo_steps + 1,
+                self.resolution_secs,
+            )[self.embargo_steps];
+            ensure!(
+                fold.validation.start_ms == expected_start,
+                "fold {index} validation does not follow exactly {} scheduled embargo bars",
+                self.embargo_steps
+            );
+            ensure!(
+                previous_validation_end <= fold.validation.start_ms,
+                "fold {index} validation overlaps its predecessor"
+            );
+            previous_validation_end = fold.validation.end_ms;
+        }
+        ensure!(
+            previous_validation_end == self.development.end_ms,
+            "the final validation fold must end at the pinned validation/test boundary"
+        );
+        self.terminal_test.validate()
+    }
+
+    /// Domain-separated SHA-256 of every persisted contract member in a fixed byte order.
+    ///
+    /// The encoding is manual rather than JSON-based, so map ordering, whitespace, and serializer
+    /// upgrades cannot move the identity. Call [`Self::validate`] when accepting an external plan;
+    /// hashing itself intentionally includes invalid mutations so corruption always changes the
+    /// digest instead of collapsing to a shared error.
+    pub fn canonical_sha256(&self) -> String {
+        let mut digest = DigestContext::new(&SHA256);
+        digest.update(b"bar-rolling-origin-plan-v1");
+        digest_u64(&mut digest, u64::from(self.format_version));
+        digest_u64(&mut digest, u64::from(self.resolution_secs));
+        digest_range(&mut digest, self.development);
+        digest_u64(&mut digest, self.folds.len() as u64);
+        for fold in &self.folds {
+            digest_u64(&mut digest, u64::from(fold.id));
+            digest_range(&mut digest, fold.fit);
+            digest_range(&mut digest, fold.validation);
+            digest_u64(&mut digest, fold.windows as u64);
+        }
+        digest_u64(&mut digest, self.embargo_steps as u64);
+        for horizon in self.target_horizons {
+            digest_u64(&mut digest, horizon as u64);
+        }
+        digest_u64(&mut digest, self.eval_seed);
+        digest_string(&mut digest, &self.earliest_origin_universe_digest);
+        digest.update(&self.earliest_origin_universe_cutoff_ms.to_le_bytes());
+        digest.update(&[match self.terminal_test.status {
+            TerminalTestStatus::Spent => 0,
+            TerminalTestStatus::Generated => 1,
+        }]);
+        digest_u64(&mut digest, self.terminal_test.max_windows as u64);
+        digest_u64(&mut digest, self.terminal_test.generated_windows as u64);
+        digest_option_u64(&mut digest, self.terminal_test.generation_seed);
+        digest_option_string(&mut digest, self.terminal_test.artifact_sha256.as_deref());
+        hex_digest(digest)
+    }
+}
+
+fn digest_u64(digest: &mut DigestContext, value: u64) {
+    digest.update(&value.to_le_bytes());
+}
+
+fn digest_range(digest: &mut DigestContext, range: TimeRange) {
+    digest.update(&range.start_ms.to_le_bytes());
+    digest.update(&range.end_ms.to_le_bytes());
+}
+
+fn digest_string(digest: &mut DigestContext, value: &str) {
+    digest_u64(digest, value.len() as u64);
+    digest.update(value.as_bytes());
+}
+
+fn digest_option_u64(digest: &mut DigestContext, value: Option<u64>) {
+    match value {
+        Some(value) => {
+            digest.update(&[1]);
+            digest_u64(digest, value);
+        }
+        None => digest.update(&[0]),
+    }
+}
+
+fn digest_option_string(digest: &mut DigestContext, value: Option<&str>) {
+    match value {
+        Some(value) => {
+            digest.update(&[1]);
+            digest_string(digest, value);
+        }
+        None => digest.update(&[0]),
+    }
+}
+
+fn is_sha256_hex(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
 /// Which region of the global timeline a sampler draws from.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Split {
@@ -1178,6 +1475,136 @@ pub struct BarEndpoint {
     pub bar: usize,
 }
 
+/// Causal symbol-admission rule recorded in reports and checkpoint provenance.
+pub const CORPUS_UNIVERSE_RULE: &str = "min training bars strictly before train_end";
+
+/// Point-in-time audit produced by the corpus loader from the exact files it admitted.
+///
+/// `candidate_symbols` is the set considered by the strict-prefix gate (for derived bounds,
+/// files shorter than `minimum_training_bars` are first removed as a necessary prefilter).
+/// `admitted_symbols` is the final corpus after an optional allow-list, while
+/// `restricted_symbols` counts causally eligible names removed by that allow-list.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CorpusUniverseAudit {
+    pub resolution_secs: u32,
+    pub train_end_cutoff_ms: i64,
+    pub minimum_training_bars: usize,
+    pub candidate_symbols: usize,
+    pub admitted_symbols: usize,
+    pub restricted_symbols: usize,
+    pub no_val_symbols: usize,
+    pub no_test_symbols: usize,
+    /// Admitted names whose final observation is strictly before `train_end_cutoff_ms`.
+    pub disappeared_symbols: usize,
+    pub adjusted_daily_available_symbols: usize,
+    pub adjusted_daily_missing_symbols: usize,
+    pub train_bars: usize,
+    pub val_bars: usize,
+    pub test_bars: usize,
+    pub admitted_symbols_digest: String,
+    pub admitted_symbol_names: Vec<String>,
+}
+
+impl CorpusUniverseAudit {
+    /// Write the Corpus-owned point-in-time audits for every loaded resolution.
+    pub fn write_report_of(audits: &[Self], dir: &Path) -> Result<()> {
+        let title = format!(
+            "Pretrain universe integrity | rule={CORPUS_UNIVERSE_RULE} | {}",
+            audits
+                .iter()
+                .map(|audit| format!(
+                    "res={} cutoff={} minimum={} daily_available={} daily_missing={} digest={} symbols={}",
+                    audit.resolution_secs,
+                    audit.train_end_cutoff_ms,
+                    audit.minimum_training_bars,
+                    audit.adjusted_daily_available_symbols,
+                    audit.adjusted_daily_missing_symbols,
+                    audit.admitted_symbols_digest,
+                    serde_json::to_string(&audit.admitted_symbol_names)
+                        .expect("serializing symbol strings cannot fail")
+                ))
+                .collect::<Vec<_>>()
+                .join(" | ")
+        );
+        let values = |field: fn(&Self) -> usize| {
+            audits
+                .iter()
+                .map(|audit| field(audit) as f32)
+                .collect::<Vec<_>>()
+        };
+        let report = Report {
+            title,
+            x_label: Some("loaded resolution (series index; see title)".to_owned()),
+            y_label: Some("count".to_owned()),
+            scale: ScaleKind::Linear,
+            kind: ReportKind::MultiLine {
+                series: vec![
+                    ReportSeries {
+                        label: "candidate_symbols".to_owned(),
+                        values: values(|audit| audit.candidate_symbols),
+                    },
+                    ReportSeries {
+                        label: "admitted_symbols".to_owned(),
+                        values: values(|audit| audit.admitted_symbols),
+                    },
+                    ReportSeries {
+                        label: "restricted_symbols".to_owned(),
+                        values: values(|audit| audit.restricted_symbols),
+                    },
+                    ReportSeries {
+                        label: "no_val_symbols".to_owned(),
+                        values: values(|audit| audit.no_val_symbols),
+                    },
+                    ReportSeries {
+                        label: "no_test_symbols".to_owned(),
+                        values: values(|audit| audit.no_test_symbols),
+                    },
+                    ReportSeries {
+                        label: "disappeared_symbols".to_owned(),
+                        values: values(|audit| audit.disappeared_symbols),
+                    },
+                    ReportSeries {
+                        label: "adjusted_daily_available_symbols".to_owned(),
+                        values: values(|audit| audit.adjusted_daily_available_symbols),
+                    },
+                    ReportSeries {
+                        label: "adjusted_daily_missing_symbols".to_owned(),
+                        values: values(|audit| audit.adjusted_daily_missing_symbols),
+                    },
+                    ReportSeries {
+                        label: "train_bars".to_owned(),
+                        values: values(|audit| audit.train_bars),
+                    },
+                    ReportSeries {
+                        label: "val_bars".to_owned(),
+                        values: values(|audit| audit.val_bars),
+                    },
+                    ReportSeries {
+                        label: "test_bars".to_owned(),
+                        values: values(|audit| audit.test_bars),
+                    },
+                ],
+            },
+        };
+        let path = dir.join(format!(
+            "{PRETRAIN_UNIVERSE_INTEGRITY_REPORT_BASE}.report.bin"
+        ));
+        shared::report::write_report(&path, &report)
+            .with_context(|| format!("writing {}", path.display()))
+    }
+}
+
+fn admitted_symbols_digest(symbols: &[String]) -> String {
+    let mut digest = DigestContext::new(&SHA256);
+    digest.update(b"bar-corpus-admitted-symbols-v1");
+    digest.update(&(symbols.len() as u64).to_le_bytes());
+    for symbol in symbols {
+        digest.update(&(symbol.len() as u64).to_le_bytes());
+        digest.update(symbol.as_bytes());
+    }
+    hex_digest(digest)
+}
+
 struct Corpus {
     dir: PathBuf,
     res_secs: u32,
@@ -1190,6 +1617,24 @@ struct Corpus {
     /// the directory holds no proxy file at this resolution, in which case every row's market
     /// ids are [`MARKET_MISSING`] and the trunk sees an honestly absent channel.
     market: Option<MarketChannel>,
+    adjusted_daily: AdjustedDailyContextStore,
+    universe_audit: CorpusUniverseAudit,
+}
+
+/// One decision row in the complete-H100 population used to fit direct-return supports.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct DirectReturnRow {
+    pub symbol: usize,
+    pub decision_bar: usize,
+}
+
+/// Deterministic without-replacement draw and the census work needed to construct it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DirectReturnRowSample {
+    pub rows: Vec<DirectReturnRow>,
+    pub population: usize,
+    /// Exchange schedules evaluated while binary-searching each series' eligible prefix.
+    pub eligibility_schedule_evaluations: usize,
 }
 
 /// All `<dir>/*.<res_secs>.bars` files, held open and mmap'd. Cloning is an `Arc` bump, so
@@ -1212,15 +1657,13 @@ impl std::fmt::Debug for BarCorpus {
 }
 
 impl BarCorpus {
-    /// Open every symbol file at `res_secs` under `dir`, dropping (and reporting) symbols with
-    /// fewer than `min_bars` bars, and place the split at this resolution's own trading-time
-    /// percentiles. Files stay mmap'd and are paged in on demand; the corpus is never read
-    /// into RAM.
+    /// Open every symbol file at `res_secs`, resolve the split, then admit only names with at
+    /// least `min_bars` observations STRICTLY BEFORE the train boundary. Entire admitted files
+    /// stay mmap'd, including delisted names with empty validation or test regions.
     ///
-    /// One corpus is one resolution. `<dir>` holds `.300.bars` and `.86400.bars` side by side
-    /// and they interleave alphabetically, so the `res_secs` filter is load-bearing: a daily
-    /// bar mixed into a 5-minute corpus would be a legitimate 4x move against a threshold
-    /// tuned for five minutes, and would land on a support fitted for the wrong scale.
+    /// Derived bounds are exploratory: total length is used only as a necessary candidate
+    /// prefilter, the bounds are derived once from those candidates, and the strict-prefix gate
+    /// is then applied without recomputing them.
     pub fn load(dir: &Path, res_secs: u32, min_bars: usize) -> Result<Self> {
         Self::open_files(dir, res_secs, min_bars, None, None)
     }
@@ -1276,36 +1719,72 @@ impl BarCorpus {
             .map(|path| BarFile::open(path))
             .collect::<Result<Vec<_>>>()?;
 
-        let mut files = Vec::with_capacity(opened.len());
-        let mut dropped = 0usize;
-        for file in opened {
-            if file.len() < min_bars {
-                println!(
-                    "[dataset] dropping {}.{res_secs}: {} bars < min_bars {min_bars}",
-                    file.symbol(),
-                    file.len()
-                );
-                dropped += 1;
-                continue;
-            }
-            files.push(file);
-        }
-        if files.is_empty() {
+        // A pinned cutoff is already resolved and therefore evaluates every file directly.
+        // A derived cutoff cannot be resolved from files that are necessarily incapable of
+        // admission, so total length is used ONCE as a candidate prefilter. It is never the
+        // final rule.
+        let mut candidates = if bounds.is_some() {
+            opened
+        } else {
+            opened
+                .into_iter()
+                .filter(|file| {
+                    if file.len() >= min_bars {
+                        true
+                    } else {
+                        println!(
+                            "[dataset] dropping {}.{res_secs} candidate: {} total bars cannot \
+                             supply {min_bars} training bars strictly before train_end",
+                            file.symbol(),
+                            file.len()
+                        );
+                        false
+                    }
+                })
+                .collect()
+        };
+        if candidates.is_empty() {
             bail!(
-                "every one of {} symbol files at {res_secs}s under {} has fewer than {min_bars} bars",
+                "none of the {} symbol files at {res_secs}s under {} can supply {min_bars} \
+                 training bars strictly before train_end",
                 paths.len(),
                 dir.display()
             );
         }
+        let candidate_symbols = candidates.len();
+        let candidate_bars = candidates.iter().map(BarFile::len).sum();
+        // Resolve exactly once, before final admission and before any allow-list restriction.
+        let bounds =
+            bounds.unwrap_or_else(|| global_split_bounds(&candidates, res_secs, candidate_bars));
 
-        let total_bars_before_restriction = files.iter().map(BarFile::len).sum();
-        // Bounds first, restriction second: see `load_restricted`.
-        let bounds = bounds.unwrap_or_else(|| {
-            global_split_bounds(&files, res_secs, total_bars_before_restriction)
+        let mut dropped = 0usize;
+        candidates.retain(|file| {
+            let training_bars = file.index_at_or_after(bounds.0);
+            if training_bars >= min_bars {
+                true
+            } else {
+                println!(
+                    "[dataset] dropping {}.{res_secs}: {training_bars} training bars strictly \
+                     before train_end {} < minimum {min_bars}",
+                    file.symbol(),
+                    iso_ms(bounds.0)
+                );
+                dropped += 1;
+                false
+            }
         });
-        // Proxy before restriction, for the same reason the bounds are: a symbol-universe
-        // ablation must not change the market channel, or the two arms condition on different
-        // exogenous state and their `nll_bar` stop being commensurable.
+        if candidates.is_empty() {
+            bail!(
+                "none of the {candidate_symbols} candidate symbol files at {res_secs}s under {} \
+                 has {min_bars} training bars strictly before train_end {}",
+                dir.display(),
+                iso_ms(bounds.0)
+            );
+        }
+
+        let mut files = candidates;
+        // Proxy before restriction: a symbol-universe ablation must not change the market
+        // channel, or the two arms condition on different exogenous state.
         let market = match files
             .iter()
             .find(|file| file.symbol() == MARKET_PROXY_SYMBOL)
@@ -1320,8 +1799,8 @@ impl BarCorpus {
             }
             None => {
                 println!(
-                    "[dataset] no {MARKET_PROXY_SYMBOL}.{res_secs} file under {}: every row's \
-                     market channel is MISSING",
+                    "[dataset] no causally admitted {MARKET_PROXY_SYMBOL}.{res_secs} file under \
+                     {}: every row's market channel is MISSING",
                     dir.display()
                 );
                 None
@@ -1334,18 +1813,60 @@ impl BarCorpus {
             restricted = before - files.len();
             if files.is_empty() {
                 bail!(
-                    "the symbol restriction kept none of the {before} symbol files at \
-                     {res_secs}s under {}",
+                    "the symbol restriction kept none of the {before} causally admitted symbol \
+                     files at {res_secs}s under {}",
                     dir.display()
                 );
             }
         }
 
-        let symbols: Vec<String> = files.iter().map(|f| f.symbol().to_string()).collect();
+        let symbols: Vec<String> = files.iter().map(|file| file.symbol().to_owned()).collect();
+        let adjusted_daily = AdjustedDailyContextStore::open(dir, &symbols);
+        let (adjusted_daily_available_symbols, adjusted_daily_missing_symbols) =
+            adjusted_daily.file_coverage();
         let total_bars = files.iter().map(BarFile::len).sum();
+        let mut no_val_symbols = 0usize;
+        let mut no_test_symbols = 0usize;
+        let mut disappeared_symbols = 0usize;
+        let mut train_bars = 0usize;
+        let mut val_bars = 0usize;
+        let mut test_bars = 0usize;
+        for file in &files {
+            let train_end = file.index_at_or_after(bounds.0);
+            let val_end = file.index_at_or_after(bounds.1);
+            let val = val_end - train_end;
+            let test = file.len() - val_end;
+            train_bars += train_end;
+            val_bars += val;
+            test_bars += test;
+            no_val_symbols += usize::from(val == 0);
+            no_test_symbols += usize::from(test == 0);
+            disappeared_symbols +=
+                usize::from(file.last_ts_ms().is_none_or(|last| last < bounds.0));
+        }
+        let universe_audit = CorpusUniverseAudit {
+            resolution_secs: res_secs,
+            train_end_cutoff_ms: bounds.0,
+            minimum_training_bars: min_bars,
+            candidate_symbols,
+            admitted_symbols: files.len(),
+            restricted_symbols: restricted,
+            no_val_symbols,
+            no_test_symbols,
+            disappeared_symbols,
+            adjusted_daily_available_symbols,
+            adjusted_daily_missing_symbols,
+            train_bars,
+            val_bars,
+            test_bars,
+            admitted_symbols_digest: admitted_symbols_digest(&symbols),
+            admitted_symbol_names: symbols.clone(),
+        };
         println!(
-            "[dataset] {} symbols, {total_bars} bars at {res_secs}s ({dropped} dropped, \
-             {restricted} filtered out), split at {} | {}",
+            "[dataset] {} symbols, {total_bars} bars at {res_secs}s ({dropped} failed causal \
+             admission, {restricted} filtered out), adjusted daily files \
+             {adjusted_daily_available_symbols} available/{adjusted_daily_missing_symbols} \
+             missing, split at {} | {}; rule: {CORPUS_UNIVERSE_RULE}",
             files.len(),
             iso_ms(bounds.0),
             iso_ms(bounds.1)
@@ -1360,6 +1881,8 @@ impl BarCorpus {
                 total_bars,
                 bounds,
                 market,
+                adjusted_daily,
+                universe_audit,
             }),
         })
     }
@@ -1385,6 +1908,130 @@ impl BarCorpus {
         &self.inner.symbols
     }
 
+    pub fn adjusted_daily_features(
+        &self,
+        symbol: usize,
+        decision_ms: i64,
+    ) -> AdjustedDailyFeatures {
+        self.inner.adjusted_daily.features(symbol, decision_ms)
+    }
+
+    pub fn adjusted_daily_initialization_error(&self) -> Option<&str> {
+        self.inner.adjusted_daily.initialization_error()
+    }
+
+    pub fn adjusted_daily_file_coverage(&self) -> (usize, usize) {
+        self.inner.adjusted_daily.file_coverage()
+    }
+
+    /// Point-in-time admission audit captured while this corpus was opened.
+    pub fn universe_audit(&self) -> &CorpusUniverseAudit {
+        &self.inner.universe_audit
+    }
+
+    /// Build deterministic expanding rolling origins inside the pinned validation interval.
+    ///
+    /// Each equal-sized segment is measured on the exchange schedule. Its first
+    /// [`DIRECT_RETURN_MAX_HORIZON`] scheduled bars are embargoed and validation begins at the
+    /// following scheduled instant. Fold 0 stops fitting at the original train/validation
+    /// boundary; each later prefix expands exactly through the preceding validation end. The
+    /// terminal split is never queried.
+    pub fn rolling_origin_plan(
+        &self,
+        fold_count: usize,
+        eval_seed: u64,
+        windows_per_fold: usize,
+    ) -> Result<RollingOriginPlan> {
+        ensure!(
+            fold_count > 0,
+            "rolling-origin plan needs at least one fold"
+        );
+        ensure!(
+            windows_per_fold > 0,
+            "rolling-origin folds need at least one evaluation window"
+        );
+        let (b0, b1) = self.inner.bounds;
+        ensure!(b0 < b1, "pinned validation interval is empty");
+
+        let fit_start = self
+            .inner
+            .files
+            .iter()
+            .filter_map(BarFile::first_ts_ms)
+            .min()
+            .context("rolling-origin corpus has no bars")?;
+        ensure!(
+            fit_start < b0,
+            "rolling-origin corpus has no observation before its pinned training cutoff"
+        );
+
+        let mut scheduled = Vec::new();
+        let mut cursor = b0;
+        loop {
+            let next = forecast_schedule_after(cursor, 1, self.inner.res_secs)[0];
+            if next >= b1 {
+                break;
+            }
+            scheduled.push(next);
+            cursor = next;
+        }
+        let minimum_segment = DIRECT_RETURN_MAX_HORIZON + 2;
+        ensure!(
+            scheduled.len() / fold_count >= minimum_segment,
+            "pinned validation interval has {} scheduled bars, insufficient for {fold_count} \
+             folds with {} embargo bars and non-empty validation",
+            scheduled.len(),
+            DIRECT_RETURN_MAX_HORIZON
+        );
+
+        let development = TimeRange::new(b0, b1);
+        let mut folds = Vec::with_capacity(fold_count);
+        let mut fit_end = b0;
+        for id in 0..fold_count {
+            let validation_start = forecast_schedule_after(
+                fit_end,
+                DIRECT_RETURN_MAX_HORIZON + 1,
+                self.inner.res_secs,
+            )[DIRECT_RETURN_MAX_HORIZON];
+            let validation_end = if id + 1 == fold_count {
+                b1
+            } else {
+                let boundary = (id + 1) * scheduled.len() / fold_count;
+                scheduled[boundary - 1]
+            };
+            ensure!(
+                validation_start < validation_end && validation_end <= b1,
+                "fold {id} has insufficient forward validation after its embargo"
+            );
+            folds.push(RollingOriginFold {
+                id: id as u32,
+                fit: TimeRange::new(fit_start, fit_end),
+                validation: TimeRange::new(validation_start, validation_end),
+                windows: windows_per_fold,
+            });
+            fit_end = validation_end;
+        }
+
+        let plan = RollingOriginPlan {
+            format_version: ROLLING_ORIGIN_PLAN_FORMAT_VERSION,
+            resolution_secs: self.inner.res_secs,
+            development,
+            folds,
+            embargo_steps: DIRECT_RETURN_MAX_HORIZON,
+            target_horizons: DIRECT_RETURN_HORIZONS,
+            eval_seed,
+            earliest_origin_universe_digest: self
+                .inner
+                .universe_audit
+                .admitted_symbols_digest
+                .clone(),
+            earliest_origin_universe_cutoff_ms: b0,
+            terminal_test: TerminalTestGeneration::spent(),
+        };
+        plan.validate()?;
+        Ok(plan)
+    }
+
     pub fn res_secs(&self) -> u32 {
         self.inner.res_secs
     }
@@ -1407,6 +2054,186 @@ impl BarCorpus {
 
     pub fn series_len(&self, series: usize) -> usize {
         self.inner.files[series].len()
+    }
+
+    /// Six canonical exchange-calendar endpoint timestamps following `decision_ts_ms`.
+    ///
+    /// This is deliberately separate from the observed-price join: panel rows sharing a
+    /// decision timestamp can construct the causal schedule once and reuse it for every symbol.
+    pub fn direct_return_endpoint_timestamps(
+        &self,
+        decision_ts_ms: i64,
+    ) -> [i64; DIRECT_RETURN_HORIZONS.len()] {
+        let schedule = forecast_schedule_after(
+            decision_ts_ms,
+            DIRECT_RETURN_MAX_HORIZON,
+            self.inner.res_secs,
+        );
+        std::array::from_fn(|slot| schedule[DIRECT_RETURN_HORIZONS[slot] - 1])
+    }
+
+    /// Join one symbol's forward-filled close marks to precomputed direct-return endpoints.
+    ///
+    /// `endpoint_timestamps` must come from [`Self::direct_return_endpoint_timestamps`] for this
+    /// decision row. The timestamp axis is fixed before this method reads any future print.
+    pub fn direct_return_targets_at_endpoints(
+        &self,
+        symbol: usize,
+        decision_bar: usize,
+        label_range: TimeRange,
+        endpoint_timestamps: &[i64; DIRECT_RETURN_HORIZONS.len()],
+    ) -> Result<Option<[f32; DIRECT_RETURN_HORIZONS.len()]>> {
+        label_range.validate()?;
+        let file = self
+            .inner
+            .files
+            .get(symbol)
+            .with_context(|| format!("symbol index {symbol} is out of range"))?;
+        let bars = file.bars();
+        let decision = bars.get(decision_bar).with_context(|| {
+            format!(
+                "decision bar {decision_bar} is out of range for {}",
+                file.symbol()
+            )
+        })?;
+        if !label_range.contains(decision.ts()) {
+            return Ok(None);
+        }
+        ensure!(
+            decision.close.is_finite() && decision.close > 0.0,
+            "{} decision close is not positive and finite",
+            file.symbol()
+        );
+        if endpoint_timestamps[DIRECT_RETURN_HORIZONS.len() - 1] >= label_range.end_ms {
+            return Ok(None);
+        }
+
+        let (_, label_hi) = self.range(symbol, label_range);
+        let mut observed = decision_bar + 1;
+        let mut mark = decision.close;
+        let mut targets = [0.0f32; DIRECT_RETURN_HORIZONS.len()];
+        for (target, &scheduled_ts) in targets.iter_mut().zip(endpoint_timestamps) {
+            while observed < label_hi && bars[observed].ts() <= scheduled_ts {
+                let close = bars[observed].close;
+                ensure!(
+                    close.is_finite() && close > 0.0,
+                    "{} close at bar {observed} is not positive and finite",
+                    file.symbol()
+                );
+                mark = close;
+                observed += 1;
+            }
+            *target = (mark / decision.close).ln();
+        }
+        Ok(Some(targets))
+    }
+
+    /// Model-free cumulative log-return labels on the canonical direct horizon grid.
+    ///
+    /// This reference wrapper constructs the exchange schedule and then joins this symbol's
+    /// forward-filled marks through [`Self::direct_return_targets_at_endpoints`]. Missing
+    /// scheduled prints retain the last close; the first later print updates the mark once and
+    /// therefore carries the whole halted-period return once. A row is absent unless its
+    /// decision belongs to `label_range` and its scheduled H100 endpoint precedes the range end.
+    pub fn direct_return_targets(
+        &self,
+        symbol: usize,
+        decision_bar: usize,
+        label_range: TimeRange,
+    ) -> Result<Option<[f32; DIRECT_RETURN_HORIZONS.len()]>> {
+        label_range.validate()?;
+        let file = self
+            .inner
+            .files
+            .get(symbol)
+            .with_context(|| format!("symbol index {symbol} is out of range"))?;
+        let decision = file.bars().get(decision_bar).with_context(|| {
+            format!(
+                "decision bar {decision_bar} is out of range for {}",
+                file.symbol()
+            )
+        })?;
+        if !label_range.contains(decision.ts()) {
+            return Ok(None);
+        }
+        let endpoint_timestamps = self.direct_return_endpoint_timestamps(decision.ts());
+        self.direct_return_targets_at_endpoints(
+            symbol,
+            decision_bar,
+            label_range,
+            &endpoint_timestamps,
+        )
+    }
+
+    /// Draw decision rows uniformly without replacement from the complete-H100 population.
+    ///
+    /// Each series contributes one contiguous prefix: decisions in `label_range` whose scheduled
+    /// H100 endpoint is strictly before its exclusive end. Monotonic exchange schedules let the
+    /// prefix boundary be found in logarithmic work rather than evaluating every decision.
+    /// Global ranks make every eligible `(symbol, decision_bar)` row equiprobable, irrespective
+    /// of series length.
+    pub fn sample_direct_return_rows(
+        &self,
+        label_range: TimeRange,
+        requested: usize,
+        seed: u64,
+    ) -> Result<DirectReturnRowSample> {
+        label_range.validate()?;
+        let mut series = Vec::with_capacity(self.series_count());
+        let mut cumulative = Vec::with_capacity(self.series_count());
+        let mut population = 0usize;
+        let mut eligibility_schedule_evaluations = 0usize;
+
+        for symbol in 0..self.series_count() {
+            let (lo, hi) = self.range(symbol, label_range);
+            let bars = self.bars(symbol);
+            let mut left = lo;
+            let mut right = hi;
+            while left < right {
+                let middle = left + (right - left) / 2;
+                let endpoints = self.direct_return_endpoint_timestamps(bars[middle].ts());
+                eligibility_schedule_evaluations += 1;
+                if endpoints[DIRECT_RETURN_HORIZONS.len() - 1] < label_range.end_ms {
+                    left = middle + 1;
+                } else {
+                    right = middle;
+                }
+            }
+            let count = left - lo;
+            population = population
+                .checked_add(count)
+                .context("direct-return row population exceeds usize")?;
+            series.push((symbol, lo));
+            cumulative.push(population);
+        }
+
+        let sample_count = requested.min(population);
+        let ranks = if sample_count == population {
+            (0..population).collect()
+        } else {
+            let mut rng = ChaCha12Rng::seed_from_u64(mix64(seed, DIRECT_RETURN_SAMPLE_STREAM));
+            rand::seq::index::sample(&mut rng, population, sample_count).into_vec()
+        };
+        let rows = ranks
+            .into_iter()
+            .map(|rank| {
+                let series_index = cumulative.partition_point(|&end| end <= rank);
+                let previous_end = series_index
+                    .checked_sub(1)
+                    .map_or(0, |previous| cumulative[previous]);
+                let (symbol, first_decision) = series[series_index];
+                DirectReturnRow {
+                    symbol,
+                    decision_bar: first_decision + rank - previous_end,
+                }
+            })
+            .collect();
+
+        Ok(DirectReturnRowSample {
+            rows,
+            population,
+            eligibility_schedule_evaluations,
+        })
     }
 
     /// Stream every DOF-carrying bar of one series through `sink`, in bar order, with the bar's
@@ -1445,9 +2272,9 @@ impl BarCorpus {
         self.inner.files[series].bars()[bar].ts()
     }
 
-    /// `[endpoints.len(), len, ..]` DOF and calendar ids on `device`. Row `i` covers bars
-    /// `bar + offset - len + 1 ..= bar + offset` of its endpoint's series, where `offsets` is
-    /// either a single broadcast value or one entry per endpoint.
+    /// `[endpoints.len(), len, ..]` DOF, calendar ids, and adjusted-daily context on `device`.
+    /// Row `i` covers bars `bar + offset - len + 1 ..= bar + offset` of its endpoint's series,
+    /// where `offsets` is either a single broadcast value or one entry per endpoint.
     ///
     /// Every row is encoded with the same causal span-20 volume EMA warm-up the pretrainer
     /// uses, so a `len == 1` request still pays [`DOF_WARMUP_BARS`] encodes: ask for the whole
@@ -1475,6 +2302,7 @@ impl BarCorpus {
             len,
             self.inner.res_secs,
             self.inner.market.as_ref(),
+            &self.inner.adjusted_daily,
             device,
         ))
     }
@@ -1609,17 +2437,17 @@ impl BarCorpus {
 
     /// SHA-256 over everything that decides which bars a split contains and what the model is
     /// conditioned on: the resolution, both split instants, every symbol's name, length and
-    /// timestamp span, and the market channel's bucket geometry. Fold this into any evaluation
-    /// fingerprint — the corpus grows under running jobs, and a fingerprint blind to the symbol
-    /// set would compare two different evaluation sets as if they were one.
+    /// timestamp span, adjusted-daily file availability and span, and the market channel's
+    /// bucket geometry. Fold this into any evaluation fingerprint — the corpus grows under
+    /// running jobs, and a fingerprint blind to the symbol set would compare two different
+    /// evaluation sets as if they were one.
     ///
-    /// `v2` adds the market channel. `MarketChannel::support_sha256` is a geometry hash, not a
-    /// file hash, so re-persisting the same buckets does not move the fingerprint while a refit
-    /// that moves one edge does — which is the whole reason the buckets are pinned to an
-    /// artifact rather than refitted per run.
+    /// `v2` adds the market channel. `v3` adds the point-in-time adjusted-daily file identities.
+    /// File identities use geometry rather than bytes, matching the primary corpus identity:
+    /// an append or coverage change moves lineage without hashing multi-gigabyte bar files.
     pub fn identity_fingerprint(&self) -> String {
         let mut digest = DigestContext::new(&SHA256);
-        digest.update(b"bar-corpus-v2");
+        digest.update(b"bar-corpus-v3");
         digest.update(&self.inner.res_secs.to_le_bytes());
         digest.update(&self.inner.bounds.0.to_le_bytes());
         digest.update(&self.inner.bounds.1.to_le_bytes());
@@ -1628,6 +2456,19 @@ impl BarCorpus {
             digest.update(&(file.len() as u64).to_le_bytes());
             digest.update(&file.first_ts_ms().unwrap_or(0).to_le_bytes());
             digest.update(&file.last_ts_ms().unwrap_or(0).to_le_bytes());
+        }
+        for (slot, symbol) in self.inner.symbols.iter().enumerate() {
+            digest.update(b"adjusted-daily");
+            digest.update(symbol.as_bytes());
+            match self.inner.adjusted_daily.file_identity(slot) {
+                Some((len, first, last)) => {
+                    digest.update(&[1]);
+                    digest.update(&(len as u64).to_le_bytes());
+                    digest.update(&first.to_le_bytes());
+                    digest.update(&last.to_le_bytes());
+                }
+                None => digest.update(&[0]),
+            }
         }
         match &self.inner.market {
             Some(channel) => {
@@ -1646,9 +2487,24 @@ impl BarCorpus {
         self.inner.market.as_ref()
     }
 
+    /// Half-open bar-index range `[lo, hi)` of `symbol` inside a shared wall-clock interval.
+    pub fn range(&self, symbol: usize, range: TimeRange) -> (usize, usize) {
+        range
+            .validate()
+            .unwrap_or_else(|error| panic!("invalid corpus range: {error}"));
+        self.inner.range(symbol, range)
+    }
+
+    /// The wall-clock interval corresponding to a legacy global split.
+    pub fn split_time_range(&self, split: Split) -> TimeRange {
+        self.inner.split_time_range(split)
+    }
+
     /// Half-open bar-index range `[lo, hi)` of `symbol` inside `split`.
+    ///
+    /// Split callers are a convenience over [`Self::range`]; there is no second index rule.
     pub fn split_range(&self, symbol: usize, split: Split) -> (usize, usize) {
-        self.inner.split_range(symbol, split)
+        self.range(symbol, self.split_time_range(split))
     }
 
     /// Bars belonging to `split` across the whole corpus.
@@ -1706,6 +2562,20 @@ impl BarCorpus {
         self.flatten_train_blocks(&blocks, max_samples, |_, _, bar, dof| (bar.ts(), dof))
     }
 
+    /// Deterministically draw support-fitting DOF only from an explicit half-open fit range.
+    pub fn sample_dof_in_range(
+        &self,
+        range: TimeRange,
+        max_samples: usize,
+        seed: u64,
+    ) -> Vec<(i64, BarDof)> {
+        range
+            .validate()
+            .unwrap_or_else(|error| panic!("invalid support-fit range: {error}"));
+        let blocks = self.dof_blocks_in_range(range, max_samples, seed);
+        self.flatten_train_blocks(&blocks, max_samples, |_, _, bar, dof| (bar.ts(), dof))
+    }
+
     /// [`Self::sample_train_dof`] with the originating series and bar index carried alongside
     /// each row.
     ///
@@ -1737,9 +2607,17 @@ impl BarCorpus {
     /// The block anchors the draw is taken from, in draw order and already truncated to the
     /// blocks `max_samples` rows can reach.
     fn train_dof_blocks(&self, max_samples: usize, seed: u64) -> Vec<WindowRef> {
+        self.dof_blocks_in_range(self.split_time_range(Split::Train), max_samples, seed)
+    }
+
+    fn dof_blocks_in_range(
+        &self,
+        range: TimeRange,
+        max_samples: usize,
+        seed: u64,
+    ) -> Vec<WindowRef> {
         assert!(max_samples > 0, "support fitting needs a positive budget");
         let inner = &self.inner;
-
         // Block anchors per symbol: `1 + k * SUPPORT_BLOCK` while the whole block stays inside
         // the train region. Index 0 is excluded because the first bar of a file has no
         // predecessor and therefore no DOF.
@@ -1747,8 +2625,9 @@ impl BarCorpus {
         let mut total_blocks: u64 = 0;
         cumulative.push(0u64);
         for s in 0..inner.files.len() {
-            let (_, hi) = inner.split_range(s, Split::Train);
-            total_blocks += (hi.saturating_sub(1) / SUPPORT_BLOCK) as u64;
+            let (lo, hi) = inner.range(s, range);
+            let first = lo.max(1);
+            total_blocks += (hi.saturating_sub(first) / SUPPORT_BLOCK) as u64;
             cumulative.push(total_blocks);
         }
         assert!(
@@ -1785,9 +2664,10 @@ impl BarCorpus {
             .map(|&block| {
                 let symbol = cumulative.partition_point(|&c| c <= block) - 1;
                 let local = block - cumulative[symbol];
+                let (lo, _) = inner.range(symbol, range);
                 WindowRef {
                     symbol: symbol as u32,
-                    bar_index: (1 + local as usize * SUPPORT_BLOCK) as u32,
+                    bar_index: (lo.max(1) + local as usize * SUPPORT_BLOCK) as u32,
                 }
             })
             .collect()
@@ -1819,21 +2699,33 @@ impl BarCorpus {
 }
 
 impl Corpus {
-    fn split_range(&self, symbol: usize, split: Split) -> (usize, usize) {
-        let file = &self.files[symbol];
+    fn split_time_range(&self, split: Split) -> TimeRange {
         let (b0, b1) = self.bounds;
         match split {
-            Split::Train => (0, file.index_at_or_after(b0)),
-            Split::Val => (file.index_at_or_after(b0), file.index_at_or_after(b1)),
-            Split::Test => (file.index_at_or_after(b1), file.len()),
+            Split::Train => TimeRange::new(i64::MIN, b0),
+            Split::Val => TimeRange::new(b0, b1),
+            Split::Test => TimeRange::new(b1, i64::MAX),
         }
+    }
+
+    fn range(&self, symbol: usize, range: TimeRange) -> (usize, usize) {
+        let file = &self.files[symbol];
+        (
+            file.index_at_or_after(range.start_ms),
+            file.index_at_or_after(range.end_ms),
+        )
+    }
+
+    fn split_range(&self, symbol: usize, split: Split) -> (usize, usize) {
+        self.range(symbol, self.split_time_range(split))
     }
 }
 
-/// Deterministic near-disjoint window sampler over one split.
+/// Deterministic near-disjoint window sampler over one shared wall-clock range.
 pub struct BarSampler {
     corpus: Arc<Corpus>,
-    split: Split,
+    split: Option<Split>,
+    range: TimeRange,
     context: i64,
     seed: u64,
     anchors: Vec<WindowRef>,
@@ -1860,19 +2752,44 @@ impl std::fmt::Debug for BarSampler {
 }
 
 impl BarSampler {
+    /// Legacy split convenience over [`Self::new_in_range`].
+    ///
     /// Anchors are strided by exactly `context`, so consecutive windows of one symbol share
     /// only their seam bar. A window occupies bars `[a, a + context]` — `context + 1` DOF, the
     /// caller slices inputs `[..context]` and targets `[1..]` — and every one of those bars is
-    /// required to lie inside `split`.
+    /// required to lie inside the same wall-clock range.
     pub fn new(corpus: &BarCorpus, split: Split, context: i64, seed: u64) -> Self {
-        assert!(context > 0, "context must be positive");
+        let range = corpus.split_time_range(split);
+        Self::build(corpus, Some(split), range, context, seed)
+            .expect("a corpus-owned split is a valid time range")
+    }
+
+    /// Construct a sampler over an explicit half-open wall-clock range.
+    pub fn new_in_range(
+        corpus: &BarCorpus,
+        range: TimeRange,
+        context: i64,
+        seed: u64,
+    ) -> Result<Self> {
+        Self::build(corpus, None, range, context, seed)
+    }
+
+    fn build(
+        corpus: &BarCorpus,
+        split: Option<Split>,
+        range: TimeRange,
+        context: i64,
+        seed: u64,
+    ) -> Result<Self> {
+        range.validate()?;
+        ensure!(context > 0, "context must be positive");
         let inner = corpus.inner.clone();
         let ctx = context as usize;
         let mut anchors = Vec::new();
         let mut symbol_runs = Vec::with_capacity(inner.files.len());
         for symbol in 0..inner.files.len() {
             let start = anchors.len() as u32;
-            let (lo, hi) = inner.split_range(symbol, split);
+            let (lo, hi) = inner.range(symbol, range);
             // Bar 0 has no predecessor close, so it can never carry a DOF.
             let first = lo.max(1);
             if hi > first + ctx {
@@ -1885,19 +2802,27 @@ impl BarSampler {
             }
             symbol_runs.push((start, anchors.len() as u32 - start));
         }
-        Self {
+        Ok(Self {
             corpus: inner,
             split,
+            range,
             context,
             seed,
             anchors,
             symbol_runs,
             order: RwLock::new(EpochOrder::default()),
-        }
+        })
     }
 
+    /// Legacy split identity. Explicit-range samplers have no split identity and must use
+    /// [`Self::range`] for provenance.
     pub fn split(&self) -> Split {
         self.split
+            .expect("an explicit-range sampler does not have a legacy split identity")
+    }
+
+    pub fn range(&self) -> TimeRange {
+        self.range
     }
 
     /// The two shared wall-clock instants this sampler's split was cut at, in epoch millis.
@@ -1949,8 +2874,8 @@ impl BarSampler {
         &self.anchors
     }
 
-    /// `[batch, context + 1, ..]` DOF and calendar ids on `device`, bit-identical for a given
-    /// `(seed, epoch, index, batch)` and reordered by `epoch`.
+    /// `[batch, context + 1, ..]` aligned DOF, calendar ids, and adjusted-daily context on
+    /// `device`, bit-identical for a given `(seed, epoch, index, batch)` and reordered by `epoch`.
     pub fn batch(&self, epoch: usize, index: usize, batch: usize, device: Device) -> BarBatch {
         self.batch_of(&self.batch_refs(epoch, index, batch), device)
     }
@@ -2040,7 +2965,7 @@ impl BarSampler {
         refs.par_iter().for_each(|r| readahead(self.slab(r, len)));
     }
 
-    /// `[refs.len(), context + 1, ..]` DOF and calendar ids on `device`.
+    /// `[refs.len(), context + 1, ..]` aligned DOF, calendar ids, and adjusted-daily context.
     pub fn batch_of(&self, refs: &[WindowRef], device: Device) -> BarBatch {
         assert!(!refs.is_empty(), "cannot build an empty batch");
         let len = (self.context + 1) as usize;
@@ -2054,6 +2979,7 @@ impl BarSampler {
             len,
             self.corpus.res_secs,
             self.corpus.market.as_ref(),
+            &self.corpus.adjusted_daily,
             device,
         )
     }
@@ -2401,6 +3327,37 @@ impl PassPlan {
         token_weights: &[f64],
         seed: u64,
     ) -> Result<Self> {
+        Self::build(
+            corpus,
+            split,
+            corpus.split_time_range(split),
+            contexts,
+            token_weights,
+            seed,
+        )
+    }
+
+    /// Partition an explicit fold-local fit range. The retained `Train` label is reporting
+    /// ownership only; all addresses and accounting are derived from `range`.
+    pub fn new_in_range(
+        corpus: &BarCorpus,
+        range: TimeRange,
+        contexts: &[i64],
+        token_weights: &[f64],
+        seed: u64,
+    ) -> Result<Self> {
+        range.validate()?;
+        Self::build(corpus, Split::Train, range, contexts, token_weights, seed)
+    }
+
+    fn build(
+        corpus: &BarCorpus,
+        split: Split,
+        range: TimeRange,
+        contexts: &[i64],
+        token_weights: &[f64],
+        seed: u64,
+    ) -> Result<Self> {
         ensure!(
             !contexts.is_empty(),
             "a pass plan needs at least one ramp context"
@@ -2443,7 +3400,7 @@ impl PassPlan {
         // drift is bounded by one window in total.
         let mut deficit = vec![0f64; stages];
         for symbol in 0..inner.files.len() {
-            let (lo, hi) = inner.split_range(symbol, split);
+            let (lo, hi) = inner.range(symbol, range);
             // Bar 0 has no predecessor close, so it can never carry a DOF, and the anchor bar
             // is an input rather than a target.
             let first = lo.max(1);
@@ -3234,29 +4191,35 @@ impl CumulativeCoverage {
 }
 
 /// Encode `len` bars starting at `start` for every `(series, start)` row into one
-/// [`BarBatch`]. The DOF and the calendar ids come off the same bar in the same pass, which is
-/// the whole reason the two tensors are returned together.
+/// [`BarBatch`]. DOF, calendar ids, and adjusted-daily context come off the same bar timestamp
+/// in the same pass, which is the whole reason the tensors are returned together.
 fn build_batch(
     files: &[BarFile],
     rows: &[(usize, usize)],
     len: usize,
     res_secs: u32,
     market: Option<&MarketChannel>,
+    adjusted_daily: &AdjustedDailyContextStore,
     device: Device,
 ) -> BarBatch {
     let dof_row = len * BAR_DOF;
     let time_row = len * BAR_TIME_FEATURES;
     let mut dof = vec![0f32; rows.len() * dof_row];
     let mut time = vec![0i64; rows.len() * time_row];
-    let market_missing = dof
+    let daily_row = len * ADJUSTED_DAILY_CONTEXT_FEATURES;
+    let mut daily = vec![0f32; rows.len() * daily_row];
+    let (market_missing, adjusted_daily_missing_bars) = dof
         .par_chunks_mut(dof_row)
         .zip(time.par_chunks_mut(time_row))
+        .zip(daily.par_chunks_mut(daily_row))
         .zip(rows.par_iter())
-        .map(|((dof_out, time_out), &(series, start))| {
+        .map(|(((dof_out, time_out), daily_out), &(series, start))| {
             let bars = files[series].bars();
             readahead(&bars[start.saturating_sub(DOF_WARMUP_BARS + 1)..start + len]);
             let mut slot = 0usize;
-            let mut missing = 0usize;
+            let mut daily_cursor = adjusted_daily.cursor(series);
+            let mut market_missing = 0usize;
+            let mut daily_missing = 0usize;
             for_each_window_dof(bars, start, len, |bar, encoded| {
                 dof_out[slot * BAR_DOF..(slot + 1) * BAR_DOF].copy_from_slice(&encoded.to_array());
                 // `start >= 1` for every window — bar 0 carries no DOF — so the predecessor is
@@ -3271,15 +4234,22 @@ fn build_batch(
                     res_secs,
                     market,
                 );
-                missing += usize::from(ids[TIME_MARKET_R] == MARKET_MISSING);
+                market_missing += usize::from(ids[TIME_MARKET_R] == MARKET_MISSING);
                 time_out[slot * BAR_TIME_FEATURES..(slot + 1) * BAR_TIME_FEATURES]
                     .copy_from_slice(&ids);
+                let daily = daily_cursor.features(bar.ts());
+                daily_missing += usize::from(!daily.is_available());
+                daily_out[slot * ADJUSTED_DAILY_CONTEXT_FEATURES
+                    ..(slot + 1) * ADJUSTED_DAILY_CONTEXT_FEATURES]
+                    .iter_mut()
+                    .zip(daily.values)
+                    .for_each(|(out, value)| *out = value as f32);
                 slot += 1;
             });
             debug_assert_eq!(slot, len);
-            missing
+            (market_missing, daily_missing)
         })
-        .sum();
+        .reduce(|| (0, 0), |lhs, rhs| (lhs.0 + rhs.0, lhs.1 + rhs.1));
     let n = rows.len() as i64;
     let len = len as i64;
     BarBatch {
@@ -3289,7 +4259,11 @@ fn build_batch(
         time_ids: Tensor::from_slice(&time)
             .view([n, len, BAR_TIME_FEATURES as i64])
             .to_device(device),
+        adjusted_daily: Tensor::from_slice(&daily)
+            .view([n, len, ADJUSTED_DAILY_CONTEXT_FEATURES as i64])
+            .to_device(device),
         market_missing,
+        adjusted_daily_missing_bars,
     }
 }
 
@@ -3812,6 +4786,7 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).unwrap();
         let base = 1_600_000_000_000i64 / RES_MS * RES_MS;
+
         for (symbol, seed, count, offset) in [
             ("AAA", 1u64, 5_000usize, 0i64),
             ("BBB", 2, 3_100, 1_200),
@@ -3828,12 +4803,233 @@ mod tests {
     fn bar_path(dir: &Path, symbol: &str) -> PathBuf {
         dir.join(format!("{symbol}.{RES}.{FILE_EXTENSION}"))
     }
+    fn priced_bar(ts_ms: i64, open: f32, close: f32) -> PackedBar {
+        PackedBar {
+            ts_ms,
+            open,
+            high: open.max(close),
+            low: open.min(close),
+            close,
+            volume: 1_000.0,
+            vwap: 0.5 * (open + close),
+            trades: 10,
+        }
+    }
+
+    fn direct_sampling_corpus(label: &str) -> (Fixture, BarCorpus, TimeRange) {
+        let decision_ts = et("2024-07-08T10:00:00");
+        let schedule = forecast_schedule_after(decision_ts, 180, RES);
+        let range = TimeRange::new(decision_ts, schedule[130]);
+        let dir = std::env::temp_dir().join(format!(
+            "trading_bot_0_dataset_{label}_{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        for (symbol, keep) in [
+            ("AAA", None),
+            ("BBB", Some((7usize, 0usize))),
+            ("CCC", Some((5usize, 2usize))),
+        ] {
+            let mut timestamps = vec![forecast_schedule_previous(decision_ts, RES), decision_ts];
+            timestamps.extend(
+                schedule
+                    .iter()
+                    .take(140)
+                    .enumerate()
+                    .filter(|(index, _)| {
+                        keep.is_none_or(|(stride, residue)| *index % stride != residue)
+                    })
+                    .map(|(_, &ts)| ts),
+            );
+            let bars = timestamps
+                .into_iter()
+                .enumerate()
+                .map(|(index, ts)| {
+                    let open = 100.0 + index as f32 * 0.01;
+                    priced_bar(ts, open, open + 0.005)
+                })
+                .collect::<Vec<_>>();
+            write_bar_file(&bar_path(&dir, symbol), symbol, RES, &bars).unwrap();
+        }
+        let corpus =
+            BarCorpus::load_with_bounds(&dir, RES, 1, (range.end_ms, schedule[170])).unwrap();
+        (Fixture { dir }, corpus, range)
+    }
+
+    fn sparse_pinned_corpus(
+        label: &str,
+        res_secs: u32,
+        bounds: (i64, i64),
+        terminal_ts_ms: i64,
+    ) -> (Fixture, BarCorpus) {
+        let dir = std::env::temp_dir().join(format!(
+            "trading_bot_0_dataset_{label}_{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let bars = [
+            priced_bar(bounds.0 - i64::from(res_secs) * 1_000, 100.0, 100.0),
+            priced_bar(bounds.0, 100.0, 101.0),
+            priced_bar(terminal_ts_ms, 101.0, 102.0),
+        ];
+        let path = dir.join(format!("AAA.{res_secs}.{FILE_EXTENSION}"));
+        write_bar_file(&path, "AAA", res_secs, &bars).unwrap();
+        let corpus = BarCorpus::load_with_bounds(&dir, res_secs, 1, bounds).unwrap();
+        (Fixture { dir }, corpus)
+    }
 
     #[test]
     fn undersized_symbols_are_dropped() {
         let (_fx, corpus) = fixture("drop");
         assert_eq!(corpus.symbols(), &["AAA", "BBB", "CCC"]);
         assert_eq!(corpus.unique_bars(), 5_000 + 3_100 + 4_400);
+    }
+
+    fn write_offset_bars(dir: &Path, symbol: &str, res_secs: u32, base: i64, offsets: &[i64]) {
+        let mut bars = synth_bars(
+            symbol.len() as u64 + offsets.len() as u64,
+            offsets.len(),
+            base,
+        );
+        for (bar, offset) in bars.iter_mut().zip(offsets) {
+            bar.ts_ms = base + offset * res_secs as i64 * 1_000;
+        }
+        write_bar_file(
+            &dir.join(format!("{symbol}.{res_secs}.{FILE_EXTENSION}")),
+            symbol,
+            res_secs,
+            &bars,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn pinned_admission_uses_only_the_strict_training_prefix_and_reports_membership() {
+        let dir = std::env::temp_dir().join(format!(
+            "trading_bot_0_dataset_causal_universe_{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let _fx = Fixture { dir: dir.clone() };
+        let base = 1_600_000_000_000i64 / RES_MS * RES_MS;
+        let bounds = (base + 3 * RES_MS, base + 5 * RES_MS);
+        write_offset_bars(&dir, "EXACT", RES, base, &[0, 1, 2, 3, 6]);
+        write_offset_bars(&dir, "AT_BOUNDARY", RES, base, &[0, 1, 3, 4, 6]);
+        write_offset_bars(&dir, "TRAIN_ONLY", RES, base, &[0, 1, 2]);
+        write_offset_bars(&dir, "VAL_GONE", RES, base, &[0, 1, 2, 4]);
+        write_offset_bars(&dir, "FUTURE_RESCUE", RES, base, &[0, 1, 3, 4, 6, 7, 8]);
+
+        let corpus = BarCorpus::load_with_bounds(&dir, RES, 3, bounds).unwrap();
+        assert_eq!(
+            corpus.symbols(),
+            &["EXACT", "TRAIN_ONLY", "VAL_GONE"],
+            "exactly-minimum prefixes, including delisted names, remain; a boundary bar does not count"
+        );
+        let audit = corpus.universe_audit();
+        assert_eq!(audit.minimum_training_bars, 3);
+        assert_eq!(audit.train_end_cutoff_ms, bounds.0);
+        assert_eq!(audit.no_val_symbols, 1);
+        assert_eq!(audit.no_test_symbols, 2);
+        assert_eq!(audit.disappeared_symbols, 1);
+        assert_eq!(audit.admitted_symbol_names, corpus.symbols());
+        let digest_before = audit.admitted_symbols_digest.clone();
+
+        let report_dir = dir.join("reports");
+        CorpusUniverseAudit::write_report_of(std::slice::from_ref(audit), &report_dir).unwrap();
+        let report_path = report_dir.join(format!(
+            "{PRETRAIN_UNIVERSE_INTEGRITY_REPORT_BASE}.report.bin"
+        ));
+        let report = shared::report::read_report(&report_path).unwrap();
+        assert!(report.title.contains(CORPUS_UNIVERSE_RULE));
+        assert!(report.title.contains(&digest_before));
+        assert!(report
+            .title
+            .contains(r#"["EXACT","TRAIN_ONLY","VAL_GONE"]"#));
+        assert!(shared::report::PRETRAIN_REPORT_BASES
+            .contains(&PRETRAIN_UNIVERSE_INTEGRITY_REPORT_BASE));
+        assert_eq!(
+            crate::data::universe::eligible_bar_universe(&dir, RES, 3, Some(bounds.0)),
+            corpus.symbols()
+        );
+        drop(corpus);
+
+        // Appending arbitrarily deep held-out history to a rejected name cannot rescue it or
+        write_offset_bars(
+            &dir,
+            "FUTURE_RESCUE",
+            RES,
+            base,
+            &[0, 1, 3, 4, 6, 7, 8, 9, 10, 11, 12, 13],
+        );
+        let grown = BarCorpus::load_with_bounds(&dir, RES, 3, bounds).unwrap();
+        assert_eq!(
+            grown.universe_audit().admitted_symbols_digest,
+            digest_before
+        );
+    }
+
+    #[test]
+    fn derived_bounds_are_resolved_once_before_the_strict_prefix_gate() {
+        let dir = std::env::temp_dir().join(format!(
+            "trading_bot_0_dataset_derived_once_{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let _fx = Fixture { dir: dir.clone() };
+        let base = 1_600_000_000_000i64 / RES_MS * RES_MS;
+        write_offset_bars(
+            &dir,
+            "EARLY",
+            RES,
+            base,
+            &(0..100).map(i64::from).collect::<Vec<_>>(),
+        );
+        write_offset_bars(
+            &dir,
+            "LATE",
+            RES,
+            base,
+            &(1_000..1_100).map(i64::from).collect::<Vec<_>>(),
+        );
+        let mut opened = corpus_paths(&dir, RES)
+            .unwrap()
+            .into_iter()
+            .map(|path| BarFile::open(&path))
+            .collect::<Result<Vec<_>>>()
+            .unwrap();
+        opened.sort_by(|a, b| a.symbol().cmp(b.symbol()));
+        let expected = global_split_bounds(&opened, RES, 200);
+        drop(opened);
+
+        let corpus = BarCorpus::load(&dir, RES, 80).unwrap();
+        assert_eq!(corpus.split_bounds(), expected);
+        assert_eq!(corpus.symbols(), &["EARLY"]);
+        let recomputed = global_split_bounds(&corpus.inner.files, RES, corpus.inner.total_bars);
+        assert_ne!(
+            corpus.split_bounds(),
+            recomputed,
+            "strict-prefix rejection must not trigger an iterative bound derivation"
+        );
+    }
+
+    #[test]
+    fn auxiliary_resolution_applies_the_deployment_cutoff_on_its_own_axis() {
+        const DAILY: u32 = 86_400;
+        let dir = std::env::temp_dir().join(format!(
+            "trading_bot_0_dataset_aux_cutoff_{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let _fx = Fixture { dir: dir.clone() };
+        let base = 1_500_000_000_000i64 / 86_400_000 * 86_400_000;
+        let cutoff = base + 4 * 86_400_000;
+        write_offset_bars(&dir, "AUX_OK", DAILY, base, &[0, 1, 2, 3, 4, 5]);
+        write_offset_bars(&dir, "AUX_BOUNDARY", DAILY, base, &[0, 1, 2, 4, 5, 6]);
+        let corpus =
+            BarCorpus::load_with_bounds(&dir, DAILY, 4, (cutoff, cutoff + 86_400_000)).unwrap();
+        assert_eq!(corpus.symbols(), &["AUX_OK"]);
+        assert_eq!(corpus.universe_audit().resolution_secs, DAILY);
+        assert_eq!(corpus.universe_audit().train_end_cutoff_ms, cutoff);
     }
 
     /// The located draw must be the SAME draw: same rows, same order, same truncation. Two
@@ -4006,8 +5202,8 @@ mod tests {
             "loading one auxiliary resolution twice would double-count its bars"
         );
         assert_eq!(
-            crate::data::universe::eligible_bar_universe(&dir, RES, 100),
-            vec!["AAA".to_string(), "BBB".to_string()]
+            crate::data::universe::eligible_bar_universe(&dir, RES, 100, Some(b0)),
+            intraday.symbols()
         );
         assert_eq!(intraday.scan_anomalies().res_secs, RES);
     }
@@ -4224,6 +5420,362 @@ mod tests {
     }
 
     #[test]
+    fn explicit_ranges_share_wall_clock_bounds_across_staggered_symbols() {
+        let (_fx, corpus) = fixture("shared_range");
+        let (b0, b1) = corpus.split_bounds();
+        let range = TimeRange::new(b0 + 20 * RES_MS, b1 - 20 * RES_MS);
+        let mut index_bounds = Vec::new();
+        for symbol in 0..corpus.series_count() {
+            let got = corpus.range(symbol, range);
+            let file = &corpus.inner.files[symbol];
+            assert_eq!(
+                got,
+                (
+                    file.index_at_or_after(range.start_ms),
+                    file.index_at_or_after(range.end_ms)
+                )
+            );
+            assert!(file.bars()[got.0..got.1]
+                .iter()
+                .all(|bar| range.contains(bar.ts())));
+            index_bounds.push(got);
+        }
+        assert!(
+            index_bounds.windows(2).any(|pair| pair[0] != pair[1]),
+            "staggered symbols must map one clock range to different index bounds"
+        );
+
+        let sampler = BarSampler::new_in_range(&corpus, range, 16, 17).unwrap();
+        assert_eq!(sampler.range(), range);
+        assert!(sampler.windows() > 0);
+        for window in sampler.anchors() {
+            let bars = corpus.bars(window.symbol as usize);
+            assert!(range.contains(bars[window.bar_index as usize].ts()));
+            assert!(range.contains(bars[window.bar_index as usize + 16].ts()));
+        }
+    }
+
+    #[test]
+    fn rolling_origins_are_deterministic_expanding_and_terminal_blind() {
+        const HOURLY: u32 = 3_600;
+        let bounds = (et("2024-07-03T19:00:00"), et("2024-09-03T19:00:00"));
+        let (_a_dir, a) = sparse_pinned_corpus("rolling_a", HOURLY, bounds, bounds.1 + 3_600_000);
+        let (_b_dir, b) = sparse_pinned_corpus("rolling_b", HOURLY, bounds, bounds.1 + 36_000_000);
+        let plan = a.rolling_origin_plan(3, 0xA11C_E55, 73).unwrap();
+        let again = a.rolling_origin_plan(3, 0xA11C_E55, 73).unwrap();
+        let changed_terminal_history = b.rolling_origin_plan(3, 0xA11C_E55, 73).unwrap();
+        plan.validate().unwrap();
+        assert_eq!(plan, again);
+        assert_eq!(plan.canonical_sha256(), again.canonical_sha256());
+        assert_eq!(
+            plan.canonical_sha256(),
+            changed_terminal_history.canonical_sha256(),
+            "terminal observations must not affect a development plan"
+        );
+        assert_eq!(plan.development, TimeRange::new(bounds.0, bounds.1));
+        assert_eq!(plan.folds[0].fit.end_ms, bounds.0);
+        assert_eq!(plan.folds.last().unwrap().validation.end_ms, bounds.1);
+        for pair in plan.folds.windows(2) {
+            assert_eq!(pair[1].fit.start_ms, pair[0].fit.start_ms);
+            assert_eq!(pair[1].fit.end_ms, pair[0].validation.end_ms);
+            assert!(pair[0].validation.end_ms <= pair[1].validation.start_ms);
+        }
+
+        let encoded = serde_json::to_value(&plan).unwrap();
+        let decoded: RollingOriginPlan = serde_json::from_value(encoded.clone()).unwrap();
+        assert_eq!(decoded, plan);
+        let terminal = encoded["terminal_test"].as_object().unwrap();
+        assert!(
+            !terminal.contains_key("range")
+                && !terminal.contains_key("start_ms")
+                && !terminal.contains_key("end_ms"),
+            "terminal metadata must never expose the Test interval to development"
+        );
+        assert_eq!(plan.terminal_test.status, TerminalTestStatus::Spent);
+        assert_eq!(plan.terminal_test.max_windows, 0);
+        assert_eq!(plan.terminal_test.generated_windows, 0);
+    }
+
+    #[test]
+    fn rolling_embargo_is_exactly_h100_on_the_exchange_schedule() {
+        const HOURLY: u32 = 3_600;
+        let bounds = (et("2024-07-03T19:00:00"), et("2024-09-03T19:00:00"));
+        let (_dir, corpus) =
+            sparse_pinned_corpus("rolling_calendar", HOURLY, bounds, bounds.1 + 3_600_000);
+        let plan = corpus.rolling_origin_plan(1, 9, 8).unwrap();
+        let fold = &plan.folds[0];
+        let through_start =
+            forecast_schedule_after(fold.fit.end_ms, DIRECT_RETURN_MAX_HORIZON + 1, HOURLY);
+        assert_eq!(
+            through_start[DIRECT_RETURN_MAX_HORIZON],
+            fold.validation.start_ms
+        );
+        assert!(through_start[..DIRECT_RETURN_MAX_HORIZON]
+            .iter()
+            .all(|&ts| ts < fold.validation.start_ms));
+        assert_eq!(
+            forecast_schedule_after(fold.fit.end_ms, DIRECT_RETURN_MAX_HORIZON, HOURLY)
+                .last()
+                .copied(),
+            through_start.get(DIRECT_RETURN_MAX_HORIZON - 1).copied()
+        );
+        assert!(
+            fold.validation.start_ms > et("2024-07-08T04:00:00"),
+            "100 hourly scheduled bars must cross the overnight, July 4 holiday, and weekend"
+        );
+        assert!(through_start.iter().all(|&ts| {
+            let local = New_York.timestamp_millis_opt(ts).single().unwrap();
+            is_us_equity_trading_date(local.date_naive())
+                && !matches!(local.weekday(), Weekday::Sat | Weekday::Sun)
+                && local.date_naive() != NaiveDate::from_ymd_opt(2024, 7, 4).unwrap()
+        }));
+    }
+
+    #[test]
+    fn every_rolling_contract_mutation_moves_the_canonical_hash() {
+        const HOURLY: u32 = 3_600;
+        let bounds = (et("2024-07-03T19:00:00"), et("2024-09-03T19:00:00"));
+        let (_dir, corpus) =
+            sparse_pinned_corpus("rolling_hash", HOURLY, bounds, bounds.1 + 3_600_000);
+        let plan = corpus.rolling_origin_plan(2, 41, 19).unwrap();
+        let baseline = plan.canonical_sha256();
+        let mut changed = Vec::new();
+
+        let mut mutation = plan.clone();
+        mutation.format_version += 1;
+        changed.push(mutation.canonical_sha256());
+        let mut mutation = plan.clone();
+        mutation.resolution_secs += 1;
+        changed.push(mutation.canonical_sha256());
+        let mut mutation = plan.clone();
+        mutation.development.start_ms -= 1;
+        changed.push(mutation.canonical_sha256());
+        let mut mutation = plan.clone();
+        mutation.development.end_ms += 1;
+        changed.push(mutation.canonical_sha256());
+        let mut mutation = plan.clone();
+        mutation.folds[0].id += 1;
+        changed.push(mutation.canonical_sha256());
+        let mut mutation = plan.clone();
+        mutation.folds[0].fit.start_ms -= 1;
+        changed.push(mutation.canonical_sha256());
+        let mut mutation = plan.clone();
+        mutation.folds[0].fit.end_ms += 1;
+        changed.push(mutation.canonical_sha256());
+        let mut mutation = plan.clone();
+        mutation.folds[0].validation.start_ms += 1;
+        changed.push(mutation.canonical_sha256());
+        let mut mutation = plan.clone();
+        mutation.folds[0].validation.end_ms -= 1;
+        changed.push(mutation.canonical_sha256());
+        let mut mutation = plan.clone();
+        mutation.folds[0].windows += 1;
+        changed.push(mutation.canonical_sha256());
+        let mut mutation = plan.clone();
+        mutation.embargo_steps += 1;
+        changed.push(mutation.canonical_sha256());
+        let mut mutation = plan.clone();
+        mutation.target_horizons[0] += 1;
+        changed.push(mutation.canonical_sha256());
+        let mut mutation = plan.clone();
+        mutation.eval_seed += 1;
+        changed.push(mutation.canonical_sha256());
+        let mut mutation = plan.clone();
+        let replacement = if mutation.earliest_origin_universe_digest.starts_with('f') {
+            "e"
+        } else {
+            "f"
+        };
+        mutation
+            .earliest_origin_universe_digest
+            .replace_range(0..1, replacement);
+        changed.push(mutation.canonical_sha256());
+        let mut mutation = plan.clone();
+        mutation.earliest_origin_universe_cutoff_ms += 1;
+        changed.push(mutation.canonical_sha256());
+        let mut mutation = plan.clone();
+        mutation.terminal_test.max_windows += 1;
+        changed.push(mutation.canonical_sha256());
+        let mut mutation = plan.clone();
+        mutation.terminal_test.status = TerminalTestStatus::Generated;
+        changed.push(mutation.canonical_sha256());
+        let mut mutation = plan.clone();
+        mutation.terminal_test.generated_windows += 1;
+        changed.push(mutation.canonical_sha256());
+        let mut mutation = plan.clone();
+        mutation.terminal_test.generation_seed = Some(1);
+        changed.push(mutation.canonical_sha256());
+        let mut mutation = plan.clone();
+        mutation.terminal_test.artifact_sha256 = Some("0".repeat(64));
+        changed.push(mutation.canonical_sha256());
+
+        assert!(changed.iter().all(|hash| hash != &baseline));
+        let unique: HashSet<_> = changed.iter().collect();
+        assert_eq!(unique.len(), changed.len());
+    }
+
+    #[test]
+    fn direct_targets_follow_scheduled_marks_and_reject_incomplete_h100() {
+        let decision_ts = et("2024-07-05T19:50:00");
+        let schedule = forecast_schedule_after(decision_ts, 120, RES);
+        let label_range = TimeRange::new(decision_ts, schedule[100]);
+        let dir = std::env::temp_dir().join(format!(
+            "trading_bot_0_dataset_direct_targets_{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let _fixture = Fixture { dir: dir.clone() };
+        let bars = [
+            priced_bar(forecast_schedule_previous(decision_ts, RES), 100.0, 100.0),
+            priced_bar(decision_ts, 100.0, 100.0),
+            priced_bar(schedule[2], 100.0, 110.0),
+            priced_bar(schedule[3], 110.0, 121.0),
+            priced_bar(schedule[15], 121.0, 133.1),
+        ];
+        write_bar_file(&bar_path(&dir, "AAA"), "AAA", RES, &bars).unwrap();
+        let corpus =
+            BarCorpus::load_with_bounds(&dir, RES, 1, (decision_ts, schedule[100])).unwrap();
+
+        let targets = corpus
+            .direct_return_targets(0, 1, label_range)
+            .unwrap()
+            .expect("H100 ends strictly inside the label range");
+        let endpoints = corpus.direct_return_endpoint_timestamps(decision_ts);
+        let factored = corpus
+            .direct_return_targets_at_endpoints(0, 1, label_range, &endpoints)
+            .unwrap()
+            .expect("factored H100 target");
+        assert_eq!(
+            targets.map(f32::to_bits),
+            factored.map(f32::to_bits),
+            "factored forward-filled marks must bit-match the reference wrapper"
+        );
+        let expected = [
+            0.0f32,
+            1.21f32.ln(),
+            1.331f32.ln(),
+            1.331f32.ln(),
+            1.331f32.ln(),
+            1.331f32.ln(),
+        ];
+        for (horizon, (actual, expected)) in DIRECT_RETURN_HORIZONS
+            .iter()
+            .zip(targets.into_iter().zip(expected))
+        {
+            assert!(
+                (actual - expected).abs() < 1e-6,
+                "H{horizon} target {actual} != {expected}"
+            );
+        }
+        assert!(
+            corpus
+                .direct_return_targets(
+                    0,
+                    1,
+                    TimeRange::new(decision_ts, schedule[DIRECT_RETURN_MAX_HORIZON - 1])
+                )
+                .unwrap()
+                .is_none(),
+            "an H100 endpoint on the exclusive range boundary is incomplete"
+        );
+    }
+
+    #[test]
+    fn direct_return_row_sampling_is_exact_deterministic_and_sublinear() {
+        let (_fixture, corpus, range) = direct_sampling_corpus("direct_row_sampling");
+        let requested = 17;
+        let first = corpus
+            .sample_direct_return_rows(range, requested, 0x5eed)
+            .unwrap();
+        let repeated = corpus
+            .sample_direct_return_rows(range, requested, 0x5eed)
+            .unwrap();
+        assert_eq!(
+            first, repeated,
+            "the same support seed must reproduce the draw"
+        );
+        assert!(first.population >= requested);
+        assert_eq!(
+            first.rows.len(),
+            requested,
+            "a sufficient census must fill the budget"
+        );
+
+        let unique = first.rows.iter().copied().collect::<HashSet<_>>();
+        assert_eq!(
+            unique.len(),
+            first.rows.len(),
+            "sampled rows must be unique"
+        );
+        for location in &first.rows {
+            let decision_ts = corpus.bars(location.symbol)[location.decision_bar].ts();
+            assert!(range.contains(decision_ts));
+            let endpoints = corpus.direct_return_endpoint_timestamps(decision_ts);
+            assert!(
+                endpoints[DIRECT_RETURN_HORIZONS.len() - 1] < range.end_ms,
+                "sampled H100 must be strictly inside the fit range"
+            );
+            assert!(
+                corpus
+                    .direct_return_targets_at_endpoints(
+                        location.symbol,
+                        location.decision_bar,
+                        range,
+                        &endpoints,
+                    )
+                    .unwrap()
+                    .is_some(),
+                "every sampled row must have complete six-horizon evidence"
+            );
+        }
+
+        let binary_search_bound = (0..corpus.series_count())
+            .map(|symbol| {
+                let (lo, hi) = corpus.range(symbol, range);
+                let rows = hi - lo;
+                if rows == 0 {
+                    0
+                } else {
+                    usize::BITS as usize - rows.leading_zeros() as usize
+                }
+            })
+            .sum::<usize>();
+        assert!(
+            first.eligibility_schedule_evaluations <= binary_search_bound,
+            "{} eligibility schedules exceed the series-log-row bound {binary_search_bound}",
+            first.eligibility_schedule_evaluations
+        );
+
+        let corpus_ref = &corpus;
+        let expected = (0..corpus.series_count())
+            .flat_map(|symbol| {
+                let (lo, hi) = corpus_ref.range(symbol, range);
+                (lo..hi).filter_map(move |decision_bar| {
+                    corpus_ref
+                        .direct_return_targets(symbol, decision_bar, range)
+                        .unwrap()
+                        .is_some()
+                        .then_some(DirectReturnRow {
+                            symbol,
+                            decision_bar,
+                        })
+                })
+            })
+            .collect::<HashSet<_>>();
+        assert_eq!(expected.len(), first.population);
+
+        let census = corpus
+            .sample_direct_return_rows(range, usize::MAX, 0xdead_beef)
+            .unwrap();
+        assert_eq!(census.rows.len(), census.population);
+        assert_eq!(
+            census.rows.into_iter().collect::<HashSet<_>>(),
+            expected,
+            "a full-population request must return every eligible row exactly once"
+        );
+    }
+
+    #[test]
     fn no_window_crosses_a_split_boundary() {
         let (_fx, corpus) = fixture("bounds");
         let (b0, b1) = corpus.split_bounds();
@@ -4334,6 +5886,15 @@ mod tests {
         let sampler = BarSampler::new(&corpus, Split::Val, 32, 5);
         let refs: Vec<WindowRef> = sampler.anchors().iter().copied().take(4).collect();
         let batch = sampler.batch_of(&refs, Device::Cpu);
+        assert_eq!(
+            batch.adjusted_daily.size(),
+            [
+                refs.len() as i64,
+                33,
+                ADJUSTED_DAILY_CONTEXT_FEATURES as i64
+            ]
+        );
+        assert_eq!(batch.adjusted_daily_missing_bars, refs.len() * 33);
         for (row, r) in refs.iter().enumerate() {
             let bars = corpus.bars(r.symbol as usize);
             let series = encode_series(bars);
@@ -4366,8 +5927,109 @@ mod tests {
                         BAR_TIME_NAMES[f]
                     );
                 }
+                let want_daily = corpus.adjusted_daily_features(r.symbol as usize, bars[bar].ts());
+                for (feature, expected) in want_daily.values.into_iter().enumerate() {
+                    let got = batch.adjusted_daily.double_value(&[
+                        row as i64,
+                        step as i64,
+                        feature as i64,
+                    ]);
+                    assert_eq!(
+                        (got as f32).to_bits(),
+                        (expected as f32).to_bits(),
+                        "row {row} step {step} daily feature {feature}"
+                    );
+                }
             }
         }
+    }
+
+    #[test]
+    fn adjusted_daily_batch_rows_are_nonzero_position_varying_and_timestamp_aligned() {
+        let dir = std::env::temp_dir().join(format!(
+            "trading_bot_0_dataset_daily_batch_{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let _fixture = Fixture { dir: dir.clone() };
+        let base = 1_600_000_000_000i64 / RES_MS * RES_MS;
+        let intraday = synth_bars(17, 1_000, base);
+        write_bar_file(&bar_path(&dir, "AAA"), "AAA", RES, &intraday).unwrap();
+        let missing_daily_intraday = synth_bars(18, 1_000, base);
+        write_bar_file(&bar_path(&dir, "BBB"), "BBB", RES, &missing_daily_intraday).unwrap();
+        let day = 86_400_000i64;
+        let daily: Vec<PackedBar> = (0..7)
+            .map(|index| {
+                let close = 100.0 + 10.0 * index as f32;
+                PackedBar {
+                    ts_ms: base + (index as i64 - 2) * day,
+                    open: close - 1.0,
+                    high: close + 2.0,
+                    low: close - 2.0,
+                    close,
+                    volume: 1_000.0 + 100.0 * index as f32,
+                    vwap: close - 0.25,
+                    trades: 100 + index as u32,
+                }
+            })
+            .collect();
+        write_bar_file(
+            &dir.join(format!("AAA.86400.{FILE_EXTENSION}")),
+            "AAA",
+            86_400,
+            &daily,
+        )
+        .unwrap();
+        let corpus = BarCorpus::load(&dir, RES, 100).unwrap();
+        assert_eq!(corpus.adjusted_daily_file_coverage(), (1, 1));
+        let batch = corpus
+            .dof_window(
+                &[
+                    BarEndpoint {
+                        series: 0,
+                        bar: 500,
+                    },
+                    BarEndpoint {
+                        series: 1,
+                        bar: 500,
+                    },
+                ],
+                &[0],
+                400,
+                Device::Cpu,
+            )
+            .unwrap();
+        assert_eq!(batch.adjusted_daily_missing_bars, 400);
+        assert_eq!(
+            batch.adjusted_daily.size(),
+            [2, 400, ADJUSTED_DAILY_CONTEXT_FEATURES as i64]
+        );
+        assert_eq!(
+            batch
+                .adjusted_daily
+                .select(0, 1)
+                .abs()
+                .sum(Kind::Float)
+                .double_value(&[]),
+            0.0,
+            "the symbol without a daily file must remain neutral with mask 0"
+        );
+        for step in 0..400usize {
+            let bar = 101 + step;
+            let expected = corpus.adjusted_daily_features(0, intraday[bar].ts());
+            assert!(expected.is_available());
+            for (feature, value) in expected.values.into_iter().enumerate() {
+                let actual = batch
+                    .adjusted_daily
+                    .double_value(&[0, step as i64, feature as i64])
+                    as f32;
+                assert_eq!(actual.to_bits(), (value as f32).to_bits());
+            }
+        }
+        let first = batch.adjusted_daily.double_value(&[0, 0, 0]);
+        let last = batch.adjusted_daily.double_value(&[0, 399, 0]);
+        assert_ne!(first.to_bits(), 0.0f64.to_bits());
+        assert_ne!(first.to_bits(), last.to_bits());
     }
 
     #[test]

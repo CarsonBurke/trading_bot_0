@@ -6499,9 +6499,8 @@ mod tests {
     /// Executes the writer of all FIVE registered bases and reads each one back, under a
     /// measured cost model so the arm sweep and the edge-versus-cost chart are exercised too.
     ///
-    /// This is the test named in `pretrain_reports::tests::CYCLE_EXEMPT`: the portfolio bench
-    /// is not part of a pretraining cycle, so the cycle walk cannot cover it and only an
-    /// explicit execution can prove the bases are not blank panels.
+    /// The portfolio writer owns these bases in the shared registry and is not part of an
+    /// optimizer-step report cycle, so only direct execution can prove its panels are populated.
     #[test]
     fn the_five_portfolio_bases_are_written_and_read_back() {
         let rows: Vec<(i64, Vec<(u32, f32)>)> = (0..30)
@@ -6558,9 +6557,10 @@ mod tests {
             PORTFOLIO_FRONTIER_BASE,
             PORTFOLIO_EDGE_BASE,
         ] {
-            assert!(
-                shared::report::PRETRAIN_REPORT_BASES.contains(&base),
-                "{base} is written but not registered, so nothing can render it"
+            assert_eq!(
+                shared::report::pretrain_report_owner(base),
+                Some(shared::report::PretrainReportOwner::Portfolio),
+                "{base} must remain owned by the portfolio writer"
             );
             let report = read_report(&dir.join(format!("{base}.report.bin")))
                 .unwrap_or_else(|e| panic!("{base} reads back: {e}"));

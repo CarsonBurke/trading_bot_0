@@ -135,9 +135,8 @@ enum Commands {
         #[arg(long, default_value_t = 20260811)]
         seed: u64,
     },
-    /// Pretrain the discrete distributional bar world model with Hard categorical NLL and
-    /// NextLat dynamics/KL. Raw-payoff growth is a detached training-batch diagnostic;
-    /// held-out promotion evidence is computed separately.
+    /// Pretrain the six-horizon direct cumulative-return law with a normalized lower-weight
+    /// joint bar-density auxiliary. Held-out promotion evidence is validation-only.
     Pretrain {
         /// Initialize from an existing pretrain checkpoint. Weights only: training
         /// restarts at step zero with a fresh optimizer and schedule.
@@ -214,15 +213,6 @@ enum Commands {
         /// test-split report, because a schedule nobody recorded explains no number later.
         #[arg(long, default_value_t = trading_bot_0::torch::train::pretrain::LR_PLATEAU_FRACTION)]
         lr_plateau_fraction: f64,
-        /// Opt-in categorical beta-NLL exponent. Reweights each per-factor Hard NLL by the
-        /// detached predicted variance relative to that factor's train-marginal variance.
-        /// Absence preserves proper Hard categorical NLL exactly.
-        #[arg(
-            long,
-            requires = "exact_batch",
-            conflicts_with_all = ["sdlr", "optimizer_ablation", "auxiliary_resolutions"]
-        )]
-        beta_nll: Option<f64>,
         /// Enable signed-delta row-wise learned learning rates on Muon-routed matrices.
         /// Off by default. AdamW parameters and auxiliary-resolution updates remain static.
         #[arg(long, default_value_t = false)]
@@ -242,6 +232,14 @@ enum Commands {
         /// Schraudolph SMD meta learning rate, used only by `--optimizer-ablation smd-idbd`.
         #[arg(long, default_value_t = 0.05)]
         smd_meta_lr: f64,
+        /// Number of folds in the canonical rolling-origin development plan.
+        /// Must be supplied together with `--rolling-fold-index`.
+        #[arg(long, requires = "rolling_fold_index")]
+        rolling_fold_count: Option<usize>,
+        /// Zero-based canonical fold to retrain independently.
+        /// Must be supplied together with `--rolling-fold-count`.
+        #[arg(long, requires = "rolling_fold_count")]
+        rolling_fold_index: Option<usize>,
 
         /// Batch size at the first ramp stage. The declared ceiling for the later stages is
         /// 2x and 3x, but the ramp that RUNS is derived from a device capacity probe taken
@@ -251,10 +249,10 @@ enum Commands {
         #[arg(long, default_value_t = 24)]
         batch_size: usize,
 
-        /// Seeds the TRAINING sampler, support fitting and the torch/CUDA RNGs. It does NOT
-        /// move the pinned evaluation windows or the PIT draws — those are pinned by the
-        /// campaign constant `EVAL_WINDOW_SEED` — so seed replicates measure training noise
-        /// on an unchanged bench and every run stays paired on identical windows.
+        /// Seeds the TRAINING sampler and torch/CUDA RNGs. It does NOT move direct-return
+        /// support geometry, pinned evaluation windows, or PIT draws: those use
+        /// campaign-constant domain-separated seeds. Seed replicates therefore measure
+        /// training noise on an unchanged target law and unchanged validation bench.
         #[arg(long, default_value_t = 0x5EED)]
         seed: u64,
 
@@ -265,10 +263,8 @@ enum Commands {
         #[arg(long, default_value_t = 300)]
         resolution_secs: u32,
 
-        /// Drop symbols with fewer bars than this. The default guarantees every
-        /// symbol contributes at least one full-context window to each split, and is
-        /// shared with `ingest --min-bars` so the universe and the split agree on
-        /// which files exist.
+        /// Minimum training bars strictly before `train_end`. A bar exactly at the boundary does
+        /// not count, and held-out/future bars cannot rescue a symbol.
         #[arg(long, default_value_t = trading_bot_0::torch::dataset::DEFAULT_MIN_BARS)]
         min_bars: usize,
 
@@ -317,6 +313,12 @@ enum Commands {
         /// Weight on the NextLat categorical-KL term, i.e. the reference's `lambda_kl`.
         #[arg(long, default_value_t = 1.0)]
         lambda_kl: f64,
+
+        /// Matched v8 control: feed exact zeros into only the six adjusted-daily context
+        /// features while retaining the identical direct-return projection and every other
+        /// training, sampling, objective, and evaluation setting.
+        #[arg(long, default_value_t = false)]
+        mask_adjusted_daily_context: bool,
 
         /// Held-out windows in each pinned evaluation set. Pinned by the campaign constant
         /// `EVAL_WINDOW_SEED`, so they are identical across runs, seeds and ablations.
@@ -450,6 +452,8 @@ enum Commands {
         #[arg(long, default_value_t = 300)]
         resolution_secs: u32,
 
+        /// Minimum training bars strictly before `train_end`; not total file length or held-out
+        /// coverage.
         #[arg(long, default_value_t = trading_bot_0::torch::dataset::DEFAULT_MIN_BARS)]
         min_bars: usize,
 
@@ -485,7 +489,7 @@ enum Commands {
         #[arg(long)]
         output: String,
 
-        /// Held-out split to trade. `test` is scored once and is the number that counts.
+        /// Validation split to trade during alpha development.
         #[arg(long, value_enum, default_value_t = PlannerDataSplit::Validation)]
         split: PlannerDataSplit,
 
@@ -509,6 +513,8 @@ enum Commands {
         #[arg(long, default_value_t = 300)]
         resolution_secs: u32,
 
+        /// Minimum training bars strictly before `train_end`; not total file length or held-out
+        /// coverage.
         #[arg(long, default_value_t = trading_bot_0::torch::dataset::DEFAULT_MIN_BARS)]
         min_bars: usize,
 
@@ -525,13 +531,13 @@ enum Commands {
         #[arg(long, default_value_t = 0.0)]
         min_dollar_volume: f64,
     },
-    /// Production every-bar receding-horizon Kelly/oracle evaluation.
+    /// Production every-bar direct-return Kelly/oracle evaluation.
     ///
-    /// At every calendar panel row this recomputes an autoregressive world-model forecast,
-    /// solves a cost-aware constrained multi-asset action from the actual current holdings,
-    /// executes only that action, and repeats one bar later. Forecast horizon is independent
-    /// of the fixed one-bar rebalance clock. Validation is the default; the locked test split
-    /// requires both `--split test` and `--allow-test`.
+    /// At every calendar panel row this evaluates all six fitted direct categorical
+    /// cumulative-return laws, solves a cost-aware constrained multi-asset action from the
+    /// actual current holdings, executes only that action, and repeats one bar later. Forecast
+    /// horizon is independent of the fixed one-bar rebalance clock. Validation is the only
+    /// alpha-development split; the spent Test population is not available to this command.
     PretrainKelly {
         #[arg(long)]
         weights: String,
@@ -542,10 +548,6 @@ enum Commands {
 
         #[arg(long, value_enum, default_value_t = PlannerDataSplit::Validation)]
         split: PlannerDataSplit,
-
-        /// Explicitly unlock the test split for the one final evaluation.
-        #[arg(long, default_value_t = false)]
-        allow_test: bool,
 
         #[arg(long, default_value_t = trading_bot_0::data::ingest::bars_dir().to_string_lossy().into_owned())]
         data_dir: String,
@@ -598,15 +600,9 @@ enum Commands {
         #[arg(long, default_value_t = 0.25)]
         covariance_shrinkage: f64,
 
-        #[arg(long, default_value_t = trading_bot_0::torch::train::horizon::DEFAULT_SAMPLES)]
-        samples: usize,
-
         /// CPU threads used to fit PanelCost. Must be positive.
         #[arg(long, default_value_t = 4)]
         cost_threads: usize,
-
-        #[arg(long, default_value_t = 0x5EED)]
-        seed: i64,
 
         #[arg(long, default_value_t = false)]
         cpu: bool,
@@ -637,7 +633,7 @@ enum Commands {
         #[arg(long)]
         output: String,
 
-        /// Held-out split to measure on.
+        /// Validation split to measure during alpha development.
         #[arg(long, value_enum, default_value_t = PlannerDataSplit::Validation)]
         split: PlannerDataSplit,
 
@@ -662,20 +658,14 @@ enum Commands {
         /// Windows of the drawn prefix to TRADE.
         ///
         /// Every published number was measured at the default, so leaving it alone reproduces
-        /// them exactly. Raise it only on a panel that is not being compared to anything — a
-        /// one-shot `test` read, where the interval is set by the traded slice's
-        /// `(symbol, calendar month)` block count and the split holds 43,466 near-disjoint
-        /// windows at context 896 against the 256 a default draw trades.
+        /// them exactly. Raise it only when deliberately widening a validation panel that is not
+        /// compared to the published prefix.
         #[arg(long, default_value_t = trading_bot_0::torch::train::trade_bench::TRADE_WINDOWS)]
         trade_windows: usize,
 
-        /// Draw the windows, block them, write the manifest and the held-out power census, then
-        /// STOP — before any checkpoint is opened and before any economic number exists.
-        ///
-        /// The rehearsal for a split that is scored ONCE. It establishes that the command
-        /// addresses the intended data, that the fit and traded slices are block-disjoint, and
-        /// that the population has the power to resolve the effect being looked for, without
-        /// spending the draw.
+        /// Draw the validation windows, block them, write the manifest and the held-out power
+        /// census, then STOP — before any checkpoint is opened and before any economic number
+        /// exists.
         #[arg(long, default_value_t = false)]
         dry_run: bool,
 
@@ -700,6 +690,8 @@ enum Commands {
         #[arg(long, default_value_t = 300)]
         resolution_secs: u32,
 
+        /// Minimum training bars strictly before `train_end`; not total file length or held-out
+        /// coverage.
         #[arg(long, default_value_t = trading_bot_0::torch::dataset::DEFAULT_MIN_BARS)]
         min_bars: usize,
 
@@ -775,6 +767,8 @@ enum Commands {
         #[arg(long, default_value_t = 300)]
         resolution_secs: u32,
 
+        /// Minimum training bars strictly before `train_end`; not total file length or held-out
+        /// coverage.
         #[arg(long, default_value_t = trading_bot_0::torch::dataset::DEFAULT_MIN_BARS)]
         min_bars: usize,
 
@@ -854,6 +848,8 @@ enum Commands {
         #[arg(long, default_value_t = 300)]
         resolution_secs: u32,
 
+        /// Minimum training bars strictly before `train_end`; not total file length or held-out
+        /// coverage.
         #[arg(long, default_value_t = trading_bot_0::torch::dataset::DEFAULT_MIN_BARS)]
         min_bars: usize,
 
@@ -926,6 +922,8 @@ enum Commands {
         #[arg(long, default_value_t = 300)]
         resolution_secs: u32,
 
+        /// Minimum training bars strictly before `train_end`; not total file length or held-out
+        /// coverage.
         #[arg(long, default_value_t = trading_bot_0::torch::dataset::DEFAULT_MIN_BARS)]
         min_bars: usize,
 
@@ -945,9 +943,8 @@ enum Commands {
     /// Evaluate fixed, training-free sequential residual recirculation on a frozen bar model.
     ///
     /// Stage A screens a deterministic validation prefix. Stage B uses only the disjoint
-    /// validation remainder and cannot retune the Stage-A choice. The test split is not
-    /// constructed unless the fixed choice clears the NLL, uncertainty, direction, rank and
-    /// serialized-kernel control gates.
+    /// validation remainder and cannot retune the Stage-A choice. Passing the fixed gates emits
+    /// validation evidence only; recirculation never constructs or scores Test.
     PretrainRecirculate {
         #[arg(long)]
         weights: String,
@@ -982,6 +979,8 @@ enum Commands {
         #[arg(long, default_value_t = 300)]
         resolution_secs: u32,
 
+        /// Minimum training bars strictly before `train_end`; not total file length or held-out
+        /// coverage.
         #[arg(long, default_value_t = trading_bot_0::torch::dataset::DEFAULT_MIN_BARS)]
         min_bars: usize,
 
@@ -1072,6 +1071,8 @@ enum Commands {
         #[arg(long, default_value_t = 300)]
         resolution_secs: u32,
 
+        /// Minimum training bars strictly before `train_end`; not total file length or held-out
+        /// coverage.
         #[arg(long, default_value_t = trading_bot_0::torch::dataset::DEFAULT_MIN_BARS)]
         min_bars: usize,
 
@@ -1113,7 +1114,7 @@ enum Commands {
         #[arg(long)]
         output: String,
 
-        /// Held-out split to score. `test` is scored once and is the number that counts.
+        /// Validation split to score during alpha development.
         #[arg(long, value_enum, default_value_t = PlannerDataSplit::Validation)]
         split: PlannerDataSplit,
 
@@ -1139,6 +1140,8 @@ enum Commands {
         #[arg(long, default_value_t = 300)]
         resolution_secs: u32,
 
+        /// Minimum training bars strictly before `train_end`; not total file length or held-out
+        /// coverage.
         #[arg(long, default_value_t = trading_bot_0::torch::dataset::DEFAULT_MIN_BARS)]
         min_bars: usize,
 
@@ -1152,6 +1155,55 @@ enum Commands {
         derive_split_bounds: bool,
 
         /// Liquidity floor the run used; 0 uses every file on disk.
+        #[arg(long, default_value_t = 0.0)]
+        min_dollar_volume: f64,
+    },
+    /// CPU-only rolling-origin screen of causal context families before allocating neural
+    /// capacity. This command has no checkpoint, weights, split selector, or Test path.
+    PretrainFeatureScreen {
+        /// Directory receiving the three registered `.report.bin` diagnostics.
+        #[arg(long)]
+        output: String,
+
+        /// Expanding-prefix rolling-origin folds inside the pinned development interval.
+        #[arg(long, default_value_t = 3)]
+        folds: usize,
+
+        /// Highest pre-origin-ADV names retained from the fixed earliest-origin universe.
+        #[arg(long, default_value_t = 64)]
+        max_symbols: usize,
+
+        /// Trailing synchronized instants retained for each fit prefix and leading instants for
+        /// each forward validation range.
+        #[arg(long, default_value_t = 128)]
+        max_instants: usize,
+
+        /// Bounded workers used only by the causal pre-origin cost calibration.
+        #[arg(long, default_value_t = 4)]
+        cost_threads: usize,
+
+        /// Dollars divided equally across exact selected top/bottom decile names for impact.
+        #[arg(long = "capital", default_value_t = 1_000_000.0)]
+        capital_usd: f64,
+
+        #[arg(long, default_value_t = 20260825)]
+        seed: u64,
+
+        #[arg(long, default_value_t = trading_bot_0::data::ingest::bars_dir().to_string_lossy().into_owned())]
+        data_dir: String,
+
+        #[arg(long, default_value_t = 300)]
+        resolution_secs: u32,
+
+        /// Minimum bars strictly before the earliest origin.
+        #[arg(long, default_value_t = trading_bot_0::torch::dataset::DEFAULT_MIN_BARS)]
+        min_bars: usize,
+
+        /// Required campaign pin `<train_val_ms>,<val_test_ms>`; mutable derivation is not exposed.
+        #[arg(long, value_parser = parse_split_bounds)]
+        split_bounds: (i64, i64),
+
+        /// Causal cached-universe liquidity floor; zero keeps every admitted corpus file.
         #[arg(long, default_value_t = 0.0)]
         min_dollar_volume: f64,
     },
@@ -1235,7 +1287,7 @@ enum Commands {
         #[arg(long, value_delimiter = ',')]
         tickers: Option<Vec<String>>,
 
-        #[arg(long, value_enum, default_value_t = PlannerDataSplit::Test)]
+        #[arg(long, value_enum, default_value_t = PlannerDataSplit::Validation)]
         split: PlannerDataSplit,
 
         #[arg(long)]
@@ -1340,7 +1392,7 @@ enum Commands {
         #[arg(long, value_parser = trading_bot_0::data::ingest::parse_train_end)]
         train_end: Option<chrono::DateTime<chrono::Utc>>,
 
-        /// Bars a symbol needs to count toward that boundary. Must match `pretrain --min-bars`.
+        /// Minimum training bars strictly before the resolved `train_end`. Must match pretraining.
         #[arg(long, default_value_t = trading_bot_0::torch::dataset::DEFAULT_MIN_BARS)]
         min_bars: usize,
 
@@ -1380,6 +1432,24 @@ enum Commands {
     },
 }
 
+const SPENT_TEST_ERROR: &str = "current Test is spent; a future bounded chronological generation \
+    and campaign-final permit are required";
+
+fn reject_spent_alpha_test(cli: &Cli) -> anyhow::Result<()> {
+    let split = match cli.command.as_ref() {
+        Some(Commands::PretrainTrade { split, .. })
+        | Some(Commands::PretrainCalibration { split, .. })
+        | Some(Commands::PretrainSkill { split, .. })
+        | Some(Commands::PretrainKelly { split, .. })
+        | Some(Commands::InferPlanner { split, .. }) => Some(*split),
+        _ => None,
+    };
+    if split == Some(PlannerDataSplit::Test) {
+        anyhow::bail!("{SPENT_TEST_ERROR}");
+    }
+    Ok(())
+}
+
 fn eval_work_product(factors: impl IntoIterator<Item = usize>) -> u64 {
     factors
         .into_iter()
@@ -1387,6 +1457,7 @@ fn eval_work_product(factors: impl IntoIterator<Item = usize>) -> u64 {
 }
 
 fn enforce_cli_eval_budget(cli: &Cli) -> anyhow::Result<()> {
+    reject_spent_alpha_test(cli)?;
     let allow = cli.allow_long_eval;
     match cli.command.as_ref() {
         Some(Commands::PretrainCandles {
@@ -1422,14 +1493,28 @@ fn enforce_cli_eval_budget(cli: &Cli) -> anyhow::Result<()> {
         Some(Commands::PretrainKelly {
             max_symbols,
             max_instants,
-            forecast_horizon,
-            samples,
             ..
         }) => torch::train::eval_budget::enforce(
             "pretrain-kelly",
-            "forecast row-steps",
-            eval_work_product([*max_symbols, *max_instants, *forecast_horizon, *samples]),
-            50_000_000,
+            "direct categorical horizon-laws",
+            eval_work_product([
+                *max_symbols,
+                *max_instants,
+                torch::train::horizon::FORECAST_HORIZONS.len(),
+            ]),
+            2_000_000,
+            allow,
+        ),
+        Some(Commands::PretrainFeatureScreen {
+            folds,
+            max_symbols,
+            max_instants,
+            ..
+        }) => torch::train::eval_budget::enforce(
+            "pretrain-feature-screen",
+            "fold-symbol-instant-horizon-family-control row-fits",
+            eval_work_product([*folds, *max_symbols, *max_instants, 6, 6, 3]),
+            10_000_000,
             allow,
         ),
         Some(Commands::PretrainCalibration {
@@ -1569,6 +1654,7 @@ async fn run() {
             dyn_horizon,
             lambda_dyn,
             lambda_kl,
+            mask_adjusted_daily_context,
             validation_windows,
             diagnostic_context,
             snapshot_windows,
@@ -1583,11 +1669,12 @@ async fn run() {
             min_dollar_volume,
             exact_batch,
             lr_plateau_fraction,
-            beta_nll,
             sdlr,
             optimizer_ablation,
             ablation_lr,
             smd_meta_lr,
+            rolling_fold_count,
+            rolling_fold_index,
         }) => {
             let args = PretrainArgs {
                 weights: weights.clone(),
@@ -1605,6 +1692,7 @@ async fn run() {
                 dyn_horizon: *dyn_horizon,
                 lambda_dyn: *lambda_dyn,
                 lambda_kl: *lambda_kl,
+                mask_adjusted_daily_context: *mask_adjusted_daily_context,
                 validation_windows: *validation_windows,
                 diagnostic_context: *diagnostic_context,
                 snapshot_windows: *snapshot_windows,
@@ -1619,11 +1707,12 @@ async fn run() {
                 min_dollar_volume: *min_dollar_volume,
                 exact_batch: *exact_batch,
                 lr_plateau_fraction: *lr_plateau_fraction,
-                beta_nll: *beta_nll,
                 sdlr: *sdlr,
                 optimizer_ablation: *optimizer_ablation,
                 ablation_lr: *ablation_lr,
                 smd_meta_lr: *smd_meta_lr,
+                rolling_fold_count: *rolling_fold_count,
+                rolling_fold_index: *rolling_fold_index,
             };
             tokio::task::spawn_blocking(move || torch::train::pretrain(args))
                 .await
@@ -1739,7 +1828,6 @@ async fn run() {
             weights,
             output,
             split,
-            allow_test,
             data_dir,
             resolution_secs,
             split_bounds,
@@ -1755,9 +1843,7 @@ async fn run() {
             max_adv_participation,
             covariance_window,
             covariance_shrinkage,
-            samples,
             cost_threads,
-            seed,
             cpu,
             label,
         }) => {
@@ -1786,14 +1872,11 @@ async fn run() {
                 split_bounds: split_bounds
                     .unwrap_or(trading_bot_0::data::ingest::PINNED_SPLIT_BOUNDS),
                 split: split.split(),
-                allow_test: *allow_test,
                 max_symbols: *max_symbols,
                 max_instants: *max_instants,
                 capital_usd: *capital_usd,
                 forecast_horizon: *forecast_horizon,
                 mean_sign_hysteresis_bps: *mean_sign_hysteresis_bps,
-                samples: *samples,
-                seed: *seed,
                 cost_threads: *cost_threads,
                 config,
                 label: label.clone(),
@@ -2037,6 +2120,44 @@ async fn run() {
                 .expect("memorization probe task panicked")
                 .expect("memorization probe failed");
         }
+        Some(Commands::PretrainFeatureScreen {
+            output,
+            folds,
+            max_symbols,
+            max_instants,
+            cost_threads,
+            capital_usd,
+            seed,
+            data_dir,
+            resolution_secs,
+            min_bars,
+            split_bounds,
+            min_dollar_volume,
+        }) => {
+            let args = torch::train::feature_screen::FeatureScreenArgs {
+                output: output.clone(),
+                folds: *folds,
+                max_symbols: *max_symbols,
+                max_instants: *max_instants,
+                cost_threads: *cost_threads,
+                capital_usd: *capital_usd,
+                seed: *seed,
+                corpus: torch::train::CorpusFlags {
+                    data_dir: data_dir.clone(),
+                    resolution_secs: *resolution_secs,
+                    min_bars: *min_bars,
+                    split_bounds: Some(*split_bounds),
+                    derive_split_bounds: false,
+                    min_dollar_volume: *min_dollar_volume,
+                },
+            };
+            tokio::task::spawn_blocking(move || {
+                torch::train::feature_screen::pretrain_feature_screen(args)
+            })
+            .await
+            .expect("feature screen task panicked")
+            .expect("feature screen failed");
+        }
         Some(Commands::PretrainCompare {
             baseline,
             candidate,
@@ -2220,7 +2341,7 @@ async fn run() {
 mod tests {
     use super::{
         default_paper_symbols, enforce_cli_eval_budget, Cli, Commands, PlannerDataSplit,
-        PretrainOptimizerAblation, StreamingModelVariant,
+        PretrainOptimizerAblation, StreamingModelVariant, SPENT_TEST_ERROR,
     };
     use clap::Parser;
     use trading_bot_0::torch::model::ModelVariant;
@@ -2262,11 +2383,11 @@ mod tests {
                 dyn_horizon,
                 lambda_dyn,
                 lambda_kl,
+                mask_adjusted_daily_context,
                 validation_windows,
                 diagnostic_context,
                 data_dir,
                 lr_plateau_fraction,
-                beta_nll,
                 sdlr,
                 optimizer_ablation,
                 ablation_lr,
@@ -2294,7 +2415,6 @@ mod tests {
                 trading_bot_0::torch::train::pretrain::LR_PLATEAU_FRACTION
             );
             assert_eq!(lr_plateau_fraction, 0.40);
-            assert_eq!(beta_nll, None);
             assert!(
                 !sdlr,
                 "row learned learning rates must remain explicit opt-in"
@@ -2302,6 +2422,10 @@ mod tests {
             assert_eq!(optimizer_ablation, None);
             assert_eq!(ablation_lr, 1e-3);
             assert_eq!(smd_meta_lr, 0.05);
+            assert!(
+                !mask_adjusted_daily_context,
+                "adjusted-daily masking must remain explicit opt-in"
+            );
             assert_eq!(resolution_secs, 300);
             // NextLat learns one transition at a time; long-horizon recursive diagnostics
             // remain controlled independently by their fixed rollout horizon grid.
@@ -2334,6 +2458,22 @@ mod tests {
                 "pretraining has one Hard categorical contract; Density is a diagnostic API, not \
              a training/selection CLI objective"
             );
+        });
+    }
+
+    #[test]
+    fn pretrain_adjusted_daily_mask_is_explicitly_reachable() {
+        with_large_cli_stack(|| {
+            let cli =
+                Cli::try_parse_from(["trading_bot", "pretrain", "--mask-adjusted-daily-context"])
+                    .expect("the matched adjusted-daily mask should parse");
+            assert!(matches!(
+                cli.command,
+                Some(Commands::Pretrain {
+                    mask_adjusted_daily_context: true,
+                    ..
+                })
+            ));
         });
     }
 
@@ -2401,52 +2541,6 @@ mod tests {
             };
             assert_eq!(optimizer_ablation, Some(PretrainOptimizerAblation::SmdIdbd));
             assert_eq!(smd_meta_lr, 0.1);
-        });
-    }
-
-    #[test]
-    fn pretrain_beta_nll_is_explicit_and_isolated() {
-        with_large_cli_stack(|| {
-            let cli = Cli::try_parse_from([
-                "trading_bot",
-                "pretrain",
-                "--beta-nll",
-                "0.5",
-                "--exact-batch",
-            ])
-            .expect("categorical beta-NLL should parse");
-            assert!(matches!(
-                cli.command,
-                Some(Commands::Pretrain {
-                    beta_nll: Some(0.5),
-                    ..
-                })
-            ));
-            for conflicting in [
-                vec!["trading_bot", "pretrain", "--beta-nll", "0.5"],
-                vec![
-                    "trading_bot",
-                    "pretrain",
-                    "--beta-nll",
-                    "0.5",
-                    "--exact-batch",
-                    "--sdlr",
-                ],
-                vec![
-                    "trading_bot",
-                    "pretrain",
-                    "--beta-nll",
-                    "0.5",
-                    "--exact-batch",
-                    "--optimizer-ablation",
-                    "fixed-sgd",
-                ],
-            ] {
-                assert!(
-                    Cli::try_parse_from(conflicting).is_err(),
-                    "beta-NLL must remain a one-variable exact-batch ablation"
-                );
-            }
         });
     }
 
@@ -2597,15 +2691,10 @@ mod tests {
         enforce_cli_eval_budget(&cli).expect("explicit opt-in authorizes the long evaluation");
     }
 
-    /// `pretrain-calibration`'s defaults are what every published economic number in
-    /// `training/runs` was measured under, so they are asserted rather than trusted.
-    ///
-    /// `--trade-windows` in particular: the traded prefix used to be
-    /// `trade_bench::TRADE_WINDOWS` read in place, and it became a flag so a one-shot `test`
-    /// read can spend the windows it has. The whole justification for that change is that
-    /// omitting the flag reproduces the constant EXACTLY, which is this assertion and not a
-    /// comment. `--dry-run` defaults off for the same reason: a flag that skipped the scoring
-    /// by default would silently turn every existing invocation into a no-op.
+    /// `pretrain-calibration`'s defaults are what every published validation economic number
+    /// in `training/runs` was measured under, so they are asserted rather than trusted.
+    /// `--dry-run` defaults off because a flag that skipped scoring by default would silently
+    /// turn every existing invocation into a no-op.
     #[test]
     fn pretrain_calibration_defaults_reproduce_the_published_prefix() {
         let cli = Cli::try_parse_from([
@@ -2644,47 +2733,56 @@ mod tests {
         );
     }
 
-    /// The `test` split must be ADDRESSABLE from the command line and must reach
-    /// `dataset::Split::Test`, because the campaign's one uncontaminated measurement is taken
-    /// through exactly this path. A value-enum that parsed but mapped to the wrong split would
-    /// score `Val` twice and look like it worked.
+    /// Every ordinary alpha command must reject Test before any runtime path can construct it.
     #[test]
-    fn the_test_split_is_reachable_from_the_calibration_command_line() {
-        let cli = Cli::try_parse_from([
-            "trading_bot",
-            "pretrain-calibration",
-            "--checkpoint",
-            "weights/pretrain_best.ot@1",
-            "--output",
-            "gens/0",
-            "--split",
-            "test",
-            "--trade-windows",
-            "4096",
-            "--windows",
-            "16384",
-            "--dry-run",
-        ])
-        .expect("--split test must parse");
-        let Some(Commands::PretrainCalibration {
-            split,
-            trade_windows,
-            windows,
-            dry_run,
-            ..
-        }) = cli.command
-        else {
-            panic!("unexpected subcommand");
-        };
-        assert_eq!(split, PlannerDataSplit::Test);
-        assert_eq!(
-            split.split(),
-            trading_bot_0::torch::dataset::Split::Test,
-            "the value-enum must reach the dataset split the sampler ranges on"
-        );
-        assert_eq!(trade_windows, 4096);
-        assert_eq!(windows, 16384);
-        assert!(dry_run);
+    fn ordinary_alpha_commands_reject_the_spent_test_population() {
+        with_large_cli_stack(|| {
+            let commands = [
+                vec![
+                    "trading_bot",
+                    "pretrain-trade",
+                    "--weights",
+                    "best.ot",
+                    "--output",
+                    "gens/0",
+                ],
+                vec![
+                    "trading_bot",
+                    "pretrain-calibration",
+                    "--checkpoint",
+                    "best.ot@1",
+                    "--output",
+                    "gens/0",
+                ],
+                vec![
+                    "trading_bot",
+                    "pretrain-skill",
+                    "--weights",
+                    "best.ot",
+                    "--output",
+                    "gens/0",
+                ],
+                vec![
+                    "trading_bot",
+                    "pretrain-kelly",
+                    "--weights",
+                    "best.ot",
+                    "--output",
+                    "gens/0",
+                ],
+                vec!["trading_bot", "infer-planner"],
+            ];
+            for mut command in commands {
+                command.extend(["--split", "test"]);
+                let cli = Cli::try_parse_from(&command).expect("Test request must reach the guard");
+                let error = enforce_cli_eval_budget(&cli)
+                    .expect_err("ordinary alpha development must fail closed on Test");
+                assert!(
+                    error.to_string().contains(SPENT_TEST_ERROR),
+                    "{command:?} returned unexpected error: {error}"
+                );
+            }
+        });
     }
 
     #[test]
@@ -2719,6 +2817,13 @@ mod tests {
             };
             assert_eq!(weights, "weights/pretrain_best.ot");
         }
+
+        let cli = Cli::try_parse_from(["trading_bot", "infer-planner"])
+            .expect("planner inference defaults parse");
+        let Some(Commands::InferPlanner { split, .. }) = cli.command else {
+            panic!("expected planner inference");
+        };
+        assert_eq!(split, PlannerDataSplit::Validation);
     }
 
     #[test]
@@ -2775,86 +2880,71 @@ mod tests {
         .is_err());
     }
     #[test]
-    fn receding_kelly_defaults_to_validation_and_test_requires_unlock() {
-        let cli = Cli::try_parse_from([
-            "trading_bot",
-            "pretrain-kelly",
-            "--weights",
-            "checkpoint.ot",
-            "--output",
-            "gens/0",
-        ])
-        .expect("production Kelly CLI should parse");
-        let Some(Commands::PretrainKelly {
-            split,
-            allow_test,
-            mean_sign_hysteresis_bps,
-            forecast_horizon,
-            ..
-        }) = cli.command
-        else {
-            panic!("pretrain-kelly should parse as PretrainKelly");
-        };
-        assert_eq!(split, PlannerDataSplit::Validation);
-        assert!(!allow_test);
-        assert_eq!(mean_sign_hysteresis_bps, None);
-        assert_eq!(
-            forecast_horizon,
-            trading_bot_0::torch::train::horizon::DEFAULT_FORECAST_HORIZON
-        );
-        assert!(
-            trading_bot_0::torch::train::horizon::validate_receding_split(
-                PlannerDataSplit::Test.split(),
-                false,
-            )
-            .is_err(),
-            "naming test alone must not unlock the locked split"
-        );
-        assert!(
-            trading_bot_0::torch::train::horizon::validate_receding_split(
-                PlannerDataSplit::Test.split(),
-                true,
-            )
-            .is_ok(),
-            "the explicit unlock must make the final test score addressable"
-        );
+    fn receding_kelly_defaults_to_validation_without_a_test_override() {
+        with_large_cli_stack(|| {
+            let cli = Cli::try_parse_from([
+                "trading_bot",
+                "pretrain-kelly",
+                "--weights",
+                "checkpoint.ot",
+                "--output",
+                "gens/0",
+            ])
+            .expect("production Kelly CLI should parse");
+            let Some(Commands::PretrainKelly {
+                split,
+                mean_sign_hysteresis_bps,
+                forecast_horizon,
+                ..
+            }) = cli.command
+            else {
+                panic!("pretrain-kelly should parse as PretrainKelly");
+            };
+            assert_eq!(split, PlannerDataSplit::Validation);
+            assert_eq!(mean_sign_hysteresis_bps, None);
+            assert_eq!(
+                forecast_horizon,
+                trading_bot_0::torch::train::horizon::DEFAULT_FORECAST_HORIZON
+            );
+            assert!(
+                Cli::try_parse_from([
+                    "trading_bot",
+                    "pretrain-kelly",
+                    "--weights",
+                    "checkpoint.ot",
+                    "--output",
+                    "gens/0",
+                    "--allow-test",
+                ])
+                .is_err(),
+                "the reusable --allow-test flag must not exist"
+            );
+        });
+    }
+    #[test]
+    fn receding_kelly_rejects_obsolete_sampling_controls() {
+        with_large_cli_stack(|| {
+            for flag in ["--samples", "--seed"] {
+                assert!(
+                    Cli::try_parse_from([
+                        "trading_bot",
+                        "pretrain-kelly",
+                        "--weights",
+                        "checkpoint.ot",
+                        "--output",
+                        "gens/0",
+                        flag,
+                        "8",
+                    ])
+                    .is_err(),
+                    "{flag} must not remain on the analytic direct-return evaluator"
+                );
+            }
+        });
     }
     #[test]
     fn receding_kelly_accepts_one_explicit_hysteresis_margin() {
-        let cli = Cli::try_parse_from([
-            "trading_bot",
-            "pretrain-kelly",
-            "--weights",
-            "checkpoint.ot",
-            "--output",
-            "gens/0",
-            "--split",
-            "test",
-            "--allow-test",
-            "--forecast-horizon",
-            "1",
-            "--mean-sign-hysteresis-bps",
-            "8",
-        ])
-        .expect("the preselected hysteresis margin should parse");
-        let Some(Commands::PretrainKelly {
-            mean_sign_hysteresis_bps,
-            split,
-            allow_test,
-            forecast_horizon,
-            ..
-        }) = cli.command
-        else {
-            panic!("pretrain-kelly should parse as PretrainKelly");
-        };
-        assert_eq!(mean_sign_hysteresis_bps, Some(8.0));
-        assert_eq!(split, PlannerDataSplit::Test);
-        assert!(allow_test);
-        assert_eq!(forecast_horizon, 1);
-    }
-    #[test]
-    fn receding_kelly_cli_accepts_only_exact_evaluated_forecast_horizons() {
-        for (value, expected) in [("1", 1usize), ("100", 100usize)] {
+        with_large_cli_stack(|| {
             let cli = Cli::try_parse_from([
                 "trading_bot",
                 "pretrain-kelly",
@@ -2863,31 +2953,99 @@ mod tests {
                 "--output",
                 "gens/0",
                 "--forecast-horizon",
-                value,
+                "1",
+                "--mean-sign-hysteresis-bps",
+                "8",
             ])
-            .expect("an exact production-grid horizon should parse");
+            .expect("the preselected hysteresis margin should parse");
             let Some(Commands::PretrainKelly {
-                forecast_horizon, ..
+                mean_sign_hysteresis_bps,
+                split,
+                forecast_horizon,
+                ..
             }) = cli.command
             else {
                 panic!("pretrain-kelly should parse as PretrainKelly");
             };
-            assert_eq!(forecast_horizon, expected);
-        }
+            assert_eq!(mean_sign_hysteresis_bps, Some(8.0));
+            assert_eq!(split, PlannerDataSplit::Validation);
+            assert_eq!(forecast_horizon, 1);
+        });
+    }
+    #[test]
+    fn receding_kelly_cli_accepts_only_exact_evaluated_forecast_horizons() {
+        with_large_cli_stack(|| {
+            for (value, expected) in [("1", 1usize), ("100", 100usize)] {
+                let cli = Cli::try_parse_from([
+                    "trading_bot",
+                    "pretrain-kelly",
+                    "--weights",
+                    "checkpoint.ot",
+                    "--output",
+                    "gens/0",
+                    "--forecast-horizon",
+                    value,
+                ])
+                .expect("an exact production-grid horizon should parse");
+                let Some(Commands::PretrainKelly {
+                    forecast_horizon, ..
+                }) = cli.command
+                else {
+                    panic!("pretrain-kelly should parse as PretrainKelly");
+                };
+                assert_eq!(forecast_horizon, expected);
+            }
 
-        assert!(
-            Cli::try_parse_from([
+            assert!(
+                Cli::try_parse_from([
+                    "trading_bot",
+                    "pretrain-kelly",
+                    "--weights",
+                    "checkpoint.ot",
+                    "--output",
+                    "gens/0",
+                    "--forecast-horizon",
+                    "2",
+                ])
+                .is_err(),
+                "a horizon without an exact evaluated prefix must fail at CLI parsing"
+            );
+        });
+    }
+
+    #[test]
+    fn feature_screen_cli_has_no_test_or_weights_surface() {
+        with_large_cli_stack(|| {
+            let base = [
                 "trading_bot",
-                "pretrain-kelly",
-                "--weights",
-                "checkpoint.ot",
+                "pretrain-feature-screen",
                 "--output",
-                "gens/0",
-                "--forecast-horizon",
-                "2",
-            ])
-            .is_err(),
-            "a horizon without an exact evaluated prefix must fail at CLI parsing"
-        );
+                "gens/screen",
+                "--split-bounds",
+                "1700000000000,1710000000000",
+            ];
+            let cli = Cli::try_parse_from(base).expect("CPU feature screen should parse");
+            let Some(Commands::PretrainFeatureScreen {
+                folds,
+                max_symbols,
+                max_instants,
+                split_bounds,
+                ..
+            }) = cli.command
+            else {
+                panic!("expected PretrainFeatureScreen");
+            };
+            assert_eq!((folds, max_symbols, max_instants), (3, 64, 128));
+            assert_eq!(split_bounds, (1_700_000_000_000, 1_710_000_000_000));
+            for forbidden in [["--split", "test"], ["--weights", "anything.ot"]] {
+                let mut args = base.to_vec();
+                args.extend(forbidden);
+                assert!(
+                    Cli::try_parse_from(args).is_err(),
+                    "{} must be unreachable by construction",
+                    forbidden[0]
+                );
+            }
+        });
     }
 }

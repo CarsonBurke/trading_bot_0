@@ -586,12 +586,9 @@ mod tests {
         (Fixture { dir }, corpus)
     }
 
-    /// The writer named in `pretrain_reports::CYCLE_EXEMPT` for `pretrain_auxiliary_nll`.
-    ///
-    /// Drives the whole auxiliary path — open, fit per-resolution supports, tile the pass, draw
-    /// every window, accumulate, roll the epoch, write the report — and reads the artifact back.
-    /// Exists because an exemption from the full-cycle walk is only honest if some test actually
-    /// executes the writer; a stated reason is not coverage.
+    /// Executes the writer owned by `PretrainReportOwner::Auxiliary`: open and fit each
+    /// resolution, tile the pass, draw every window, accumulate, roll the epoch, write, and
+    /// read the artifact back.
     #[test]
     fn the_auxiliary_report_lands_with_one_distinguishable_series_pair_per_resolution() {
         let (fx, deployment) = fixture("report");
@@ -731,15 +728,20 @@ mod tests {
     #[test]
     fn the_auxiliary_floor_admits_daily_files_the_deployment_floor_rejects() {
         let (fx, _deployment) = fixture("floor");
-        let admitted = eligible_bar_universe(&fx.dir, 86_400, AUXILIARY_MIN_BARS);
+        let admitted = eligible_bar_universe(&fx.dir, 86_400, AUXILIARY_MIN_BARS, None);
         assert_eq!(
             admitted.len(),
             3,
             "the auxiliary floor must admit every daily symbol"
         );
         assert!(
-            eligible_bar_universe(&fx.dir, 86_400, crate::torch::dataset::DEFAULT_MIN_BARS)
-                .is_empty(),
+            eligible_bar_universe(
+                &fx.dir,
+                86_400,
+                crate::torch::dataset::DEFAULT_MIN_BARS,
+                None,
+            )
+            .is_empty(),
             "the deployment floor is expected to reject every daily file; if it stopped doing \
              so, AUXILIARY_MIN_BARS is no longer load-bearing and this test is the record of it"
         );

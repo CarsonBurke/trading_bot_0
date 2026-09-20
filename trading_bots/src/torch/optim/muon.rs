@@ -698,11 +698,9 @@ impl RowLrState {
             return (scaled, None);
         };
 
-        let raw_f32 = raw_gradient
-            .to_kind(Kind::Float)
-            .nan_to_num(0.0, 0.0, 0.0);
-        let evidence_raw = -(&raw_f32 * &self.previous_delta)
-            .mean_dim([1i64].as_slice(), true, Kind::Float);
+        let raw_f32 = raw_gradient.to_kind(Kind::Float).nan_to_num(0.0, 0.0, 0.0);
+        let evidence_raw =
+            -(&raw_f32 * &self.previous_delta).mean_dim([1i64].as_slice(), true, Kind::Float);
         let centered = &evidence_raw - evidence_raw.mean(Kind::Float);
         let std = centered.square().mean(Kind::Float).sqrt();
         let evidence = (&centered / std.clamp_min(1e-8))
@@ -717,15 +715,12 @@ impl RowLrState {
                 -&evidence * ROW_LR_LOG_SPAN * &sigmoid * (1.0 - &sigmoid) / rows;
             let (beta1, beta2) = ROW_LR_CONTROLLER_BETAS;
             let _ = self.adam_m.lerp_(&objective_gradient, 1.0 - beta1);
-            let _ = self
-                .adam_v
-                .lerp_(&objective_gradient.square(), 1.0 - beta2);
+            let _ = self.adam_v.lerp_(&objective_gradient.square(), 1.0 - beta2);
             self.adam_step += 1;
             let bc1 = 1.0 - beta1.powi(self.adam_step as i32);
             let bc2 = 1.0 - beta2.powi(self.adam_step as i32);
             let denom = self.adam_v.sqrt() / bc2.sqrt() + ROW_LR_CONTROLLER_EPS;
-            let logit_delta =
-                &self.adam_m / denom * (-ROW_LR_CONTROLLER_LR / bc1);
+            let logit_delta = &self.adam_m / denom * (-ROW_LR_CONTROLLER_LR / bc1);
             update_magnitude = logit_delta.abs();
             let _ = self.logit.g_add_(&logit_delta);
         }
@@ -859,9 +854,7 @@ impl Muon {
                         second_momentum_shape(&size, layout).as_slice(),
                         (Kind::Float, device),
                     ),
-                    row_lr: cfg
-                        .row_learned_lr
-                        .then(|| RowLrState::new(m, n, device)),
+                    row_lr: cfg.row_learned_lr.then(|| RowLrState::new(m, n, device)),
                 });
             } else {
                 adamw_indices.push(i);
@@ -1027,11 +1020,9 @@ impl Muon {
                     // This is theta_new - theta_old from the gradient update only. Decoupled
                     // decay above is intentionally absent from the next-step credit tensor.
                     let signed_delta = &update * (-eff_lr);
-                    controller.previous_delta.copy_(
-                        &signed_delta
-                            .to_kind(Kind::Float)
-                            .nan_to_num(0.0, 0.0, 0.0),
-                    );
+                    controller
+                        .previous_delta
+                        .copy_(&signed_delta.to_kind(Kind::Float).nan_to_num(0.0, 0.0, 0.0));
                     let _ = p.g_add_(&signed_delta);
                     continue;
                 }
@@ -1381,17 +1372,23 @@ impl Muon {
                     controller.logit.copy_(
                         loaded
                             .get(&format!("{name}.__row_lr_logit"))
-                            .with_context(|| format!("optimizer state missing row LR logit for {name}"))?,
+                            .with_context(|| {
+                                format!("optimizer state missing row LR logit for {name}")
+                            })?,
                     );
                     controller.adam_m.copy_(
                         loaded
                             .get(&format!("{name}.__row_lr_adam_m"))
-                            .with_context(|| format!("optimizer state missing row LR m for {name}"))?,
+                            .with_context(|| {
+                                format!("optimizer state missing row LR m for {name}")
+                            })?,
                     );
                     controller.adam_v.copy_(
                         loaded
                             .get(&format!("{name}.__row_lr_adam_v"))
-                            .with_context(|| format!("optimizer state missing row LR v for {name}"))?,
+                            .with_context(|| {
+                                format!("optimizer state missing row LR v for {name}")
+                            })?,
                     );
                     controller.previous_delta.copy_(
                         loaded
@@ -2934,8 +2931,10 @@ mod tests {
         let mut off_cfg = controller_config();
         off_cfg.row_learned_lr = false;
         let mut off = Muon::new_named(&[("w".to_owned(), off_param.shallow_clone())], off_cfg);
-        let mut on =
-            Muon::new_named(&[("w".to_owned(), on_param.shallow_clone())], controller_config());
+        let mut on = Muon::new_named(
+            &[("w".to_owned(), on_param.shallow_clone())],
+            controller_config(),
+        );
 
         backward_rows(&off_param, &[1.0, -2.0, 0.5, 3.0]);
         backward_rows(&on_param, &[1.0, -2.0, 0.5, 3.0]);
@@ -2975,12 +2974,21 @@ mod tests {
         backward_rows(&parameter, &[1.0, 1.0, 1.0, 1.0]);
         optimizer.step(StepKind::Primary);
         let first = optimizer.row_learned_lr_metrics().unwrap();
-        assert_eq!(first.alpha_mean, 1.0, "the logit update must take effect next step");
+        assert_eq!(
+            first.alpha_mean, 1.0,
+            "the logit update must take effect next step"
+        );
         assert!(first.evidence_mean.abs() < 1e-6);
         assert!((first.evidence_std - 1.0).abs() < 1e-6);
         let logit = &optimizer.entries_2d[0].row_lr.as_ref().unwrap().logit;
-        assert!(logit.double_value(&[0, 0]) > 0.0, "productive row must speed up");
-        assert!(logit.double_value(&[1, 0]) < 0.0, "harmful row must slow down");
+        assert!(
+            logit.double_value(&[0, 0]) > 0.0,
+            "productive row must speed up"
+        );
+        assert!(
+            logit.double_value(&[1, 0]) < 0.0,
+            "harmful row must slow down"
+        );
 
         optimizer.zero_grad();
         backward_rows(&parameter, &[1.0, 1.0, 1.0, 1.0]);
@@ -3068,10 +3076,11 @@ mod tests {
             quiet: true,
             ..MuonConfig::default()
         };
-        let mut off =
-            Muon::new_named(&[("head".to_owned(), off_param.shallow_clone())], cfg(false));
-        let mut on =
-            Muon::new_named(&[("head".to_owned(), on_param.shallow_clone())], cfg(true));
+        let mut off = Muon::new_named(
+            &[("head".to_owned(), off_param.shallow_clone())],
+            cfg(false),
+        );
+        let mut on = Muon::new_named(&[("head".to_owned(), on_param.shallow_clone())], cfg(true));
         backward_rows(&off_param, &[1.0, -2.0, 3.0, -4.0]);
         backward_rows(&on_param, &[1.0, -2.0, 3.0, -4.0]);
         off.step(StepKind::Primary);
@@ -3084,14 +3093,14 @@ mod tests {
     #[test]
     fn previous_delta_is_the_actual_signed_muon_update_without_weight_decay() {
         let _torch_rng_guard = test_rng::shared();
-        let parameter =
-            Tensor::from_slice(&[0.5f32, -0.25, 0.75, -1.0]).reshape([2, 2]).set_requires_grad(true);
+        let parameter = Tensor::from_slice(&[0.5f32, -0.25, 0.75, -1.0])
+            .reshape([2, 2])
+            .set_requires_grad(true);
         let before = parameter.copy();
         let mut cfg = controller_config();
         cfg.weight_decay = 0.4;
         let decay = cfg.weight_decay * cfg.lr;
-        let mut optimizer =
-            Muon::new_named(&[("w".to_owned(), parameter.shallow_clone())], cfg);
+        let mut optimizer = Muon::new_named(&[("w".to_owned(), parameter.shallow_clone())], cfg);
         backward_rows(&parameter, &[1.0, -2.0, 3.0, -4.0]);
         optimizer.step(StepKind::Primary);
 
@@ -3105,6 +3114,9 @@ mod tests {
             .abs()
             .max()
             .double_value(&[]);
-        assert!(error < 1e-6, "credit delta included decay or missed the applied update: {error}");
+        assert!(
+            error < 1e-6,
+            "credit delta included decay or missed the applied update: {error}"
+        );
     }
 }

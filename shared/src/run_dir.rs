@@ -41,8 +41,26 @@ pub struct RunProvenance {
     pub resolution_secs: u32,
     /// `BarCorpus::identity_fingerprint()`, taken after any symbol restriction.
     pub corpus_fingerprint: String,
-    /// Corpus membership floor in bars.
+    /// Requested training-prefix membership floor; bars at/after `train_end` do not count.
     pub min_bars: usize,
+    /// Causal corpus-admission rule. Absent on historical run metadata.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub universe_admission_rule: Option<String>,
+    /// Resolved cutoff used by that rule, in epoch millis.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub universe_train_end_ms: Option<i64>,
+    /// Required count strictly before the cutoff.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub minimum_training_bars: Option<usize>,
+    /// Domain-separated SHA-256 of the exact ordered admitted symbol list.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub admitted_symbols_digest: Option<String>,
+    /// Exact ordered admitted list, sufficient to reconstruct membership.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub admitted_symbols: Option<Vec<String>>,
+    /// Alpha-development evaluation policy. Absent on historical metadata.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evaluation_policy: Option<String>,
     /// Liquidity floor for corpus membership; `0` loads every file on disk.
     pub min_dollar_volume: f64,
     /// Corpus the run read.
@@ -471,6 +489,15 @@ mod tests {
             resolution_secs: 300,
             corpus_fingerprint: "5297:368222980:deadbeef".to_owned(),
             min_bars: 20_480,
+            universe_admission_rule: Some("min training bars strictly before train_end".to_owned()),
+            universe_train_end_ms: Some(1_759_839_000_000),
+            minimum_training_bars: Some(20_480),
+            admitted_symbols_digest: Some("deadbeef".to_owned()),
+            admitted_symbols: Some(vec!["AAA".to_owned(), "BBB".to_owned()]),
+            evaluation_policy: Some(
+                "validation-only-v1; historical-terminal-test=spent; future-test=bounded-campaign-final-permit"
+                    .to_owned(),
+            ),
             min_dollar_volume: 0.0,
             data_dir: "long_data/bars".to_owned(),
             diagnostic_context_bars: 896,
@@ -521,6 +548,28 @@ mod tests {
         );
         assert_eq!(parsed["provenance"]["diagnostic_context_bars"], 896);
         assert_eq!(parsed["provenance"]["split_bounds_pinned"], true);
+        assert_eq!(
+            parsed["provenance"]["admitted_symbols"],
+            serde_json::json!(["AAA", "BBB"])
+        );
+
+        let mut legacy = serde_json::to_value(&handed).unwrap();
+        let object = legacy.as_object_mut().unwrap();
+        for field in [
+            "universe_admission_rule",
+            "universe_train_end_ms",
+            "minimum_training_bars",
+            "admitted_symbols_digest",
+            "admitted_symbols",
+        ] {
+            object.remove(field);
+        }
+        let legacy: RunProvenance = serde_json::from_value(legacy).unwrap();
+        assert!(legacy.universe_admission_rule.is_none());
+        assert!(legacy.universe_train_end_ms.is_none());
+        assert!(legacy.minimum_training_bars.is_none());
+        assert!(legacy.admitted_symbols_digest.is_none());
+        assert!(legacy.admitted_symbols.is_none());
 
         fs::remove_dir_all(runs).unwrap();
     }

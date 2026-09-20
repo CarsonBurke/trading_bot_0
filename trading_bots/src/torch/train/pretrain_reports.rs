@@ -37,7 +37,6 @@ use super::bar_family::{BarFamilyFit, DENSITY_BASES};
 use super::mem_probe::{Arm, GapPoint, PairedContrast, RecencyBucket, StabilityPoint};
 use super::pretrain::{
     HeldOutPower, SelectionLedger, SelectionOutcome, EVAL_WINDOW_SEED, SELECTION_CAP,
-    SELECTION_CAP_SLOT,
 };
 use super::pretrain_stats::Dispersion;
 use super::split_seams::{
@@ -59,7 +58,11 @@ use crate::torch::bar_dist::{
     decode_dof, BarDof, BarScoring, BarSupports, BAR_DOF, BAR_DOF_NAMES, DOF_R, DOF_S, DOF_U,
     DOF_V, NUM_BAR_BINS,
 };
-use crate::torch::dataset::{mix64, Split, MULTIPLICITY_BUCKETS};
+use crate::torch::dataset::{mix64, Split, DIRECT_RETURN_HORIZONS, MULTIPLICITY_BUCKETS};
+use crate::torch::direct_return::ValidationStats as DirectReturnValidationStats;
+
+mod series;
+use series::{labeled_dof, labeled_dof_pairs, Mean, Series, StepAccumulator};
 
 /// Resolution of the per-DOF PIT histogram.
 pub const PIT_HIST_BINS: usize = 16;
@@ -172,11 +175,10 @@ pub struct StepMetrics {
     pub step: usize,
     pub nll_bar: f64,
     pub nll_dof: [f64; BAR_DOF],
-    /// Categorical beta-NLL term attached to the optimizer, and its detached per-DOF
-    /// uncertainty weights. NaN outside the explicit beta-NLL arm.
-    pub beta_nll_objective: f64,
-    pub beta_nll_weight_mean_dof: [f64; BAR_DOF],
-    pub beta_nll_variance_floor_share_dof: [f64; BAR_DOF],
+    /// Proper categorical CE and valid target count in canonical horizon order.
+    pub direct_return_nll_horizon: [f64; DIRECT_RETURN_HORIZONS.len()],
+    pub direct_return_valid_horizon: [f64; DIRECT_RETURN_HORIZONS.len()],
+    pub direct_return_nll_mean: f64,
     pub dyn_loss: f64,
     pub kl_loss: f64,
     pub total_loss: f64,
@@ -270,6 +272,10 @@ pub struct StepMetrics {
     /// never there".
     pub market_missing_bars: u64,
     pub market_total_bars: u64,
+    /// Adjusted-daily rows whose explicit availability mask is 0, and the same batch total.
+    /// Missing files and insufficient completed history both remain observable here.
+    pub adjusted_daily_missing_bars: u64,
+    pub adjusted_daily_total_bars: u64,
 }
 
 impl StepMetrics {
@@ -279,9 +285,9 @@ impl StepMetrics {
             step: 0,
             nll_bar: f64::NAN,
             nll_dof: [f64::NAN; BAR_DOF],
-            beta_nll_objective: f64::NAN,
-            beta_nll_weight_mean_dof: [f64::NAN; BAR_DOF],
-            beta_nll_variance_floor_share_dof: [f64::NAN; BAR_DOF],
+            direct_return_nll_horizon: [f64::NAN; DIRECT_RETURN_HORIZONS.len()],
+            direct_return_valid_horizon: [f64::NAN; DIRECT_RETURN_HORIZONS.len()],
+            direct_return_nll_mean: f64::NAN,
             dyn_loss: f64::NAN,
             kl_loss: f64::NAN,
             total_loss: f64::NAN,
@@ -325,6 +331,8 @@ impl StepMetrics {
             capacity_ceiling_gib: f64::NAN,
             market_missing_bars: 0,
             market_total_bars: 0,
+            adjusted_daily_missing_bars: 0,
+            adjusted_daily_total_bars: 0,
         }
     }
 }
@@ -343,13 +351,16 @@ pub struct EpochMetrics {
     pub val_nll_bar: f64,
     pub best_val_nll_bar: f64,
     /// Path the promoted checkpoint was written to, or `None` if this validation
-    /// did not promote. The reporter fingerprints the artifact here so the
-    /// end-of-run test battery can prove it scored that exact file.
+    /// did not promote. The reporter fingerprints the artifact here so completion
+    /// can prove the validation reports still identify that exact file.
     pub promoted_checkpoint: Option<PathBuf>,
     /// Across-run diagnostic at the fixed [`DIAGNOSTIC_CONTEXT`].
     pub val_nll_bar_diag: f64,
     pub train_nll_dof: [f64; BAR_DOF],
     pub val_nll_dof: [f64; BAR_DOF],
+    /// Direct six-horizon categorical law and fitted-moment calibration on pinned fold
+    /// validation rows at the fixed diagnostic context.
+    pub direct_return_validation: DirectReturnValidationStats,
     pub val_crps_dof: [f64; BAR_DOF],
     pub val_pit: PitHistogram,
     /// Deterministic sign accuracy of `E[r | past]` from the prefix-free `r` law, scoring
@@ -479,6 +490,7 @@ impl EpochMetrics {
             val_nll_bar_diag: f64::NAN,
             train_nll_dof: [f64::NAN; BAR_DOF],
             val_nll_dof: [f64::NAN; BAR_DOF],
+            direct_return_validation: DirectReturnValidationStats::nan(),
             val_crps_dof: [f64::NAN; BAR_DOF],
             val_pit: PitHistogram::default(),
             val_dir_acc: f64::NAN,
@@ -694,133 +706,6 @@ pub const DEPLOYED_CONTEXT_METRICS: [&str; 5] = [
     "val_nll_bar_se_level",
     "val_nll_bar_conditional_deployed",
 ];
-
-/// End-of-run held-out battery, emitted exactly once as `pretrain_test`.
-///
-/// The validation split drives promotion, so across an ablation campaign it
-/// stops being an unbiased estimate of generalization: we select against it
-/// repeatedly and it drifts optimistic. This battery is the split that is
-/// touched once, after the last promotion decision, and never feeds back into
-/// any decision. [`PretrainReporter::finish`] enforces both properties; see its
-/// documentation for exactly what is checked and what is not.
-#[derive(Clone, Debug)]
-pub struct TestBattery {
-    /// The checkpoint passed to `BarWorldModel::load`. Must be the promoted one.
-    pub checkpoint: PathBuf,
-    /// `BarWorldModel::lineage_sha256()` of the reloaded model. Evidence that the
-    /// numbers came from an artifact read back off disk rather than from the
-    /// in-memory training model.
-    pub model_lineage: String,
-    pub nll_bar: f64,
-    pub nll_dof: [f64; BAR_DOF],
-    pub crps_dof: [f64; BAR_DOF],
-    pub rollout_nll_exact: [f64; ROLLOUT_HORIZONS.len()],
-    pub rollout_nll_dynamics: [f64; ROLLOUT_HORIZONS.len()],
-    pub pit: PitHistogram,
-    /// Deterministic sign accuracy of `E[r | past]` from the prefix-free `r` law, scoring
-    /// every non-flat realized return.
-    pub dir_acc: f64,
-    /// `BarCorpus::identity_fingerprint()` of the corpus this battery scored. The corpus is
-    /// live and the split instants are percentiles of it, so without this two batteries a
-    /// week apart are not the same measurement and nothing says so.
-    pub corpus_fingerprint: String,
-    /// `(train|val, val|test)` instants, in epoch millis.
-    pub split_bounds: (i64, i64),
-    /// `nll_bar` with the `s == 0 => u = v = 0.5` encoding tautology excluded.
-    pub nll_bar_conditional: f64,
-    pub nll_dof_conditional: [f64; BAR_DOF],
-    /// Block-bootstrap standard error and 95% interval of `nll_bar`.
-    pub nll_bar_se: f64,
-    pub nll_bar_ci: (f64, f64),
-    /// NLL of each independently marginalized per-DOF law and the chain-conditional terms
-    /// on identical rows.
-    ///
-    /// The first array contains valid marginal scores, but summing them is not a joint forecast
-    /// likelihood. The second array sums to the proper joint bar likelihood. Their difference
-    /// is a held-out score gap; it does not isolate model dependence under misspecification.
-    pub independent_marginal_nll_dof: [f64; BAR_DOF],
-    pub chain_conditional_nll_dof: [f64; BAR_DOF],
-    /// Monte-Carlo standard error of `independent_marginal_nll_dof.iter().sum()`.
-    pub independent_marginal_nll_se: f64,
-    /// Context the scored checkpoint was SELECTED at, the context it is meant to be deployed
-    /// at, and the longest context the run trained at. Equal on a full run; the first is
-    /// shorter on a run that never reached the deployed context, and then every number here
-    /// carries that caveat.
-    pub selection_context: i64,
-    pub deployed_context: i64,
-    pub reached_context: i64,
-    /// The run's `--lr-plateau-fraction`: the fraction of the run held at the flat
-    /// learning-rate plateau before the linear decay to the floor.
-    ///
-    /// In the report because every figure below is a reading of ONE checkpoint at one point on
-    /// that schedule, and past the plateau the passes and rate axes are the same axis. A
-    /// one-epoch run at 0.40 ends fully annealed and at 0.90 ends at the peak rate; a reader
-    /// comparing two reports has to be able to see which.
-    pub lr_plateau_fraction: f64,
-    /// The trading bench on the TEST split, with the identical policy set.
-    pub trade: TradeBench,
-    /// The artifact the legacy NLL-only rule would have shipped, scored on the same independent
-    /// test windows and at the same context only when it differs from the economics-primary
-    /// winner.
-    ///
-    /// This is a diagnostic counterfactual, not a second deployable best or evidence of deployed
-    /// profitability. `None` when both rules chose the same final step, so the held-out split
-    /// never scores duplicate weights.
-    pub nll_rule: Option<RivalSelection>,
-}
-
-/// The legacy NLL-only comparator as the test split measures it.
-///
-/// Deliberately a small flat record rather than a second [`TestBattery`]: it carries only the
-/// two currencies needed to compare selection rules and can never be mistaken for the artifact
-/// the planner loads.
-#[derive(Clone, Debug)]
-pub struct RivalSelection {
-    pub checkpoint: PathBuf,
-    pub model_lineage: String,
-    /// Global step the legacy comparator selected.
-    pub step: usize,
-    pub nll_bar_conditional: f64,
-    pub nll_dof: [f64; BAR_DOF],
-    /// Net moment-correct quadratic Kelly edge over the unconditional-marginal null at the
-    /// selection cap, in bps/bar.
-    pub selection_edge_bps: f64,
-    /// The same at the headline 4x cap, in bps/bar, where 85% of bars are at the cap.
-    pub edge_at_default: f64,
-    /// Quarter of the quadratic Kelly fraction, reported as annualized realized Sharpe.
-    pub sharpe: f64,
-}
-
-impl TestBattery {
-    pub fn nan(checkpoint: PathBuf, model_lineage: String) -> Self {
-        Self {
-            checkpoint,
-            model_lineage,
-            nll_bar: f64::NAN,
-            nll_dof: [f64::NAN; BAR_DOF],
-            crps_dof: [f64::NAN; BAR_DOF],
-            rollout_nll_exact: [f64::NAN; ROLLOUT_HORIZONS.len()],
-            rollout_nll_dynamics: [f64::NAN; ROLLOUT_HORIZONS.len()],
-            pit: PitHistogram::default(),
-            dir_acc: f64::NAN,
-            corpus_fingerprint: String::new(),
-            split_bounds: (0, 0),
-            nll_bar_conditional: f64::NAN,
-            nll_dof_conditional: [f64::NAN; BAR_DOF],
-            nll_bar_se: f64::NAN,
-            nll_bar_ci: (f64::NAN, f64::NAN),
-            independent_marginal_nll_dof: [f64::NAN; BAR_DOF],
-            chain_conditional_nll_dof: [f64::NAN; BAR_DOF],
-            independent_marginal_nll_se: f64::NAN,
-            selection_context: 0,
-            deployed_context: 0,
-            reached_context: 0,
-            lr_plateau_fraction: f64::NAN,
-            trade: TradeBench::nan(),
-            nll_rule: None,
-        }
-    }
-}
 
 /// Reference lines that need more than the fitted supports to compute, plus the scoring
 /// rule they are all expressed in.
@@ -1352,213 +1237,6 @@ pub fn belief_effective_rank(beliefs: &Tensor) -> f64 {
 }
 
 // ---------------------------------------------------------------------------
-// Series plumbing
-// ---------------------------------------------------------------------------
-
-/// A sparse curve on the shared record-tick axis.
-///
-/// [`Self::set`] DROPS a non-finite value, so a metric that was not measured leaves a gap
-/// instead of a NaN pretending to be a measurement, and a curve that was never measured at all
-/// says so in its own label — see [`Self::labeled`].
-#[derive(Clone, Debug, Default)]
-struct Series(Vec<f32>);
-
-impl Series {
-    fn set(&mut self, tick: usize, value: f64) {
-        if !value.is_finite() {
-            return;
-        }
-        if self.0.len() <= tick {
-            self.0.resize(tick + 1, f32::NAN);
-        }
-        self.0[tick] = value as f32;
-    }
-
-    fn padded(&self, len: usize) -> Vec<f32> {
-        let mut values = self.0.clone();
-        values.resize(len, f32::NAN);
-        values
-    }
-
-    /// Whether the series ever received a finite value. Charts that only exist once a
-    /// producer has run gate on it.
-    fn measured(&self) -> bool {
-        self.0.iter().any(|value| value.is_finite())
-    }
-
-    /// Label the curve, appending `(NOT MEASURED)` when it holds no finite value at all.
-    ///
-    /// A chart with an empty `val` line and a healthy `train` line is exactly what a run with
-    /// a NaN held-out column looks like, and the two possible readings — "never evaluated" and
-    /// "evaluated as a catastrophe" — call for opposite responses. The legend answers it.
-    fn labeled(&self, label: &str, len: usize) -> ReportSeries {
-        let measured = self.measured();
-        ReportSeries {
-            label: if measured {
-                label.to_owned()
-            } else {
-                format!("{label} (NOT MEASURED)")
-            },
-            values: self.padded(len),
-        }
-    }
-}
-
-/// Running mean that ignores non-finite contributions.
-#[derive(Clone, Copy, Debug, Default)]
-struct Mean {
-    sum: f64,
-    count: usize,
-}
-
-impl Mean {
-    fn push(&mut self, value: f64) {
-        if value.is_finite() {
-            self.sum += value;
-            self.count += 1;
-        }
-    }
-
-    fn value(self) -> f64 {
-        if self.count == 0 {
-            f64::NAN
-        } else {
-            self.sum / self.count as f64
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Default)]
-struct StepAccumulator {
-    steps: usize,
-    nll_bar: Mean,
-    nll_dof: [Mean; BAR_DOF],
-    beta_nll_objective: Mean,
-    beta_nll_weight_mean_dof: [Mean; BAR_DOF],
-    beta_nll_variance_floor_share_dof: [Mean; BAR_DOF],
-    dyn_loss: Mean,
-    kl_loss: Mean,
-    total_loss: Mean,
-    nll_share: Mean,
-    dyn_share: Mean,
-    kl_share: Mean,
-    growth_loss: Mean,
-    growth_share: Mean,
-    growth_abs_f: Mean,
-    growth_clamp_bind: Mean,
-    belief_autocorr: Mean,
-    dyn_vs_identity: Mean,
-    lr_mult: Mean,
-    muon_momentum: Mean,
-    grad_norm: Mean,
-    sdlr_alpha_mean: Mean,
-    sdlr_alpha_std: Mean,
-    sdlr_alpha_min: Mean,
-    sdlr_alpha_max: Mean,
-    sdlr_alpha_bound_fraction: Mean,
-    sdlr_evidence_mean: Mean,
-    sdlr_evidence_std: Mean,
-    sdlr_objective: Mean,
-    sdlr_update_magnitude: Mean,
-    smd_gain_mean: Mean,
-    smd_gain_std: Mean,
-    smd_gain_min: Mean,
-    smd_gain_max: Mean,
-    smd_gain_bound_fraction: Mean,
-    smd_credit_mean: Mean,
-    smd_credit_std: Mean,
-    smd_beta_update_abs_mean: Mean,
-    smd_trace_rms: Mean,
-    smd_hv_gradient_rms_ratio: Mean,
-    context: Mean,
-    batch_size: Mean,
-    bars_seen: u64,
-    free_vram_gib: Mean,
-    bar_tokens: Mean,
-    projected_footprint_gib: Mean,
-    /// Constant over a run, so the mean IS the value; kept as a `Mean` only so a tick with no
-    /// measured capacity leaves a gap like every other series here.
-    capacity_ceiling_gib: Mean,
-    /// Bars, not batches: a tick spans steps of different batch and context, so a mean of
-    /// per-step SHARES would weight a 24x896 step like a 24x2048 one.
-    market_missing_bars: u64,
-    market_total_bars: u64,
-}
-
-impl StepAccumulator {
-    fn push(&mut self, step: &StepMetrics) {
-        self.steps += 1;
-        self.nll_bar.push(step.nll_bar);
-        for (slot, &value) in self.nll_dof.iter_mut().zip(step.nll_dof.iter()) {
-            slot.push(value);
-        }
-        self.beta_nll_objective.push(step.beta_nll_objective);
-        for (slot, &value) in self
-            .beta_nll_weight_mean_dof
-            .iter_mut()
-            .zip(step.beta_nll_weight_mean_dof.iter())
-        {
-            slot.push(value);
-        }
-        for (slot, &value) in self
-            .beta_nll_variance_floor_share_dof
-            .iter_mut()
-            .zip(step.beta_nll_variance_floor_share_dof.iter())
-        {
-            slot.push(value);
-        }
-        self.dyn_loss.push(step.dyn_loss);
-        self.kl_loss.push(step.kl_loss);
-        self.total_loss.push(step.total_loss);
-        self.nll_share.push(step.nll_share);
-        self.dyn_share.push(step.dyn_share);
-        self.kl_share.push(step.kl_share);
-        self.growth_loss.push(step.growth_loss);
-        self.growth_share.push(step.growth_share);
-        self.growth_abs_f.push(step.growth_abs_f);
-        self.growth_clamp_bind.push(step.growth_clamp_bind);
-        self.belief_autocorr.push(step.belief_autocorr);
-        self.dyn_vs_identity.push(step.dyn_vs_identity);
-        self.lr_mult.push(step.lr_mult);
-        self.muon_momentum.push(step.muon_momentum);
-        self.grad_norm.push(step.grad_norm);
-        self.sdlr_alpha_mean.push(step.sdlr_alpha_mean);
-        self.sdlr_alpha_std.push(step.sdlr_alpha_std);
-        self.sdlr_alpha_min.push(step.sdlr_alpha_min);
-        self.sdlr_alpha_max.push(step.sdlr_alpha_max);
-        self.sdlr_alpha_bound_fraction
-            .push(step.sdlr_alpha_bound_fraction);
-        self.sdlr_evidence_mean.push(step.sdlr_evidence_mean);
-        self.sdlr_evidence_std.push(step.sdlr_evidence_std);
-        self.sdlr_objective.push(step.sdlr_objective);
-        self.sdlr_update_magnitude.push(step.sdlr_update_magnitude);
-        self.smd_gain_mean.push(step.smd_gain_mean);
-        self.smd_gain_std.push(step.smd_gain_std);
-        self.smd_gain_min.push(step.smd_gain_min);
-        self.smd_gain_max.push(step.smd_gain_max);
-        self.smd_gain_bound_fraction
-            .push(step.smd_gain_bound_fraction);
-        self.smd_credit_mean.push(step.smd_credit_mean);
-        self.smd_credit_std.push(step.smd_credit_std);
-        self.smd_beta_update_abs_mean
-            .push(step.smd_beta_update_abs_mean);
-        self.smd_trace_rms.push(step.smd_trace_rms);
-        self.smd_hv_gradient_rms_ratio
-            .push(step.smd_hv_gradient_rms_ratio);
-        self.context.push(step.context as f64);
-        self.batch_size.push(step.batch_size as f64);
-        self.bars_seen = self.bars_seen.max(step.bars_seen);
-        self.free_vram_gib.push(step.free_vram_gib);
-        self.bar_tokens.push(step.bar_tokens);
-        self.projected_footprint_gib
-            .push(step.projected_footprint_gib);
-        self.capacity_ceiling_gib.push(step.capacity_ceiling_gib);
-        self.market_missing_bars += step.market_missing_bars;
-        self.market_total_bars += step.market_total_bars;
-    }
-}
-
-// ---------------------------------------------------------------------------
 // Reporter
 // ---------------------------------------------------------------------------
 
@@ -1571,8 +1249,8 @@ pub struct PretrainReporter {
     global_step: usize,
     accumulator: StepAccumulator,
     promotions: usize,
-    /// Canonical path and SHA-256 of the most recently promoted checkpoint; the
-    /// end-of-run test battery is checked against this.
+    /// Canonical path and SHA-256 of the most recently promoted checkpoint; validation-only
+    /// completion checks the artifact against this.
     promoted_checkpoint: Option<(PathBuf, [u8; 32])>,
     /// Per-DOF entropy of the fitted marginals, the honest yardstick. A head that
     /// only learned the unconditional marginals sits exactly here; beating it is
@@ -1587,9 +1265,20 @@ pub struct PretrainReporter {
     nll_bar_diag: Series,
     nll_dof_train: [Series; BAR_DOF],
     nll_dof_val: [Series; BAR_DOF],
-    beta_nll_objective: Series,
-    beta_nll_weight_mean_dof: [Series; BAR_DOF],
-    beta_nll_variance_floor_share_dof: [Series; BAR_DOF],
+    direct_return_nll_horizon: [Series; DIRECT_RETURN_HORIZONS.len()],
+    direct_return_nll_mean: Series,
+    direct_return_valid_horizon: [Series; DIRECT_RETURN_HORIZONS.len()],
+    direct_return_nll_val_model: [Series; DIRECT_RETURN_HORIZONS.len()],
+    direct_return_nll_val_marginal: [Series; DIRECT_RETURN_HORIZONS.len()],
+    direct_return_gain: [Series; DIRECT_RETURN_HORIZONS.len()],
+    direct_return_val_valid_rows: [Series; DIRECT_RETURN_HORIZONS.len()],
+    direct_return_val_coverage: [Series; DIRECT_RETURN_HORIZONS.len()],
+    direct_return_mean_bias: [Series; DIRECT_RETURN_HORIZONS.len()],
+    direct_return_mean_rmse: [Series; DIRECT_RETURN_HORIZONS.len()],
+    direct_return_predicted_variance: [Series; DIRECT_RETURN_HORIZONS.len()],
+    direct_return_squared_error: [Series; DIRECT_RETURN_HORIZONS.len()],
+    direct_return_directional_accuracy: [Series; DIRECT_RETURN_HORIZONS.len()],
+    direct_return_directional_rows: [Series; DIRECT_RETURN_HORIZONS.len()],
     vs_uniform_train: Series,
     vs_uniform_val: Series,
     vs_uniform_diag: Series,
@@ -1667,14 +1356,17 @@ pub struct PretrainReporter {
     bar_tokens: Series,
     projected_footprint_gib: Series,
     capacity_ceiling_gib: Series,
-    /// Market-channel coverage: this tick's observed share, and the run's, both in percent.
-    /// The run-scoped counters live here rather than in the trainer because the reporter is
-    /// already the run-scoped object and a second pair of counters in the training loop would be
-    /// a second thing to keep in step.
+    /// Observed-input coverage: this tick's share and the run's, for market and adjusted daily.
+    /// Run-scoped counters live here rather than in the trainer because the reporter is already
+    /// the run-scoped object and a second set in the training loop would drift.
     market_observed_pct: Series,
     market_observed_run_pct: Series,
     market_missing_bars: u64,
     market_total_bars: u64,
+    adjusted_daily_observed_pct: Series,
+    adjusted_daily_observed_run_pct: Series,
+    adjusted_daily_missing_bars: u64,
+    adjusted_daily_total_bars: u64,
 
     pit: Option<[[f64; PIT_HIST_BINS]; BAR_DOF]>,
     /// Latest bounded free-running validation. Owned by the reporter so all four ancestral
@@ -1766,11 +1458,9 @@ pub struct PretrainReporter {
     trade_abs_position: Series,
     trade_drawdown_mean: Series,
     trade_drawdown_max: Series,
-    /// Latest validation cost curve and, once the run ends, the test-split one. Both live
-    /// on the COST axis rather than the record-tick axis, so they are held whole rather
-    /// than appended per tick.
+    /// Latest validation cost curve. It lives on the COST axis rather than the record-tick
+    /// axis, so it is held whole rather than appended per tick.
     trade_val: Option<TradeBench>,
-    trade_test: Option<TradeBench>,
     /// One row per EPOCH BOUNDARY, on its own axis. Held whole rather than decimated into
     /// the record tick: a handful of rows per run, and every series drawn from them has to
     /// stay index-aligned with the others, which independent `Series` could not guarantee.
@@ -1810,9 +1500,20 @@ impl PretrainReporter {
             nll_bar_diag: Series::default(),
             nll_dof_train: array::from_fn(|_| Series::default()),
             nll_dof_val: array::from_fn(|_| Series::default()),
-            beta_nll_objective: Series::default(),
-            beta_nll_weight_mean_dof: array::from_fn(|_| Series::default()),
-            beta_nll_variance_floor_share_dof: array::from_fn(|_| Series::default()),
+            direct_return_nll_horizon: array::from_fn(|_| Series::default()),
+            direct_return_nll_mean: Series::default(),
+            direct_return_valid_horizon: array::from_fn(|_| Series::default()),
+            direct_return_nll_val_model: array::from_fn(|_| Series::default()),
+            direct_return_nll_val_marginal: array::from_fn(|_| Series::default()),
+            direct_return_gain: array::from_fn(|_| Series::default()),
+            direct_return_val_valid_rows: array::from_fn(|_| Series::default()),
+            direct_return_val_coverage: array::from_fn(|_| Series::default()),
+            direct_return_mean_bias: array::from_fn(|_| Series::default()),
+            direct_return_mean_rmse: array::from_fn(|_| Series::default()),
+            direct_return_predicted_variance: array::from_fn(|_| Series::default()),
+            direct_return_squared_error: array::from_fn(|_| Series::default()),
+            direct_return_directional_accuracy: array::from_fn(|_| Series::default()),
+            direct_return_directional_rows: array::from_fn(|_| Series::default()),
             vs_uniform_train: Series::default(),
             vs_uniform_val: Series::default(),
             vs_uniform_diag: Series::default(),
@@ -1888,6 +1589,10 @@ impl PretrainReporter {
             market_observed_run_pct: Series::default(),
             market_missing_bars: 0,
             market_total_bars: 0,
+            adjusted_daily_observed_pct: Series::default(),
+            adjusted_daily_observed_run_pct: Series::default(),
+            adjusted_daily_missing_bars: 0,
+            adjusted_daily_total_bars: 0,
             pit: None,
             ancestral: None,
             candle_dclose: Vec::new(),
@@ -1943,7 +1648,6 @@ impl PretrainReporter {
             trade_drawdown_mean: Series::default(),
             trade_drawdown_max: Series::default(),
             trade_val: None,
-            trade_test: None,
             epoch_rows: Vec::new(),
             warned_unmeasured: BTreeSet::new(),
         }
@@ -1996,6 +1700,23 @@ impl PretrainReporter {
             self.nll_dof_val[dof].set(tick, metrics.val_nll_dof[dof]);
             self.crps_dof[dof].set(tick, metrics.val_crps_dof[dof]);
             self.marginal_dof[dof].set(tick, self.marginal_nll_dof[dof]);
+        }
+        for horizon in 0..DIRECT_RETURN_HORIZONS.len() {
+            let direct = &metrics.direct_return_validation;
+            self.direct_return_nll_val_model[horizon].set(tick, direct.model_ce[horizon]);
+            self.direct_return_nll_val_marginal[horizon].set(tick, direct.marginal_ce[horizon]);
+            self.direct_return_gain[horizon].set(tick, direct.gain[horizon]);
+            self.direct_return_val_valid_rows[horizon].set(tick, direct.valid_rows[horizon] as f64);
+            self.direct_return_val_coverage[horizon].set(tick, direct.coverage[horizon]);
+            self.direct_return_mean_bias[horizon].set(tick, direct.mean_bias[horizon]);
+            self.direct_return_mean_rmse[horizon].set(tick, direct.mean_rmse[horizon]);
+            self.direct_return_predicted_variance[horizon]
+                .set(tick, direct.predicted_variance_mean[horizon]);
+            self.direct_return_squared_error[horizon].set(tick, direct.squared_error_mean[horizon]);
+            self.direct_return_directional_accuracy[horizon]
+                .set(tick, direct.directional_accuracy[horizon]);
+            self.direct_return_directional_rows[horizon]
+                .set(tick, direct.directional_rows[horizon] as f64);
         }
         self.nll_bar_conditional
             .set(tick, metrics.val_nll_bar_conditional);
@@ -2374,261 +2095,25 @@ impl PretrainReporter {
         self.flush()
     }
 
-    /// Emit the end-of-run held-out battery as `pretrain_test` and consume the
-    /// reporter.
+    /// Finalize a successful validation-only run and consume the reporter.
     ///
-    /// Two properties are enforced here rather than left to convention, because
-    /// a test number that leaks into model selection stops being a test number.
-    ///
-    /// 1. **It cannot precede the final promotion decision.** Taking `self` by
-    ///    value means every promotion must already have been reported: once this
-    ///    returns there is no reporter left to call [`Self::record_epoch`] on, so
-    ///    a later promotion is a compile error, not a review comment. The old
-    ///    loop ordered the battery before the last promotion only by luck.
-    /// 2. **It must score the promoted artifact, read back off disk.** The
-    ///    checkpoint named by the battery must be the last one reported promoted,
-    ///    and its SHA-256 must still match the fingerprint taken at promotion
-    ///    time, so scoring the in-memory model, a stale `*_best.ot`, or a file
-    ///    rewritten since promotion all fail loudly. `model_lineage` must be
-    ///    non-empty, which only a real `BarWorldModel::load` can supply.
-    pub fn finish(mut self, battery: &TestBattery) -> Result<()> {
+    /// Taking `self` by value makes completion follow the final promotion decision. The
+    /// promoted checkpoint must still match the digest recorded by [`Self::record_epoch`];
+    /// this preserves the artifact/report integrity check without constructing or scoring the
+    /// spent Test population.
+    pub fn finish(mut self) -> Result<()> {
         let (promoted, promoted_digest) = self.promoted_checkpoint.clone().context(
-            "no promotion was ever reported, so there is no checkpoint the held-out battery could \
-             legitimately score; report the promotion through EpochMetrics::promoted_checkpoint first",
+            "no promotion was ever reported, so there is no checkpoint for the planner to load; \
+             report the promotion through EpochMetrics::promoted_checkpoint first",
         )?;
-        if battery.model_lineage.trim().is_empty() {
+        if file_digest(&promoted)? != promoted_digest {
             anyhow::bail!(
-                "held-out battery carries no model lineage; it must be scored on a model reloaded \
-                 through BarWorldModel::load, not on the in-memory training model"
-            );
-        }
-        let scored = battery.checkpoint.canonicalize().with_context(|| {
-            format!(
-                "held-out battery checkpoint {} is not readable",
-                battery.checkpoint.display()
-            )
-        })?;
-        if scored != promoted {
-            anyhow::bail!(
-                "held-out battery scored {} but the promoted checkpoint is {}; the test split must \
-                 only ever measure the artifact that was actually selected",
-                scored.display(),
+                "{} changed on disk after it was promoted; validation reports no longer identify \
+                 the selected weights",
                 promoted.display()
             );
         }
-        if file_digest(&scored)? != promoted_digest {
-            anyhow::bail!(
-                "{} changed on disk after it was promoted; the held-out battery would not be \
-                 measuring the selected weights",
-                scored.display()
-            );
-        }
-
-        // Held before the flush, so the cost-curve chart carries the TEST curve beside the
-        // validation one instead of two files disagreeing about which split they depict.
-        self.trade_test = Some(battery.trade);
-        self.flush()?;
-        let dir = self.gens_dir.join(self.epoch.to_string());
-        fs::create_dir_all(&dir).with_context(|| format!("failed to create {}", dir.display()))?;
-        let uniform = self.baselines.uniform_nll_bar;
-        let score_contract = self.baselines.scoring.report_contract();
-        let mut series = vec![
-            point_series(&format!("{score_contract} nats/bar"), battery.nll_bar),
-            point_series(
-                &format!("{score_contract} vs uniform"),
-                uniform - battery.nll_bar,
-            ),
-            point_series(
-                &format!("{score_contract} vs marginal"),
-                self.marginal_nll_bar - battery.nll_bar,
-            ),
-            point_series(&format!("uniform ({score_contract})"), uniform),
-            point_series(
-                &format!("marginal ({score_contract})"),
-                self.marginal_nll_bar,
-            ),
-            point_series(
-                "scoring contract code (0 smoothed diagnostic, 1 hard categorical NLL, 2 \
-                 fixed-support mixed-measure diagnostic)",
-                match self.baselines.scoring {
-                    BarScoring::Smoothed => 0.0,
-                    BarScoring::Hard => 1.0,
-                    BarScoring::Density => 2.0,
-                },
-            ),
-        ];
-        let pit_tv = battery.pit.total_variation();
-        for (dof, name) in BAR_DOF_NAMES.iter().enumerate() {
-            series.push(point_series(&format!("nll {name}"), battery.nll_dof[dof]));
-            series.push(point_series(&format!("crps {name}"), battery.crps_dof[dof]));
-            series.push(point_series(&format!("pit tv {name}"), pit_tv[dof]));
-        }
-        for (i, horizon) in ROLLOUT_HORIZONS.iter().enumerate() {
-            series.push(point_series(
-                &format!("TEACHER-FORCED score h{horizon} exact belief advance"),
-                battery.rollout_nll_exact[i],
-            ));
-            series.push(point_series(
-                &format!("TEACHER-FORCED score h{horizon} dynamics advance"),
-                battery.rollout_nll_dynamics[i],
-            ));
-        }
-        series.push(point_series("dir acc", battery.dir_acc));
-        series.push(point_series("nll_bar se", battery.nll_bar_se));
-        series.push(point_series("nll_bar ci95 low", battery.nll_bar_ci.0));
-        series.push(point_series("nll_bar ci95 high", battery.nll_bar_ci.1));
-        series.push(point_series(
-            "nll_bar conditional",
-            battery.nll_bar_conditional,
-        ));
-        series.push(point_series(
-            "marginal conditional",
-            self.baselines.marginal_nll_bar_conditional(),
-        ));
-        series.push(point_series(
-            "encoding identity nats",
-            self.baselines.encoding_identity_nats,
-        ));
-        for dof in [DOF_U, DOF_V] {
-            series.push(point_series(
-                &format!("nll {} | s!=0", BAR_DOF_NAMES[dof]),
-                battery.nll_dof_conditional[dof],
-            ));
-        }
-        // Per-DOF deltas against the marginal, stated rather than left to be subtracted by
-        // eye. The aggregate hides that `w` has exactly zero headroom below uniform while
-        // `u` and `v` have over a nat each.
-        for (dof, name) in BAR_DOF_NAMES.iter().enumerate() {
-            series.push(point_series(
-                &format!("nll {name} vs marginal"),
-                self.marginal_nll_dof[dof] - battery.nll_dof[dof],
-            ));
-        }
-        // Each factor below is a valid marginal prediction from strictly past bars. Their sum
-        // is not a joint forecast likelihood. The gap to the chain-conditional joint score is
-        // reported descriptively and is not interpreted as model dependence.
-        let independent: f64 = battery.independent_marginal_nll_dof.iter().sum();
-        let chain: f64 = battery.chain_conditional_nll_dof.iter().sum();
-        series.push(point_series(
-            "sum of independent per-DOF marginal NLLs",
-            independent,
-        ));
-        series.push(point_series(
-            "independent-marginal sum se (MC)",
-            battery.independent_marginal_nll_se,
-        ));
-        series.push(point_series(
-            "chain-conditional joint NLL (same rows)",
-            chain,
-        ));
-        series.push(point_series(
-            "marginal-joint score gap (marginal sum - joint)",
-            independent - chain,
-        ));
-        for (dof, name) in BAR_DOF_NAMES.iter().enumerate() {
-            series.push(point_series(
-                &format!("independent marginal NLL {name}"),
-                battery.independent_marginal_nll_dof[dof],
-            ));
-            series.push(point_series(
-                &format!("chain-conditional NLL {name}"),
-                battery.chain_conditional_nll_dof[dof],
-            ));
-        }
-        series.push(point_series(
-            "selection context bars",
-            battery.selection_context as f64,
-        ));
-        series.push(point_series(
-            "deployed context bars",
-            battery.deployed_context as f64,
-        ));
-        series.push(point_series(
-            "reached context bars",
-            battery.reached_context as f64,
-        ));
-        series.push(point_series(
-            "lr plateau fraction",
-            battery.lr_plateau_fraction,
-        ));
-        push_trade_series(&mut series, &battery.trade);
-        // The historical diagnostic comparison. The economics-primary winner is always the
-        // planner artifact; the legacy NLL-only comparator appears only when it chose different
-        // weights. Both currencies are independent-window model-quality reads, not deployed P&L.
-        if let Some(rival) = &battery.nll_rule {
-            let rival_lineage: String = rival.model_lineage.chars().take(12).collect();
-            series.push(point_series(
-                &format!(
-                    "COMPARATOR legacy NLL-only step (lineage {rival_lineage}, {})",
-                    rival
-                        .checkpoint
-                        .file_name()
-                        .map(|n| n.to_string_lossy().into_owned())
-                        .unwrap_or_default()
-                ),
-                rival.step as f64,
-            ));
-            series.push(point_series(
-                &format!("comparator edge @{SELECTION_CAP:.2}x cap bps/bar"),
-                rival.selection_edge_bps,
-            ));
-            series.push(point_series(
-                &format!("comparator edge @{LEVERAGE_CAP:.2}x cap bps/bar (headline)"),
-                rival.edge_at_default,
-            ));
-            series.push(point_series(
-                "comparator quarter quadratic-kelly sharpe (annualized)",
-                rival.sharpe,
-            ));
-            series.push(point_series(
-                "comparator conditional nll_bar",
-                rival.nll_bar_conditional,
-            ));
-            for (dof, name) in BAR_DOF_NAMES.iter().enumerate() {
-                series.push(point_series(
-                    &format!("comparator nll {name}"),
-                    rival.nll_dof[dof],
-                ));
-            }
-            // `CapPoint::edge` is net log growth per bar; the criterion is quoted in bps, as
-            // everywhere else the cap curve is printed.
-            let promoted_edge = battery.trade.cap_curve[SELECTION_CAP_SLOT].edge * 1.0e4;
-            series.push(point_series(
-                &format!(
-                    "RULE DELTA edge @{SELECTION_CAP:.2}x cap, economics-primary - legacy \
-                     NLL-only (bps/bar, + = economics-primary has higher independent-window \
-                     edge; not deployed profitability)"
-                ),
-                promoted_edge - rival.selection_edge_bps,
-            ));
-            series.push(point_series(
-                &format!(
-                    "RULE DELTA conditional {score_contract}, economics-primary - legacy \
-                     NLL-only (nats/bar, + = economics-primary has worse predictive score)"
-                ),
-                battery.nll_bar_conditional - rival.nll_bar_conditional,
-            ));
-        }
-
-        let name = scored
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_else(|| scored.display().to_string());
-        let lineage: String = battery.model_lineage.chars().take(12).collect();
-        let corpus: String = battery.corpus_fingerprint.chars().take(12).collect();
-        write_chart(
-            &dir,
-            "pretrain_test",
-            format!(
-                "Pretrain Held-out Test Battery - {score_contract} - {name} - lineage {lineage} \
-                 - corpus {corpus} - split {}|{} - step {}",
-                battery.split_bounds.0, battery.split_bounds.1, self.global_step
-            ),
-            "single evaluation",
-            "held-out test split, scored once, never used for selection",
-            ScaleKind::Linear,
-            series,
-        )
+        self.flush()
     }
 
     fn commit_steps(&mut self) {
@@ -2641,13 +2126,14 @@ impl PretrainReporter {
         for dof in 0..BAR_DOF {
             self.nll_dof_train[dof].set(tick, acc.nll_dof[dof].value());
         }
-        self.beta_nll_objective
-            .set(tick, acc.beta_nll_objective.value());
-        for dof in 0..BAR_DOF {
-            self.beta_nll_weight_mean_dof[dof].set(tick, acc.beta_nll_weight_mean_dof[dof].value());
-            self.beta_nll_variance_floor_share_dof[dof]
-                .set(tick, acc.beta_nll_variance_floor_share_dof[dof].value());
+        for horizon in 0..DIRECT_RETURN_HORIZONS.len() {
+            self.direct_return_nll_horizon[horizon]
+                .set(tick, acc.direct_return_nll_horizon[horizon].value());
+            self.direct_return_valid_horizon[horizon]
+                .set(tick, acc.direct_return_valid_horizon[horizon].value());
         }
+        self.direct_return_nll_mean
+            .set(tick, acc.direct_return_nll_mean.value());
         self.dyn_loss.set(tick, acc.dyn_loss.value());
         self.kl_loss.set(tick, acc.kl_loss.value());
         self.total_loss.set(tick, acc.total_loss.value());
@@ -2714,6 +2200,25 @@ impl PretrainReporter {
             self.market_observed_run_pct.set(
                 tick,
                 observed(self.market_missing_bars, self.market_total_bars),
+            );
+        }
+        if acc.adjusted_daily_total_bars > 0 {
+            self.adjusted_daily_missing_bars += acc.adjusted_daily_missing_bars;
+            self.adjusted_daily_total_bars += acc.adjusted_daily_total_bars;
+            let observed = |missing: u64, total: u64| 100.0 * (1.0 - missing as f64 / total as f64);
+            self.adjusted_daily_observed_pct.set(
+                tick,
+                observed(
+                    acc.adjusted_daily_missing_bars,
+                    acc.adjusted_daily_total_bars,
+                ),
+            );
+            self.adjusted_daily_observed_run_pct.set(
+                tick,
+                observed(
+                    self.adjusted_daily_missing_bars,
+                    self.adjusted_daily_total_bars,
+                ),
             );
         }
         self.accumulator = StepAccumulator::default();
@@ -2798,16 +2303,13 @@ impl PretrainReporter {
             self.independent_marginal_nll_bar_se
                 .labeled("independent-marginal MC se", len),
         ];
-        for (dof, name) in BAR_DOF_NAMES.iter().enumerate() {
-            independent.push(
-                self.independent_marginal_nll_dof[dof]
-                    .labeled(&format!("{name} independent marginal"), len),
-            );
-            independent.push(
-                self.chain_conditional_nll_dof[dof]
-                    .labeled(&format!("{name} chain-conditional"), len),
-            );
-        }
+        independent.extend(labeled_dof_pairs(
+            &self.independent_marginal_nll_dof,
+            "independent marginal",
+            &self.chain_conditional_nll_dof,
+            "chain-conditional",
+            len,
+        ));
         write_chart(
             &dir,
             "pretrain_independent_marginal_nll",
@@ -2824,19 +2326,12 @@ impl PretrainReporter {
             independent,
         )?;
 
-        let mut nll_dof = Vec::with_capacity(3 * BAR_DOF);
-        for (dof, name) in BAR_DOF_NAMES.iter().enumerate() {
-            nll_dof.push(self.nll_dof_train[dof].labeled(&format!("{name} train"), len));
-        }
-        for (dof, name) in BAR_DOF_NAMES.iter().enumerate() {
-            nll_dof.push(self.nll_dof_val[dof].labeled(&format!("{name} val diag"), len));
-        }
+        let mut nll_dof = labeled_dof(&self.nll_dof_train, "train", len);
+        nll_dof.extend(labeled_dof(&self.nll_dof_val, "val diag", len));
         // Per-DOF marginal floors. Without them a DOF like u, whose marginal
         // entropy is far below ln(128) because 42% of bars pin the close to a bar
         // extreme, looks like it is learning when it has only found its marginal.
-        for (dof, name) in BAR_DOF_NAMES.iter().enumerate() {
-            nll_dof.push(self.marginal_dof[dof].labeled(&format!("{name} marginal"), len));
-        }
+        nll_dof.extend(labeled_dof(&self.marginal_dof, "marginal", len));
         // The `u` and `v` curves conditioned on a non-flat bar, against the matching
         // conditional floors. Without this pair, a head that has learned only the flat-bar
         // identity shows a large gain on both DOF and nothing distinguishes it from one that
@@ -2874,6 +2369,129 @@ impl PretrainReporter {
             &format!("nats (val series at the fixed {diag} context)"),
             ScaleKind::Linear,
             nll_dof,
+        )?;
+
+        let mut direct_nll = Vec::with_capacity(3 * DIRECT_RETURN_HORIZONS.len() + 1);
+        for (slot, horizon) in DIRECT_RETURN_HORIZONS.iter().enumerate() {
+            direct_nll.push(
+                self.direct_return_nll_horizon[slot]
+                    .labeled(&format!("train H{horizon} cumulative log return"), len),
+            );
+            direct_nll.push(self.direct_return_nll_val_model[slot].labeled(
+                &format!("fold validation model H{horizon} cumulative log return"),
+                len,
+            ));
+            direct_nll.push(
+                self.direct_return_nll_val_marginal[slot].labeled(
+                    &format!(
+                        "fold validation actual train-fit categorical marginal H{horizon} cumulative log return"
+                    ),
+                    len,
+                ),
+            );
+        }
+        direct_nll.push(
+            self.direct_return_nll_mean
+                .labeled("train equal-horizon mean", len),
+        );
+        write_chart(
+            &dir,
+            "pretrain_direct_return_nll",
+            format!("Pretrain Direct Cumulative Log-Return NLL on Fold Validation - {suffix}"),
+            "record",
+            "categorical cross-entropy (nats per valid H row)",
+            ScaleKind::Linear,
+            direct_nll,
+        )?;
+
+        let mut direct_valid = Vec::with_capacity(3 * DIRECT_RETURN_HORIZONS.len());
+        for (slot, horizon) in DIRECT_RETURN_HORIZONS.iter().enumerate() {
+            direct_valid.push(self.direct_return_valid_horizon[slot].labeled(
+                &format!("train H{horizon} valid H rows per optimizer batch"),
+                len,
+            ));
+            direct_valid.push(
+                self.direct_return_val_valid_rows[slot]
+                    .labeled(&format!("fold validation H{horizon} valid H rows"), len),
+            );
+            direct_valid.push(self.direct_return_val_coverage[slot].labeled(
+                &format!("fold validation H{horizon} valid H-row coverage fraction"),
+                len,
+            ));
+        }
+        write_chart(
+            &dir,
+            "pretrain_direct_return_valid_coverage",
+            format!(
+                "Pretrain Direct Cumulative Log-Return Fold Validation Valid H Rows and Coverage - {suffix}"
+            ),
+            "record",
+            "valid H rows (coverage curves are fractions)",
+            ScaleKind::Symlog,
+            direct_valid,
+        )?;
+
+        let direct_gain = DIRECT_RETURN_HORIZONS
+            .iter()
+            .zip(&self.direct_return_gain)
+            .map(|(horizon, values)| {
+                values.labeled(
+                    &format!(
+                        "fold validation H{horizon}: actual train-fit categorical marginal minus model"
+                    ),
+                    len,
+                )
+            })
+            .collect();
+        write_chart(
+            &dir,
+            "pretrain_direct_return_gain",
+            format!(
+                "Pretrain Direct Cumulative Log-Return Fold Validation Gain over Actual Train-Fit Categorical Marginal - {suffix}"
+            ),
+            "record",
+            "categorical CE gain (nats per valid H row)",
+            ScaleKind::Linear,
+            direct_gain,
+        )?;
+
+        let mut direct_calibration = Vec::with_capacity(6 * DIRECT_RETURN_HORIZONS.len());
+        for (slot, horizon) in DIRECT_RETURN_HORIZONS.iter().enumerate() {
+            direct_calibration.push(self.direct_return_mean_bias[slot].labeled(
+                &format!("fold validation H{horizon} cumulative log-return analytic-mean bias"),
+                len,
+            ));
+            direct_calibration.push(self.direct_return_mean_rmse[slot].labeled(
+                &format!("fold validation H{horizon} cumulative log-return analytic-mean RMSE"),
+                len,
+            ));
+            direct_calibration.push(self.direct_return_predicted_variance[slot].labeled(
+                &format!("fold validation H{horizon} fitted-moment predicted variance mean"),
+                len,
+            ));
+            direct_calibration.push(self.direct_return_squared_error[slot].labeled(
+                &format!("fold validation H{horizon} analytic-mean squared error"),
+                len,
+            ));
+            direct_calibration.push(self.direct_return_directional_accuracy[slot].labeled(
+                &format!(
+                    "fold validation H{horizon} directional accuracy (exactly flat realizations excluded)"
+                ),
+                len,
+            ));
+            direct_calibration.push(self.direct_return_directional_rows[slot].labeled(
+                &format!("fold validation H{horizon} non-flat valid H rows"),
+                len,
+            ));
+        }
+        write_chart(
+            &dir,
+            "pretrain_direct_return_calibration",
+            format!("Pretrain Direct Cumulative Log-Return Fold Validation Calibration - {suffix}"),
+            "record",
+            "cumulative log return, squared return, rate, and valid H rows",
+            ScaleKind::Symlog,
+            direct_calibration,
         )?;
 
         // Gain over the uniform chain, with every yardstick drawn flat. Crossing `uniform`
@@ -3117,11 +2735,7 @@ impl PretrainReporter {
             "record",
             &format!("CRPS at the fixed {diag} context"),
             ScaleKind::Linear,
-            BAR_DOF_NAMES
-                .iter()
-                .enumerate()
-                .map(|(dof, name)| self.crps_dof[dof].labeled(name, len))
-                .collect(),
+            labeled_dof(&self.crps_dof, "", len),
         )?;
 
         if let Some(density) = self.pit {
@@ -3313,43 +2927,6 @@ impl PretrainReporter {
             vec![self.grad_norm.labeled("grad norm", len)],
         )?;
 
-        if self.beta_nll_objective.measured() {
-            write_chart(
-                &dir,
-                "pretrain_beta_nll_objective",
-                format!("Pretrain Categorical Beta-NLL Objective - {suffix}"),
-                "record",
-                "nats/bar; proper Hard categorical NLL remains the validation and promotion \
-                 score, while beta-NLL is the variance-reweighted term attached to the optimizer",
-                ScaleKind::Linear,
-                vec![
-                    self.nll_bar_train.labeled("proper Hard NLL", len),
-                    self.beta_nll_objective.labeled("optimized beta-NLL", len),
-                ],
-            )?;
-            let mut series = Vec::with_capacity(2 * BAR_DOF);
-            for dof in 0..BAR_DOF {
-                series.push(
-                    self.beta_nll_weight_mean_dof[dof]
-                        .labeled(&format!("mean weight {}", BAR_DOF_NAMES[dof]), len),
-                );
-                series.push(
-                    self.beta_nll_variance_floor_share_dof[dof]
-                        .labeled(&format!("variance-floor share {}", BAR_DOF_NAMES[dof]), len),
-                );
-            }
-            write_chart(
-                &dir,
-                "pretrain_beta_nll_weights",
-                format!("Pretrain Categorical Beta-NLL Weights - {suffix}"),
-                "record",
-                "detached (predicted fitted-moment variance / train-marginal variance)^beta; \
-                 floor share is the fraction below the fixed numerical variance-ratio floor",
-                ScaleKind::Linear,
-                series,
-            )?;
-        }
-
         if self.sdlr_alpha_mean.measured() {
             write_chart(
                 &dir,
@@ -3521,24 +3098,26 @@ impl PretrainReporter {
             ],
         )?;
 
-        // Market-channel coverage. Three conditioning channels carry the common factor, joined
-        // to each bar on exact timestamp equality against the proxy's own bar, and a bar the
-        // proxy never printed takes a reserved MISSING row. Nothing in any loss distinguishes a
-        // channel that did not help from a channel that was never populated, so the share is
-        // charted directly. The per-tick curve shows coverage moving with the ramp's mix of
-        // extended-hours bars; the run curve is the number to quote when reading an ablation.
+        // Observed-input coverage. Market rows join on exact timestamp equality; adjusted-daily
+        // rows require a file plus enough history completed by the decision timestamp. Both use
+        // explicit missing representations invisible in the loss, so both per-tick and run-wide
+        // shares live in this registered coverage report.
         write_chart(
             &dir,
             "pretrain_market_coverage",
-            format!("Pretrain Market Channel Coverage - {suffix}"),
+            format!("Pretrain Observed Input Coverage - {suffix}"),
             "record",
-            "% of bars with an observed market proxy bar",
+            "% of bars with observed causal context",
             ScaleKind::Linear,
             vec![
                 self.market_observed_pct
-                    .labeled("observed this tick (%)", len),
+                    .labeled("market observed this tick (%)", len),
                 self.market_observed_run_pct
-                    .labeled("observed, run to date (%)", len),
+                    .labeled("market observed, run to date (%)", len),
+                self.adjusted_daily_observed_pct
+                    .labeled("adjusted daily observed this tick (%)", len),
+                self.adjusted_daily_observed_run_pct
+                    .labeled("adjusted daily observed, run to date (%)", len),
             ],
         )?;
 
@@ -3964,35 +3543,18 @@ impl PretrainReporter {
 
         if let Some(val) = self.trade_val {
             // A different x axis from every other chart here: the index runs over
-            // COST_GRID_BPS, and one curve per Kelly fraction is drawn on it. The TEST split
-            // contributes the model's curve only: it is one number, and overlaying four more
-            // one-off curves on top of the validation family would bury it.
-            let mut series = cost_curve_series(&val, "val");
-            if let Some(test) = self.trade_test {
-                series.push(ReportSeries {
-                    label: "TEST edge".to_owned(),
-                    values: test
-                        .model_cost_curve()
-                        .iter()
-                        .map(|edge| (edge * 1e4) as f32)
-                        .collect(),
-                });
-            }
+            // COST_GRID_BPS, and one curve per Kelly fraction is drawn on it.
             write_chart(
                 dir,
                 "pretrain_trade_cost_curve",
                 format!(
-                    "Pretrain Quadratic Kelly Edge vs Transaction Cost (val break-even {}{}) - {suffix}",
+                    "Pretrain Quadratic Kelly Edge vs Transaction Cost (val break-even {}) - {suffix}",
                     break_even_label(&val),
-                    self.trade_test.map_or_else(String::new, |t| format!(
-                        ", TEST break-even {}",
-                        break_even_label(&t)
-                    )),
                 ),
                 "cost grid index (see the `cost (bps)` series)",
                 "net growth minus the marginal null, bps/bar",
                 ScaleKind::Symlog,
-                series,
+                cost_curve_series(&val, "val"),
             )?;
         }
 
@@ -4045,7 +3607,7 @@ impl PretrainReporter {
         let Some(val) = self.trade_val else {
             return Ok(());
         };
-        write_cap_and_tail_charts(dir, suffix, &val, self.trade_test.as_ref())
+        write_cap_and_tail_charts(dir, suffix, &val)
     }
 
     /// The EPOCH-INDEXED panel: three charts whose x-axis is the epoch, not the record
@@ -4248,22 +3810,16 @@ impl PretrainReporter {
     }
 }
 
-/// The cap curve and the two calibration panels of ONE measured bench.
+/// The cap curve and the two calibration panels of one measured validation bench.
 ///
 /// Shared by the in-run reporter and the standalone command: unlike every other trade
 /// chart these have no tick axis at all — their x-axes are the cap grid, the `|f*|` bucket
 /// and the tail level — so the two callers would otherwise have written the same three
-/// pictures twice and been free to disagree. `test` overlays the TEST split's cap curve
-/// when one exists.
-fn write_cap_and_tail_charts(
-    dir: &Path,
-    suffix: &str,
-    val: &TradeBench,
-    test: Option<&TradeBench>,
-) -> Result<()> {
+/// pictures twice and been free to disagree.
+fn write_cap_and_tail_charts(dir: &Path, suffix: &str, val: &TradeBench) -> Result<()> {
     // 1. The cap curve. The x axis is the cap grid index and the `cap (x)` series is
     //    the axis itself, exactly as the cost curve carries its own cost axis.
-    let mut cap_series = vec![
+    let cap_series = vec![
         ReportSeries {
             label: "cap (x)".to_owned(),
             values: CAP_GRID.iter().map(|cap| *cap as f32).collect(),
@@ -4311,16 +3867,6 @@ fn write_cap_and_tail_charts(
         },
         constant_series("no edge", 0.0, CAP_GRID.len()),
     ];
-    if let Some(test) = test {
-        cap_series.push(ReportSeries {
-            label: "TEST edge, bps/bar".to_owned(),
-            values: test
-                .cap_curve
-                .iter()
-                .map(|point| (point.edge * 1e4) as f32)
-                .collect(),
-        });
-    }
     write_chart(
         dir,
         "pretrain_trade_cap_curve",
@@ -4560,9 +4106,8 @@ pub fn write_trade_bench(dir: &Path, label: &str, trade: &TradeBench) -> Result<
         ],
     )?;
 
-    // The cap curve and the two calibration panels, byte-for-byte the in-run pictures: one
-    // measured bench is all they need, and there is no TEST split to overlay here.
-    write_cap_and_tail_charts(dir, &suffix, trade, None)
+    // The cap curve and the two calibration panels, byte-for-byte the in-run pictures.
+    write_cap_and_tail_charts(dir, &suffix, trade)
 }
 
 // ---------------------------------------------------------------------------
@@ -6149,10 +5694,9 @@ fn cost_curve_series(trade: &TradeBench, tag: &str) -> Vec<ReportSeries> {
     series
 }
 
-/// Every trading-bench scalar as a one-point series on the terminal battery chart.
+/// Every trading-bench scalar as a one-point series in the standalone validation chart.
 ///
-/// The charts carry the validation curve; this is the split that is touched once. Growth
-/// is in basis points per bar so the two are read in the same unit.
+/// Growth is in basis points per bar so it shares the same unit as the in-run reports.
 fn push_trade_series(series: &mut Vec<ReportSeries>, trade: &TradeBench) {
     for (policy, name) in POLICY_NAMES.iter().enumerate() {
         let stats = &trade.policies[policy];
@@ -7575,26 +7119,31 @@ pub fn write_mem_probe(
     Ok(())
 }
 
-/// The POPULATION a held-out pass will measure on, and the interval that population can
-/// support — charted before anything is scored.
+/// The development-visible populations a validation pass can measure, and the interval that
+/// population can support — charted before anything is scored.
 ///
 /// Two panels because there are two questions and they have different x-axes. The census asks
-/// what each split HOLDS at one context: bars, near-disjoint windows, and symbols carrying at
-/// least one window. The ladder asks what a traded prefix of the addressed split can RESOLVE,
-/// indexed on the prefix size, with the `(symbol, calendar month)` block count COUNTED over the
+/// what Train and Validation hold at one context: bars, near-disjoint windows, and symbols
+/// carrying at least one window. The ladder asks what a traded validation prefix can resolve,
+/// indexed on the prefix size, with the `(symbol, calendar month)` block count counted over the
 /// real draw at every rung rather than assumed equal to the window count.
-///
-/// Why this is a chart at all rather than a line of log output. `Split::Test` is scored ONCE for
-/// the whole campaign; the question "does it have the power to resolve the effect we are looking
-/// for" therefore has to be answerable, and answered, before the draw is spent. Both panels are
-/// functions of the stored bars and of a draw pinned by [`EVAL_WINDOW_SEED`], so neither moves
-/// when a step does and no model is involved in producing them.
 ///
 /// Both are [`ScaleKind::Symlog`]: a bar count near 4e7, a window count near 4e4 and an interval
 /// half-width near 1 bps sit six orders of magnitude apart on one index, and `Linear` would
 /// flatten every count and every width onto the axis of the largest.
 pub(super) fn write_heldout_power(dir: &Path, power: &HeldOutPower) -> Result<()> {
     fs::create_dir_all(dir).with_context(|| format!("failed to create {}", dir.display()))?;
+    let census_split_axis = power
+        .census
+        .iter()
+        .map(|row| -> Result<f64> {
+            match row.split {
+                Split::Train => Ok(0.0),
+                Split::Val => Ok(1.0),
+                Split::Test => anyhow::bail!("Test is absent from the development census"),
+            }
+        })
+        .collect::<Result<Vec<_>>>()?;
     let of = |label: String, values: Vec<f64>| ReportSeries {
         label,
         values: values.iter().map(|v| *v as f32).collect(),
@@ -7623,23 +7172,14 @@ pub(super) fn write_heldout_power(dir: &Path, power: &HeldOutPower) -> Result<()
                 .find(|row| row.split == power.split)
                 .map_or(0, |row| row.symbols),
         ),
-        "row index: one per split, in calendar order train / val / test (see the `split` series)",
+        "row index: train then validation (see the `split` series)",
         "bars / windows / symbols",
         ScaleKind::Symlog,
         vec![
             of(
-                "split: 0 = train, 1 = val, 2 = test (the x axis of this panel). The three are \
-                 calendar-DISJOINT and half-open, cut at the two pinned instants"
+                "split: 0 = train, 1 = validation; Test is intentionally absent from development"
                     .to_owned(),
-                power
-                    .census
-                    .iter()
-                    .map(|row| match row.split {
-                        Split::Train => 0.0,
-                        Split::Val => 1.0,
-                        Split::Test => 2.0,
-                    })
-                    .collect(),
+                census_split_axis,
             ),
             of(
                 "bars in the split - f32, so counts above 16.7M are rounded; the window manifest \
@@ -7886,172 +7426,13 @@ mod tests {
         );
     }
 
-    /// Every base this module can write. Aliased rather than restated: the list lives in
-    /// `shared` so the TUI extends its `meta_chart_bases` from the SAME slice this test
-    /// walks. A base registered with no writer and a base written with no registration
-    /// are both unrepresentable rather than merely tested for.
+    /// Every base in the pretraining domain. Writer ownership is declared beside each base in
+    /// `shared`, so this suite no longer maintains a second, comment-only exemption registry.
     const EXPECTED_BASES: &[&str] = shared::report::PRETRAIN_REPORT_BASES;
 
-    /// Registered bases a single in-run cycle cannot produce.
-    ///
-    /// **The rule, arrived at the hard way.** A base may be exempt from the cycle walk ONLY if
-    /// some other test EXECUTES its writer, and that test is named in the entry. A stated reason
-    /// is not coverage: `pretrain_corpus_anomalies` carried the reason "written by the corpus
-    /// loader at startup, not by this module" while no writer existed at all, and the exemption
-    /// is precisely what made that invisible to the bidirectional test built to find exactly
-    /// that gap. The comment was true about the intent and false about the code, and only
-    /// execution can tell those apart.
-    ///
-    /// Every name here is also asserted to BE in the registry, so a rename turns into a failure
-    /// rather than into an exemption that silently covers for nothing.
-    const CYCLE_EXEMPT: &[&str] = &[
-        // `finish` writes it and consumes the reporter, so it belongs to the end of a run.
-        // Executed by `the_held_out_battery_is_written_once_with_every_scalar`.
-        "pretrain_test",
-        // Written by the corpus loader — `dataset::CorpusAnomalies::write_report_of`, called
-        // from `pretrain::build_trainer` once the generation directory exists — not by this
-        // module. Executed by `dataset::tests::the_anomaly_report_carries_every_resolution_on_one_base`.
-        "pretrain_corpus_anomalies",
-        // Written by `pretrain_aux::AuxiliaryReport::write_report` at each pass boundary, and
-        // only by a run that named `--auxiliary-resolutions`, which the default configuration
-        // this fixture drives does not. Executed by
-        // `pretrain_aux::tests::the_auxiliary_report_lands_with_one_distinguishable_series_pair_per_resolution`.
-        "pretrain_auxiliary_nll",
-        // Written by `portfolio::write_portfolio_bench`, which runs ONE book over a
-        // calendar-aligned panel and is not part of a pretraining cycle at all: it needs a
-        // whole held-out panel and a loaded checkpoint, neither of which this fixture has.
-        // All five are executed by
-        // `portfolio::tests::the_five_portfolio_bases_are_written_and_read_back`.
-        "pretrain_portfolio_equity",
-        "pretrain_portfolio_metrics",
-        "pretrain_portfolio_gross_curve",
-        "pretrain_portfolio_frontier",
-        "pretrain_portfolio_edge_vs_cost",
-        // Written by `portfolio_cost::write_cost_capacity_reports`. A measured spread, a
-        // dollar ADV and a realized cross-sectional covariance are properties of the stored
-        // bars, not of a training step, so no in-run cycle over synthetic step metrics can
-        // produce any of them. All three are executed by
-        // `portfolio_cost::tests::the_cost_capacity_battery_writes_all_three_registered_bases`.
-        "pretrain_cost_deciles",
-        "pretrain_capacity_curve",
-        "pretrain_cross_correlation",
-        // Written by `write_mean_calibration`, from the multi-checkpoint calibration
-        // experiment: one point per CHECKPOINT, each needing its own held-out pass plus a
-        // second pass on a block-disjoint fit slice, so an in-run cycle over one step's
-        // metrics cannot produce either. All three are executed by
-        // `the_calibration_experiment_writes_both_registered_bases`.
-        "pretrain_mean_calibration",
-        "pretrain_shrunk_policy",
-        // The no-trade band needs the same two passes AND a re-scored ledger per band width
-        // per shape rule, so it is exempt for the same reason and executed by the same test.
-        "pretrain_no_trade_band",
-        // The edge attribution re-scores the SAME two passes with the model's magnitude and
-        // then its sign destroyed, so it is exempt for the same reason and executed by the
-        // same test. Three bases because they have three different x-axes: the arm, the
-        // checkpoint and the confidence decile.
-        "pretrain_edge_attribution",
-        "pretrain_edge_panel",
-        "pretrain_edge_confidence",
-        // The sign-hysteresis frontier and the signal-decay curve re-score the SAME held-out
-        // pass along two axes the attribution does not have - the flip margin and the holding
-        // horizon - so they are exempt for the same reason and executed by the same test.
-        "pretrain_edge_hysteresis",
-        "pretrain_signal_decay",
-        // The shrink x hysteresis 2x2 needs the recalibrated fraction from a disjoint fit slice
-        // AND the frontier's constant-stake reconstruction on the same windows, so it is exempt
-        // for the same reason and executed by the same test.
-        "pretrain_edge_composition",
-        // Written by `horizon::write_horizon_frontier`. One point per holding horizon, each
-        // needing a whole held-out panel, a loaded checkpoint and a sampled multi-bar rollout,
-        // so an in-run cycle over one step's metrics cannot produce it. Executed by
-        // `horizon::tests::the_horizon_frontier_base_is_written_and_read_back`.
-        "pretrain_horizon_frontier",
-        // Written by `horizon::write_receding_reports`,
-        // `horizon::write_receding_attribution`, `horizon::write_receding_policy_frontier`, and
-        // optional `horizon::write_receding_hysteresis` after a whole held-out panel, one common
-        // max-H ancestral rollout and every-bar economic solves. The selected production
-        // horizon is highlighted inside the existing grid reports and held fixed across the
-        // attribution ladder. Validation alone reuses it as the zero-width fixed-frontier
-        // incumbent; locked test never writes that selection grid. The optional hysteresis
-        // base instead carries exactly one predeclared margin paired against the selected-H Raw
-        // incumbent on common cached rows, and is absent unless named on the CLI. None is an
-        // optimizer-step metric. The grid writers are exercised by
-        // `horizon::tests::receding_reports_persist_the_selected_run_and_keep_the_full_grid`;
-        // the attribution writer and schema by
-        // `horizon::tests::receding_attribution_writes_the_registered_five_stage_schema`; the
-        // frontier writer by
-        // `horizon::tests::receding_policy_frontier_round_trips_the_fixed_registered_grid`; and
-        // hysteresis by
-        // `horizon::tests::receding_hysteresis_round_trips_two_exact_paired_rows`.
-        "pretrain_receding_kelly",
-        "pretrain_receding_covariance",
-        "pretrain_receding_attribution",
-        "pretrain_receding_policy_frontier",
-        "pretrain_receding_hysteresis",
-        // Written by `skill::write_skill_profile`. Indexed by DECILE of the model's own
-        // confidence rather than by step, and produced from a whole held-out panel scored with
-        // no trading policy, so an in-run cycle over one step's metrics cannot produce it.
-        // Executed by `skill::tests::the_skill_chart_round_trips_with_a_complete_finite_series`.
-        "pretrain_skill_profile",
-        // Written by `write_support_decode` during the geometry-preserving support-moments
-        // upgrade. Indexed by DOF and BIN rather than step, with direct simple-return moment
-        // and provenance diagnostics. Both bases are exercised by
-        // `support_moments::tests::the_support_decode_writes_both_registered_bases`.
-        "support_decode_moments",
-        "support_decode_bins",
-        // Written by `write_mem_probe`, from the multi-epoch memorization probe in `mem_probe`.
-        // The spine needs SEVERAL checkpoints, each scored on both splits; the contrast needs the
-        // run's training pass partition rebuilt at one checkpoint's own step and split at the
-        // issue cursor; the recency profile is indexed by how long ago a window was issued; and
-        // the stability panel refits the same slope at six DIFFERENT bootstrap draw counts. None
-        // of the four is a function of a step's metrics, so no in-run reporter cycle can produce
-        // any of them. All four are executed by
-        // `mem_probe::tests::the_mem_probe_writes_every_registered_base`.
-        "memprobe_epoch_spine",
-        "memprobe_one_repetition",
-        "memprobe_recency",
-        "memprobe_bootstrap_stability",
-        // Written by `write_bar_family`, from the offline continuous-family gate in `bar_family`.
-        // Each panel needs a whole drawn sample plus a fitted mixture battery — a component sweep
-        // with a withheld holdout, upper order statistics of `|r|`, and a discrete support loaded
-        // from disk to score against — none of which is a function of a step's metrics, so no
-        // in-run reporter cycle can produce any of the ten. All ten are executed by
-        // `bar_family::tests::the_bar_family_fit_writes_every_registered_base`.
-        "bar_family_density_r",
-        "bar_family_density_s",
-        "bar_family_density_u",
-        "bar_family_density_v",
-        "bar_family_density_w",
-        "bar_family_tail_r",
-        "bar_family_k_sweep",
-        "bar_family_nll",
-        "bar_family_atoms",
-        "bar_family_ruin_bound",
-        // Written by `write_bar_seams`, from the corporate-action seam audit in `split_seams`.
-        // Every panel needs a STREAMING pass over all 451,507,140 stored bars plus a support
-        // artifact loaded from disk, and the tail pair needs the 4M fitting draw read twice — once
-        // untouched and once with the classified seam rows joined out by `(series, bar)`. None of
-        // that is a function of a step's metrics, so no in-run reporter cycle can produce any of the
-        // six. All six are executed by
-        // `split_seams::tests::the_seam_audit_writes_every_registered_base`.
-        "bar_seam_census",
-        "bar_seam_ratios",
-        "bar_seam_context",
-        "bar_seam_tail_r",
-        "bar_seam_bin_mass",
-        "bar_seam_ruin_licence",
-        // Written by `write_heldout_power`, from the window draw `pretrain-calibration` performs
-        // BEFORE it opens a checkpoint. Both panels are functions of the stored bars and of a
-        // seed-pinned draw and no model is involved, so no in-run reporter cycle can produce
-        // either: the point of the pass is that nothing has been scored yet. Both are executed by
-        // `the_heldout_power_census_writes_both_registered_bases`.
-        "pretrain_heldout_census",
-        "pretrain_heldout_power",
-        // Written by the frozen-checkpoint two-stage recirculation sweep rather than an
-        // optimizer-step cycle. Executed by
-        // `recirculate::tests::recirculation_report_is_registered_and_readable`.
-        "pretrain_recirculation_sweep",
-    ];
+    fn bases_owned_by(owner: shared::report::PretrainReportOwner) -> Vec<&'static str> {
+        shared::report::pretrain_report_bases_owned_by(owner).collect()
+    }
 
     static SCRATCH_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
@@ -8074,30 +7455,6 @@ mod tests {
         // 5 * ln(128) = 24.2601513..., not the 24.2536 quoted in the brief.
         assert!((uniform_categorical_nll_bar() - 24.260_151_3).abs() < 1.0e-6);
         assert_eq!(uniform_categorical_nll_bar(), 5.0 * 128.0f64.ln());
-    }
-
-    #[test]
-    fn series_nan_pads_skipped_ticks() {
-        let mut series = Series::default();
-        series.set(0, 1.0);
-        series.set(3, 4.0);
-        series.set(4, f64::NAN);
-        let values = series.padded(6);
-        assert_eq!(values[0], 1.0);
-        assert!(values[1].is_nan() && values[2].is_nan());
-        assert_eq!(values[3], 4.0);
-        assert!(values[4].is_nan() && values[5].is_nan());
-    }
-
-    #[test]
-    fn mean_ignores_non_finite_samples() {
-        let mut mean = Mean::default();
-        mean.push(f64::NAN);
-        mean.push(2.0);
-        mean.push(4.0);
-        mean.push(f64::INFINITY);
-        assert_eq!(mean.value(), 3.0);
-        assert!(Mean::default().value().is_nan());
     }
 
     #[test]
@@ -8789,6 +8146,19 @@ mod tests {
         metrics.promoted_checkpoint = promoted;
         metrics.train_nll_dof = [4.0; BAR_DOF];
         metrics.val_nll_dof = [4.2; BAR_DOF];
+        metrics.direct_return_validation = DirectReturnValidationStats {
+            model_ce: [1.0, 1.1, 1.2, 1.3, 1.4, 1.5],
+            marginal_ce: [2.0, 2.1, 2.2, 2.3, 2.4, 2.5],
+            gain: [1.0; DIRECT_RETURN_HORIZONS.len()],
+            valid_rows: [100, 97, 85, 62, 23, 1],
+            coverage: [1.0, 0.97, 0.85, 0.62, 0.23, 0.01],
+            mean_bias: [-0.03, -0.02, -0.01, 0.0, 0.01, 0.02],
+            mean_rmse: [0.1, 0.2, 0.3, 0.4, 0.5, 0.6],
+            predicted_variance_mean: [0.01, 0.04, 0.09, 0.16, 0.25, 0.36],
+            squared_error_mean: [0.02, 0.05, 0.10, 0.17, 0.26, 0.37],
+            directional_accuracy: [0.51, 0.52, 0.53, 0.54, 0.55, 0.56],
+            directional_rows: [90, 87, 75, 52, 13, 1],
+        };
         metrics.val_crps_dof = [0.1; BAR_DOF];
         metrics.val_dir_acc = 0.52;
         metrics.rollout_nll_exact = [21.0, 22.0, 23.0, 24.0, 24.6];
@@ -9054,9 +8424,7 @@ mod tests {
             .collect()
     }
 
-    /// All NINE calibration bases land on disk with finite values, which is the coverage their
-    /// [`CYCLE_EXEMPT`] entries name. An exemption whose writer no test executes is how a
-    /// permanently blank panel ships.
+    /// Every base owned by the calibration writer lands on disk with finite values.
     #[test]
     fn the_calibration_experiment_writes_every_registered_base() {
         let root = scratch_dir("mean_calibration");
@@ -9076,26 +8444,13 @@ mod tests {
             "the fixture must carry the edge attribution and its panel, or three bases are \
              never exercised"
         );
-        for base in [
-            "pretrain_mean_calibration",
-            "pretrain_shrunk_policy",
-            "pretrain_no_trade_band",
-            "pretrain_edge_attribution",
-            "pretrain_edge_panel",
-            "pretrain_edge_confidence",
-            "pretrain_edge_hysteresis",
-            "pretrain_signal_decay",
-            "pretrain_edge_composition",
-        ] {
-            assert!(
-                EXPECTED_BASES.contains(&base),
-                "{base} is written but not registered, so the TUI never scans for it"
-            );
-            assert!(
-                CYCLE_EXEMPT.contains(&base),
-                "{base} cannot be produced by an in-run cycle, so it must be exempt WITH this \
-                 test named in its entry"
-            );
+        let bases = bases_owned_by(shared::report::PretrainReportOwner::Calibration);
+        assert_eq!(
+            bases.len(),
+            9,
+            "the ownership registry must cover every calibration panel"
+        );
+        for base in bases {
             let path = root.join(format!("{base}.report.bin"));
             assert!(path.exists(), "{base} was never written");
             let report = read_report(&path).expect("report reads back");
@@ -9272,9 +8627,27 @@ mod tests {
             metrics.step = step;
             metrics.nll_bar = 24.0 - step as f64 * 0.01;
             metrics.nll_dof = [4.8; BAR_DOF];
-            metrics.beta_nll_objective = 23.5;
-            metrics.beta_nll_weight_mean_dof = [1.1; BAR_DOF];
-            metrics.beta_nll_variance_floor_share_dof = [0.0; BAR_DOF];
+            // Distinct, step-varying sentinels prove all seven NLL fields and all six
+            // valid-count fields pass through their own decimation accumulators rather than
+            // being reconstructed when the report is written.
+            let direct_offset = step as f64;
+            metrics.direct_return_nll_horizon = [
+                1.25 + direct_offset,
+                2.25 + direct_offset,
+                3.25 + direct_offset,
+                4.25 + direct_offset,
+                5.25 + direct_offset,
+                6.25 + direct_offset,
+            ];
+            metrics.direct_return_nll_mean = 7.75 + direct_offset;
+            metrics.direct_return_valid_horizon = [
+                16.0 + direct_offset,
+                15.0 + direct_offset,
+                14.0 + direct_offset,
+                13.0 + direct_offset,
+                12.0 + direct_offset,
+                11.0 + direct_offset,
+            ];
             metrics.dyn_loss = 0.5;
             metrics.kl_loss = 0.25;
             metrics.total_loss = 24.75;
@@ -9319,6 +8692,8 @@ mod tests {
             metrics.market_total_bars =
                 (metrics.batch_size * (metrics.context as usize + 1)) as u64;
             metrics.market_missing_bars = metrics.market_total_bars / 20;
+            metrics.adjusted_daily_total_bars = metrics.market_total_bars;
+            metrics.adjusted_daily_missing_bars = metrics.adjusted_daily_total_bars / 10;
             reporter.record_step(&metrics).unwrap();
         }
 
@@ -9353,15 +8728,7 @@ mod tests {
             .unwrap();
 
         let dir = root.join("0");
-        for exempt in CYCLE_EXEMPT {
-            assert!(
-                EXPECTED_BASES.contains(exempt),
-                "{exempt} is exempted from the cycle walk but is not a registered base at \
-                 all; the exemption is now covering for nothing and hiding whatever \
-                 replaced it"
-            );
-        }
-        for base in EXPECTED_BASES.iter().filter(|b| !CYCLE_EXEMPT.contains(b)) {
+        for base in bases_owned_by(shared::report::PretrainReportOwner::Run) {
             let path = dir.join(format!("{base}.report.bin"));
             assert!(path.exists(), "{base} was never written");
             let report = read_report(&path).expect("report reads back");
@@ -9375,6 +8742,103 @@ mod tests {
                 other => panic!("{base} has unexpected kind {other:?}"),
             }
         }
+        let coverage = read_report(&dir.join("pretrain_market_coverage.report.bin"))
+            .expect("observed-input coverage reads");
+        let ReportKind::MultiLine { series } = coverage.kind else {
+            panic!("observed-input coverage must be a multiline chart");
+        };
+        let daily = series
+            .iter()
+            .find(|line| line.label == "adjusted daily observed, run to date (%)")
+            .expect("daily availability must share the registered coverage report");
+        assert!((daily.values[0] - 90.0).abs() < 0.01);
+        let direct_nll = read_report(&dir.join("pretrain_direct_return_nll.report.bin"))
+            .expect("direct-return NLL reads");
+        assert_eq!(
+            direct_nll.y_label.as_deref(),
+            Some("categorical cross-entropy (nats per valid H row)")
+        );
+        assert!(direct_nll.title.contains("Fold Validation"));
+        let ReportKind::MultiLine { series } = direct_nll.kind else {
+            panic!("direct-return NLL must be a multiline chart");
+        };
+        assert_eq!(series.len(), 3 * DIRECT_RETURN_HORIZONS.len() + 1);
+        let find = |label: &str| {
+            series
+                .iter()
+                .find(|line| line.label == label)
+                .unwrap_or_else(|| panic!("missing direct NLL series {label}"))
+        };
+        let train_h1 = &find("train H1 cumulative log return").values;
+        assert_eq!(train_h1[0], 10.75);
+        assert!(train_h1[1].is_nan());
+        let model_h1 = &find("fold validation model H1 cumulative log return").values;
+        assert!(model_h1[0].is_nan());
+        assert_eq!(model_h1[1], 1.0);
+        let marginal_h1 =
+            &find("fold validation actual train-fit categorical marginal H1 cumulative log return")
+                .values;
+        assert!(marginal_h1[0].is_nan());
+        assert_eq!(marginal_h1[1], 2.0);
+        let train_mean = &find("train equal-horizon mean").values;
+        assert_eq!(train_mean[0], 17.25);
+        assert!(train_mean[1].is_nan());
+
+        let direct_valid =
+            read_report(&dir.join("pretrain_direct_return_valid_coverage.report.bin"))
+                .expect("direct-return valid-target report reads");
+        assert_eq!(
+            direct_valid.y_label.as_deref(),
+            Some("valid H rows (coverage curves are fractions)")
+        );
+        assert!(direct_valid.title.contains("Fold Validation Valid H Rows"));
+        let ReportKind::MultiLine { series } = direct_valid.kind else {
+            panic!("direct-return valid-target report must be a multiline chart");
+        };
+        assert_eq!(series.len(), 3 * DIRECT_RETURN_HORIZONS.len());
+        let find = |label: &str| {
+            series
+                .iter()
+                .find(|line| line.label == label)
+                .unwrap_or_else(|| panic!("missing direct coverage series {label}"))
+        };
+        let train_h100 = &find("train H100 valid H rows per optimizer batch").values;
+        assert_eq!(train_h100[0], 20.5);
+        assert!(train_h100[1].is_nan());
+        let val_h100 = &find("fold validation H100 valid H rows").values;
+        assert!(val_h100[0].is_nan());
+        assert_eq!(val_h100[1], 1.0);
+        let coverage_h100 = &find("fold validation H100 valid H-row coverage fraction").values;
+        assert!(coverage_h100[0].is_nan());
+        assert_eq!(coverage_h100[1], 0.01);
+        let gain = read_report(&dir.join("pretrain_direct_return_gain.report.bin"))
+            .expect("direct-return gain reads");
+        assert!(gain.title.contains("Actual Train-Fit Categorical Marginal"));
+        let ReportKind::MultiLine { series } = gain.kind else {
+            panic!("direct-return gain must be a multiline chart");
+        };
+        assert_eq!(series.len(), DIRECT_RETURN_HORIZONS.len());
+        assert!(series[0].values[0].is_nan());
+        assert_eq!(
+            series[0].values[1], 1.0,
+            "gain is the held-out actual marginal CE minus model CE"
+        );
+
+        let calibration = read_report(&dir.join("pretrain_direct_return_calibration.report.bin"))
+            .expect("direct-return calibration reads");
+        assert!(calibration
+            .title
+            .contains("Cumulative Log-Return Fold Validation"));
+        let ReportKind::MultiLine { series } = calibration.kind else {
+            panic!("direct-return calibration must be a multiline chart");
+        };
+        assert_eq!(series.len(), 6 * DIRECT_RETURN_HORIZONS.len());
+        let direction_count = series
+            .iter()
+            .find(|line| line.label == "fold validation H100 non-flat valid H rows")
+            .expect("undefined direction rates carry their denominator");
+        assert!(direction_count.values[0].is_nan());
+        assert_eq!(direction_count.values[1], 1.0);
 
         // And the CONVERSE, which is the half that kept shipping: a chart this module
         // writes but nobody registered is invisible in the TUI and nothing else would
@@ -9444,6 +8908,24 @@ mod tests {
                 "honest diagnostic label {required:?} is missing from {labels:?}"
             );
         }
+        let dof_labels = &labels[4..];
+        let expected_dof_labels: Vec<String> = BAR_DOF_NAMES
+            .iter()
+            .flat_map(|name| {
+                [
+                    format!("{name} independent marginal"),
+                    format!("{name} chain-conditional"),
+                ]
+            })
+            .collect();
+        assert_eq!(
+            dof_labels,
+            expected_dof_labels
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            "existing per-DOF independent/chain pair order is a serialized contract"
+        );
         assert!(
             !dir.join("pretrain_forecast_nll.report.bin").exists(),
             "the misleading old report base must not be written"
@@ -9752,10 +9234,8 @@ mod tests {
     /// finite value. It shipped writing three of five, which renders as blank panels —
     /// indistinguishable, in the TUI, from a bench that measured nothing.
     ///
-    /// The expectation is DERIVED from the registry rather than counted here, so adding a
-    /// trade chart extends this test by itself. A chart the standalone path genuinely
-    /// cannot produce belongs in [`CYCLE_EXEMPT`] with its reason, which is the same
-    /// convention the in-run cycle walk uses — one exemption list, not two.
+    /// The expectation is derived from the shared registry rather than counted here, so
+    /// adding an in-run trade chart extends this test automatically.
     #[test]
     fn the_standalone_bench_writes_every_registered_trade_base() {
         let root = scratch_dir("standalone_trade");
@@ -9767,7 +9247,6 @@ mod tests {
             .iter()
             .copied()
             .filter(|base| base.starts_with("pretrain_trade_"))
-            .filter(|base| !CYCLE_EXEMPT.contains(base))
             .collect();
         assert!(
             bases.len() >= 5,
@@ -9963,37 +9442,6 @@ mod tests {
         fs::remove_dir_all(&root).ok();
     }
 
-    fn populated_battery(checkpoint: PathBuf) -> TestBattery {
-        let mut battery = TestBattery::nan(checkpoint, "0f1e2d3c4b5a".to_owned());
-        battery.nll_bar = 21.4;
-        battery.nll_dof = [4.2, 4.3, 4.2, 4.3, 4.4];
-        battery.crps_dof = [0.003, 0.002, 0.19, 0.21, 0.44];
-        battery.rollout_nll_exact = [21.4, 22.1, 22.9, 23.8, 24.4];
-        battery.rollout_nll_dynamics = [21.5, 22.4, 23.6, 25.1, 26.2];
-        battery.dir_acc = 0.514;
-        battery.pit.accumulate(
-            &(Tensor::arange(1024, (Kind::Float, Device::Cpu)) / 1024.0)
-                .unsqueeze(-1)
-                .repeat([1, BAR_DOF as i64]),
-        );
-        battery.corpus_fingerprint = "c".repeat(64);
-        battery.split_bounds = (1_600_000_000_000, 1_650_000_000_000);
-        battery.nll_bar_conditional = 22.1;
-        battery.nll_dof_conditional = [4.2, 4.3, 4.55, 4.65, 4.4];
-        battery.nll_bar_se = 0.031;
-        battery.nll_bar_ci = (21.34, 21.46);
-        // Independent marginals sum above the chain-conditional joint score on identical rows.
-        battery.independent_marginal_nll_dof = [4.35, 4.62, 4.71, 4.78, 4.58];
-        battery.chain_conditional_nll_dof = [4.2, 4.3, 4.2, 4.3, 4.4];
-        battery.independent_marginal_nll_se = 0.019;
-        battery.selection_context = 896;
-        battery.deployed_context = 2048;
-        battery.reached_context = 1024;
-        battery.lr_plateau_fraction = 0.40;
-        battery.trade = populated_trade();
-        battery
-    }
-
     fn promoted_reporter(root: &Path, weights: &Path) -> PretrainReporter {
         let mut reporter = PretrainReporter::new(root, MARGINAL_DOF);
         reporter.set_held_out_baselines(smoothed_baselines());
@@ -10018,95 +9466,33 @@ mod tests {
     }
 
     #[test]
-    fn the_held_out_battery_is_written_once_with_every_scalar() {
-        let root = scratch_dir("battery");
+    fn validation_completion_preserves_integrity_without_writing_a_test_report() {
+        let root = scratch_dir("validation_finish");
         let weights = checkpoint(&root, "best.ot", b"promoted");
         let reporter = promoted_reporter(&root, &weights);
-        reporter.finish(&populated_battery(weights)).unwrap();
+        reporter.finish().expect("validation completion");
 
-        let report = read_report(&root.join("0").join("pretrain_test.report.bin")).unwrap();
         assert!(
-            report.title.contains("best.ot")
-                && report.title.contains("0f1e2d3c4b5a")
-                && report
-                    .title
-                    .contains(BarScoring::Smoothed.report_contract()),
-            "the battery must name the artifact, lineage, and exact scoring contract: {}",
-            report.title
+            root.join("0").join("pretrain_nll_bar.report.bin").exists(),
+            "validation reports must remain complete"
         );
-        let ReportKind::MultiLine { series } = report.kind else {
-            panic!("expected MultiLine");
-        };
-        let labels: Vec<&str> = series.iter().map(|s| s.label.as_str()).collect();
-        for expected in [
-            "smoothed-target cross entropy (diagnostic) nats/bar",
-            "smoothed-target cross entropy (diagnostic) vs uniform",
-            "smoothed-target cross entropy (diagnostic) vs marginal",
-            "uniform (smoothed-target cross entropy (diagnostic))",
-            "marginal (smoothed-target cross entropy (diagnostic))",
-            "nll r",
-            "crps w",
-            "pit tv u",
-            "TEACHER-FORCED score h64 exact belief advance",
-            "TEACHER-FORCED score h64 dynamics advance",
-            "dir acc",
-            "nll_bar se",
-            "nll_bar ci95 low",
-            "nll_bar conditional",
-            "marginal conditional",
-            "encoding identity nats",
-            "nll u | s!=0",
-            "nll r vs marginal",
-        ] {
-            assert!(labels.contains(&expected), "battery is missing {expected}");
-        }
-        for entry in &series {
-            assert_eq!(
-                entry.values.len(),
-                1,
-                "{} is not a single point",
-                entry.label
-            );
-            assert!(entry.values[0].is_finite(), "{} is not finite", entry.label);
-        }
-        let marginal_total: f64 = MARGINAL_DOF.iter().sum();
-        let gain = series
-            .iter()
-            .find(|s| s.label == "smoothed-target cross entropy (diagnostic) vs marginal")
-            .unwrap()
-            .values[0] as f64;
-        assert!((gain - (marginal_total - 21.4)).abs() < 1.0e-4);
+        assert!(
+            !root.join("0").join("pretrain_test.report.bin").exists(),
+            "normal completion must not emit a fresh terminal Test report"
+        );
 
         fs::remove_dir_all(&root).ok();
     }
 
     #[test]
-    fn the_battery_refuses_a_checkpoint_that_was_never_promoted() {
-        let root = scratch_dir("battery_wrong");
-        let promoted = checkpoint(&root, "best.ot", b"promoted");
-        let other = checkpoint(&root, "final.ot", b"not-promoted");
-        let reporter = promoted_reporter(&root, &promoted);
-        let error = reporter
-            .finish(&populated_battery(other))
-            .expect_err("scoring an unpromoted artifact must fail");
-        assert!(
-            error.to_string().contains("actually selected"),
-            "unexpected error: {error}"
-        );
-        assert!(!root.join("0").join("pretrain_test.report.bin").exists());
-
-        fs::remove_dir_all(&root).ok();
-    }
-
-    #[test]
-    fn the_battery_refuses_a_checkpoint_rewritten_after_promotion() {
-        let root = scratch_dir("battery_mutated");
+    fn validation_completion_refuses_a_checkpoint_rewritten_after_promotion() {
+        let root = scratch_dir("validation_finish_mutated");
         let weights = checkpoint(&root, "best.ot", b"promoted");
         let reporter = promoted_reporter(&root, &weights);
         fs::write(&weights, b"rewritten-after-promotion").unwrap();
         let error = reporter
-            .finish(&populated_battery(weights))
-            .expect_err("a mutated artifact must fail");
+            .finish()
+            .expect_err("a mutated promoted artifact must fail");
         assert!(
             error.to_string().contains("changed on disk"),
             "unexpected error: {error}"
@@ -10116,31 +9502,42 @@ mod tests {
     }
 
     #[test]
-    fn the_battery_refuses_an_in_memory_model_and_an_unpromoted_run() {
-        let root = scratch_dir("battery_guards");
-        let weights = checkpoint(&root, "best.ot", b"promoted");
-
-        let never_promoted = PretrainReporter::new(&root, MARGINAL_DOF);
-        let error = never_promoted
-            .finish(&populated_battery(weights.clone()))
-            .expect_err("a run that never promoted has nothing to score");
+    fn validation_completion_requires_a_promotion() {
+        let root = scratch_dir("validation_finish_unpromoted");
+        let reporter = PretrainReporter::new(&root, MARGINAL_DOF);
+        let error = reporter
+            .finish()
+            .expect_err("a run that never promoted has nothing to finalize");
         assert!(
             error.to_string().contains("no promotion was ever reported"),
             "unexpected error: {error}"
         );
 
-        let reporter = promoted_reporter(&root, &weights);
-        let mut battery = populated_battery(weights);
-        battery.model_lineage = "   ".to_owned();
-        let error = reporter
-            .finish(&battery)
-            .expect_err("an empty lineage means no reload happened");
-        assert!(
-            error
-                .to_string()
-                .contains("reloaded through BarWorldModel::load"),
-            "unexpected error: {error}"
-        );
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn legacy_terminal_test_reports_still_decode() {
+        let root = scratch_dir("legacy_test_report");
+        let generation = root.join("0");
+        write_chart(
+            &generation,
+            "pretrain_test",
+            "Pretrain Held-out Test Battery - historical evidence".to_owned(),
+            "single evaluation",
+            "held-out test split, historical",
+            ScaleKind::Linear,
+            vec![point_series("hard categorical nats/bar", 21.4)],
+        )
+        .expect("write legacy-shaped report");
+
+        let report = read_report(&generation.join("pretrain_test.report.bin"))
+            .expect("historical terminal report still decodes");
+        assert!(report.title.contains("historical evidence"));
+        let ReportKind::MultiLine { series } = report.kind else {
+            panic!("expected historical multi-line report");
+        };
+        assert_eq!(series[0].values, vec![21.4]);
 
         fs::remove_dir_all(&root).ok();
     }

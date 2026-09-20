@@ -1,8 +1,10 @@
 pub mod action_space;
+pub mod adjusted_daily;
 pub mod bar_dist;
 pub mod constants;
 pub mod cuda;
 pub mod dataset;
+pub mod direct_return;
 pub mod env;
 pub mod fa4;
 pub(crate) mod hashing;

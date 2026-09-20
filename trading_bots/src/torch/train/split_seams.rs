@@ -2124,9 +2124,8 @@ mod tests {
         assert_eq!(supports.lower_bounds(DOF_R).len(), bins);
     }
 
-    /// Every base this module writes must be registered, must land on disk and must carry a finite
-    /// value. The registry side of the two-sided contract; the exemption in
-    /// `pretrain_reports::tests::CYCLE_EXEMPT` names THIS test as the executor.
+    /// Every base owned by `PretrainReportOwner::SplitSeams` must land on disk with a finite
+    /// value and remain in the shared discovery registry.
     #[test]
     fn the_seam_audit_writes_every_registered_base() {
         let (_fx, corpus, supports) = fixture("bases");
@@ -2134,10 +2133,10 @@ mod tests {
         let dir = scratch("charts");
         write_bar_seams(&dir, &audit).expect("every chart writes");
         for base in BAR_SEAM_BASES {
-            assert!(
-                shared::report::PRETRAIN_REPORT_BASES.contains(base),
-                "{base} must be registered in shared::report::PRETRAIN_REPORT_BASES or the TUI \
-                 never scans for it"
+            assert_eq!(
+                shared::report::pretrain_report_owner(base),
+                Some(shared::report::PretrainReportOwner::SplitSeams),
+                "{base} must remain owned by the split-seam writer"
             );
             let path = dir.join(format!("{base}.report.bin"));
             assert!(path.exists(), "{base} was not written");

@@ -146,7 +146,11 @@ use super::pretrain::{
     configure_threads, evaluate, load_corpus, pinned_blocks, CorpusFlags, PinnedSet,
     EVAL_WINDOW_SEED,
 };
-use super::pretrain_stats::{Dispersion, BOOTSTRAP_DRAWS, BOOTSTRAP_SEED, CI_MASS};
+use super::pretrain_stats::{
+    bucket_of, mid_ranks, paired_block_statistic as blocked, percentile_cutpoints,
+    sample_standard_deviation, sorted_percentile, BlockSums, Dispersion, ProductMoments as Moments,
+    BOOTSTRAP_DRAWS, BOOTSTRAP_SEED, CI_MASS,
+};
 use super::trade_bench::{WindowPaths, MAX_BREAK_EVEN_BPS, TRADE_WINDOWS};
 
 /// This module scores `p(r | past)`, which is the head's own `r` row only because `r` heads
@@ -372,98 +376,6 @@ impl SkillPanel {
 // The block bootstrap, over sufficient statistics rather than over bars
 // ---------------------------------------------------------------------------
 
-/// A per-block accumulator a reported statistic is a function of.
-///
-/// Additivity is the whole requirement: a bootstrap draw is a sum of block accumulators, so
-/// any statistic expressible as a function of one is refittable EXACTLY in one pass over the
-/// blocks. Nothing here is linearized and no delta-method variance appears anywhere.
-trait BlockSums: Copy + Default {
-    fn absorb(&mut self, other: &Self);
-    /// Observations behind the accumulator, reported as `Dispersion::samples`.
-    fn count(&self) -> f64;
-}
-
-/// Resample BLOCKS with replacement and refit `stat` on each draw.
-///
-/// The scheme is [`super::pretrain_stats::block_bootstrap`]'s: the same `ChaCha12Rng` seeded
-/// with the same [`BOOTSTRAP_SEED`], [`BOOTSTRAP_DRAWS`] draws of `blocks.len()` blocks,
-/// percentiles of the draws at [`CI_MASS`], `se` their standard deviation. Because the seed
-/// is fixed and the block order is fixed, every statistic in this module is intervalled over
-/// the SAME sequence of resampled block sets. That is what makes two of them comparable, and
-/// it is what makes a paired difference (see
-/// [`ConfidenceCurve::top_minus_bottom_accuracy`]) an honest interval on the difference
-/// rather than a combination of two marginal ones.
-///
-/// Draws whose statistic is not finite are dropped rather than counted as zero: a resample
-/// that happens to contain no down-bar has no down-bar accuracy, and imputing one would
-/// narrow the interval with fabricated data.
-fn blocked<S: BlockSums>(blocks: &[S], stat: impl Fn(&S) -> f64) -> Dispersion {
-    let mut pooled = S::default();
-    for block in blocks {
-        pooled.absorb(block);
-    }
-    let mut out = Dispersion {
-        mean: stat(&pooled),
-        se: f64::NAN,
-        ci_low: f64::NAN,
-        ci_high: f64::NAN,
-        blocks: blocks.len(),
-        samples: pooled.count() as usize,
-    };
-    if blocks.len() < 2 {
-        // One block is one observation. A zero-width interval reported as precision is the
-        // failure this refuses to commit.
-        return out;
-    }
-    let mut rng = ChaCha12Rng::seed_from_u64(BOOTSTRAP_SEED);
-    let mut draws: Vec<f64> = Vec::with_capacity(BOOTSTRAP_DRAWS);
-    for _ in 0..BOOTSTRAP_DRAWS {
-        let mut draw = S::default();
-        for _ in 0..blocks.len() {
-            draw.absorb(blocks.choose(&mut rng).expect("blocks is non-empty"));
-        }
-        let value = stat(&draw);
-        if value.is_finite() {
-            draws.push(value);
-        }
-    }
-    if draws.len() < 2 {
-        return out;
-    }
-    draws.sort_by(f64::total_cmp);
-    out.se = standard_deviation(&draws);
-    let tail = (1.0 - CI_MASS) / 2.0;
-    out.ci_low = sorted_percentile(&draws, tail);
-    out.ci_high = sorted_percentile(&draws, 1.0 - tail);
-    out
-}
-
-fn standard_deviation(values: &[f64]) -> f64 {
-    if values.len() < 2 {
-        return f64::NAN;
-    }
-    let mean = values.iter().sum::<f64>() / values.len() as f64;
-    let variance =
-        values.iter().map(|v| (v - mean) * (v - mean)).sum::<f64>() / (values.len() - 1) as f64;
-    variance.sqrt()
-}
-
-/// Linear-interpolated percentile of an ascending slice, the convention every interval in
-/// this repository is reported under.
-fn sorted_percentile(sorted: &[f64], q: f64) -> f64 {
-    if sorted.is_empty() {
-        return f64::NAN;
-    }
-    let position = q.clamp(0.0, 1.0) * (sorted.len() - 1) as f64;
-    let lower = position.floor() as usize;
-    let upper = position.ceil() as usize;
-    if lower == upper {
-        return sorted[lower];
-    }
-    let weight = position - lower as f64;
-    sorted[lower] * (1.0 - weight) + sorted[upper] * weight
-}
-
 /// `numerator / denominator`, NaN on an empty denominator.
 ///
 /// A rate over zero observations is UNMEASURED, and returning zero for it would let "we saw
@@ -550,73 +462,6 @@ fn direction(value: f64) -> i8 {
 // ---------------------------------------------------------------------------
 // Sufficient statistics
 // ---------------------------------------------------------------------------
-
-/// Product moments of one `(x, y)` pair stream, enough for a Pearson correlation.
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
-struct Moments {
-    n: f64,
-    x: f64,
-    y: f64,
-    xx: f64,
-    yy: f64,
-    xy: f64,
-}
-
-impl Moments {
-    fn push(&mut self, x: f64, y: f64) {
-        if !x.is_finite() || !y.is_finite() {
-            return;
-        }
-        self.n += 1.0;
-        self.x += x;
-        self.y += y;
-        self.xx += x * x;
-        self.yy += y * y;
-        self.xy += x * y;
-    }
-
-    fn absorb(&mut self, other: &Self) {
-        self.n += other.n;
-        self.x += other.x;
-        self.y += other.y;
-        self.xx += other.xx;
-        self.yy += other.yy;
-        self.xy += other.xy;
-    }
-
-    /// Pearson `corr(x, y)`, NaN when either side does not vary.
-    ///
-    /// Written on the scaled cross-products `n Sxy - Sx Sy` rather than on centered sums so
-    /// the whole statistic is a function of the six additive numbers above and a bootstrap
-    /// Mean of the first argument, for the places a `Moments` is fed one quantity twice purely
-    /// to accumulate its mean.
-    fn mean_x(&self) -> f64 {
-        ratio(self.x, self.n)
-    }
-
-    /// refit needs no second pass over the bars.
-    fn corr(&self) -> f64 {
-        if self.n < 2.0 {
-            return f64::NAN;
-        }
-        let sxx = self.n * self.xx - self.x * self.x;
-        let syy = self.n * self.yy - self.y * self.y;
-        let sxy = self.n * self.xy - self.x * self.y;
-        if !(sxx > 0.0) || !(syy > 0.0) {
-            return f64::NAN;
-        }
-        sxy / (sxx * syy).sqrt()
-    }
-}
-
-impl BlockSums for Moments {
-    fn absorb(&mut self, other: &Self) {
-        Moments::absorb(self, other);
-    }
-    fn count(&self) -> f64 {
-        self.n
-    }
-}
 
 const PRED_UP_REAL_UP: usize = 0;
 const PRED_UP_REAL_DOWN: usize = 1;
@@ -895,32 +740,6 @@ impl BlockSums for Placements {
     fn count(&self) -> f64 {
         self.up_n + self.down_n
     }
-}
-
-/// Pooled mid-ranks of `values`, `1..=n`, with tied values sharing their mean rank.
-///
-/// Mid-ranks rather than ordinal ranks because a tie broken by array order is an arbitrary
-/// preference between two identical predictions, and both the Spearman IC and the AUC identity
-/// above are only exact under the mid-rank convention.
-fn mid_ranks(values: &[f64]) -> Vec<f64> {
-    let mut order: Vec<usize> = (0..values.len()).collect();
-    order.sort_by(|a, b| values[*a].total_cmp(&values[*b]));
-    let mut ranks = vec![f64::NAN; values.len()];
-    let mut start = 0usize;
-    while start < order.len() {
-        let mut end = start + 1;
-        while end < order.len() && values[order[end]] == values[order[start]] {
-            end += 1;
-        }
-        // Ranks are 1-based, so the tied group spans `start + 1 ..= end` and its mean rank is
-        // the midpoint of that closed interval.
-        let mean = 0.5 * ((start + 1) + end) as f64;
-        for slot in &order[start..end] {
-            ranks[*slot] = mean;
-        }
-        start = end;
-    }
-    ranks
 }
 
 // ---------------------------------------------------------------------------
@@ -1220,7 +1039,7 @@ fn within_name_ic(panel: &SkillPanel) -> WithinName {
     for moments in grouped.into_values() {
         let ic = moments.corr();
         if ic.is_finite() {
-            values.push((ic, moments.n as usize));
+            values.push((ic, moments.count() as usize));
         } else {
             dropped += 1;
         }
@@ -1260,7 +1079,7 @@ fn within_name_ic(panel: &SkillPanel) -> WithinName {
             return out;
         }
         draws.sort_by(f64::total_cmp);
-        out.se = standard_deviation(&draws);
+        out.se = sample_standard_deviation(&draws);
         let tail = (1.0 - CI_MASS) / 2.0;
         out.ci_low = sorted_percentile(&draws, tail);
         out.ci_high = sorted_percentile(&draws, 1.0 - tail);
@@ -1611,15 +1430,8 @@ impl SkillCutpoints {
 }
 
 fn pooled_cutpoints(panel: &SkillPanel, selector: impl Fn(&SkillBar) -> f64) -> Vec<f64> {
-    let mut values: Vec<f64> = panel
-        .flat()
-        .map(|(_, bar)| selector(bar))
-        .filter(|value| value.is_finite())
-        .collect();
-    values.sort_by(f64::total_cmp);
-    (1..DECILES)
-        .map(|k| sorted_percentile(&values, k as f64 / DECILES as f64))
-        .collect()
+    let values: Vec<f64> = panel.flat().map(|(_, bar)| selector(bar)).collect();
+    percentile_cutpoints(&values, DECILES)
 }
 
 /// Per-block cells induced by GIVEN cutpoints, plus the count of unrankable bars.
@@ -1650,9 +1462,7 @@ fn decile_assignment(
 /// Bucket index of `value` against ascending interior `cutpoints`: the number of cutpoints
 /// strictly below it, clamped into `0..DECILES`.
 fn decile_of(cutpoints: &[f64], value: f64) -> usize {
-    cutpoints
-        .partition_point(|cut| *cut < value)
-        .min(DECILES - 1)
+    bucket_of(cutpoints, value).min(DECILES - 1)
 }
 
 /// Spearman correlation of a short series against its own index, for the shape summary.
@@ -2901,6 +2711,7 @@ pub struct SkillArgs {
 /// intervals. The panel is therefore the same panel, and a disagreement between this module's
 /// numbers and the bench's is a real disagreement rather than two samples.
 pub fn pretrain_skill(args: SkillArgs) -> Result<()> {
+    super::pretrain::ensure_alpha_validation_split(args.split, "pretrain-skill")?;
     ensure!(args.windows > 0, "--windows must be positive");
     ensure!(args.context > 0, "--context must be positive");
     ensure!(args.batch_size > 0, "--batch-size must be positive");

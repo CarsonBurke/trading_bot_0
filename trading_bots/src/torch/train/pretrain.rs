@@ -33,7 +33,7 @@
 
 use anyhow::{anyhow, bail, ensure, Context, Result};
 use nvml_wrapper::Nvml;
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs::{self, File};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock};
@@ -42,16 +42,21 @@ use tch::{autocast, nn, Device, Kind, Reduction, Tensor};
 
 use crate::torch::bar_dist::{
     bar_categorical_kl, bar_crps_from_logits, bar_nll_decomposition, bar_nll_from_logits,
-    bar_nll_terms, bar_pit_from_logits, bar_supports_format_version, BarScoring, BarSupports,
-    BarSupportsProvenance, CategoricalBetaNll, BAR_DOF, BAR_DOF_NAMES,
-    BAR_EMISSION_ADAMW_NAME_SUBSTRINGS, BAR_SUPPORTS_FORMAT_VERSION, BAR_SUPPORTS_MOMENTS_VERSION,
-    BETA_NLL_VARIANCE_FLOOR_RATIO, DOF_R, DOF_S, DOF_U, DOF_V, NUM_BAR_BINS,
+    bar_nll_terms, bar_pit_from_logits, BarScoring, BarSupports, BarSupportsProvenance, BAR_DOF,
+    BAR_DOF_NAMES, BAR_EMISSION_ADAMW_NAME_SUBSTRINGS, DOF_R, DOF_S, DOF_U, DOF_V, NUM_BAR_BINS,
 };
 use crate::torch::cuda::cfg::configure_cuda;
 use crate::torch::dataset::{
     iso_ms, mix64, time_ids_without_market, BarBatch, BarCorpus, BarSampler, CorpusAnomalies,
-    CoverageAudit, PassCensus, PassLayout, PassLedger, PassPlan, Split, WindowRef,
-    BAR_TIME_CARDINALITY, BAR_TIME_CONDITIONING,
+    CorpusUniverseAudit, CoverageAudit, PassCensus, PassLayout, PassLedger, PassPlan, Split,
+    TimeRange, WindowRef, BAR_TIME_CARDINALITY, BAR_TIME_CONDITIONING, CORPUS_UNIVERSE_RULE,
+    DIRECT_RETURN_HORIZONS,
+};
+use crate::torch::direct_return::{
+    direct_return_targets_with_mask, direct_return_validation_sums, DirectReturnContextMode,
+    DirectReturnSupports, DirectReturnSupportsProvenance,
+    ValidationStats as DirectReturnValidationStats, ValidationSums as DirectReturnValidationSums,
+    DIRECT_RETURN_COUNT,
 };
 use crate::torch::hashing::file_sha256;
 use crate::torch::load::load_var_store_partial;
@@ -62,12 +67,12 @@ use crate::torch::optim::muon::{
 };
 use crate::torch::world_model::{
     bar_adamw_embedding_substrings, bar_adamw_scalar_substrings,
-    bar_muon_down_projection_substrings, bar_muon_name_substrings, world_model_metadata_path,
-    world_model_optimizer_path, world_model_supports_path, BarBetaNllProvenance, BarModules,
-    BarOptimizerAblationProvenance, BarOptimizerProvenance, BarPretrainRecovery,
-    BarRowLearnedLrProvenance, BarSupportSet, BarTrainingProvenance, BarWorldModel,
-    BarWorldModelMetadata, RolloutMode, BAR_ARCHITECTURE, BAR_LAYERS, BAR_MAX_CONTEXT,
-    BAR_MODEL_DIM,
+    bar_muon_down_projection_substrings, bar_muon_name_substrings,
+    world_model_direct_return_supports_path, world_model_metadata_path, world_model_optimizer_path,
+    world_model_supports_path, BarModules, BarOptimizerAblationProvenance, BarOptimizerProvenance,
+    BarPretrainRecovery, BarRowLearnedLrProvenance, BarSupportSet, BarTrainingProvenance,
+    BarWorldModel, BarWorldModelMetadata, RolloutMode, ALPHA_EVALUATION_POLICY, BAR_ARCHITECTURE,
+    BAR_LAYERS, BAR_MAX_CONTEXT, BAR_MODEL_DIM,
 };
 use shared::{
     paths::RUNS_PATH,
@@ -79,11 +84,11 @@ use super::optimizer_glue::named_trainable_variables;
 use super::pretrain_aux::{
     AuxiliaryConfig, AuxiliaryReport, AuxiliaryStream, AUXILIARY_HELDOUT_CONTEXT,
 };
+use super::pretrain_report_packet::PackedStepMetrics;
 use super::pretrain_reports::{
     belief_effective_rank, EpochBoundary, EpochMetrics, HeldOutBaselines, PitHistogram,
-    PretrainReporter, RivalSelection, SnapshotInput, StepMetrics, TestBattery, UnmeasuredMetric,
-    AUX_SHARE_WARN, AUX_SHARE_WARN_STREAK, DEPLOYED_CONTEXT_METRICS, MIN_FAN_SAMPLES,
-    ROLLOUT_HORIZONS,
+    PretrainReporter, SnapshotInput, StepMetrics, UnmeasuredMetric, AUX_SHARE_WARN,
+    AUX_SHARE_WARN_STREAK, DEPLOYED_CONTEXT_METRICS, MIN_FAN_SAMPLES, ROLLOUT_HORIZONS,
 };
 use super::pretrain_stats::{
     block_bootstrap, block_bootstrap_conditional_difference, calendar_month, window_scores_path,
@@ -239,6 +244,9 @@ const ADAMW_HIGH_LR_SCALAR_MULT: f64 = 5.0;
 /// quadratic in the learning rate is inert. Emission heads instead match NextLat
 /// with no weight decay.
 const ADAMW_TABLE_WEIGHT_DECAY_MULT: f64 = 150.0;
+/// Five-DOF joint bar density is task-normalized before this fixed auxiliary coefficient.
+pub const JOINT_BAR_AUXILIARY_COEFFICIENT: f64 = 0.25;
+const SUPPORT_SAMPLE_SEED_DOMAIN: u64 = 0xD1EC_7A11_5A77_0001;
 
 /// Realized continuation length handed to the rollout diagnostics and the candle
 /// snapshot writer. Must cover the longest reported rollout horizon, which the
@@ -359,15 +367,16 @@ pub const EVAL_WINDOW_SEED: u64 = 0xE7A1_5E7D_0001;
 /// context — a checkpoint the planner loads must have been trained at the positional range it
 /// runs at.
 const SELECTION_METRIC: &str =
-    "paired economics-primary selection on the pinned val windows at the fixed diagnostic \
-     context: after the first measured usable artifact, promote only a net moment-correct \
-     quadratic Kelly edge improvement over the unconditional-marginal null at the 0.25x \
-     leverage cap that clears 2.0 paired standard errors. A significant regression in \
-     conditional nll_bar or nll_dof[r] vetoes that edge-led promotion; conditional-NLL \
-     improvement never drives promotion, and unresolved or non-improving edge promotes \
-     nothing. The independent-window ruler is model-quality evidence, not proof of deployed \
-     profitability. The legacy NLL-only comparator is retained as pretrain_best_nll.ot only \
-     when it selects different weights and is never loaded by the planner";
+    "provisional density-era validation selection pending external shared-book selection, on \
+     pinned val windows at the fixed diagnostic context: after the first measured usable \
+     artifact, promote only a net moment-correct quadratic Kelly edge improvement over the \
+     unconditional-marginal null at the 0.25x leverage cap that clears 2.0 paired standard \
+     errors. A significant regression in conditional nll_bar or nll_dof[r] vetoes that \
+     edge-led promotion; conditional-NLL improvement never drives promotion, and unresolved \
+     or non-improving edge promotes nothing. The independent-window ruler is model-quality \
+     evidence, not proof of deployed profitability. The legacy NLL-only comparator is retained \
+     as pretrain_best_nll.ot only when it selects different weights and is never loaded by the \
+     planner";
 const SELECTION_WEIGHTS: [f64; BAR_DOF] = [1.0; BAR_DOF];
 /// Leverage cap the economic coordinate is measured at. See [`SELECTION_METRIC`] for why the
 /// 0.25x column rather than the 4x headline: at 0.25x the position size is a constant of the
@@ -586,7 +595,8 @@ pub struct PretrainArgs {
     pub seed: u64,
     pub data_dir: String,
     pub resolution_secs: u32,
-    /// Symbols with fewer bars than this are dropped from the corpus.
+    /// Required training bars strictly before `train_end`; total file length and held-out
+    /// coverage do not count toward admission.
     pub min_bars: usize,
     /// Extra bar resolutions, in seconds, trained on ALONGSIDE `resolution_secs`.
     ///
@@ -719,6 +729,10 @@ pub struct PretrainArgs {
     /// bars a split contains — so a restricted run will need `--freeze-supports` to reuse
     /// the unrestricted fit, which is the correct choice for comparability and is recorded.
     pub min_dollar_volume: f64,
+    /// Feed exact zeros into the six adjusted-daily features while retaining the identical v8
+    /// 518-wide direct-return projection. This is the matched no-context control, not a
+    /// missing-data path, and is persisted in every checkpoint.
+    pub mask_adjusted_daily_context: bool,
     /// Refuse to start if measured capacity would REDUCE `batch_size`, instead of clamping.
     ///
     /// # The confound this exists to make unlaunchable
@@ -755,11 +769,11 @@ pub struct PretrainArgs {
     /// of an algebraic identity, and the value is recorded in the checkpoint metadata and in
     /// the run's report so a future reader can tell which schedule produced a number.
     pub lr_plateau_fraction: f64,
-    /// Exponent for the categorical beta-NLL ablation. Absence keeps the proper Hard
-    /// categorical NLL objective exactly. Present values lie in `(0, 1]` and reweight each
-    /// per-factor Hard NLL by the detached predicted variance relative to that factor's
-    /// train-marginal variance.
-    pub beta_nll: Option<f64>,
+    /// Number of folds in the canonical rolling-origin plan. Paired with
+    /// [`Self::rolling_fold_index`]; absence selects the single canonical fold.
+    pub rolling_fold_count: Option<usize>,
+    /// Zero-based fold retrained by this independent run.
+    pub rolling_fold_index: Option<usize>,
     /// Enable row-wise signed-delta learning-rate adaptation for Muon-routed matrices.
     /// Disabled by default; AdamW parameters and auxiliary-resolution updates are excluded.
     pub sdlr: bool,
@@ -773,6 +787,14 @@ pub struct PretrainArgs {
 }
 
 impl PretrainArgs {
+    fn direct_return_context_mode(&self) -> DirectReturnContextMode {
+        if self.mask_adjusted_daily_context {
+            DirectReturnContextMode::Masked
+        } else {
+            DirectReturnContextMode::Enabled
+        }
+    }
+
     fn corpus_flags(&self) -> CorpusFlags {
         CorpusFlags {
             data_dir: self.data_dir.clone(),
@@ -1341,7 +1363,7 @@ fn probe_shape_used_bytes(
     modules: &BarModules,
     supports: &BarSupports,
     growth_support: &GrowthSupport,
-    beta_nll: Option<&CategoricalBetaNll>,
+    direct_return_supports: &DirectReturnSupports,
     sample: &BarBatch,
     args: &PretrainArgs,
     optimizer: &mut PretrainOptimizer,
@@ -1357,12 +1379,14 @@ fn probe_shape_used_bytes(
                 growth_support,
                 &sample.dof,
                 &sample.time_ids,
+                &sample.adjusted_daily,
+                args.direct_return_context_mode(),
                 context,
                 args.dyn_horizon as i64,
                 args.lambda_dyn,
                 args.lambda_kl,
-                beta_nll,
                 BarScoring::Hard,
+                direct_return_supports,
                 device,
             )
         });
@@ -1391,7 +1415,7 @@ fn probe_capacity(
     modules: &BarModules,
     supports: &BarSupports,
     growth_support: &GrowthSupport,
-    beta_nll: Option<&CategoricalBetaNll>,
+    direct_return_supports: &DirectReturnSupports,
     sampler: &BarSampler,
     optimizer: &mut PretrainOptimizer,
     args: &PretrainArgs,
@@ -1417,7 +1441,7 @@ fn probe_capacity(
             modules,
             supports,
             growth_support,
-            beta_nll,
+            direct_return_supports,
             &sample,
             args,
             optimizer,
@@ -1642,7 +1666,10 @@ fn validate_recorded_pretrain_scoring(recorded: Option<&str>) -> Result<()> {
     Ok(())
 }
 
-fn validate_pretrain_weights_contract(weights: Option<&str>) -> Result<()> {
+fn validate_pretrain_weights_contract(
+    weights: Option<&str>,
+    direct_return_context_mode: DirectReturnContextMode,
+) -> Result<()> {
     let Some(weights) = weights else {
         return Ok(());
     };
@@ -1658,6 +1685,14 @@ fn validate_pretrain_weights_contract(weights: Option<&str>) -> Result<()> {
             metadata_path.display()
         )
     })?;
+    metadata.validate_schema()?;
+    ensure!(
+        metadata.direct_return_context_mode == direct_return_context_mode,
+        "initialization checkpoint uses {} adjusted-daily context, but this run requested {}; \
+         use the matching --mask-adjusted-daily-context setting or omit --weights",
+        metadata.direct_return_context_mode.as_str(),
+        direct_return_context_mode.as_str(),
+    );
     validate_recorded_pretrain_scoring(
         metadata
             .training
@@ -1729,6 +1764,13 @@ fn preflight_resume(args: &PretrainArgs) -> Result<Option<PretrainResume>> {
         "--seed mismatch with resume checkpoint"
     );
     ensure!(
+        metadata.direct_return_context_mode == args.direct_return_context_mode(),
+        "--mask-adjusted-daily-context mismatch with resume checkpoint: checkpoint is {}, \
+         requested arm is {}",
+        metadata.direct_return_context_mode.as_str(),
+        args.direct_return_context_mode().as_str(),
+    );
+    ensure!(
         args.lr_plateau_fraction.to_bits() == training.lr_plateau_fraction.to_bits(),
         "--lr-plateau-fraction mismatch with resume checkpoint"
     );
@@ -1764,10 +1806,6 @@ fn preflight_resume(args: &PretrainArgs) -> Result<Option<PretrainResume>> {
         "checkpoint or validation cadence mismatch with resume checkpoint"
     );
     ensure!(
-        args.beta_nll.map(f64::to_bits) == recovery.beta_nll.map(f64::to_bits),
-        "--beta-nll mismatch with resume checkpoint"
-    );
-    ensure!(
         args.ablation_lr.to_bits() == recovery.ablation_lr.to_bits()
             && args.smd_meta_lr.to_bits() == recovery.smd_meta_lr.to_bits(),
         "optimizer hyperparameters mismatch with resume checkpoint"
@@ -1798,11 +1836,77 @@ fn preflight_resume(args: &PretrainArgs) -> Result<Option<PretrainResume>> {
         checkpoint,
         optimizer,
         metadata,
+
         recovery,
         next_step,
     }))
 }
+#[derive(Clone, Debug)]
+struct ResolvedPretrainFold {
+    plan_hash: String,
+    fold_index: u32,
+    fit: TimeRange,
+    validation: TimeRange,
+    embargo_steps: usize,
+}
 
+fn resolve_pretrain_fold(corpus: &BarCorpus, args: &PretrainArgs) -> Result<ResolvedPretrainFold> {
+    let count = args.rolling_fold_count.unwrap_or(1);
+    let index = args.rolling_fold_index.unwrap_or(0);
+    let plan = corpus
+        .rolling_origin_plan(count, EVAL_WINDOW_SEED, args.validation_windows)
+        .context("failed resolving canonical rolling-origin plan")?;
+    plan.validate()?;
+    let plan_hash = plan.canonical_sha256();
+    let fold = plan
+        .folds
+        .get(index)
+        .with_context(|| format!("rolling fold {index} is absent from a {count}-fold plan"))?;
+    Ok(ResolvedPretrainFold {
+        plan_hash,
+        fold_index: fold.id,
+        fit: fold.fit,
+        validation: fold.validation,
+        embargo_steps: plan.embargo_steps,
+    })
+}
+fn validate_resume_fold_identity(
+    recorded_plan_hash: &str,
+    recorded_fold_index: u32,
+    fold: &ResolvedPretrainFold,
+) -> Result<()> {
+    ensure!(
+        recorded_plan_hash == fold.plan_hash,
+        "rolling plan mismatch with resume checkpoint: recorded {}, resolved {}",
+        recorded_plan_hash,
+        fold.plan_hash
+    );
+    ensure!(
+        recorded_fold_index == fold.fold_index,
+        "rolling fold mismatch with resume checkpoint: recorded {}, resolved {}",
+        recorded_fold_index,
+        fold.fold_index
+    );
+    Ok(())
+}
+
+fn fold_support_sample_seed(fold: &ResolvedPretrainFold) -> u64 {
+    let hash_prefix = fold.plan_hash.get(..16).unwrap_or(&fold.plan_hash);
+    let plan_bits = u64::from_str_radix(hash_prefix, 16).unwrap_or(0);
+    mix64(
+        EVAL_WINDOW_SEED ^ SUPPORT_SAMPLE_SEED_DOMAIN,
+        mix64(plan_bits, fold.fold_index as u64),
+    )
+}
+
+fn require_adjusted_daily_pretrain_coverage(available: usize, missing: usize) -> Result<()> {
+    ensure!(
+        available > 0,
+        "direct-return pretraining requires at least one adjusted daily file for the admitted \
+         corpus; all {missing} symbols are unavailable"
+    );
+    Ok(())
+}
 /// Everything `pretrain` does before the first optimizer step, split out so a test can drive
 /// one validation of a real trainer against a synthetic corpus instead of only unit-testing
 /// the pieces around it. `runs_root` is a parameter for exactly that reason: a test must not
@@ -1818,7 +1922,7 @@ fn preflight_resume(args: &PretrainArgs) -> Result<Option<PretrainResume>> {
 /// instead of an accident of the machine the suite runs on.
 fn build_trainer(mut args: PretrainArgs, runs_root: &str, device: Device) -> Result<Trainer> {
     validate_args(&args)?;
-    validate_pretrain_weights_contract(args.weights.as_deref())?;
+    validate_pretrain_weights_contract(args.weights.as_deref(), args.direct_return_context_mode())?;
     let resume = preflight_resume(&args)?;
     if device.is_cuda() {
         configure_cuda();
@@ -1829,13 +1933,27 @@ fn build_trainer(mut args: PretrainArgs, runs_root: &str, device: Device) -> Res
         tch::Cuda::manual_seed_all(args.seed);
     }
 
+    let corpus = load_corpus(&args.corpus_flags())?;
+    let (daily_available, daily_missing) = corpus.adjusted_daily_file_coverage();
+    require_adjusted_daily_pretrain_coverage(daily_available, daily_missing)?;
     let run = RunDir::create_fresh(runs_root, args.run.as_deref())
         .context("failed to create pretrain run dir")?;
 
-    let corpus = load_corpus(&args.corpus_flags())?;
     // Taken AFTER any symbol restriction, because the symbol set decides which bars a split
     // contains. The corpus also grows under running jobs and the split instants are
     // percentiles of it, so the identity of the data is a first-class output of the run.
+    let fold = resolve_pretrain_fold(&corpus, &args)?;
+    println!(
+        "[pretrain] canonical fold {}/{} fit [{}..{}) validation [{}..{}) embargo {} plan {} terminal Test spent",
+        fold.fold_index,
+        args.rolling_fold_count.unwrap_or(1),
+        fold.fit.start_ms,
+        fold.fit.end_ms,
+        fold.validation.start_ms,
+        fold.validation.end_ms,
+        fold.embargo_steps,
+        &fold.plan_hash[..12.min(fold.plan_hash.len())],
+    );
     let corpus_fingerprint = corpus.identity_fingerprint();
     if let Some(resume) = &resume {
         let training = resume
@@ -1843,6 +1961,11 @@ fn build_trainer(mut args: PretrainArgs, runs_root: &str, device: Device) -> Res
             .training
             .as_ref()
             .expect("preflight requires training provenance");
+        validate_resume_fold_identity(
+            &training.rolling_plan_sha256,
+            training.rolling_fold_index,
+            &fold,
+        )?;
         ensure!(
             corpus_fingerprint == training.corpus_fingerprint,
             "corpus fingerprint mismatch with resume checkpoint: recorded {}, current {}",
@@ -1858,6 +1981,9 @@ fn build_trainer(mut args: PretrainArgs, runs_root: &str, device: Device) -> Res
                 .to_string_lossy()
                 .into_owned(),
         );
+        // A recovery checkpoint's sidecar is already the immutable support geometry for the
+        // optimizer state being resumed; treat its internally injected path as frozen input.
+        args.freeze_supports = true;
     }
 
     // RECORDED, not inferred, and recorded HERE — before the first optimizer step and before
@@ -1870,12 +1996,19 @@ fn build_trainer(mut args: PretrainArgs, runs_root: &str, device: Device) -> Res
     // `args`, is asked for them: under `--derive-split-bounds` the args carry no instants at
     // all and the RESOLVED pair is the only thing a later reader can validate against.
     let (b0, b1) = corpus.split_bounds();
+    let universe_audit = corpus.universe_audit().clone();
     run.record_provenance(RunProvenance {
         split_bounds_ms: [b0, b1],
         split_bounds_pinned: !args.derive_split_bounds,
         resolution_secs: args.resolution_secs,
         corpus_fingerprint: corpus_fingerprint.clone(),
         min_bars: args.min_bars,
+        universe_admission_rule: Some(CORPUS_UNIVERSE_RULE.to_owned()),
+        universe_train_end_ms: Some(universe_audit.train_end_cutoff_ms),
+        minimum_training_bars: Some(universe_audit.minimum_training_bars),
+        admitted_symbols_digest: Some(universe_audit.admitted_symbols_digest.clone()),
+        admitted_symbols: Some(universe_audit.admitted_symbol_names.clone()),
+        evaluation_policy: Some(ALPHA_EVALUATION_POLICY.to_owned()),
         min_dollar_volume: args.min_dollar_volume,
         data_dir: args.data_dir.clone(),
         diagnostic_context_bars: args.diagnostic_context,
@@ -1885,19 +2018,27 @@ fn build_trainer(mut args: PretrainArgs, runs_root: &str, device: Device) -> Res
     })
     .context("failed recording the run's provenance")?;
 
-    let train_bars = corpus.split_bars(Split::Train) as u64;
+    let train_bars = (0..corpus.series_count())
+        .map(|symbol| {
+            let (lo, hi) = corpus.range(symbol, fold.fit);
+            (hi - lo) as u64
+        })
+        .sum::<u64>();
     ensure!(
         train_bars > 0,
-        "training split is empty; check --data-dir, --resolution-secs and --min-bars"
+        "rolling fold fit range is empty; check the pinned split bounds and fold selection"
     );
 
-    let (supports, supports_frozen) = fit_supports(&corpus, &args, &corpus_fingerprint)?;
+    let (supports, supports_frozen) = fit_supports(&corpus, &args, &corpus_fingerprint, &fold)?;
     let supports_dev = supports.to_device(device);
-    let beta_nll = args
-        .beta_nll
-        .map(|beta| supports_dev.categorical_beta_nll(beta))
-        .transpose()
-        .context("failed constructing categorical beta-NLL geometry")?;
+    let direct_return_supports = fit_direct_return_supports(
+        &corpus,
+        &args,
+        &corpus_fingerprint,
+        &fold,
+        &universe_audit.admitted_symbols_digest,
+    )?;
+    let direct_return_supports_dev = direct_return_supports.to_device(device);
     // Before the capacity probe, because the detached diagnostic is part of the measured
     // step footprint. Construction also validates the fitted raw-payoff law before the run.
     let growth_deployment = GrowthSupport::new(&supports_dev, device)
@@ -1938,7 +2079,7 @@ fn build_trainer(mut args: PretrainArgs, runs_root: &str, device: Device) -> Res
         )?;
     }
 
-    let (train_samplers, eval) = build_samplers(&corpus, &args)?;
+    let (train_samplers, eval) = build_samplers(&corpus, &args, &fold)?;
 
     // The ramp is derived from what the card MEASURABLY holds, before anything is announced
     // or any step is taken. Everything downstream — the step count, the learning-rate
@@ -2006,7 +2147,7 @@ fn build_trainer(mut args: PretrainArgs, runs_root: &str, device: Device) -> Res
             &modules,
             &supports_dev,
             &growth_deployment,
-            beta_nll.as_ref(),
+            &direct_return_supports_dev,
             &train_samplers[RAMP_STAGES - 1],
             &mut optimizer,
             &args,
@@ -2029,8 +2170,8 @@ fn build_trainer(mut args: PretrainArgs, runs_root: &str, device: Device) -> Res
     if let Some(notice) = notice {
         println!("{notice}");
     }
-    // Every consumer of `args.batch_size` — the eval passes, the test battery, the recorded
-    // provenance — must see the batch the run will actually use, not the one it asked for.
+    // Every consumer of `args.batch_size` — evaluation passes and recorded provenance — must see
+    // the batch the run will actually use, not the one it asked for.
     args.batch_size = base_batch;
 
     // The auxiliary resolutions, AFTER the ramp is resolved because their pass partitions
@@ -2070,6 +2211,12 @@ fn build_trainer(mut args: PretrainArgs, runs_root: &str, device: Device) -> Res
     let corpus_audits: Vec<CorpusAnomalies> = std::iter::once(corpus.scan_anomalies())
         .chain(aux.iter().map(AuxiliaryStream::scan_anomalies))
         .collect();
+    let universe_audits: Vec<CorpusUniverseAudit> = std::iter::once(universe_audit.clone())
+        .chain(
+            aux.iter()
+                .map(|stream| stream.corpus().universe_audit().clone()),
+        )
+        .collect();
     for audit in &corpus_audits {
         println!("[corpus] {}", audit.summary());
     }
@@ -2096,14 +2243,14 @@ fn build_trainer(mut args: PretrainArgs, runs_root: &str, device: Device) -> Res
     // so the plan needs the ramp that will execute, and the step count is then whatever it
     // takes to issue every window the plan assigned — not a bar-token target divided by an
     // average step size, which is what let a run label 71% of a pass "one epoch".
-    let pass = PassPlan::new(
+    let pass = PassPlan::new_in_range(
         &corpus,
-        Split::Train,
+        fold.fit,
         &stage_contexts(),
         &ramp_token_weights(&derived_batch_ramp),
         args.seed,
     )
-    .context("failed partitioning the training split across the ramp contexts")?;
+    .context("failed partitioning the fold fit range across the ramp contexts")?;
     print_pass_plan(&pass, base_batch, &derived_batch_ramp);
     let stage_steps =
         Schedule::steps_for_pass(pass.windows_per_stage(), base_batch, &derived_batch_ramp);
@@ -2254,6 +2401,8 @@ fn build_trainer(mut args: PretrainArgs, runs_root: &str, device: Device) -> Res
     // artifact instead of in a log line.
     CorpusAnomalies::write_report_of(&corpus_audits, &run.gens)
         .context("failed writing the corpus anomaly report")?;
+    CorpusUniverseAudit::write_report_of(&universe_audits, &run.gens)
+        .context("failed writing the corpus universe-integrity report")?;
     // Taken before the trainer owns the set, and re-checked at every boundary.
     let snapshot_window_fingerprint = pinned_fingerprint(&eval.snapshot);
     Ok(Trainer {
@@ -2264,7 +2413,9 @@ fn build_trainer(mut args: PretrainArgs, runs_root: &str, device: Device) -> Res
         run,
         supports,
         supports_dev,
-        beta_nll,
+        direct_return_supports,
+        direct_return_supports_dev,
+        fold,
         support_set_dev,
         growth_supports,
         vs,
@@ -2280,6 +2431,7 @@ fn build_trainer(mut args: PretrainArgs, runs_root: &str, device: Device) -> Res
         corpus_fingerprint,
         supports_frozen,
         symbol_count: corpus.symbols().len(),
+        corpus_universe_audit: universe_audit,
         pass_ledger,
         pass_layout,
         pass,
@@ -2454,6 +2606,20 @@ pub fn pretrain_candles(args: CandleArgs) -> Result<()> {
     Ok(())
 }
 
+pub(super) fn ensure_alpha_validation_split(split: Split, command: &str) -> Result<()> {
+    if split == Split::Test {
+        anyhow::bail!(
+            "{command}: current Test is spent; a future bounded chronological generation and \
+             campaign-final permit are required"
+        );
+    }
+    ensure!(
+        split == Split::Val,
+        "{command} is a validation-only alpha-development command"
+    );
+    Ok(())
+}
+
 /// Arguments of the standalone trading-bench entry point.
 #[derive(Clone, Debug)]
 pub struct TradeArgs {
@@ -2462,8 +2628,7 @@ pub struct TradeArgs {
     pub weights: String,
     /// Directory the `pretrain_trade_*.report.bin` charts are written into.
     pub output: String,
-    /// Held-out split to trade. `val` is the pinned diagnostic set a run reports on every
-    /// validation; `test` is the split that is scored once.
+    /// Validation split to trade during alpha development.
     pub split: Split,
     /// Pinned windows to draw. The bench trades the first
     /// [`trade_bench::TRADE_WINDOWS`] of them, and the count is part of the pin, so this
@@ -2485,6 +2650,7 @@ pub struct TradeArgs {
 /// [`pinned_blocks`] blocks the interval. The numbers are therefore the same numbers the
 /// run would report for that artifact, not a second implementation of them.
 pub fn pretrain_trade(args: TradeArgs) -> Result<()> {
+    ensure_alpha_validation_split(args.split, "pretrain-trade")?;
     ensure!(args.windows > 0, "--windows must be positive");
     ensure!(args.context > 0, "--context must be positive");
     ensure!(args.batch_size > 0, "--batch-size must be positive");
@@ -2615,14 +2781,9 @@ pub struct CalibrationArgs {
     pub fit_windows: usize,
     /// Windows of the drawn prefix to TRADE.
     ///
-    /// Defaults to [`trade_bench::TRADE_WINDOWS`] and every published number was measured at
-    /// that value, which is why it is a parameter rather than the constant read in place: a
-    /// fresh panel with nothing to stay comparable to should spend the windows it has, and a
-    /// panel that IS being compared must not move. `Split::Val` keeps 256 so this batch stays
-    /// comparable to itself; a one-shot `Split::Test` read can ask for thousands, because the
-    /// interval is set by the `(symbol, calendar month)` block count of the traded slice and
-    /// Test holds 43,466 near-disjoint windows at context 896 against the 256 a default draw
-    /// would trade.
+    /// Defaults to [`trade_bench::TRADE_WINDOWS`] and every published validation number was
+    /// measured at that value. Keep the default for comparable panels; raise it only for an
+    /// explicitly wider validation study.
     pub trade_windows: usize,
     /// Conditioning context. Must match the context the reported bench reads were taken at.
     pub context: i64,
@@ -2637,15 +2798,9 @@ pub struct CalibrationArgs {
     /// call is itself measurable — see [`trade_bench::MzFit::block_dispersion_measured`], which
     /// says whether the slope varies across blocks by more than its own noise.
     pub restrict_symbols: Vec<String>,
-    /// Draw the windows, block them, write the window manifest and the held-out power census,
-    /// then STOP — before any checkpoint is opened and before any economic number exists.
-    ///
-    /// This is not a convenience. `Split::Test` is scored ONCE for the whole campaign, and the
-    /// only way to establish that the command addresses the intended data, that the block
-    /// partition is disjoint, and that the population has the power to resolve the effect being
-    /// looked for is to perform every step that decides WHAT is measured and none of the steps
-    /// that measure it. A rehearsal that scored anything would consume the draw it was
-    /// rehearsing.
+    /// Draw the validation windows, block them, write the window manifest and the held-out
+    /// power census, then STOP — before any checkpoint is opened and before any economic
+    /// number exists.
     pub dry_run: bool,
 }
 
@@ -2688,18 +2843,12 @@ pub(super) struct SplitCensus {
     pub(super) symbols: usize,
 }
 
-/// The population a held-out pass will measure on, and the interval that population can
-/// support — established by counting, with nothing scored.
-///
-/// Exists because `Split::Test` is scored ONCE for the whole campaign. "Does this split have
-/// the power to resolve the effect we are looking for" has to be answerable before the draw is
-/// spent, and it is answerable: the interval is set by the BLOCK count, the block count is a
-/// property of the draw rather than of the model, and the draw is reproducible from
-/// [`EVAL_WINDOW_SEED`] alone.
+/// The validation population a held-out pass will measure on, and the interval that population
+/// can support — established by counting, with nothing scored.
 pub(super) struct HeldOutPower {
     pub(super) split: Split,
     pub(super) context: i64,
-    /// Every split, so the addressed one is readable against the two it is not.
+    /// Development-visible splits only; the spent Test population is deliberately absent.
     pub(super) census: Vec<SplitCensus>,
     pub(super) windows_drawn: usize,
     pub(super) traded_windows: usize,
@@ -2740,7 +2889,7 @@ impl HeldOutPower {
         fit: &[u64],
     ) -> Self {
         let distinct = |ids: &[u64]| ids.iter().collect::<BTreeSet<_>>().len();
-        let census = [Split::Train, Split::Val, Split::Test]
+        let census = [Split::Train, Split::Val]
             .into_iter()
             .map(|which| {
                 let sampler = BarSampler::new(corpus, which, context, EVAL_WINDOW_SEED);
@@ -2926,6 +3075,7 @@ impl HeldOutPower {
 /// the shape of job the serialization rule exists for. Two checkpoints take about two and a
 /// half minutes and about 1.1 GiB of device memory when a device is allowed.
 pub fn pretrain_calibration(args: CalibrationArgs) -> Result<()> {
+    ensure_alpha_validation_split(args.split, "pretrain-calibration")?;
     ensure!(
         !args.checkpoints.is_empty(),
         "--checkpoint must be given at least once, as path@step"
@@ -3672,27 +3822,26 @@ fn validate_args(args: &PretrainArgs) -> Result<()> {
          than extreme ones, so they are refused at the boundary instead of clamped.",
         args.lr_plateau_fraction
     );
-    if let Some(beta) = args.beta_nll {
+    ensure!(
+        args.rolling_fold_count.is_some() == args.rolling_fold_index.is_some(),
+        "--rolling-fold-count and --rolling-fold-index must be supplied together"
+    );
+    if let (Some(count), Some(index)) = (args.rolling_fold_count, args.rolling_fold_index) {
+        ensure!(count > 0, "--rolling-fold-count must be positive");
         ensure!(
-            beta.is_finite() && beta > 0.0 && beta <= 1.0,
-            "--beta-nll must lie in (0, 1], got {beta}"
-        );
-        ensure!(
-            args.exact_batch,
-            "--beta-nll requires --exact-batch so the objective arm retains the declared batch \
-             and matched global target-step accounting"
-        );
-        ensure!(
-            !args.sdlr && args.optimizer_ablation.is_none(),
-            "--beta-nll conflicts with optimizer experiments; vary one training mechanism at a \
-             time"
-        );
-        ensure!(
-            args.auxiliary_resolutions.is_empty(),
-            "--beta-nll supports only the primary resolution so every variance weight uses one \
-             fitted support geometry"
+            index < count,
+            "--rolling-fold-index {index} must be below --rolling-fold-count {count}"
         );
     }
+    ensure!(
+        !args.derive_split_bounds,
+        "rolling pretraining requires pinned split bounds; --derive-split-bounds is not allowed"
+    );
+    ensure!(
+        args.auxiliary_resolutions.is_empty(),
+        "direct-return pretraining does not admit auxiliary resolutions; every target horizon \
+         and fitted support is owned by the selected fold's deployment resolution"
+    );
     ensure!(
         args.ablation_lr.is_finite() && args.ablation_lr > 0.0,
         "--ablation-lr must be finite and positive, got {}",
@@ -3912,33 +4061,138 @@ fn fit_supports(
     corpus: &BarCorpus,
     args: &PretrainArgs,
     corpus_fingerprint: &str,
+    fold: &ResolvedPretrainFold,
 ) -> Result<(BarSupports, bool)> {
-    let path = args
-        .supports
-        .as_ref()
-        .map(PathBuf::from)
-        .unwrap_or_else(|| corpus.supports_path());
-    let (supports, frozen) =
-        fit_supports_at(corpus, &path, SupportsFit::of(args), corpus_fingerprint)?;
-    if !supports.bin_means_measured() {
-        let version = bar_supports_format_version(&path)?;
-        bail!(
-            "the bar supports this run loaded, {}, are format version {version} and carry no \
-             fitted per-bin moments, so this run can never write a checkpoint: every promotion \
-             persists these supports beside the weights as a version \
-             {BAR_SUPPORTS_FORMAT_VERSION} `.supports.<res>.json` sidecar, and that schema \
-             requires the moments. Point --supports at a version \
-             {BAR_SUPPORTS_MOMENTS_VERSION} artifact carrying fitted moments, or measure them \
-             onto this exact geometry with `bar-supports-moments --supports {} \
-             --output-supports <new path>`, which never refits the bins and so leaves the \
-             `nll_bar` scale untouched",
-            path.display(),
-            path.display()
+    if let Some(path) = args.supports.as_ref().map(PathBuf::from) {
+        let (supports, frozen) =
+            fit_supports_at(corpus, &path, SupportsFit::of(args), corpus_fingerprint)?;
+        ensure!(
+            args.freeze_supports,
+            "an explicit --supports artifact is frozen geometry; pass --freeze-supports"
         );
+        return Ok((supports, frozen));
     }
-    Ok((supports, frozen))
+    let support_sample_seed = fold_support_sample_seed(fold);
+    let samples = corpus
+        .sample_dof_in_range(fold.fit, args.support_samples, support_sample_seed)
+        .into_iter()
+        .map(|(_, dof)| dof)
+        .collect::<Vec<_>>();
+    ensure!(
+        !samples.is_empty(),
+        "fold fit range produced no bar-support rows"
+    );
+    let supports = BarSupports::fit(&samples).with_provenance(BarSupportsProvenance {
+        corpus_fingerprint: corpus_fingerprint.to_owned(),
+        split_bounds: (fold.fit.start_ms, fold.fit.end_ms),
+        sample_count: samples.len(),
+        fitted_utc: chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string(),
+    });
+    ensure!(
+        supports.bin_means_measured(),
+        "fresh fold-local supports lack fitted moments"
+    );
+    Ok((supports, false))
 }
 
+#[derive(Debug)]
+struct DirectReturnSupportRows {
+    values: Vec<[f64; DIRECT_RETURN_COUNT]>,
+    population: usize,
+    endpoint_schedule_evaluations: usize,
+    target_evaluations: usize,
+}
+
+fn direct_return_support_rows(
+    corpus: &BarCorpus,
+    fit: TimeRange,
+    capacity: usize,
+    support_sample_seed: u64,
+) -> Result<DirectReturnSupportRows> {
+    let sample = corpus.sample_direct_return_rows(fit, capacity, support_sample_seed)?;
+    ensure!(
+        sample.rows.len() == capacity.min(sample.population),
+        "direct-return sampler returned {} rows for capacity {capacity} and population {}",
+        sample.rows.len(),
+        sample.population
+    );
+
+    let mut endpoint_cache = HashMap::new();
+    let mut endpoint_schedule_evaluations = 0usize;
+    let mut target_evaluations = 0usize;
+    let mut values = Vec::with_capacity(sample.rows.len());
+    for location in sample.rows {
+        let decision_ts = corpus.bars(location.symbol)[location.decision_bar].ts();
+        let endpoints = match endpoint_cache.get(&decision_ts) {
+            Some(endpoints) => *endpoints,
+            None => {
+                let endpoints = corpus.direct_return_endpoint_timestamps(decision_ts);
+                endpoint_cache.insert(decision_ts, endpoints);
+                endpoint_schedule_evaluations += 1;
+                endpoints
+            }
+        };
+        target_evaluations += 1;
+        let row = corpus
+            .direct_return_targets_at_endpoints(
+                location.symbol,
+                location.decision_bar,
+                fit,
+                &endpoints,
+            )?
+            .context("direct-return sampler emitted a row without complete H100 evidence")?;
+        values.push(row.map(f64::from));
+    }
+    debug_assert_eq!(target_evaluations, values.len());
+    debug_assert!(endpoint_schedule_evaluations <= target_evaluations);
+
+    Ok(DirectReturnSupportRows {
+        values,
+        population: sample.population,
+        endpoint_schedule_evaluations,
+        target_evaluations,
+    })
+}
+
+fn fit_direct_return_supports(
+    corpus: &BarCorpus,
+    args: &PretrainArgs,
+    corpus_fingerprint: &str,
+    fold: &ResolvedPretrainFold,
+    admitted_universe_digest: &str,
+) -> Result<DirectReturnSupports> {
+    let capacity = args.support_samples;
+    let support_sample_seed = fold_support_sample_seed(fold);
+    let sampled = direct_return_support_rows(corpus, fold.fit, capacity, support_sample_seed)?;
+    ensure!(
+        sampled.target_evaluations == sampled.values.len(),
+        "direct-return target evaluation census drifted"
+    );
+    ensure!(
+        sampled.endpoint_schedule_evaluations <= sampled.target_evaluations,
+        "direct-return schedule cache evaluated more schedules than target rows"
+    );
+    ensure!(
+        sampled.values.len() == capacity.min(sampled.population),
+        "direct-return support fit did not consume the exact sampled-row budget"
+    );
+    let rows = sampled.values;
+    ensure!(
+        !rows.is_empty(),
+        "fold fit range has no complete six-horizon direct-return rows"
+    );
+    let provenance = DirectReturnSupportsProvenance {
+        corpus_fingerprint: corpus_fingerprint.to_owned(),
+        fit: fold.fit,
+        fold_plan_hash: fold.plan_hash.clone(),
+        fold_index: fold.fold_index,
+        admitted_universe_digest: admitted_universe_digest.to_owned(),
+        train_seed: args.seed,
+        support_sample_seed,
+        row_count: rows.len(),
+    };
+    DirectReturnSupports::fit(&rows, provenance)
+}
 /// The three run scalars a support fit depends on, so [`fit_supports_at`] does not need a whole
 /// [`PretrainArgs`] and a caller cannot silently pass the wrong `usize` for the `u64`.
 #[derive(Clone, Copy, Debug)]
@@ -4085,15 +4339,15 @@ fn require_supports_provenance(
     Ok(true)
 }
 
-/// One training sampler per ramp stage plus the pinned evaluation sets.
 fn build_samplers(
     corpus: &BarCorpus,
     args: &PretrainArgs,
+    fold: &ResolvedPretrainFold,
 ) -> Result<(Vec<BarSampler>, EvaluationSets)> {
     let train = (0..RAMP_STAGES)
-        .map(|stage| BarSampler::new(corpus, Split::Train, stage_context(stage), args.seed))
-        .collect::<Vec<_>>();
-    let eval = EvaluationSets::new(corpus, args)?;
+        .map(|stage| BarSampler::new_in_range(corpus, fold.fit, stage_context(stage), args.seed))
+        .collect::<Result<Vec<_>>>()?;
+    let eval = EvaluationSets::new(corpus, args, fold.validation)?;
     Ok((train, eval))
 }
 
@@ -4101,27 +4355,24 @@ fn build_samplers(
 // Pinned evaluation sets
 // ---------------------------------------------------------------------------
 
-/// Every held-out set, all pinned by [`EVAL_WINDOW_SEED`] so they are byte-identical across
-/// runs, across seeds and across ablations.
+/// Every validation set, pinned by [`EVAL_WINDOW_SEED`] so it is byte-identical across runs,
+/// seeds and ablations.
 ///
 /// * `diagnostic` runs at a fixed context for every run. It carries the calibration
 ///   metrics and is the curve to compare between experiments.
 /// * `promotion` runs at the deployed context, and is the only input to checkpoint
 ///   selection.
 /// * `snapshot` supplies the candle pictures and the rollout diagnostics.
-/// * `test` and `test_snapshot` are touched exactly once, by the terminal battery,
-///   and never inform any decision during the run. `test_diagnostic` is the same split at
-///   the fixed diagnostic context, for the run that never reached the deployed one: the
-///   terminal number has to be measured at the context the checkpoint was selected at, or it
-///   measures positional extrapolation instead of generalization.
+///
+/// The spent campaign Test population is deliberately absent. Ordinary alpha development
+/// cannot construct it merely by starting or completing training.
 struct EvaluationSets {
     diagnostic: PinnedSet,
     promotion: PinnedSet,
     snapshot: PinnedSet,
-    test: PinnedSet,
-    test_diagnostic: PinnedSet,
-    test_snapshot: PinnedSet,
 }
+
+const ROLLING_VALIDATION_LABEL: &str = "rolling_validation";
 
 /// A pinned held-out window set. `pub(super)` so the sibling audit modules — the directional
 /// skill audit, the horizon sweep — draw the SAME windows under the SAME seed through the same
@@ -4130,6 +4381,7 @@ pub(super) struct PinnedSet {
     pub(super) sampler: BarSampler,
     pub(super) windows: Vec<WindowRef>,
     pub(super) context: i64,
+    label: String,
 }
 
 impl PinnedSet {
@@ -4156,14 +4408,41 @@ impl PinnedSet {
             sampler,
             windows,
             context,
+            label: split.as_str().to_owned(),
         })
+    }
+
+    pub(super) fn pinned_in_range(
+        corpus: &BarCorpus,
+        range: TimeRange,
+        context: i64,
+        count: usize,
+    ) -> Result<Self> {
+        let sampler = BarSampler::new_in_range(corpus, range, context, EVAL_WINDOW_SEED)?;
+        let windows = sampler.pinned_windows(count);
+        ensure!(
+            !windows.is_empty(),
+            "validation range [{}..{}) has no window of {context} bars",
+            range.start_ms,
+            range.end_ms
+        );
+        Ok(Self {
+            sampler,
+            windows,
+            context,
+            label: ROLLING_VALIDATION_LABEL.to_owned(),
+        })
+    }
+
+    pub(super) fn label(&self) -> &str {
+        &self.label
     }
 }
 
 impl EvaluationSets {
-    fn new(corpus: &BarCorpus, args: &PretrainArgs) -> Result<Self> {
-        let build = |split: Split, context: i64, count: usize| -> Result<PinnedSet> {
-            PinnedSet::pinned(corpus, split, context, count)
+    fn new(corpus: &BarCorpus, args: &PretrainArgs, validation: TimeRange) -> Result<Self> {
+        let build = |context: i64, count: usize| -> Result<PinnedSet> {
+            PinnedSet::pinned_in_range(corpus, validation, context, count)
         };
         let deployed = stage_context(RAMP_STAGES - 1);
         ensure!(
@@ -4171,16 +4450,9 @@ impl EvaluationSets {
             "--diagnostic-context must exceed the {SNAPSHOT_HORIZON}-bar snapshot horizon"
         );
         Ok(Self {
-            diagnostic: build(Split::Val, args.diagnostic_context, args.validation_windows)?,
-            promotion: build(Split::Val, deployed, args.validation_windows)?,
-            snapshot: build(Split::Val, args.diagnostic_context, args.snapshot_windows)?,
-            test: build(Split::Test, deployed, args.validation_windows)?,
-            test_diagnostic: build(
-                Split::Test,
-                args.diagnostic_context,
-                args.validation_windows,
-            )?,
-            test_snapshot: build(Split::Test, args.diagnostic_context, args.snapshot_windows)?,
+            diagnostic: build(args.diagnostic_context, args.validation_windows)?,
+            promotion: build(deployed, args.validation_windows)?,
+            snapshot: build(args.diagnostic_context, args.snapshot_windows)?,
         })
     }
 }
@@ -4506,11 +4778,10 @@ struct Trainer {
     run: RunDir,
     supports: BarSupports,
     supports_dev: BarSupports,
-    /// Device-resident fitted-moment geometry for the opt-in categorical beta-NLL objective.
-    /// `None` is the production proper-NLL path and performs no beta-specific arithmetic.
-    beta_nll: Option<CategoricalBetaNll>,
+    direct_return_supports: DirectReturnSupports,
+    direct_return_supports_dev: DirectReturnSupports,
+    fold: ResolvedPretrainFold,
     /// Device-resident support set. One entry today; the row-routing set is what
-    /// `rollout_beliefs` and a future merged-resolution corpus need.
     support_set_dev: BarSupportSet,
     /// Device-resident constants of the raw-payoff growth diagnostic, one per bin geometry:
     /// index 0 is the deployment resolution and `1 + i` is `aux[i]`. Built once to avoid a
@@ -4541,6 +4812,8 @@ struct Trainer {
     supports_frozen: bool,
     /// Symbols the corpus held after the liquidity gate, recorded in the checkpoint.
     symbol_count: usize,
+    /// Exact point-in-time admission record folded into every checkpoint's lineage.
+    corpus_universe_audit: CorpusUniverseAudit,
     /// The corpus partition this run's epochs are passes over. Owns the per-stage window
     /// assignment; `windows_per_stage` is what the step schedule was derived from.
     pass: PassPlan,
@@ -4688,10 +4961,10 @@ struct Trainer {
 struct StepLoss {
     nll_bar: f64,
     nll_dof: [f64; BAR_DOF],
-    /// Likelihood term attached to the optimizer. Equal to `nll_bar` outside beta-NLL.
-    objective_nll: f64,
-    beta_weight_mean_dof: [f64; BAR_DOF],
-    beta_variance_floor_share_dof: [f64; BAR_DOF],
+    /// Equal-horizon direct-return categorical CE attached to the optimizer.
+    direct_return_nll_mean: f64,
+    direct_nll_horizon: [f64; DIRECT_RETURN_COUNT],
+    direct_valid_horizon: [f64; DIRECT_RETURN_COUNT],
     dyn_loss: f64,
     kl_loss: f64,
     /// Training-batch mean raw-payoff growth diagnostic in nats per bar under the deployed
@@ -4839,24 +5112,9 @@ fn significance_band(dispersion: Dispersion, multiple: f64) -> f64 {
     }
 }
 
-/// THE paired economics-primary promotion rule, as a pure function of the economic measurement
-/// and its two predictive guards.
-///
-/// Extracted from the validation loop so the criterion and both vetoes can be exercised without
-/// a Trainer, corpus, or card. Positive edge differences are improvements; positive NLL
-/// differences are regressions:
-///
-/// * significant edge improvement promotes when conditional NLL does not significantly regress;
-/// * significant conditional-NLL improvement never promotes without significant edge;
-/// * a significant conditional-NLL regression vetoes an otherwise promotable edge improvement;
-/// * a significant `r`-factor regression vetoes an otherwise promotable edge improvement;
-/// * unresolved or non-improving edge promotes nothing.
-///
-/// `first` short-circuits only after the current candidate itself is measurable; paired deltas
-/// are intentionally absent without an incumbent. Every later decision requires finite paired
-/// edge, conditional-NLL and `r` evidence because either missing guard leaves the promotion
-/// unresolved rather than clearing the candidate.
-
+/// The provisional density-era validation promotion rule. Economic edge is the sole promotion
+/// criterion; aggregate conditional NLL and the traded return factor are unconditional
+/// non-regression guards pending external shared-book selection.
 fn selection_outcome(
     first: bool,
     candidate_usable: bool,
@@ -4874,22 +5132,23 @@ fn selection_outcome(
     if first {
         return SelectionOutcome::Promoted;
     }
-    let (Some(edge), Some(nll), Some(dof)) = (edge_gain, nll_delta, dof_delta) else {
+    let (Some(edge), Some(nll), Some(dof)) = (
+        edge_gain,
+        nll_delta.filter(|nll| nll.mean.is_finite() && nll.se.is_finite() && nll.se >= 0.0),
+        dof_delta,
+    ) else {
         return SelectionOutcome::Unmeasurable;
     };
     let measured = |dispersion: Dispersion| {
         dispersion.mean.is_finite() && dispersion.se.is_finite() && dispersion.se >= 0.0
     };
-    if !measured(edge) || !measured(nll) || !measured(dof) {
+    if !measured(edge) || !measured(dof) {
         return SelectionOutcome::Unmeasurable;
     }
-
-    let edge_band = significance_band(edge, SELECTION_EDGE_SE_MULTIPLE);
-    if edge.mean <= edge_band {
+    if edge.mean <= significance_band(edge, SELECTION_EDGE_SE_MULTIPLE) {
         return SelectionOutcome::RefusedNoResolvedEdgeImprovement;
     }
-    let nll_band = significance_band(nll, SELECTION_NLL_SE_MULTIPLE);
-    if nll.mean > nll_band {
+    if nll.mean > significance_band(nll, SELECTION_NLL_SE_MULTIPLE) {
         return SelectionOutcome::RefusedNllGuard;
     }
     if dof.mean > significance_band(dof, SELECTION_GUARD_SE_MULTIPLE) {
@@ -4918,8 +5177,8 @@ fn fmt_incumbent_nats(value: f64) -> String {
 }
 
 impl Trainer {
-    /// Consumes the trainer: `PretrainReporter::finish` takes the reporter by value,
-    /// which makes reporting a promotion after the terminal battery a compile error.
+    /// Consumes the trainer: `PretrainReporter::finish` takes the reporter by value, which makes
+    /// reporting a promotion after validation completion a compile error.
     fn run_training(mut self) -> Result<()> {
         let started = Instant::now();
         let mut last_stage = if self.next_step == 0 {
@@ -5042,11 +5301,9 @@ impl Trainer {
             metrics.step = step;
             metrics.nll_bar = loss.nll_bar;
             metrics.nll_dof = loss.nll_dof;
-            if self.beta_nll.is_some() {
-                metrics.beta_nll_objective = loss.objective_nll;
-                metrics.beta_nll_weight_mean_dof = loss.beta_weight_mean_dof;
-                metrics.beta_nll_variance_floor_share_dof = loss.beta_variance_floor_share_dof;
-            }
+            metrics.direct_return_nll_horizon = loss.direct_nll_horizon;
+            metrics.direct_return_valid_horizon = loss.direct_valid_horizon;
+            metrics.direct_return_nll_mean = loss.direct_return_nll_mean;
             metrics.dyn_loss = loss.dyn_loss;
             metrics.kl_loss = loss.kl_loss;
             metrics.total_loss = loss.total;
@@ -5105,7 +5362,9 @@ impl Trainer {
             // it here would understate coverage by one bar per window.
             let span = sample.dof.size();
             metrics.market_missing_bars = sample.market_missing as u64;
+            metrics.adjusted_daily_missing_bars = sample.adjusted_daily_missing_bars as u64;
             metrics.market_total_bars = (span[0] * span[1]) as u64;
+            metrics.adjusted_daily_total_bars = metrics.market_total_bars;
             self.reporter.record_step(&metrics)?;
             self.warn_on_auxiliary_domination(step, dyn_share, kl_share);
 
@@ -5200,10 +5459,11 @@ impl Trainer {
         }
 
         let elapsed = started.elapsed().as_secs_f64();
+        let selection_nll_role = "conditional nll guard level";
         println!(
             "pretrain finished: {} steps in {elapsed:.1}s ({:.2} step/s), {} promotions under \
              the paired economics-primary rule, promoted edge@0.25x {:+.4} bps/bar with \
-             conditional nll guard level {:.4} nats/bar; the promoted artifact's {}-bar \
+             {selection_nll_role} {:.4} nats/bar; the promoted artifact's {}-bar \
              selected-context held-out nll is {:.4} nats/bar under {} scoring ({:+.4} vs the \
              calibrated marginal {:.4}, {:+.4} vs uniform {:.4})",
             self.schedule.total_steps,
@@ -5316,14 +5576,13 @@ impl Trainer {
                 "not written: no eligible read had finite conditional nll".to_owned()
             } else if self.nll_rule_step == self.promoted_step {
                 format!(
-                    "the same final step {} ({} comparator promotions), so the test battery \
-                     does not score duplicate weights",
+                    "the same final step {} ({} comparator promotions)",
                     self.nll_rule_step, self.nll_rule_promotions,
                 )
             } else {
                 format!(
-                    "{NLL_RULE_CHECKPOINT} from step {} ({} comparator promotions), kept for the \
-                     test-split comparison and never loaded by the planner",
+                    "{NLL_RULE_CHECKPOINT} from step {} ({} comparator promotions), retained as \
+                     validation-selected historical evidence and never loaded by the planner",
                     self.nll_rule_step, self.nll_rule_promotions,
                 )
             },
@@ -5342,261 +5601,44 @@ impl Trainer {
             "no checkpoint was ever promoted; there is nothing for the planner to load"
         );
 
-        let (battery, dyn_identity) = self.test_battery()?;
-        // Finalize the report BEFORE the verdict. A run whose dynamics head failed the
-        // guard is exactly the run someone needs the full report for, and a hard failure
-        // that also destroys `.report.bin` would be the second-worst outcome after shipping
-        // the head silently.
-        self.reporter.finish(&battery)?;
-        check_dynamics_beats_identity(dyn_identity, self.args.dyn_horizon as i64)
+        let dyn_identity = self.completion_dynamics_ratio()?;
+        // Finalize validation reports BEFORE the verdict. A run whose dynamics head failed the
+        // guard is exactly the run someone needs the full report for.
+        let horizon = self.args.dyn_horizon as i64;
+        self.reporter.finish()?;
+        check_dynamics_beats_identity(dyn_identity, horizon)
     }
 
-    /// Score the promoted checkpoint on the TEST split, exactly once, at the very end.
-    /// The model is reloaded from disk rather than read out of memory so the reported
-    /// numbers provably belong to the artifact the planner will load.
-    fn test_battery(&self) -> Result<(TestBattery, f64)> {
+    /// Reload the promoted checkpoint and measure its speculative dynamics-draft head against
+    /// the trivial `z_k = h_t` identity map on the validation set that selected it.
+    fn completion_dynamics_ratio(&self) -> Result<f64> {
         let checkpoint = self.run.weights.join("pretrain_best.ot");
         let metadata = world_model_metadata_path(&checkpoint);
         let world =
             BarWorldModel::load(&checkpoint, &metadata, self.device).with_context(|| {
                 format!(
-                    "the promoted checkpoint {} could not be reloaded for the test battery",
+                    "the promoted checkpoint {} could not be reloaded for the completion guard",
                     checkpoint.display()
                 )
             })?;
-        let lineage = world.lineage_sha256().to_owned();
-        ensure!(
-            !lineage.is_empty(),
-            "the promoted checkpoint carries no lineage hash"
-        );
-
-        // The test split is scored at the context the checkpoint was SELECTED at. Scoring a
-        // model that never trained past 896 bars on 2048-bar windows measures positional
-        // extrapolation, not generalization, and it would be the one number in the run nobody
-        // could interpret.
-        let set = self.test_set();
-        let stats = evaluate(
-            world.modules(),
-            world.deployment_supports(),
-            set,
-            self.args.batch_size,
-            self.device,
-            true,
-            BarScoring::Hard,
-            None,
-            trade_bench::TRADE_WINDOWS,
-        )?;
-        let dispersion = self.dispersion(set, &stats);
-        let window = pinned_snapshot_window(&self.eval.test_snapshot, self.device);
-        let exact = rollout_nll(
-            world.modules(),
-            world.supports(),
-            &window,
-            RolloutMode::Exact,
-            BarScoring::Hard,
-        );
-        let dynamics = rollout_nll(
-            world.modules(),
-            world.supports(),
-            &window,
-            RolloutMode::Dynamics,
-            BarScoring::Hard,
-        );
-        let dyn_identity = self.measure_dynamics_versus_identity(
-            world.modules(),
-            world.deployment_supports(),
-            set,
-        )?;
-
-        println!(
-            "test split ({} windows at context {}, {} scoring): nll {} nats/bar, {:+.4} vs the \
-             calibrated marginal {:.4}, {:+.4} vs uniform {:.4}; rollout h1 {:.4} exact / \
-             {:.4} dynamics",
-            set.windows.len(),
-            set.context,
-            BarScoring::Hard,
-            dispersion,
-            self.marginal_nll_bar - stats.nll_bar,
-            self.marginal_nll_bar,
-            self.baselines.uniform_nll_bar - stats.nll_bar,
-            self.baselines.uniform_nll_bar,
-            exact[0],
-            dynamics[0],
-        );
-        println!("test split {}", self.per_dof_line(&stats));
-        println!(
-            "test split conditional nll {:.4} nats/bar ({:+.4} vs the conditional marginal \
-             {:.4}); the {:.4}-nat s=0 => u=v=0.5 identity is excluded",
-            stats.nll_bar_conditional,
-            self.baselines.marginal_nll_bar_conditional() - stats.nll_bar_conditional,
-            self.baselines.marginal_nll_bar_conditional(),
-            self.baselines.encoding_identity_nats,
-        );
-        let independent: f64 = stats.independent_marginal_nll_dof.iter().sum();
-        let chain: f64 = stats.chain_conditional_nll_dof.iter().sum();
-        println!(
-            "test split independent per-DOF marginal NLL sum {independent:.4} +/- {:.4} \
-             nats/bar vs chain-conditional joint NLL {chain:.4} on identical rows: \
-             marginal-joint score gap {:.4}. Each marginal conditions only on strictly past \
-             bars, but their sum is not a joint forecast likelihood; the chain score is. The \
-             gap is descriptive and does not isolate model dependence under misspecification.",
-            stats.independent_marginal_nll_se,
-            independent - chain,
-        );
-        println!(
-            "test split selection context {} bars (deployed {}, longest trained {})",
-            self.selection_context, self.eval.promotion.context, self.reached_context,
-        );
-
-        let trade = self.trade(set, &stats);
-        let mut battery = TestBattery::nan(checkpoint, lineage);
-        battery.nll_bar = stats.nll_bar;
-        battery.nll_dof = stats.nll_dof;
-        battery.crps_dof = stats.crps_dof;
-        battery.rollout_nll_exact = exact;
-        battery.rollout_nll_dynamics = dynamics;
-        battery.pit = stats.pit;
-        battery.dir_acc = stats.dir_acc;
-        battery.corpus_fingerprint = self.corpus_fingerprint.clone();
-        battery.split_bounds = self.split_bounds();
-        battery.nll_bar_conditional = stats.nll_bar_conditional;
-        battery.nll_dof_conditional = stats.nll_dof_conditional;
-        battery.nll_bar_se = dispersion.se;
-        battery.nll_bar_ci = (dispersion.ci_low, dispersion.ci_high);
-        battery.independent_marginal_nll_dof = stats.independent_marginal_nll_dof;
-        battery.chain_conditional_nll_dof = stats.chain_conditional_nll_dof;
-        battery.independent_marginal_nll_se = stats.independent_marginal_nll_se;
-        battery.selection_context = self.selection_context;
-        battery.deployed_context = self.eval.promotion.context;
-        battery.reached_context = self.reached_context;
-        battery.trade = trade;
-        for line in battery.trade.report_lines() {
-            println!("test split {line}");
-        }
-        // The historical counterfactual beside the planner artifact: score what the legacy
-        // NLL-only rule would have shipped on the SAME independent test windows and in the same
-        // pass shape, only when it differs from the economics-primary winner. These reads
-        // compare model-quality rulers; they do not establish deployed profitability.
-        let rival = self.nll_rule_battery(set, &battery)?;
-        battery.nll_rule = rival;
-        Ok((battery, dyn_identity))
-    }
-
-    /// Score the legacy NLL-only comparator on the test split beside the economics-primary
-    /// artifact.
-    ///
-    /// `None` when both rules chose the same final step. In that case the duplicate comparator
-    /// and its sidecars are removed without a second test evaluation. When they differ, both
-    /// artifacts are scored on one independent set at one context.
-    fn nll_rule_battery(
-        &self,
-        set: &PinnedSet,
-        promoted: &TestBattery,
-    ) -> Result<Option<RivalSelection>> {
-        let checkpoint = self.run.weights.join(NLL_RULE_CHECKPOINT);
-        if self.nll_rule_step == self.promoted_step {
-            for redundant in [
-                world_model_metadata_path(&checkpoint),
-                world_model_supports_path(&checkpoint, self.args.resolution_secs),
-                window_scores_path(&checkpoint),
-                checkpoint.clone(),
-            ] {
-                if redundant.exists() {
-                    std::fs::remove_file(&redundant).with_context(|| {
-                        format!(
-                            "failed removing redundant comparator {}",
-                            redundant.display()
-                        )
-                    })?;
-                }
-            }
-            println!(
-                "test split: economics-primary and legacy NLL-only selection both chose step {}; \
-                 the duplicate comparator artifact and sidecars were removed without scoring. \
-                 `pretrain_best.ot` remains the planner artifact.",
-                self.promoted_step,
-            );
-            return Ok(None);
-        }
-        if !checkpoint.exists() {
-            println!(
-                "test split: the legacy NLL-only rule wrote no comparator artifact, so only the \
-                 economics-primary winner is scored."
-            );
-            return Ok(None);
-        }
-        let metadata = world_model_metadata_path(&checkpoint);
-        let world =
-            BarWorldModel::load(&checkpoint, &metadata, self.device).with_context(|| {
-                format!(
-                    "the legacy NLL-only comparator {} could not be reloaded for the test \
-                     comparison",
-                    checkpoint.display(),
-                )
-            })?;
-        let stats = evaluate(
-            world.modules(),
-            world.deployment_supports(),
-            set,
-            self.args.batch_size,
-            self.device,
-            true,
-            BarScoring::Hard,
-            None,
-            trade_bench::TRADE_WINDOWS,
-        )?;
-        let trade = self.trade(set, &stats);
-        let rival = RivalSelection {
-            checkpoint: checkpoint.clone(),
-            model_lineage: world.lineage_sha256().to_owned(),
-            step: self.nll_rule_step,
-            nll_bar_conditional: stats.nll_bar_conditional,
-            nll_dof: stats.nll_dof,
-            // `CapPoint::edge` is net log growth per bar; the economic criterion is reported in
-            // bps everywhere.
-            selection_edge_bps: trade.cap_curve[SELECTION_CAP_SLOT].edge * 1.0e4,
-            edge_at_default: trade.model_edge().mean * 1.0e4,
-            sharpe: trade.policies[trade_bench::POLICY_QUARTER].sharpe,
+        let set = if self.selection_context == self.eval.diagnostic.context {
+            &self.eval.diagnostic
+        } else {
+            &self.eval.promotion
         };
-        let promoted_edge = promoted.trade.cap_curve[SELECTION_CAP_SLOT].edge * 1.0e4;
-        println!(
-            "test split RULE COMPARISON on {} independent windows at context {}: ECONOMICS-PRIMARY \
-             pick (step {}) edge@{SELECTION_CAP:.2}x {promoted_edge:+.4} bps/bar, 4x edge {:+.4}, \
-             quarter-quadratic-Kelly sharpe {:+.2}, conditional nll {:.4}; legacy NLL-only \
-             comparator (step {}) edge@{SELECTION_CAP:.2}x {:+.4}, 4x edge {:+.4}, \
-             quarter-quadratic-Kelly sharpe {:+.2}, conditional nll {:.4}. Economics-primary \
-             minus comparator: edge {:+.4} bps/bar, conditional nll {:+.4} nats/bar. These are \
-             independent-window diagnostics that fed neither decision and do not prove deployed \
-             profitability.",
-            set.windows.len(),
-            set.context,
-            self.promoted_step,
-            promoted.trade.model_edge().mean * 1.0e4,
-            promoted.trade.policies[trade_bench::POLICY_QUARTER].sharpe,
-            promoted.nll_bar_conditional,
-            rival.step,
-            rival.selection_edge_bps,
-            rival.edge_at_default,
-            rival.sharpe,
-            rival.nll_bar_conditional,
-            promoted_edge - rival.selection_edge_bps,
-            promoted.nll_bar_conditional - rival.nll_bar_conditional,
-        );
-        Ok(Some(rival))
+        self.measure_dynamics_versus_identity(world.modules(), world.deployment_supports(), set)
     }
 
     /// Measure the checkpoint's speculative dynamics-draft head against the trivial
     /// `z_k = h_t` identity map, and report it. The VERDICT is
-    /// [`check_dynamics_beats_identity`], which `run_training` applies only after the report
-    /// has been finalized.
     ///
     /// [`BarDynamics`] is exported only as a latent draft that must be verified against the
     /// canonical exact-cache law. [`RolloutMode::Dynamics`] recursively probes it here, so
     /// `dyn / identity > 1` means the artifact carries a draft component that actively
     /// degrades the belief it is asked to advance — a trained MLP losing to doing nothing.
-    /// That is never a legitimate end state, and it is silent in every other
-    /// number the battery prints: the head's own loss keeps shrinking along with the beliefs
-    /// it is chasing, so only the ratio against the trivial baseline exposes it.
+    /// That is never a legitimate end state, and it is silent in the other predictive metrics:
+    /// the head's own loss keeps shrinking along with the beliefs it is chasing, so only the
+    /// ratio against the trivial baseline exposes it.
     ///
     /// The run that motivated the check annealed both NextLat weights to zero at 2/3 of the
     /// schedule (see [`Args::lambda_dyn`]) and promoted every one of its checkpoints from
@@ -5621,7 +5663,7 @@ impl Trainer {
             self.device,
         )?;
         println!(
-            "test split dyn/identity {ratio:.3} at horizon {horizon} (1.0 is the trivial \
+            "validation split dyn/identity {ratio:.3} at horizon {horizon} (1.0 is the trivial \
              z_k = h_t identity map; below 1.0 means the shipped dynamics head beats it)"
         );
         Ok(ratio)
@@ -5643,6 +5685,7 @@ impl Trainer {
     ) -> Result<StepLoss> {
         let dof = &sample.dof;
         let time_ids = &sample.time_ids;
+        let adjusted_daily = &sample.adjusted_daily;
         let context = dof.size()[1] - 1;
         let horizon = self.args.dyn_horizon as i64;
         ensure!(
@@ -5660,7 +5703,7 @@ impl Trainer {
                 &self.growth_supports[1 + index],
             ),
         };
-        let beta_nll = stream.is_none().then_some(self.beta_nll.as_ref()).flatten();
+        let direct_return_supports = &self.direct_return_supports_dev;
 
         self.optimizer.zero_grad();
         let graph = autocast(self.device.is_cuda(), || {
@@ -5670,12 +5713,14 @@ impl Trainer {
                 growth_support,
                 dof,
                 time_ids,
+                adjusted_daily,
+                self.args.direct_return_context_mode(),
                 context,
                 horizon,
                 lambda_dyn,
                 lambda_kl,
-                beta_nll,
                 BarScoring::Hard,
+                direct_return_supports,
                 self.device,
             )
         });
@@ -5692,32 +5737,24 @@ impl Trainer {
             row_lr_metrics.as_ref(),
             smd_metrics.as_ref(),
         );
-        let metrics = read_packed_step_metrics(&packed);
-        ensure_finite_step_metrics(&metrics, step)?;
-        let total = metrics[STEP_METRIC_TOTAL];
-        let grad_norm = metrics[STEP_METRIC_GRAD_NORM];
-        let nll_value = metrics[STEP_METRIC_NLL];
-        let mut nll_dof = [f64::NAN; BAR_DOF];
-        nll_dof.copy_from_slice(&metrics[STEP_METRIC_NLL_DOF]);
-        let objective_nll = if metrics[STEP_METRIC_BETA_NLL_OBJECTIVE].is_finite() {
-            metrics[STEP_METRIC_BETA_NLL_OBJECTIVE]
-        } else {
-            nll_value
-        };
-        let mut beta_weight_mean_dof = [f64::NAN; BAR_DOF];
-        beta_weight_mean_dof.copy_from_slice(&metrics[STEP_METRIC_BETA_NLL_WEIGHT]);
-        let mut beta_variance_floor_share_dof = [f64::NAN; BAR_DOF];
-        beta_variance_floor_share_dof.copy_from_slice(&metrics[STEP_METRIC_BETA_NLL_FLOOR]);
-        let dyn_value = metrics[STEP_METRIC_DYN];
-        let kl_value = metrics[STEP_METRIC_KL];
-        let growth_value = metrics[STEP_METRIC_GROWTH_DIAGNOSTIC];
-        let growth_stats = growth::GrowthStats {
-            mean_abs_f: metrics[STEP_METRIC_GROWTH_STATS.start],
-            clamp_bind: metrics[STEP_METRIC_GROWTH_STATS.start + 1],
-            min_log_argument: metrics[STEP_METRIC_GROWTH_STATS.start + 2],
-        };
-        let identity = metrics[STEP_METRIC_IDENTITY];
-        let autocorr = metrics[STEP_METRIC_AUTOCORR];
+        let metrics = PackedStepMetrics::read(&packed);
+        metrics.ensure_finite(step)?;
+        let total = metrics.total();
+        let grad_norm = metrics.grad_norm();
+        let nll_value = metrics.canonical_nll();
+        let nll_dof = metrics.nll_dof();
+        let direct_return_nll_mean = metrics
+            .direct_return_nll_mean()
+            .expect("direct objective is always packed");
+        let joint_categorical_ce = metrics.joint_categorical_ce();
+        let direct_nll_horizon = metrics.direct_nll_horizon();
+        let direct_valid_horizon = metrics.direct_valid_horizon();
+        let dyn_value = metrics.dyn_loss();
+        let kl_value = metrics.kl_loss();
+        let growth_value = metrics.growth_diagnostic();
+        let growth_stats = metrics.growth_stats();
+        let identity = metrics.identity();
+        let autocorr = metrics.autocorr();
         // Raw open-tail returns may legitimately cross zero wealth. The held-out diagnostic
         // handles those through its finite bankruptcy-domain continuation; only a non-finite
         // raw argument indicates corrupted data or arithmetic. This guard runs before
@@ -5739,17 +5776,21 @@ impl Trainer {
         Ok(StepLoss {
             nll_bar: nll_value,
             nll_dof,
-            objective_nll,
-            beta_weight_mean_dof,
-            beta_variance_floor_share_dof,
+            direct_return_nll_mean,
+            direct_nll_horizon,
+            direct_valid_horizon,
             dyn_loss: dyn_value,
             kl_loss: kl_value,
             growth_diagnostic: growth_value,
             growth_stats,
             total,
-            // The likelihood share follows the term actually attached to the optimizer.
-            // Validation and promotion still read the separate proper Hard NLL.
-            shares: loss_shares(objective_nll, lambda_dyn * dyn_value, lambda_kl * kl_value),
+            // Likelihood share includes both likelihood terms attached to the optimizer.
+            // Validation and promotion still read the separate proper direct and Hard scores.
+            shares: loss_shares(
+                direct_return_nll_mean + JOINT_BAR_AUXILIARY_COEFFICIENT * joint_categorical_ce,
+                lambda_dyn * dyn_value,
+                lambda_kl * kl_value,
+            ),
             belief_autocorr: autocorr,
             // A zero-init dynamics MLP is exactly the identity, so the ratio starts at 1.0
             // by construction and any departure is the MLP doing something. A degenerate
@@ -5761,12 +5802,8 @@ impl Trainer {
                 f64::NAN
             },
             grad_norm,
-            row_learned_lr: metrics[STEP_METRIC_ROW_LR]
-                .try_into()
-                .expect("controller metric slice has fixed width"),
-            smd_idbd: metrics[STEP_METRIC_SMD_IDBD]
-                .try_into()
-                .expect("SMD metric slice has fixed width"),
+            row_learned_lr: metrics.row_learned_lr(),
+            smd_idbd: metrics.smd_idbd(),
         })
     }
 
@@ -5785,9 +5822,11 @@ impl Trainer {
     /// NaN that reads exactly like a measured catastrophe.
     fn validate(&mut self, step: usize, epoch_boundary: bool, final_step: bool) -> Result<()> {
         let eval_batch = self.args.batch_size;
-        let diagnostic = evaluate(
+        let diagnostic = evaluate_with_direct_return(
             &self.modules,
             &self.supports_dev,
+            &self.direct_return_supports_dev,
+            self.args.direct_return_context_mode(),
             &self.eval.diagnostic,
             eval_batch,
             self.device,
@@ -5816,9 +5855,11 @@ impl Trainer {
         let deployed_ready = self.schedule.in_final_stage(step)
             && self.reached_context >= self.eval.promotion.context;
         let promotion = if deployed_ready {
-            let stats = evaluate(
+            let stats = evaluate_with_direct_return(
                 &self.modules,
                 &self.supports_dev,
+                &self.direct_return_supports_dev,
+                self.args.direct_return_context_mode(),
                 &self.eval.promotion,
                 eval_batch,
                 self.device,
@@ -5832,8 +5873,8 @@ impl Trainer {
             // A run that never trained at the deployed context would otherwise end with no
             // promotion, no `pretrain_best.ot` and therefore no held-out number at all — the
             // one outcome a run must never have. Promote at the context actually reached,
-            // loudly, and record that context in the checkpoint metadata, the banner and the
-            // terminal battery so it can never be mistaken for a full-context selection.
+            // loudly, and record that context in the checkpoint metadata and banner so it can
+            // never be mistaken for a full-context selection.
             println!(
                 "WARNING step {step}: THE RUN ENDED WITHOUT REACHING THE DEPLOYED {}-BAR \
                  CONTEXT — ramp stage {}, longest context trained {} bars. Promoting on the \
@@ -5983,8 +6024,8 @@ impl Trainer {
             // bench is ever measured at. That makes consecutive decisions comparisons across
             // MODELS rather than across rulers. The DEPLOYED pass above is what makes this
             // read ELIGIBLE — the planner must not load weights selected outside the
-            // positional range they run at — and is what the artifact's metadata and the
-            // terminal battery are measured at. It is not the comparison.
+            // positional range they run at — and is what the artifact's metadata records.
+            // It is not the comparison.
             // ---------------------------------------------------------------------------
             let scores = self.window_scores(set, &stats, step);
             let selection_nll = diagnostic_scores.conditional_nll();
@@ -6000,8 +6041,6 @@ impl Trainer {
             let nll_rule_edge_level = self.bootstrap_traded(set, &nll_rule_edge);
             let candidate_usable = selection_nll.is_finite()
                 && edge_level.mean.is_finite()
-                && edge_level.se.is_finite()
-                && edge_level.se >= 0.0
                 && !diagnostic_scores.windows.is_empty()
                 && diagnostic_scores
                     .windows
@@ -6042,10 +6081,11 @@ impl Trainer {
             // Every decision states the economic criterion, both predictive guards and their
             // incumbents so the decision and every veto can be reconstructed from this log.
             println!(
-                "step {step}: SELECTION on the {}-bar ruler — edge@{SELECTION_CAP:.2}x \
+                "step {step}: PROVISIONAL DENSITY-ERA VALIDATION SELECTION pending external \
+                 shared-book selection, on the {}-bar ruler — edge@{SELECTION_CAP:.2}x \
                  {:+.4} bps/bar (level SE {:.4}, turnover {:.3}/bar absolute at gross {:.3}, \
-                 i.e. {:.2} book rotations/bar) vs incumbent {}; \
-                 conditional nll {selection_nll:.4} vs incumbent {}",
+                 i.e. {:.2} book rotations/bar) vs incumbent {}; conditional nll \
+                 {selection_nll:.4} vs incumbent {}",
                 self.eval.diagnostic.context,
                 edge_level.mean,
                 edge_level.se,
@@ -6068,11 +6108,6 @@ impl Trainer {
             // compared rather than multiples a reader has to apply.
             match outcome {
                 SelectionOutcome::Promoted if forced || self.promotions == 0 => {
-                    // No incumbent exists, so paired deltas cannot decide. The current edge,
-                    // conditional NLL and `r` scores were still required to be finite above:
-                    // the first promotion is comparison-free, not measurement-free. `forced`
-                    // additionally means the run never reached deployed context, which is a
-                    // stated caveat on the artifact.
                     println!(
                         "step {step}: FIRST promotion at the {}-bar context{} — the current \
                          edge, conditional NLL and r score are measured, but there is no \
@@ -6092,8 +6127,6 @@ impl Trainer {
                     );
                 }
                 SelectionOutcome::Unmeasurable => {
-                    // Edge and both predictive guards must be measurable. Refusing keeps the
-                    // incumbent, which is the safe half.
                     println!(
                         "step {step}: REFUSING promotion — the trade bench or a predictive guard \
                          produced no measurement comparable to the incumbent ({} traded windows \
@@ -6112,20 +6145,17 @@ impl Trainer {
                         "step {step}: REFUSING promotion — the sole primary criterion did not \
                          improve significantly: paired economic edge delta {:+.4} +/- {:.4} \
                          bps/bar against its {edge_band:.4} band. Conditional-nll delta {:+.4} \
-                         nats against its {nll_band:.6} veto band (+ means worse) is diagnostic \
-                         here; NLL improvement cannot promote without resolved economic edge.",
+                         nats is diagnostic here; NLL improvement cannot promote without \
+                         resolved economic edge.",
                         edge.mean, edge.se, ledger.nll_delta,
                     );
                 }
                 SelectionOutcome::RefusedNllGuard => {
                     let delta = nll_delta.expect("an NLL veto implies a measured delta");
                     println!(
-                        "step {step}: REFUSING promotion — economic edge IMPROVED by {:+.4} \
-                         bps/bar, clearing its {SELECTION_EDGE_SE_MULTIPLE:.1}-SE band \
-                         ({edge_band:.4}), but conditional nll REGRESSED by {:+.4} nats, beyond \
-                         its {SELECTION_NLL_SE_MULTIPLE:.1}-SE band ({nll_band:.6}). A resolved \
-                         predictive regression vetoes the economics-led promotion.",
-                        edge_gain.map_or(f64::NAN, |gain| gain.mean),
+                        "step {step}: REFUSING promotion — economic edge cleared its paired band, \
+                         but conditional nll regressed by {:+.4} nats beyond its \
+                         {SELECTION_NLL_SE_MULTIPLE:.1}-SE band ({nll_band:.6}).",
                         delta.mean,
                     );
                 }
@@ -6135,21 +6165,17 @@ impl Trainer {
                     println!(
                         "step {step}: REFUSING promotion — economic edge cleared its paired band, \
                          but {} regressed by {:+.4} nats, more than the \
-                         {SELECTION_GUARD_SE_MULTIPLE:.1}-SE band ({dof_band:.6}) allowed. {} \
-                         is the traded factor and vetoes the economics-led promotion.",
-                        BAR_DOF_NAMES[SELECTION_GUARD_DOF],
-                        delta.mean,
-                        BAR_DOF_NAMES[SELECTION_GUARD_DOF],
+                         {SELECTION_GUARD_SE_MULTIPLE:.1}-SE band ({dof_band:.6}) allowed.",
+                        BAR_DOF_NAMES[SELECTION_GUARD_DOF], delta.mean,
                     );
                 }
                 SelectionOutcome::Promoted => {
                     let edge = edge_gain.expect("a measurable promotion implies an edge delta");
                     println!(
-                        "step {step}: PROMOTING on statistically resolved economic edge — paired \
-                         edge delta {:+.4} +/- {:.4} bps/bar against its {edge_band:.4} band; \
-                         paired conditional-nll delta {:+.4} nats against its {nll_band:.6} veto \
-                         band; paired {} delta {:+.4} nats. Both predictive regression vetoes \
-                         are clear.",
+                        "step {step}: PROMOTING on statistically resolved economic edge — \
+                         paired edge delta {:+.4} +/- {:.4} bps/bar; paired \
+                         conditional-nll delta {:+.4} nats and paired {} delta {:+.4} \
+                         nats clear both density-era provisional predictive guards.",
                         edge.mean,
                         edge.se,
                         ledger.nll_delta,
@@ -6158,8 +6184,8 @@ impl Trainer {
                     );
                 }
                 SelectionOutcome::NotEligible => unreachable!(
-                    "this branch only runs on an eligible read; `NotEligible` is the ledger's \
-                     initial state, not a decision"
+                    "this branch only runs on an eligible read; NotEligible is only the initial \
+                     ledger state"
                 ),
             }
             ledger.outcome = outcome;
@@ -6184,10 +6210,8 @@ impl Trainer {
                 self.promotions += 1;
                 self.selection_context = selected_context;
             }
-            // The legacy NLL-only comparator, replayed unchanged on every eligible read:
-            // primary `nll_bar_conditional` on the deployed pass, guarded by paired
-            // `nll_dof[r]`. It records what the former rule would have shipped without
-            // affecting the planner artifact. See [`Self::promote_nll_rule`].
+            // Density-era provisional validation-only comparator; this is not shared-book
+            // candidate ranking.
             self.promote_nll_rule(step, &scores, target, nll_rule_edge_level)?;
             promotion_stats = Some(stats);
         }
@@ -6215,6 +6239,7 @@ impl Trainer {
             .then_some(promotion_nll)
             .unwrap_or(f64::NAN);
         metrics.val_nll_bar_diag = diagnostic.nll_bar;
+        metrics.direct_return_validation = diagnostic.direct_return;
         metrics.val_nll_dof = diagnostic.nll_dof;
         metrics.val_crps_dof = diagnostic.crps_dof;
         // Cloned rather than moved: the epoch-boundary record below reads the same
@@ -6626,6 +6651,10 @@ impl Trainer {
         self.supports
             .save(&supports_path)
             .with_context(|| format!("failed writing {}", supports_path.display()))?;
+        let direct_supports_path = world_model_direct_return_supports_path(weights);
+        self.direct_return_supports
+            .save(&direct_supports_path)
+            .with_context(|| format!("failed writing {}", direct_supports_path.display()))?;
         self.vs
             .save(weights)
             .with_context(|| format!("failed writing {}", weights.display()))?;
@@ -6635,6 +6664,7 @@ impl Trainer {
             weights,
             &[res],
             res,
+            self.args.direct_return_context_mode(),
             Some(self.training_provenance(step, selection_context, selection, selection_metric)),
         )
         .with_context(|| format!("failed writing metadata for {}", weights.display()))
@@ -6657,7 +6687,6 @@ impl Trainer {
             dyn_horizon: self.args.dyn_horizon,
             lambda_dyn: self.args.lambda_dyn,
             lambda_kl: self.args.lambda_kl,
-            beta_nll: self.args.beta_nll,
             auxiliary_resolutions: self.args.auxiliary_resolutions.clone(),
             checkpoint_every: self.args.checkpoint_every,
             validate_every: self.args.validate_every,
@@ -6680,6 +6709,18 @@ impl Trainer {
             format!(
                 "failed committing support state {}",
                 supports_path.display()
+            )
+        })?;
+        let direct_supports_path = world_model_direct_return_supports_path(weights);
+        let direct_supports_tmp = temporary_sibling(&direct_supports_path);
+        self.direct_return_supports
+            .save(&direct_supports_tmp)
+            .with_context(|| format!("failed writing {}", direct_supports_tmp.display()))?;
+        File::open(&direct_supports_tmp)?.sync_all()?;
+        fs::rename(&direct_supports_tmp, &direct_supports_path).with_context(|| {
+            format!(
+                "failed committing direct-return support state {}",
+                direct_supports_path.display()
             )
         })?;
 
@@ -6711,6 +6752,7 @@ impl Trainer {
             weights,
             &[res],
             res,
+            self.args.direct_return_context_mode(),
             Some(self.training_provenance(step, 0, None, SELECTION_METRIC)),
         )?;
         metadata.attach_pretrain_recovery(
@@ -6912,8 +6954,7 @@ impl Trainer {
     /// planner never loads.
     ///
     /// Its semantics are deliberately narrow and historical: it shows what the former
-    /// likelihood-led rule would have shipped. The test battery omits it when its final step
-    /// equals the economics-primary winner, so a rule comparison never duplicates weights.
+    /// likelihood-led rule would have shipped, using validation evidence only.
     ///
     /// Deliberately NOT round-trip re-scored the way [`Self::promote`] is: that costs a full
     /// pass over the pinned set, this artifact is never deployed, and the reload below already
@@ -6976,8 +7017,7 @@ impl Trainer {
              {selection:.4} nats/bar at {context} bars, improving on {}, with the same-pass \
              0.25x edge at {:+.4} +/- {:.4} bps/bar. Written to {} as a non-deployable \
              diagnostic comparator. The planner loads the economics-primary \
-             `pretrain_best.ot`; the test battery scores this artifact only if the final \
-             selected steps differ.",
+             `pretrain_best.ot`; neither artifact is automatically scored on Test.",
             if previous.is_finite() {
                 format!("{previous:.4}")
             } else {
@@ -7082,6 +7122,16 @@ impl Trainer {
         BarTrainingProvenance {
             corpus_fingerprint: self.corpus_fingerprint.clone(),
             split_bounds: self.split_bounds(),
+            rolling_plan_sha256: self.fold.plan_hash.clone(),
+            rolling_fold_index: self.fold.fold_index,
+            rolling_fit_range_ms: [self.fold.fit.start_ms, self.fold.fit.end_ms],
+            rolling_validation_range_ms: [
+                self.fold.validation.start_ms,
+                self.fold.validation.end_ms,
+            ],
+            rolling_embargo_steps: self.fold.embargo_steps,
+            terminal_test_spent: true,
+            support_sample_seed: fold_support_sample_seed(&self.fold),
             split_bounds_pinned: !self.args.derive_split_bounds,
             eval_window_seed: EVAL_WINDOW_SEED,
 
@@ -7100,19 +7150,26 @@ impl Trainer {
                 .map(|instant| instant.timestamp_millis()),
             min_dollar_volume: self.args.min_dollar_volume,
             symbols: self.symbol_count,
+            universe_admission_rule: Some(CORPUS_UNIVERSE_RULE.to_owned()),
+            universe_admission_cutoff_ms: Some(
+                self.corpus_universe_audit.train_end_cutoff_ms,
+            ),
+            minimum_training_bars: Some(
+                self.corpus_universe_audit.minimum_training_bars,
+            ),
+            admitted_symbols_digest: Some(
+                self.corpus_universe_audit.admitted_symbols_digest.clone(),
+            ),
+            admitted_symbols: Some(
+                self.corpus_universe_audit.admitted_symbol_names.clone(),
+            ),
+            evaluation_policy: Some(ALPHA_EVALUATION_POLICY.to_owned()),
             supports_frozen: self.supports_frozen,
             supports_corpus_fingerprint: self
                 .supports
                 .provenance()
                 .map(|p| p.corpus_fingerprint.clone()),
             scoring: BarScoring::Hard.to_string(),
-            beta_nll: self.args.beta_nll.map(|exponent| BarBetaNllProvenance {
-                exponent,
-                variance_normalization:
-                    "fitted categorical predictive variance / train-marginal variance"
-                        .to_owned(),
-                variance_floor_ratio: BETA_NLL_VARIANCE_FLOOR_RATIO,
-            }),
             // The context this artifact's selection was actually taken at, beside the one it
             // is meant to be deployed at. They differ only when the ramp never got there, and
             // that difference is the difference between a deployable artifact and one that is
@@ -7181,19 +7238,6 @@ impl Trainer {
         match target {
             PromotionTarget::Deployed => &self.eval.promotion,
             PromotionTarget::Diagnostic => &self.eval.diagnostic,
-        }
-    }
-
-    /// The TEST split at the context the promoted checkpoint was selected at.
-    ///
-    /// Falls back to the deployed-context set when nothing was promoted yet, which cannot
-    /// happen on the battery path — `run_training` refuses to reach it with zero promotions —
-    /// but keeps this a total function rather than a panic waiting for a refactor.
-    fn test_set(&self) -> &PinnedSet {
-        if self.selection_context == self.eval.test_diagnostic.context {
-            &self.eval.test_diagnostic
-        } else {
-            &self.eval.test
         }
     }
 
@@ -7437,7 +7481,7 @@ impl Trainer {
     /// The aggregate cannot show that `w` sits exactly at uniform with no headroom at all
     /// while `u` and `v` have over a nat each, so a model that regresses on `r` — the only
     /// DOF that determines P&L — can still be promoted on an intra-bar gain. Printed on
-    /// every promotion and on the terminal battery.
+    /// every promotion.
     fn per_dof_line(&self, stats: &EvalStats) -> String {
         let parts: Vec<String> = BAR_DOF_NAMES
             .iter()
@@ -7633,7 +7677,7 @@ impl Trainer {
                 .map(|name| name.to_string_lossy().into_owned())
                 .unwrap_or_else(|| self.run.root.display().to_string()),
             global_step: step,
-            split: set.sampler.split().as_str().to_owned(),
+            split: set.label().to_owned(),
             context: set.context,
             eval_window_seed: EVAL_WINDOW_SEED,
             corpus_fingerprint: self.corpus_fingerprint.clone(),
@@ -7684,9 +7728,11 @@ impl Trainer {
                 candidate.display()
             )
         })?;
-        let reloaded = evaluate(
+        let reloaded = evaluate_with_direct_return(
             world.modules(),
             world.deployment_supports(),
+            world.direct_return_supports(),
+            world.direct_return_context_mode(),
             self.promotion_set(target),
             eval_batch,
             self.device,
@@ -7709,6 +7755,10 @@ impl Trainer {
             (
                 world_model_supports_path(&candidate, self.args.resolution_secs),
                 world_model_supports_path(&best, self.args.resolution_secs),
+            ),
+            (
+                world_model_direct_return_supports_path(&candidate),
+                world_model_direct_return_supports_path(&best),
             ),
             (metadata, world_model_metadata_path(&best)),
         ] {
@@ -8022,6 +8072,8 @@ pub(super) struct EvalStats {
     /// Per-window Kelly positions for the trading bench, over the first
     /// [`trade_bench::TRADE_WINDOWS`] windows of the set. Empty unless `full`.
     pub(super) trade_paths: ChunkPaths,
+    /// Direct six-horizon law on these same pinned fold-validation sequences.
+    direct_return: DirectReturnValidationStats,
 }
 
 /// `(symbol, calendar month)` block id of every window in a pinned set, so windows of one
@@ -8323,7 +8375,19 @@ pub(super) fn evaluate_with_trunk(
     trunk: EvaluationTrunk<'_>,
 ) -> Result<EvalStats> {
     evaluate_impl(
-        modules, supports, set, batch, device, false, scoring, None, 0, trunk, true,
+        modules,
+        supports,
+        None,
+        DirectReturnContextMode::Enabled,
+        set,
+        batch,
+        device,
+        false,
+        scoring,
+        None,
+        0,
+        trunk,
+        true,
     )
 }
 
@@ -8349,6 +8413,37 @@ pub(super) fn evaluate_with_trunk(
 /// transfer per chunk and it is the only thing that makes the held-out mean a measurement
 /// rather than a number.
 #[allow(clippy::too_many_arguments)]
+fn evaluate_with_direct_return(
+    modules: &BarModules,
+    supports: &BarSupports,
+    direct_return_supports: &DirectReturnSupports,
+    direct_return_context_mode: DirectReturnContextMode,
+    set: &PinnedSet,
+    batch: usize,
+    device: Device,
+    full: bool,
+    scoring: BarScoring,
+    shrink: Option<MeanShrink>,
+    trade_budget: usize,
+) -> Result<EvalStats> {
+    evaluate_impl(
+        modules,
+        supports,
+        Some(direct_return_supports),
+        direct_return_context_mode,
+        set,
+        batch,
+        device,
+        full,
+        scoring,
+        shrink,
+        trade_budget,
+        EvaluationTrunk::Parallel,
+        false,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
 pub(super) fn evaluate(
     modules: &BarModules,
     supports: &BarSupports,
@@ -8363,6 +8458,8 @@ pub(super) fn evaluate(
     evaluate_impl(
         modules,
         supports,
+        None,
+        DirectReturnContextMode::Enabled,
         set,
         batch,
         device,
@@ -8379,6 +8476,8 @@ pub(super) fn evaluate(
 fn evaluate_impl(
     modules: &BarModules,
     supports: &BarSupports,
+    direct_return_supports: Option<&DirectReturnSupports>,
+    direct_return_context_mode: DirectReturnContextMode,
     set: &PinnedSet,
     batch: usize,
     device: Device,
@@ -8412,6 +8511,7 @@ fn evaluate_impl(
     let mut marginal_dof_sum = [0.0f64; BAR_DOF];
     let mut chain_dof_sum = [0.0f64; BAR_DOF];
     let mut marginal_group_sums = [0.0f64; FORECAST_MC_GROUPS];
+    let mut direct_return_sums = DirectReturnValidationSums::default();
     // The trading bench. Built once: the null's position is a property of the supports, so
     // re-deriving it per chunk would be 170 identical derivations and would leave open the
     // question of whether the null moved.
@@ -8427,7 +8527,7 @@ fn evaluate_impl(
         let context = sample.dof.size()[1] - 1;
         let rows = chunk.len() as f64;
 
-        let (per_window, live, extras, focused) = tch::no_grad(|| {
+        let (per_window, live, extras, focused, direct_return) = tch::no_grad(|| {
             let input = sample.dof.narrow(1, 0, context);
             let target = sample.dof.narrow(1, 1, context);
             let bin_ids = supports.bin_ids(&input);
@@ -8538,6 +8638,28 @@ fn evaluate_impl(
                         .unwrap_or_default(),
                 }
             });
+            let direct_return = direct_return_supports.map(|supports| {
+                let mut valid_shape = sample.dof.size();
+                valid_shape.pop();
+                let row_valid = Tensor::ones(&valid_shape, (Kind::Bool, sample.dof.device()));
+                let targets = direct_return_targets_with_mask(&sample.dof, &row_valid);
+                let realized = targets.values.narrow(1, 0, context);
+                let valid = targets.valid.narrow(1, 0, context);
+                let target_bins = supports.bin_ids(&realized);
+                let direct_context = sample.adjusted_daily.narrow(1, 0, context);
+                let direct_logits = modules.direct_return_head.logits(
+                    &beliefs,
+                    &direct_context,
+                    direct_return_context_mode,
+                );
+                direct_return_validation_sums(
+                    supports,
+                    &direct_logits,
+                    &realized,
+                    &target_bins,
+                    &valid,
+                )
+            });
             (
                 host_rows(&per_window_dof, chunk.len()),
                 (
@@ -8547,8 +8669,12 @@ fn evaluate_impl(
                 ),
                 extras,
                 focused,
+                direct_return,
             )
         });
+        if let Some(sums) = direct_return {
+            direct_return_sums.absorb(sums);
+        }
 
         for row in &per_window {
             let total: f64 = row.iter().sum();
@@ -8556,7 +8682,7 @@ fn evaluate_impl(
                 total.is_finite(),
                 "held-out nll is not finite on window chunk {chunk_index} of the {} split: \
                  {total}",
-                set.sampler.split().as_str()
+                set.label()
             );
             window_nll.push(total);
             window_nll_dof.push(*row);
@@ -8665,6 +8791,11 @@ fn evaluate_impl(
         } else {
             f64::NAN
         },
+        direct_return: if direct_return_supports.is_some() {
+            direct_return_sums.finish()
+        } else {
+            DirectReturnValidationStats::nan()
+        },
     })
 }
 
@@ -8760,7 +8891,7 @@ fn marginal_nll_dof_on(
     ensure!(
         rows_total > 0.0,
         "the pinned {} set produced no bars to measure the held-out marginal on",
-        set.sampler.split().as_str()
+        set.label()
     );
 
     let q_val = Vec::<f64>::try_from(totals.reshape([-1]))
@@ -8914,14 +9045,15 @@ fn next_lat_loss(predicted: &Tensor, target: &Tensor) -> Tensor {
 /// One optimizer step's graph, still attached.
 struct TrainingGraph {
     loss: Tensor,
-    /// Proper Hard categorical NLL, always used for reporting, validation and promotion.
+    /// Canonical joint five-DOF Hard NLL, retained unchanged as a diagnostic.
     nll: Tensor,
     nll_dof: Tensor,
-    /// Likelihood term actually attached to the optimizer. Present only for beta-NLL;
-    /// production uses `nll` directly without a clone or beta-specific allocation.
-    objective_nll: Option<Tensor>,
-    /// Per-DOF detached mean beta weights and variance-floor shares. Absent on production.
-    beta_diagnostics: Option<(Tensor, Tensor)>,
+    /// Equal-horizon six-target proper categorical CE attached to the optimizer.
+    direct_return_nll_mean: Tensor,
+    /// Raw joint categorical CE before the fixed task-normalized auxiliary coefficient.
+    joint_categorical_ce: Tensor,
+    direct_nll_horizon: Tensor,
+    direct_valid_horizon: Tensor,
     dyn_loss: Tensor,
     kl_loss: Tensor,
     /// Detached raw-payoff diagnostic under the deployed cap, including the explicit
@@ -8939,6 +9071,44 @@ struct TrainingGraph {
 ///
 /// Shared verbatim by [`Trainer::optimizer_step`] and [`probe_capacity`] so the capacity
 /// probe measures the graph and detached diagnostics the run actually executes.
+fn masked_direct_return_ce(
+    modules: &BarModules,
+    supports: &DirectReturnSupports,
+    beliefs: &Tensor,
+    adjusted_daily: &Tensor,
+    direct_return_context_mode: DirectReturnContextMode,
+    dof: &Tensor,
+    context: i64,
+) -> (Tensor, Tensor, Tensor) {
+    let longest_horizon = *DIRECT_RETURN_HORIZONS
+        .last()
+        .expect("the direct-return horizon grid is non-empty") as i64;
+    assert!(
+        context >= longest_horizon,
+        "training context {context} cannot supply an H{longest_horizon} target"
+    );
+    let mut valid_shape = dof.size();
+    valid_shape.pop();
+    let row_valid = Tensor::ones(&valid_shape, (Kind::Bool, dof.device()));
+    let direct = direct_return_targets_with_mask(dof, &row_valid);
+    let values = direct.values.narrow(1, 0, context);
+    let valid = direct.valid.narrow(1, 0, context);
+    let target_bins = supports.bin_ids(&values);
+    let logits =
+        modules
+            .direct_return_head
+            .logits(beliefs, adjusted_daily, direct_return_context_mode);
+    let terms = -logits
+        .log_softmax(-1, Kind::Float)
+        .gather(-1, &target_bins.unsqueeze(-1), false)
+        .squeeze_dim(-1);
+    let valid_f = valid.to_kind(Kind::Float);
+    let counts = valid_f.sum_dim_intlist([0i64, 1].as_slice(), false, Kind::Float);
+    let per_horizon =
+        (terms * valid_f).sum_dim_intlist([0i64, 1].as_slice(), false, Kind::Float) / &counts;
+    (per_horizon.mean(Kind::Float), per_horizon, counts)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn forward_losses(
     modules: &BarModules,
@@ -8946,12 +9116,14 @@ fn forward_losses(
     growth_support: &GrowthSupport,
     dof: &Tensor,
     time_ids: &Tensor,
+    adjusted_daily: &Tensor,
+    direct_return_context_mode: DirectReturnContextMode,
     context: i64,
     horizon: i64,
     lambda_dyn: f64,
     lambda_kl: f64,
-    beta_nll: Option<&CategoricalBetaNll>,
     scoring: BarScoring,
+    direct_return_supports: &DirectReturnSupports,
     device: Device,
 ) -> TrainingGraph {
     let input = dof.narrow(1, 0, context);
@@ -8987,21 +9159,25 @@ fn forward_losses(
     } else {
         supports.targets_from_class_ids(&target_bins, scoring)
     };
-    let (objective_nll, nll, nll_dof, beta_diagnostics) = match beta_nll {
-        Some(beta_nll) => {
-            let beta = beta_nll.loss(&logits, &targets);
-            (
-                Some(beta.objective),
-                beta.proper_nll,
-                beta.proper_nll_dof,
-                Some((beta.weight_mean_dof, beta.variance_floor_share_dof)),
-            )
-        }
-        None => {
-            let (nll, nll_dof) = bar_nll_from_logits(&logits, &targets);
-            (None, nll, nll_dof, None)
-        }
-    };
+    let (nll, nll_dof) = bar_nll_from_logits(&logits, &targets);
+    // Auxiliary optimization uses categorical CE, not the canonical Hard reporting score:
+    // Hard includes fitted support measure terms whose constants do not change gradients but
+    // make an objective level negative and incomparable across support geometries.
+    let joint_categorical_ce = -logits
+        .log_softmax(-1, Kind::Float)
+        .gather(-1, &target_bins.unsqueeze(-1), false)
+        .squeeze_dim(-1)
+        .mean(Kind::Float);
+    let direct_context = adjusted_daily.narrow(1, 0, context);
+    let (direct_nll, direct_nll_horizon, direct_valid_horizon) = masked_direct_return_ce(
+        modules,
+        direct_return_supports,
+        &beliefs,
+        &direct_context,
+        direct_return_context_mode,
+        dof,
+        context,
+    );
 
     let (dyn_loss, kl_loss, identity) = dynamics_losses(
         modules, dof, &bins, time_ids, &beliefs, context, horizon, device,
@@ -9021,14 +9197,16 @@ fn forward_losses(
         )
     });
     let autocorr = belief_autocorrelation(&beliefs);
-    let likelihood = objective_nll.as_ref().unwrap_or(&nll);
-    let loss = likelihood + lambda_dyn * &dyn_loss + lambda_kl * &kl_loss;
+    let joint_auxiliary = &joint_categorical_ce * JOINT_BAR_AUXILIARY_COEFFICIENT;
+    let loss = &direct_nll + joint_auxiliary + lambda_dyn * &dyn_loss + lambda_kl * &kl_loss;
     TrainingGraph {
         loss,
         nll,
         nll_dof,
-        objective_nll,
-        beta_diagnostics,
+        direct_return_nll_mean: direct_nll,
+        joint_categorical_ce,
+        direct_nll_horizon,
+        direct_valid_horizon,
         dyn_loss,
         kl_loss,
         growth_diagnostic,
@@ -9207,7 +9385,7 @@ fn dyn_identity_ratio(
 fn check_dynamics_beats_identity(ratio: f64, horizon: i64) -> Result<()> {
     ensure!(
         ratio.is_finite(),
-        "the promoted checkpoint's dyn/identity ratio is {ratio} on the test split, so the \
+        "the promoted checkpoint's dyn/identity ratio is {ratio} on the validation split, so the \
          shipped dynamics head cannot be certified against the trivial-identity baseline at \
          all. A non-finite ratio means the baseline is degenerate — the trunk's beliefs do \
          not move across the {horizon}-bar horizon — which is a collapsed trunk, not a \
@@ -9216,7 +9394,7 @@ fn check_dynamics_beats_identity(ratio: f64, horizon: i64) -> Result<()> {
     ensure!(
         ratio <= 1.0,
         "the promoted checkpoint's dynamics head is WORSE THAN DOING NOTHING: dyn/identity \
-         is {ratio:.3} on the test split at horizon {horizon}, where 1.0 is the trivial \
+         is {ratio:.3} on the validation split at horizon {horizon}, where 1.0 is the trivial \
          `z_k = h_t` identity map. BarDynamics ships only as a speculative latent draft \
          that must be verified against exact-cache, and RolloutMode::Dynamics recursively \
          probes it here. This artifact would therefore hand a planner a draft that degrades \
@@ -9387,36 +9565,11 @@ fn dof_array(per_dof: &Tensor) -> [f64; BAR_DOF] {
     out
 }
 
-const STEP_METRIC_TOTAL: usize = 0;
-const STEP_METRIC_NLL: usize = 1;
-const STEP_METRIC_NLL_DOF: std::ops::Range<usize> = 2..2 + BAR_DOF;
-const STEP_METRIC_DYN: usize = 2 + BAR_DOF;
-const STEP_METRIC_KL: usize = 3 + BAR_DOF;
-const STEP_METRIC_GROWTH_DIAGNOSTIC: usize = 4 + BAR_DOF;
-const STEP_METRIC_GROWTH_STATS: std::ops::Range<usize> =
-    5 + BAR_DOF..5 + BAR_DOF + growth::GROWTH_STAT_COUNT;
-const STEP_METRIC_IDENTITY: usize = 5 + BAR_DOF + growth::GROWTH_STAT_COUNT;
-const STEP_METRIC_AUTOCORR: usize = STEP_METRIC_IDENTITY + 1;
-const STEP_METRIC_GRAD_NORM: usize = STEP_METRIC_AUTOCORR + 1;
-const STEP_METRIC_BASE_COUNT: usize = STEP_METRIC_GRAD_NORM + 1;
-const STEP_METRIC_ROW_LR: std::ops::Range<usize> =
-    STEP_METRIC_BASE_COUNT..STEP_METRIC_BASE_COUNT + ROW_LR_METRIC_COUNT;
-const STEP_METRIC_SMD_IDBD: std::ops::Range<usize> =
-    STEP_METRIC_ROW_LR.end..STEP_METRIC_ROW_LR.end + SMD_METRIC_COUNT;
-const STEP_METRIC_BETA_NLL: std::ops::Range<usize> =
-    STEP_METRIC_SMD_IDBD.end..STEP_METRIC_SMD_IDBD.end + 1 + 2 * BAR_DOF;
-const STEP_METRIC_BETA_NLL_OBJECTIVE: usize = STEP_METRIC_BETA_NLL.start;
-const STEP_METRIC_BETA_NLL_WEIGHT: std::ops::Range<usize> =
-    STEP_METRIC_BETA_NLL_OBJECTIVE + 1..STEP_METRIC_BETA_NLL_OBJECTIVE + 1 + BAR_DOF;
-const STEP_METRIC_BETA_NLL_FLOOR: std::ops::Range<usize> =
-    STEP_METRIC_BETA_NLL_WEIGHT.end..STEP_METRIC_BETA_NLL_WEIGHT.end + BAR_DOF;
-const STEP_METRIC_COUNT: usize = STEP_METRIC_BETA_NLL.end;
-
 /// Pack every device-resident scalar read by one optimizer step.
 ///
-/// The production packet is byte-for-byte unchanged. Optional segments are appended in fixed
-/// order; a later segment supplies NaN placeholders for absent earlier segments, so one host
-/// transfer remains sufficient without allocating placeholders on the production path.
+/// The direct-return objective is always present. Optional controller segments occupy fixed
+/// slots filled with NaNs when disabled, keeping the packet layout stable and the step to one
+/// device-to-host transfer.
 fn pack_step_metrics(
     graph: &TrainingGraph,
     grad_norm: &Tensor,
@@ -9424,112 +9577,33 @@ fn pack_step_metrics(
     smd_metrics: Option<&Tensor>,
 ) -> Tensor {
     let flat_f32 = |tensor: &Tensor| tensor.detach().to_kind(Kind::Float).reshape([-1]);
-    let beta_metrics = graph.beta_diagnostics.as_ref();
-
-    let base = [
-        flat_f32(&graph.loss),
-        flat_f32(&graph.nll),
-        flat_f32(&graph.nll_dof),
-        flat_f32(&graph.dyn_loss),
-        flat_f32(&graph.kl_loss),
-        flat_f32(&graph.growth_diagnostic),
-        flat_f32(&graph.growth_stats),
-        flat_f32(&graph.identity),
-        flat_f32(&graph.autocorr),
-        flat_f32(grad_norm),
-    ];
-    let mut tensors = Vec::from(base);
-    if let Some(metrics) = row_lr_metrics {
-        tensors.push(flat_f32(metrics));
-    } else if smd_metrics.is_some() || beta_metrics.is_some() {
-        tensors.push(Tensor::full(
-            [ROW_LR_METRIC_COUNT as i64],
-            f64::NAN,
-            (Kind::Float, graph.loss.device()),
-        ));
-    }
-    if let Some(metrics) = smd_metrics {
-        tensors.push(flat_f32(metrics));
-    } else if beta_metrics.is_some() {
-        tensors.push(Tensor::full(
-            [SMD_METRIC_COUNT as i64],
-            f64::NAN,
-            (Kind::Float, graph.loss.device()),
-        ));
-    }
-    if let Some((weight_mean_dof, floor_share_dof)) = beta_metrics {
-        tensors.push(flat_f32(
-            graph
-                .objective_nll
-                .as_ref()
-                .expect("beta diagnostics require the beta objective"),
-        ));
-        tensors.push(flat_f32(weight_mean_dof));
-        tensors.push(flat_f32(floor_share_dof));
-    }
-    Tensor::cat(&tensors, 0)
-}
-
-/// The optimizer step's single device-to-host metric transfer.
-fn read_packed_step_metrics(packed: &Tensor) -> [f64; STEP_METRIC_COUNT] {
-    let values = Vec::<f64>::try_from(packed.to_kind(Kind::Double).reshape([-1]))
-        .expect("packed step metrics are convertible");
-    assert!(
-        [
-            STEP_METRIC_BASE_COUNT,
-            STEP_METRIC_ROW_LR.end,
-            STEP_METRIC_SMD_IDBD.end,
-            STEP_METRIC_BETA_NLL.end,
-        ]
-        .contains(&values.len()),
-        "packed step metrics carry {} entries, expected {STEP_METRIC_BASE_COUNT}, {}, {}, or {}",
-        values.len(),
-        STEP_METRIC_ROW_LR.end,
-        STEP_METRIC_SMD_IDBD.end,
-        STEP_METRIC_BETA_NLL.end,
-    );
-    let mut out = [f64::NAN; STEP_METRIC_COUNT];
-    out[..values.len()].copy_from_slice(&values);
-    out
-}
-
-/// Fail before optimizer mutation if the packed loss, gradient or any diagnostic is
-/// non-finite. Kept separate so the safety boundary is directly testable.
-fn ensure_finite_step_metrics(metrics: &[f64; STEP_METRIC_COUNT], step: usize) -> Result<()> {
-    let total = metrics[STEP_METRIC_TOTAL];
-    ensure!(
-        total.is_finite(),
-        "loss is not finite at step {step}: {total}"
-    );
-    let grad_norm = metrics[STEP_METRIC_GRAD_NORM];
-    ensure!(
-        grad_norm.is_finite(),
-        "gradient norm is not finite at step {step}: {grad_norm}"
-    );
-    ensure!(
-        metrics[..STEP_METRIC_BASE_COUNT]
-            .iter()
-            .all(|value| value.is_finite()),
-        "packed loss/gradient diagnostics are not finite at step {step}: {metrics:?}"
-    );
-    let controller = &metrics[STEP_METRIC_ROW_LR];
-    ensure!(
-        controller.iter().all(|value| value.is_nan())
-            || controller.iter().all(|value| value.is_finite()),
-        "row learned-LR diagnostics are partially non-finite at step {step}: {controller:?}"
-    );
-    let smd = &metrics[STEP_METRIC_SMD_IDBD];
-    ensure!(
-        smd.iter().all(|value| value.is_nan()) || smd.iter().all(|value| value.is_finite()),
-        "SMD-IDBD diagnostics are partially non-finite at step {step}: {smd:?}"
-    );
-    let beta_nll = &metrics[STEP_METRIC_BETA_NLL];
-    ensure!(
-        beta_nll.iter().all(|value| value.is_nan())
-            || beta_nll.iter().all(|value| value.is_finite()),
-        "beta-NLL diagnostics are partially non-finite at step {step}: {beta_nll:?}"
-    );
-    Ok(())
+    let optional_metrics = |metrics: Option<&Tensor>, width: usize| {
+        metrics.map_or_else(
+            || Tensor::full([width as i64], f64::NAN, (Kind::Float, graph.loss.device())),
+            flat_f32,
+        )
+    };
+    Tensor::cat(
+        &[
+            flat_f32(&graph.loss),
+            flat_f32(&graph.nll),
+            flat_f32(&graph.nll_dof),
+            flat_f32(&graph.direct_nll_horizon),
+            flat_f32(&graph.direct_valid_horizon),
+            flat_f32(&graph.dyn_loss),
+            flat_f32(&graph.kl_loss),
+            flat_f32(&graph.growth_diagnostic),
+            flat_f32(&graph.growth_stats),
+            flat_f32(&graph.identity),
+            flat_f32(&graph.autocorr),
+            flat_f32(grad_norm),
+            optional_metrics(row_lr_metrics, ROW_LR_METRIC_COUNT),
+            optional_metrics(smd_metrics, SMD_METRIC_COUNT),
+            flat_f32(&graph.direct_return_nll_mean),
+            flat_f32(&graph.joint_categorical_ce),
+        ],
+        0,
+    )
 }
 
 /// Global L2 gradient norm as a device scalar, observed only. The recipe deliberately does
@@ -9662,18 +9736,17 @@ fn print_banner(
         NUM_BAR_BINS, by_group
     );
     println!(
-        "corpus         {} symbols, {} unique bars at {}s ({} train / {} val / {} test)",
+        "corpus         {} symbols, {} unique bars at {}s ({} train / {} validation; spent Test \
+         population uninspected)",
         corpus.symbols().len(),
         corpus.unique_bars(),
         args.resolution_secs,
         corpus.split_bars(Split::Train),
         corpus.split_bars(Split::Val),
-        corpus.split_bars(Split::Test),
     );
     let (train_val, val_test) = corpus.split_bounds();
     // The corpus is live and these instants are percentiles of it, so two runs a week apart
-    // score different windows unless the bounds are pinned. Print the identity of the data
-    // next to the boundary it produced, and say which of the two it is.
+    // score different windows unless the bounds are pinned.
     println!(
         "split          global calendar boundaries {train_val} | {val_test} (ms) = {} | {} {}",
         iso_ms(train_val),
@@ -9691,8 +9764,9 @@ fn print_banner(
         if args.sdlr {
             format!(
                 "ENABLED on primary Muon matrices only: alpha=exp(2*sigmoid(logit)-1), \
-                 controller Adam lr={ROW_LR_CONTROLLER_LR:e} betas={:?} eps={ROW_LR_CONTROLLER_EPS:e}, \
-                 warmup={ROW_LR_WARMUP_STEPS} primary steps, evidence clipped at +/-3",
+                 controller Adam lr={ROW_LR_CONTROLLER_LR:e} betas={:?} \
+                 eps={ROW_LR_CONTROLLER_EPS:e}, warmup={ROW_LR_WARMUP_STEPS} primary steps, \
+                 evidence clipped at +/-3",
                 ROW_LR_CONTROLLER_BETAS,
             )
         } else {
@@ -9729,18 +9803,9 @@ fn print_banner(
         args.epochs,
         planned_bars as f64 / train_bars as f64
     );
-    // `lambda_dyn` is swept over orders of magnitude, so a fixed three-decimal format would
-    // print the sweep's whole lower half as `0.000` — i.e. as if the NextLat term were
-    // switched off — in the one artifact that records which objective a run trained under.
-    let likelihood_objective = args.beta_nll.map_or_else(
-        || "proper Hard categorical NLL".to_owned(),
-        |beta| {
-            format!(
-                "categorical beta-NLL(beta={beta}): Hard NLL times stop-gradient \
-                 (fitted predictive variance / train-marginal variance)^beta, variance-ratio \
-                 floor {BETA_NLL_VARIANCE_FLOOR_RATIO:e}"
-            )
-        },
+    let likelihood_objective = format!(
+        "equal-horizon proper Hard CE over direct returns {:?} + {} * mean five-DOF joint Hard CE",
+        DIRECT_RETURN_HORIZONS, JOINT_BAR_AUXILIARY_COEFFICIENT,
     );
     println!(
         "objective      {likelihood_objective} + {:e}*dyn + {:e}*kl, dynamics horizon {}. \
@@ -9780,8 +9845,8 @@ fn print_banner(
         args.seed,
     );
     println!(
-        "selection      {SELECTION_METRIC}; predictive scoring contract: {}, weights \
-         {SELECTION_WEIGHTS:?}",
+        "selection      {} [density-era provisional validation-only; NOT shared-book selection]; predictive scoring contract: {}, weights {SELECTION_WEIGHTS:?}",
+        SELECTION_METRIC,
         BarScoring::Hard.report_contract(),
     );
     println!(
@@ -9881,6 +9946,48 @@ mod tests {
     use shared::bars::{write_bar_file, PackedBar, FILE_EXTENSION};
 
     const TEST_RES: u32 = 300;
+    fn synthetic_direct_return_supports() -> DirectReturnSupports {
+        let rows: Vec<[f64; DIRECT_RETURN_COUNT]> = (0..512)
+            .map(|row| {
+                std::array::from_fn(|horizon| (row as f64 - 255.5) * (horizon + 1) as f64 * 1.0e-5)
+            })
+            .collect();
+        DirectReturnSupports::fit(
+            &rows,
+            DirectReturnSupportsProvenance {
+                corpus_fingerprint: "synthetic-pretrain-test".to_owned(),
+                fit: TimeRange::new(1, 2),
+                fold_plan_hash: "ab".repeat(32),
+                fold_index: 0,
+                admitted_universe_digest: "cd".repeat(32),
+                train_seed: 0x5eed,
+                support_sample_seed: 0x51de,
+                row_count: rows.len(),
+            },
+        )
+        .expect("synthetic direct-return supports")
+    }
+
+    #[test]
+    fn resume_identity_rejects_plan_and_fold_drift() {
+        let fold = ResolvedPretrainFold {
+            plan_hash: "canonical-plan".to_owned(),
+            fold_index: 2,
+            fit: TimeRange::new(10, 20),
+            validation: TimeRange::new(30, 40),
+            embargo_steps: 100,
+        };
+        validate_resume_fold_identity("canonical-plan", 2, &fold)
+            .expect("the recorded fold must resume");
+        assert!(validate_resume_fold_identity("different-plan", 2, &fold)
+            .expect_err("a changed rolling plan must be rejected")
+            .to_string()
+            .contains("rolling plan mismatch"));
+        assert!(validate_resume_fold_identity("canonical-plan", 1, &fold)
+            .expect_err("a changed rolling fold must be rejected")
+            .to_string()
+            .contains("rolling fold mismatch"));
+    }
 
     #[test]
     fn pretraining_initialization_requires_recorded_hard_contract() {
@@ -10133,8 +10240,8 @@ mod tests {
         });
     }
 
-    /// A corpus just large enough that the 10% validation and test regions each hold a
-    /// full deployed-context window, which is what `EvaluationSets::new` requires.
+    /// A corpus just large enough that the validation region holds a full deployed-context
+    /// window, which is what `EvaluationSets::new` requires.
     fn corpus_fixture(label: &str) -> (Fixture, BarCorpus) {
         // Every test that builds a real trainer comes through here, so this is the one place
         // the module's thread ceiling has to be set.
@@ -10173,6 +10280,33 @@ mod tests {
                 &bars,
             )
             .expect("write bars");
+            let daily_res = crate::torch::adjusted_daily::ADJUSTED_DAILY_RES_SECS;
+            let daily_step_ms = i64::from(daily_res) * 1000;
+            let daily_start = base - 128 * daily_step_ms;
+            let mut daily_close = 80.0 + seed as f32;
+            let daily_bars: Vec<PackedBar> = (0..256)
+                .map(|i| {
+                    let open = daily_close;
+                    daily_close *= 1.0005 + seed as f32 * 0.00001;
+                    PackedBar {
+                        ts_ms: daily_start + i * daily_step_ms,
+                        open,
+                        high: daily_close + 0.5,
+                        low: (open - 0.5).max(0.5),
+                        close: daily_close,
+                        volume: 100_000.0 + i as f32,
+                        vwap: 0.5 * (open + daily_close),
+                        trades: 1_000,
+                    }
+                })
+                .collect();
+            write_bar_file(
+                &dir.join(format!("{symbol}.{daily_res}.{FILE_EXTENSION}")),
+                symbol,
+                daily_res,
+                &daily_bars,
+            )
+            .expect("write adjusted daily bars");
         }
         let corpus = BarCorpus::load(&dir, TEST_RES, 100).expect("load corpus");
         (Fixture { dir }, corpus)
@@ -10311,6 +10445,17 @@ mod tests {
             "both resolutions must appear in the audit: {:?}",
             series.iter().map(|s| &s.label).collect::<Vec<_>>()
         );
+        let integrity = trainer
+            .run
+            .gens
+            .join("pretrain_universe_integrity.report.bin");
+        let integrity =
+            shared::report::read_report(&integrity).expect("the universe-integrity audit reads");
+        assert!(integrity.title.contains("res=300 "));
+        assert!(integrity.title.contains("res=3600 "));
+        assert!(integrity
+            .title
+            .contains("min training bars strictly before train_end"));
 
         // 2. It takes exactly the promised number of real optimizer steps on the Bresenham
         // cadence over one primary pass.
@@ -10535,6 +10680,8 @@ mod tests {
             lambda_dyn: 1.0,
             lambda_kl: 1.0,
             validation_windows: 3,
+            rolling_fold_count: None,
+            rolling_fold_index: None,
             diagnostic_context: BAR_CONTEXT_RAMP_START,
             snapshot_windows: 1,
             // The floor plus a margin. Every boundary now takes an ancestral rollout, the
@@ -10553,6 +10700,7 @@ mod tests {
             supports: None,
             freeze_supports: false,
             min_dollar_volume: 0.0,
+            mask_adjusted_daily_context: false,
             // The fixture runs on CPU, where capacity is unmeasured and nothing is ever
             // clamped, so the refusal mode has nothing to refuse. `false` is also the
             // production default: absent here means "behave exactly as before", which is the
@@ -10561,7 +10709,6 @@ mod tests {
             // The recipe default, so every trainer test in this file exercises the schedule
             // every persisted run was produced under.
             lr_plateau_fraction: LR_PLATEAU_FRACTION,
-            beta_nll: None,
             sdlr: false,
         }
     }
@@ -10599,32 +10746,6 @@ mod tests {
         assert!(validate_args(&args).is_err());
     }
 
-    #[test]
-    fn beta_nll_validation_requires_one_isolated_exact_batch_arm() {
-        let dir = PathBuf::from(".");
-        let mut args = test_args(0x5EED, &dir);
-        args.beta_nll = Some(0.5);
-        args.exact_batch = true;
-        validate_args(&args).expect("the isolated beta-NLL arm is valid");
-
-        for invalid in [0.0, -0.1, 1.1, f64::NAN, f64::INFINITY] {
-            args.beta_nll = Some(invalid);
-            assert!(
-                validate_args(&args).is_err(),
-                "beta exponent {invalid} must be refused"
-            );
-        }
-        args.beta_nll = Some(0.5);
-        args.exact_batch = false;
-        assert!(validate_args(&args).is_err());
-        args.exact_batch = true;
-        args.sdlr = true;
-        assert!(validate_args(&args).is_err());
-        args.sdlr = false;
-        args.auxiliary_resolutions = vec![86_400];
-        assert!(validate_args(&args).is_err());
-    }
-
     /// EVAL-GATE-001 and EVAL-GATE-002. A ramp stage below the deployed context must still
     /// produce a full fixed-context held-out read, an epoch artifact and a defensible best;
     /// and a run that NEVER reaches the deployed context must still end with a promoted
@@ -10644,6 +10765,8 @@ mod tests {
             uuid::Uuid::new_v4()
         ));
         let mut args = test_args(0x5EED, &dir);
+        args.split_bounds = Some(corpus.split_bounds());
+        args.derive_split_bounds = false;
         // One window per pinned set and no ancestral samples beyond the minimum: this test is
         // about the control flow, and the model is a 512-wide 10-layer transformer on CPU.
         args.validation_windows = 1;
@@ -10661,6 +10784,14 @@ mod tests {
         // The ramp got to the diagnostic context and no further, which is exactly the state a
         // memory-held run sits in for most of its length.
         trainer.reached_context = diag;
+        assert_eq!(
+            trainer.eval.diagnostic.label(),
+            ROLLING_VALIDATION_LABEL,
+            "explicit rolling ranges need a stable report label without asking BarSampler for \
+             a legacy split identity"
+        );
+        // This call reaches `window_scores`, finite-NLL errors, and marginal provenance for an
+        // explicit-range sampler. It regresses the former `sampler.split()` panic directly.
 
         trainer.validate(0, true, false).expect("validation runs");
         assert_eq!(
@@ -10769,30 +10900,25 @@ mod tests {
             "the selection context must be the one actually trained at"
         );
 
-        let (battery, dyn_identity) = trainer.test_battery().expect("terminal battery");
+        let dyn_identity = trainer
+            .completion_dynamics_ratio()
+            .expect("validation completion guard");
         // The shipped dynamics head must beat the trivial identity map, which is the
         // invariant the deleted auxiliary anneal violated on every promotion it made.
         assert!(
             dyn_identity.is_finite(),
-            "the terminal battery could not measure dyn/identity at all"
+            "the validation completion guard could not measure dyn/identity at all"
         );
         check_dynamics_beats_identity(dyn_identity, trainer.args.dyn_horizon as i64)
             .expect("a run must not end with a dynamics head worse than doing nothing");
         assert!(
-            battery.nll_bar.is_finite(),
-            "a run must never end without a held-out number: {}",
-            battery.nll_bar
-        );
-        assert_eq!(battery.selection_context, diag);
-        assert_eq!(battery.reached_context, diag);
-        assert_eq!(battery.deployed_context, deployed);
-        assert!(
-            battery
-                .independent_marginal_nll_dof
-                .iter()
-                .all(|v| v.is_finite()),
-            "the forecast breakdown must be measured on the test split too: {:?}",
-            battery.independent_marginal_nll_dof
+            !trainer
+                .run
+                .gens
+                .join("0")
+                .join("pretrain_test.report.bin")
+                .exists(),
+            "ordinary validation completion must not emit a new terminal Test report"
         );
         // The artifact must state the context it was selected at, on disk, not just in a log.
         let metadata = BarWorldModelMetadata::load(&world_model_metadata_path(
@@ -10817,7 +10943,7 @@ mod tests {
         assert!(
             provenance
                 .selection_metric
-                .contains("paired economics-primary selection"),
+                .contains("provisional density-era validation selection pending external shared-book selection"),
             "pretrain_best.ot metadata must name the rule that selected it: {}",
             provenance.selection_metric
         );
@@ -10894,34 +11020,28 @@ mod tests {
         std::fs::remove_dir_all(&runs).ok();
     }
 
-    /// The held-out power census must COUNT, must count the same thing the sampler and the
+    /// The validation power census must COUNT, must count the same thing the sampler and the
     /// bootstrap count, and must land on both registered bases.
     ///
-    /// This is the instrument that decides whether `Split::Test` is worth spending, so the
-    /// property under test is not "a chart appeared". Three things are asserted:
+    /// The property under test is not "a chart appeared":
     ///
     /// * The census agrees bar-for-bar and window-for-window with [`BarCorpus::split_bars`] and
-    ///   [`BarSampler`], which are what the scoring pass itself will use. A census computed by a
-    ///   second, agreeing-by-luck route would be worse than none.
+    ///   [`BarSampler`], which are what the scoring pass itself will use.
     /// * Blocks are `<=` windows and the ladder's half-width is NON-INCREASING as the prefix
-    ///   grows. The naive identity "one window, one block" is FALSE in general — two windows of
-    ///   one symbol inside one calendar month are ONE bootstrap draw — and the interval scales
-    ///   with the block count, so a ladder that read blocks off the window count would overstate
-    ///   the power of every rung.
+    ///   grows.
     /// * The scaling is exactly `sqrt(B_ref / B)`, checked against the reference itself.
     ///
-    /// No checkpoint is opened and nothing is scored, which is the whole point of the pass this
-    /// covers.
+    /// No checkpoint is opened and nothing is scored.
     #[test]
     fn the_heldout_power_census_writes_both_registered_bases() {
         let (_fx, corpus) = corpus_fixture("power");
-        let set = PinnedSet::pinned(&corpus, Split::Test, BAR_CONTEXT_RAMP_START, 64)
-            .expect("the fixture's test region holds a ramp-start window");
+        let set = PinnedSet::pinned(&corpus, Split::Val, BAR_CONTEXT_RAMP_START, 64)
+            .expect("the fixture's validation region holds a ramp-start window");
         let blocks_all = pinned_blocks(&set);
         let cut = blocks_all.len() / 2;
         let power = HeldOutPower::measure(
             &corpus,
-            Split::Test,
+            Split::Val,
             BAR_CONTEXT_RAMP_START,
             &blocks_all,
             &blocks_all[..cut],
@@ -10929,7 +11049,7 @@ mod tests {
         );
 
         // 1. The census counts what the scoring pass will count.
-        assert_eq!(power.census.len(), 3);
+        assert_eq!(power.census.len(), 2);
         for row in &power.census {
             assert_eq!(
                 row.bars,
@@ -10951,16 +11071,20 @@ mod tests {
                 row.split.as_str()
             );
         }
-        let test_row = power
+        let val_row = power
             .census
             .iter()
-            .find(|row| row.split == Split::Test)
-            .expect("the test split is censused");
+            .find(|row| row.split == Split::Val)
+            .expect("the validation split is censused");
         assert!(
-            power.windows_drawn <= test_row.anchors,
+            power.windows_drawn <= val_row.anchors,
             "a draw of {} cannot exceed the {} windows the split supplies",
             power.windows_drawn,
-            test_row.anchors
+            val_row.anchors
+        );
+        assert!(
+            power.census.iter().all(|row| row.split != Split::Test),
+            "ordinary validation census must not construct the spent Test population"
         );
 
         // 2. Blocks are a coarsening of windows, and power is monotone in the prefix.
@@ -11042,7 +11166,7 @@ mod tests {
         let shared::report::ReportKind::MultiLine { series } = census.kind else {
             panic!("the census must be a MultiLine chart");
         };
-        assert_eq!(series[0].values, vec![0.0f32, 1.0, 2.0]);
+        assert_eq!(series[0].values, vec![0.0f32, 1.0]);
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -11110,7 +11234,7 @@ mod tests {
             &trainer.modules,
             &trainer.supports_dev,
             &growth_support,
-            None,
+            &trainer.direct_return_supports_dev,
             &sample,
             &trainer.args,
             &mut trainer.optimizer,
@@ -11516,10 +11640,12 @@ mod tests {
         let (_fx, corpus) = corpus_fixture("evalseed");
         let dir = PathBuf::from(corpus.dir());
 
-        let (train_a, eval_a) =
-            build_samplers(&corpus, &test_args(0x5EED, &dir)).expect("samplers a");
-        let (train_b, eval_b) =
-            build_samplers(&corpus, &test_args(0x5EED + 1, &dir)).expect("samplers b");
+        let args_a = test_args(0x5EED, &dir);
+        let args_b = test_args(0x5EED + 1, &dir);
+        let fold_a = resolve_pretrain_fold(&corpus, &args_a).expect("fold a");
+        let fold_b = resolve_pretrain_fold(&corpus, &args_b).expect("fold b");
+        let (train_a, eval_a) = build_samplers(&corpus, &args_a, &fold_a).expect("samplers a");
+        let (train_b, eval_b) = build_samplers(&corpus, &args_b, &fold_b).expect("samplers b");
 
         // The training sampler DOES follow the seed: that is the replicate.
         assert_eq!(train_a[0].seed(), 0x5EED);
@@ -11530,12 +11656,6 @@ mod tests {
             ("promotion", &eval_a.promotion, &eval_b.promotion),
             ("diagnostic", &eval_a.diagnostic, &eval_b.diagnostic),
             ("snapshot", &eval_a.snapshot, &eval_b.snapshot),
-            ("test", &eval_a.test, &eval_b.test),
-            (
-                "test_snapshot",
-                &eval_a.test_snapshot,
-                &eval_b.test_snapshot,
-            ),
         ] {
             assert_eq!(
                 a.sampler.seed(),
@@ -11547,6 +11667,116 @@ mod tests {
             assert_eq!(
                 a.windows, b.windows,
                 "{name} windows moved when the training seed changed"
+            );
+        }
+    }
+
+    #[test]
+    fn direct_support_fit_evaluates_only_sampled_complete_rows_and_caches_panel_schedules() {
+        let (_fixture, corpus) = corpus_fixture("direct_support_census");
+        let dir = PathBuf::from(corpus.dir());
+        let args = test_args(0x5eed, &dir);
+        let fold = resolve_pretrain_fold(&corpus, &args).expect("fold");
+        let seed = fold_support_sample_seed(&fold);
+        let locations = corpus
+            .sample_direct_return_rows(fold.fit, args.support_samples, seed)
+            .expect("sample locations");
+        assert!(locations.population >= args.support_samples);
+        assert_eq!(locations.rows.len(), args.support_samples);
+
+        let distinct_decision_timestamps = locations
+            .rows
+            .iter()
+            .map(|location| {
+                let decision_ts = corpus.bars(location.symbol)[location.decision_bar].ts();
+                let endpoints = corpus.direct_return_endpoint_timestamps(decision_ts);
+                assert!(fold.fit.contains(decision_ts));
+                assert!(
+                    endpoints[DIRECT_RETURN_HORIZONS.len() - 1] < fold.fit.end_ms,
+                    "sampled H100 crossed the fold.fit boundary"
+                );
+                decision_ts
+            })
+            .collect::<HashSet<_>>()
+            .len();
+
+        let sampled = direct_return_support_rows(&corpus, fold.fit, args.support_samples, seed)
+            .expect("support rows");
+        assert_eq!(sampled.values.len(), args.support_samples);
+        assert_eq!(sampled.target_evaluations, sampled.values.len());
+        assert_eq!(
+            sampled.endpoint_schedule_evaluations, distinct_decision_timestamps,
+            "each shared panel timestamp must construct its six endpoints exactly once"
+        );
+
+        let binary_search_bound = (0..corpus.series_count())
+            .map(|symbol| {
+                let (lo, hi) = corpus.range(symbol, fold.fit);
+                let rows = hi - lo;
+                if rows == 0 {
+                    0
+                } else {
+                    usize::BITS as usize - rows.leading_zeros() as usize
+                }
+            })
+            .sum::<usize>();
+        assert!(
+            locations.eligibility_schedule_evaluations + sampled.endpoint_schedule_evaluations
+                <= binary_search_bound + sampled.values.len(),
+            "schedule work must be bounded by sampled rows plus series-log-row census work"
+        );
+
+        let fingerprint = corpus.identity_fingerprint();
+        let universe = corpus.universe_audit().admitted_symbols_digest.clone();
+        let supports = fit_direct_return_supports(&corpus, &args, &fingerprint, &fold, &universe)
+            .expect("fit direct supports");
+        assert_eq!(supports.provenance().row_count, args.support_samples);
+        assert_eq!(supports.provenance().fit, fold.fit);
+    }
+
+    #[test]
+    fn fold_support_geometry_does_not_move_with_the_training_seed() {
+        let (_fixture, corpus) = corpus_fixture("supportseed");
+        let dir = PathBuf::from(corpus.dir());
+        let args_a = test_args(0x5EED, &dir);
+        let args_b = test_args(0x5EED + 1, &dir);
+        let fold_a = resolve_pretrain_fold(&corpus, &args_a).expect("fold a");
+        let fold_b = resolve_pretrain_fold(&corpus, &args_b).expect("fold b");
+        assert_eq!(fold_a.plan_hash, fold_b.plan_hash);
+        assert_eq!(fold_a.fit, fold_b.fit);
+        assert_eq!(
+            fold_support_sample_seed(&fold_a),
+            fold_support_sample_seed(&fold_b)
+        );
+
+        let fingerprint = corpus.identity_fingerprint();
+        let universe = corpus.universe_audit().admitted_symbols_digest.clone();
+        let supports_a =
+            fit_direct_return_supports(&corpus, &args_a, &fingerprint, &fold_a, &universe)
+                .expect("direct supports a");
+        let supports_b =
+            fit_direct_return_supports(&corpus, &args_b, &fingerprint, &fold_b, &universe)
+                .expect("direct supports b");
+        assert_ne!(
+            supports_a.provenance().train_seed,
+            supports_b.provenance().train_seed
+        );
+        assert_eq!(
+            supports_a.provenance().support_sample_seed,
+            supports_b.provenance().support_sample_seed
+        );
+        for horizon in 0..DIRECT_RETURN_COUNT {
+            assert_eq!(
+                supports_a.boundaries(horizon),
+                supports_b.boundaries(horizon),
+                "H{} support moved with training seed",
+                DIRECT_RETURN_HORIZONS[horizon],
+            );
+            assert_eq!(
+                supports_a.bin_means(horizon),
+                supports_b.bin_means(horizon),
+                "H{} fitted moments moved with training seed",
+                DIRECT_RETURN_HORIZONS[horizon],
             );
         }
     }
@@ -11571,22 +11801,35 @@ mod tests {
         let mut args = test_args(0x5EED, &dir);
         args.snapshot_windows = 4;
 
-        let eval = EvaluationSets::new(&corpus, &args).expect("evaluation sets");
-        let standalone = PinnedSet::pinned(
+        let fold = resolve_pretrain_fold(&corpus, &args).expect("rolling fold");
+        let eval = EvaluationSets::new(&corpus, &args, fold.validation).expect("evaluation sets");
+        let standalone = PinnedSet::pinned_in_range(
             &corpus,
-            Split::Val,
+            fold.validation,
             args.diagnostic_context,
             args.snapshot_windows,
         )
         .expect("standalone set");
         assert_eq!(standalone.sampler.seed(), EVAL_WINDOW_SEED);
+        assert_eq!(standalone.label(), ROLLING_VALIDATION_LABEL);
+        assert_eq!(eval.diagnostic.label(), ROLLING_VALIDATION_LABEL);
+        assert_eq!(eval.promotion.label(), ROLLING_VALIDATION_LABEL);
+        let legacy_val = PinnedSet::pinned(
+            &corpus,
+            Split::Val,
+            args.diagnostic_context,
+            args.snapshot_windows,
+        )
+        .expect("legacy split-backed validation set");
+        assert_eq!(legacy_val.label(), Split::Val.as_str());
         assert_eq!(standalone.context, eval.snapshot.context);
         assert!(!standalone.windows.is_empty());
         assert_eq!(standalone.windows, eval.snapshot.windows);
 
         // A different count is a different draw, not a prefix of this one.
-        let fewer = PinnedSet::pinned(&corpus, Split::Val, args.diagnostic_context, 1)
-            .expect("single-window set");
+        let fewer =
+            PinnedSet::pinned_in_range(&corpus, fold.validation, args.diagnostic_context, 1)
+                .expect("single-window set");
         assert_eq!(fewer.windows.len(), 1);
         if standalone.windows.len() > 1 {
             assert_ne!(fewer.windows[0], standalone.windows[0]);
@@ -11892,12 +12135,14 @@ mod tests {
     #[test]
     fn step_metrics_use_one_stable_packed_transfer_layout() {
         let scalar = |value: f32| Tensor::from(value);
-        let mut graph = TrainingGraph {
+        let graph = TrainingGraph {
             loss: scalar(1.0),
             nll: scalar(2.0),
             nll_dof: Tensor::from_slice(&[3.0f32, 4.0, 5.0, 6.0, 7.0]),
-            objective_nll: None,
-            beta_diagnostics: None,
+            direct_return_nll_mean: scalar(17.0),
+            joint_categorical_ce: scalar(2.25),
+            direct_nll_horizon: Tensor::from_slice(&[2.1f32, 2.2, 2.3, 2.4, 2.5, 2.6]),
+            direct_valid_horizon: Tensor::from_slice(&[18.0f32, 17.0, 16.0, 15.0, 14.0, 13.0]),
             dyn_loss: scalar(8.0),
             kl_loss: scalar(9.0),
             growth_diagnostic: scalar(10.0),
@@ -11905,92 +12150,109 @@ mod tests {
             identity: scalar(14.0),
             autocorr: scalar(15.0),
         };
-        let packed = pack_step_metrics(&graph, &scalar(16.0), None, None);
-        assert_eq!(packed.size(), [STEP_METRIC_BASE_COUNT as i64]);
-        let read = read_packed_step_metrics(&packed);
-        assert_eq!(
-            &read[..STEP_METRIC_BASE_COUNT],
-            &[
-                1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0, 13.0, 14.0, 15.0,
-                16.0,
-            ]
-        );
-        assert!(read[STEP_METRIC_ROW_LR].iter().all(|value| value.is_nan()));
-
         let row_lr = Tensor::arange(ROW_LR_METRIC_COUNT as i64, (Kind::Float, Device::Cpu));
-        let packed = pack_step_metrics(&graph, &scalar(16.0), Some(&row_lr), None);
-        assert_eq!(packed.size(), [STEP_METRIC_ROW_LR.end as i64]);
-        let read = read_packed_step_metrics(&packed);
+        let smd = Tensor::arange(SMD_METRIC_COUNT as i64, (Kind::Float, Device::Cpu));
+        let packed = pack_step_metrics(&graph, &scalar(16.0), Some(&row_lr), Some(&smd));
+        assert_eq!(packed.size(), [PackedStepMetrics::LEN as i64]);
+        let read = PackedStepMetrics::read(&packed);
+        assert_eq!(read.total(), 1.0);
+        assert_eq!(read.canonical_nll(), 2.0);
+        assert_eq!(read.nll_dof(), [3.0, 4.0, 5.0, 6.0, 7.0]);
+        for (actual, expected) in read
+            .direct_nll_horizon()
+            .iter()
+            .zip([2.1, 2.2, 2.3, 2.4, 2.5, 2.6])
+        {
+            assert!((actual - expected).abs() < 1.0e-6);
+        }
         assert_eq!(
-            &read[STEP_METRIC_ROW_LR],
+            read.direct_valid_horizon(),
+            [18.0, 17.0, 16.0, 15.0, 14.0, 13.0]
+        );
+        assert_eq!(read.direct_return_nll_mean(), Some(17.0));
+        assert_eq!(read.joint_categorical_ce(), 2.25);
+        assert_eq!(
+            read.row_learned_lr().as_slice(),
             &(0..ROW_LR_METRIC_COUNT)
                 .map(|value| value as f64)
                 .collect::<Vec<_>>()
         );
-
-        let smd = Tensor::arange(SMD_METRIC_COUNT as i64, (Kind::Float, Device::Cpu));
-        let packed = pack_step_metrics(&graph, &scalar(16.0), None, Some(&smd));
-        assert_eq!(packed.size(), [STEP_METRIC_SMD_IDBD.end as i64]);
-        let read = read_packed_step_metrics(&packed);
-        assert!(read[STEP_METRIC_ROW_LR].iter().all(|value| value.is_nan()));
         assert_eq!(
-            &read[STEP_METRIC_SMD_IDBD],
+            read.smd_idbd().as_slice(),
             &(0..SMD_METRIC_COUNT)
                 .map(|value| value as f64)
                 .collect::<Vec<_>>()
         );
-        graph.objective_nll = Some(scalar(17.0));
-        graph.beta_diagnostics = Some((
-            Tensor::from_slice(&[1.0f32, 1.1, 1.2, 1.3, 1.4]),
-            Tensor::from_slice(&[0.0f32, 0.1, 0.2, 0.3, 0.4]),
-        ));
-        let packed = pack_step_metrics(&graph, &scalar(16.0), None, None);
-        assert_eq!(packed.size(), [STEP_METRIC_COUNT as i64]);
-        let read = read_packed_step_metrics(&packed);
-        assert!(read[STEP_METRIC_ROW_LR].iter().all(|value| value.is_nan()));
-        assert!(read[STEP_METRIC_SMD_IDBD]
-            .iter()
-            .all(|value| value.is_nan()));
-        assert_eq!(read[STEP_METRIC_BETA_NLL_OBJECTIVE], 17.0);
-        for (actual, expected) in read[STEP_METRIC_BETA_NLL_WEIGHT]
-            .iter()
-            .zip([1.0, 1.1, 1.2, 1.3, 1.4])
-        {
-            assert!((actual - expected).abs() < 1.0e-6);
-        }
-        for (actual, expected) in read[STEP_METRIC_BETA_NLL_FLOOR]
-            .iter()
-            .zip([0.0, 0.1, 0.2, 0.3, 0.4])
-        {
-            assert!((actual - expected).abs() < 1.0e-6);
-        }
     }
 
     #[test]
     fn packed_metric_guard_rejects_nonfinite_loss_and_gradient() {
-        let finite = [0.0; STEP_METRIC_COUNT];
-        ensure_finite_step_metrics(&finite, 7).expect("finite packet");
+        let scalar = |value: f32| Tensor::from(value);
+        let graph = |loss: f32| TrainingGraph {
+            loss: scalar(loss),
+            nll: scalar(2.0),
+            nll_dof: Tensor::ones([BAR_DOF as i64], (Kind::Float, Device::Cpu)),
+            direct_return_nll_mean: scalar(2.5),
+            joint_categorical_ce: scalar(2.25),
+            direct_nll_horizon: Tensor::ones(
+                [DIRECT_RETURN_COUNT as i64],
+                (Kind::Float, Device::Cpu),
+            ),
+            direct_valid_horizon: Tensor::ones(
+                [DIRECT_RETURN_COUNT as i64],
+                (Kind::Float, Device::Cpu),
+            ),
+            dyn_loss: scalar(3.0),
+            kl_loss: scalar(4.0),
+            growth_diagnostic: scalar(5.0),
+            growth_stats: Tensor::ones(
+                [growth::GROWTH_STAT_COUNT as i64],
+                (Kind::Float, Device::Cpu),
+            ),
+            identity: scalar(6.0),
+            autocorr: scalar(7.0),
+        };
+        PackedStepMetrics::read(&pack_step_metrics(&graph(1.0), &scalar(8.0), None, None))
+            .ensure_finite(7)
+            .expect("finite packet");
 
-        let mut bad_loss = finite;
-        bad_loss[STEP_METRIC_TOTAL] = f64::NAN;
-        assert!(ensure_finite_step_metrics(&bad_loss, 7)
-            .expect_err("NaN loss must stop the step")
-            .to_string()
-            .contains("loss is not finite"));
+        assert!(PackedStepMetrics::read(&pack_step_metrics(
+            &graph(f32::NAN),
+            &scalar(8.0),
+            None,
+            None,
+        ))
+        .ensure_finite(7)
+        .expect_err("NaN loss must stop the step")
+        .to_string()
+        .contains("loss is not finite"));
 
-        let mut bad_grad = finite;
-        bad_grad[STEP_METRIC_GRAD_NORM] = f64::INFINITY;
-        assert!(ensure_finite_step_metrics(&bad_grad, 7)
-            .expect_err("infinite gradient must stop the step")
-            .to_string()
-            .contains("gradient norm is not finite"));
+        assert!(PackedStepMetrics::read(&pack_step_metrics(
+            &graph(1.0),
+            &scalar(f32::INFINITY),
+            None,
+            None,
+        ))
+        .ensure_finite(7)
+        .expect_err("infinite gradient must stop the step")
+        .to_string()
+        .contains("gradient norm is not finite"));
 
-        let mut bad_smd = finite;
-        bad_smd[STEP_METRIC_SMD_IDBD.start] = f64::NAN;
-        assert!(ensure_finite_step_metrics(&bad_smd, 7)
-            .expect_err("partially non-finite SMD diagnostics must stop the step")
-            .to_string()
-            .contains("SMD-IDBD diagnostics"));
+        let smd = Tensor::from_slice(
+            &(0..SMD_METRIC_COUNT)
+                .map(|index| if index == 0 { f32::NAN } else { index as f32 })
+                .collect::<Vec<_>>(),
+        );
+        assert!(PackedStepMetrics::read(&pack_step_metrics(
+            &graph(1.0),
+            &scalar(8.0),
+            None,
+            Some(&smd),
+        ))
+        .ensure_finite(7)
+        .expect_err("partially non-finite SMD diagnostics must stop the step")
+        .to_string()
+        .contains("SMD-IDBD diagnostics"));
     }
 
     /// The snapshot window must be long enough for every horizon the report plots,
@@ -12379,7 +12641,16 @@ mod tests {
         let supports = synthetic_supports();
         let growth_support = GrowthSupport::new(&supports, Device::Cpu)
             .expect("the synthetic support carries the growth diagnostic");
+        let direct_supports = synthetic_direct_return_supports();
         let (dof, time_ids) = synthetic_window(batch, context + 1, 0xB0B0);
+        let adjusted_daily = Tensor::zeros(
+            [
+                batch,
+                context + 1,
+                crate::torch::adjusted_daily::ADJUSTED_DAILY_CONTEXT_FEATURES as i64,
+            ],
+            (Kind::Float, Device::Cpu),
+        );
 
         let mut totals: Vec<f64> = Vec::with_capacity(steps.len());
         for step in steps {
@@ -12392,18 +12663,21 @@ mod tests {
                 &growth_support,
                 &dof,
                 &time_ids,
+                &adjusted_daily,
+                DirectReturnContextMode::Enabled,
                 context,
                 horizon,
                 lambda_dyn,
                 lambda_kl,
-                None,
                 BarScoring::Density,
+                &direct_supports,
                 Device::Cpu,
             );
             // The configured lambdas, and nothing else, assemble the objective. The
             // tolerance is f32-relative: the graph accumulates in f32, so recomposing the
             // sum in f64 from f32-rounded terms cannot reproduce it to more than ~1e-7.
-            let expected = graph.nll.double_value(&[])
+            let expected = graph.direct_return_nll_mean.double_value(&[])
+                + JOINT_BAR_AUXILIARY_COEFFICIENT * graph.joint_categorical_ce.double_value(&[])
                 + lambda_dyn * graph.dyn_loss.double_value(&[])
                 + lambda_kl * graph.kl_loss.double_value(&[]);
             let total_loss = graph.loss.double_value(&[]);
@@ -12461,12 +12735,14 @@ mod tests {
             &growth_support,
             &dof,
             &time_ids,
+            &adjusted_daily,
+            DirectReturnContextMode::Enabled,
             context,
             horizon,
             0.0,
             0.0,
-            None,
             BarScoring::Density,
+            &direct_supports,
             Device::Cpu,
         );
         annealed.loss.backward();
@@ -12487,7 +12763,7 @@ mod tests {
     ///
     /// Both ratios here are MEASURED through [`dynamics_losses`] rather than asserted as
     /// literals, so the test exercises the same quantity `dyn_identity_ratio` pools over the
-    /// test split and cannot pass against a guard reading a number nothing produces.
+    /// validation split and cannot pass against a guard reading a number nothing produces.
     #[test]
     fn the_end_of_run_guard_fires_on_a_stale_dynamics_head_and_passes_on_a_healthy_one() {
         let _torch_rng_guard = test_rng::exclusive();
@@ -12985,23 +13261,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn significant_edge_improvement_is_vetoed_by_significant_nll_regression() {
-        let edge_band = SELECTION_EDGE_SE_MULTIPLE * EDGE_SE;
-        let nll_band = SELECTION_NLL_SE_MULTIPLE * NLL_SE;
-        assert_eq!(
-            selection_outcome(
-                false,
-                true,
-                &measured_edge(),
-                Some(paired(1.01 * edge_band, EDGE_SE)),
-                Some(paired(1.01 * nll_band, NLL_SE)),
-                Some(paired(0.0, DOF_SE)),
-            ),
-            SelectionOutcome::RefusedNllGuard
-        );
-    }
-
     /// The independent-window recovery comparison improved conditional NLL significantly but
     /// moved edge only +0.0258 +/- 0.0190 bps/bar. The every-bar receding execution showed why
     /// that predictive improvement cannot displace the safer economic incumbent by itself.
@@ -13129,5 +13388,11 @@ mod tests {
             selection_outcome(false, true, &measured_edge(), None, None, None),
             SelectionOutcome::Unmeasurable
         );
+    }
+    #[test]
+    fn adjusted_daily_pretrain_coverage_fails_closed_but_allows_partial_files() {
+        assert!(require_adjusted_daily_pretrain_coverage(0, 3).is_err());
+        require_adjusted_daily_pretrain_coverage(1, 2)
+            .expect("partial daily-file coverage remains explicit through row masks");
     }
 }

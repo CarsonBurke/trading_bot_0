@@ -5061,12 +5061,9 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
-    /// The writer named in `pretrain_reports::CYCLE_EXEMPT` for all three of this module's bases.
-    ///
-    /// Executes the whole path — measure a synthetic universe, build the book, sweep capacity at
-    /// every impact coefficient, measure the cross-section, write the charts — and reads each
-    /// artifact back. An exemption whose writer is never executed is what let a registered base
-    /// with no writer at all ship, so this test is the exemption's entire justification.
+    /// Executes the writer for all three bases owned by
+    /// `PretrainReportOwner::CostCapacity`: measure a synthetic universe, build the book,
+    /// sweep capacity, measure the cross-section, write the charts, and read them back.
     #[test]
     fn the_cost_capacity_battery_writes_all_three_registered_bases() {
         let symbols = 24usize;
@@ -5133,10 +5130,10 @@ mod tests {
             CAPACITY_CURVE_BASE,
             CROSS_CORRELATION_BASE,
         ] {
-            assert!(
-                shared::report::PRETRAIN_REPORT_BASES.contains(&base),
-                "{base} must be registered in shared::report::PRETRAIN_REPORT_BASES or the TUI \
-                 never scans for it"
+            assert_eq!(
+                shared::report::pretrain_report_owner(base),
+                Some(shared::report::PretrainReportOwner::CostCapacity),
+                "{base} must remain owned by the cost-capacity writer"
             );
             let path = dir.join(format!("{base}.report.bin"));
             assert!(path.exists(), "{base} was not written");

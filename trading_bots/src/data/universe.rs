@@ -28,25 +28,29 @@ pub const LIVE_RES_SECS: u32 = 300;
 pub const MIN_TRADING_BARS: usize = PRICE_DELTAS_PER_TICKER + 10 * STEPS_PER_EPISODE;
 
 static CACHED_BAR_UNIVERSE: LazyLock<Vec<String>> =
-    LazyLock::new(|| eligible_bar_universe(&bars_dir(), LIVE_RES_SECS, MIN_TRADING_BARS));
+    LazyLock::new(|| eligible_bar_universe(&bars_dir(), LIVE_RES_SECS, MIN_TRADING_BARS, None));
 
-/// The trading universe: every corpus symbol with enough 5-minute history to run a
-/// full episode, sorted and memoized.
+/// The operational PPO, paper and live universe, sorted and memoized.
 ///
-/// This is the PPO, paper and live universe, and it is nothing but a cached
-/// [`eligible_bar_universe`] over the corpus the world model also reads. There is no
-/// second, hand-curated list to drift away from it.
+/// Operational eligibility intentionally measures CURRENT total history: these consumers need
+/// enough bars to run an episode now. Causal research admission instead supplies `train_end_ms`
+/// to [`eligible_bar_universe`]. Keeping the distinction explicit prevents the live rule from
+/// masquerading as the point-in-time corpus rule.
 pub fn cached_bar_universe() -> &'static [String] {
     CACHED_BAR_UNIVERSE.as_slice()
 }
 
-/// Symbols in a packed-bar corpus directory (`<dir>/<SYMBOL>.<res_secs>.bars`) holding at
-/// least `min_bars` bars, sorted. The single source of truth for every universe in the
-/// repository: pretraining, the planner, PPO and live trading all resolve to this.
+/// Resolve eligible symbols under either current-depth (`train_end_ms == None`) or causal
+/// point-in-time (`Some(train_end_ms)`) semantics.
 ///
-/// Every rejection is reported, so a half-downloaded corpus cannot pass itself off as a
-/// healthy small one.
-pub fn eligible_bar_universe(dir: &Path, res_secs: u32, min_bars: usize) -> Vec<String> {
+/// Under a cutoff, eligibility is `file.index_at_or_after(train_end_ms) >= min_bars`: the bar at
+/// the boundary does not count. The full file remains represented by its symbol after admission.
+pub fn eligible_bar_universe(
+    dir: &Path,
+    res_secs: u32,
+    min_bars: usize,
+    train_end_ms: Option<i64>,
+) -> Vec<String> {
     let Ok(entries) = std::fs::read_dir(dir) else {
         eprintln!(
             "[universe] cannot read bar corpus directory {}",
@@ -67,11 +71,22 @@ pub fn eligible_bar_universe(dir: &Path, res_secs: u32, min_bars: usize) -> Vec<
             continue;
         }
         match BarFile::open(&path) {
-            Ok(file) if file.len() >= min_bars => eligible.push(symbol),
-            Ok(file) => println!(
-                "[universe] dropping {symbol}: {} bars < min_bars {min_bars}",
-                file.len()
-            ),
+            Ok(file) => {
+                let eligible_bars = train_end_ms
+                    .map(|cutoff| file.index_at_or_after(cutoff))
+                    .unwrap_or_else(|| file.len());
+                if eligible_bars >= min_bars {
+                    eligible.push(symbol);
+                } else {
+                    let rule = train_end_ms.map_or_else(
+                        || "current total bars".to_owned(),
+                        |cutoff| format!("training bars strictly before train_end {cutoff}"),
+                    );
+                    println!(
+                        "[universe] dropping {symbol}: {eligible_bars} {rule} < minimum {min_bars}"
+                    );
+                }
+            }
             Err(error) => eprintln!("[universe] dropping {symbol}: {error:#}"),
         }
     }

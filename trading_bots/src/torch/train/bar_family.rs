@@ -3523,12 +3523,9 @@ mod tests {
         );
     }
 
-    /// The writer named in `pretrain_reports::CYCLE_EXEMPT` for every base this module owns.
-    ///
-    /// The exemption is honest only if something EXECUTES the writer: a stated reason is not
-    /// coverage. Every base needs a whole fitted family battery over a drawn sample, which an
-    /// in-run reporter cycle over step metrics does not have, which is why they are exempt and why
-    /// this test is the exemption's entire justification.
+    /// Executes the writer for every base owned by `PretrainReportOwner::BarFamily`.
+    /// Each needs a fitted family battery over a drawn sample, so the in-run metric cycle
+    /// cannot exercise it.
     #[test]
     fn the_bar_family_fit_writes_every_registered_base() {
         let rows = 60_000usize;
@@ -3601,10 +3598,10 @@ mod tests {
         let dir = scratch_dir("bases");
         write_bar_family(&dir, &fit).expect("every chart writes");
         for base in BAR_FAMILY_BASES {
-            assert!(
-                shared::report::PRETRAIN_REPORT_BASES.contains(base),
-                "{base} must be registered in shared::report::PRETRAIN_REPORT_BASES or the TUI \
-                 never scans for it"
+            assert_eq!(
+                shared::report::pretrain_report_owner(base),
+                Some(shared::report::PretrainReportOwner::BarFamily),
+                "{base} must remain owned by the bar-family writer"
             );
             let path = dir.join(format!("{base}.report.bin"));
             assert!(path.exists(), "{base} was not written");

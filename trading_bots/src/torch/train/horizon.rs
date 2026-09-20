@@ -1,12 +1,12 @@
 //! Canonical production evaluation for the pretrained bar world model.
 //!
 //! The decision clock is always one calendar panel bar. At every row the evaluator conditions
-//! only on available history, samples one common autoregressive continuation to 100 bars, reads
-//! the 1/4/16/39/78/100 cumulative simple-return laws from prefixes of those same paths, solves
-//! a multi-asset action from the actual drifted holdings, executes only that first action, and
-//! repeats at the next row. Forecast horizon and rebalance frequency are therefore independent.
-//! `--forecast-horizon` selects and highlights the production model run from that exact grid;
-//! it does not discard the other prefixes, which remain the fixed comparison in both reports.
+//! only on available history, reads the direct head's fitted categorical cumulative-return laws
+//! at 1/4/16/39/78/100 bars, solves a multi-asset action from the actual drifted holdings,
+//! executes only that first action, and repeats at the next row. Forecast horizon and rebalance
+//! frequency are therefore independent. `--forecast-horizon` selects and highlights the
+//! production model run from that exact grid; it does not discard the other direct laws, which
+//! remain the fixed comparison in both reports.
 //!
 //! The action objective is predicted simple-return growth minus
 //! `0.5 w'(Cov(R) + E[R]E[R]')w` and [`super::portfolio::PanelCost`]. The covariance is a PSD
@@ -21,7 +21,7 @@
 //! the fixed solver-safe dead-zone frontier; locked test never does. One optional, predeclared
 //! mean-sign hysteresis candidate can be paired against Raw without changing production defaults.
 //! Economic output is written only as `.report.bin`, defaults to validation, and refuses the
-//! locked test split without an explicit second opt-in.
+//! locked test split.
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -31,10 +31,13 @@ use shared::report::{read_report, write_report, Report, ReportKind, ReportSeries
 use tch::{Device, Kind, Tensor};
 
 use crate::torch::bar_dist::{BarSupports, DOF_R, NUM_BAR_BINS};
+/// Production forecast horizons, shared with model-free direct-return labels.
+pub use crate::torch::dataset::DIRECT_RETURN_HORIZONS as FORECAST_HORIZONS;
 use crate::torch::dataset::{
     bar_time_ids, forecast_schedule_after, forecast_schedule_ids_from, BarCorpus, BarEndpoint,
     Split, BAR_TIME_FEATURES,
 };
+use crate::torch::direct_return::{DirectReturnSupports, DIRECT_RETURN_COUNT};
 use crate::torch::world_model::{world_model_metadata_path, BarWorldModel, BAR_MODEL_DIM};
 
 use super::portfolio::{
@@ -68,16 +71,11 @@ use super::trade_bench::{
 /// This is the axis of the experiment, not a tuned parameter: the deliverable is the SHAPE of
 /// break-even against `k`, and a single favourable `k` would be a selected number.
 pub const HOLD_HORIZONS: [usize; 9] = [1, 2, 4, 8, 16, 39, 78, 195, 390];
-/// Production forecast horizons.  They are all evaluated on the same one-bar rebalance
-/// clock and extracted from prefixes of one common 100-bar ancestral rollout.
-pub const FORECAST_HORIZONS: [usize; 6] = [1, 4, 16, 39, 78, 100];
+/// Production default selected from [`FORECAST_HORIZONS`].
 pub const DEFAULT_FORECAST_HORIZON: usize = 100;
 
-/// Parse and validate the production horizon selected by the CLI.
-///
-/// Selection is deliberately restricted to the exact prefix laws in [`FORECAST_HORIZONS`]:
-/// accepting an arbitrary value would either label a different run as selected or require a
-/// second rollout that is no longer part of the fixed comparison grid.
+/// Selection is deliberately restricted to the exact laws in [`FORECAST_HORIZONS`]: accepting
+/// an arbitrary value would label a horizon the direct head does not predict.
 pub fn parse_forecast_horizon(value: &str) -> std::result::Result<usize, String> {
     let horizon = value
         .parse::<usize>()
@@ -371,12 +369,13 @@ impl Construction {
 // The one-bar scan
 // ---------------------------------------------------------------------------
 
-/// Every belief the panel has, plus the fitted one-bar categorical reduction at each.
+/// Every belief the panel has, plus exact moment reductions of the one-bar bar-emission law and
+/// all six direct cumulative-return laws.
 ///
 /// The beliefs live on the HOST. At the default panel that is `instants * breadth * 512` f32,
-/// about 0.7 GiB, affordable in RAM and not on a shared GPU; chunks go to the device as the
-/// rollout needs them. The size is asserted against [`BELIEF_CACHE_LIMIT_BYTES`] before
-/// anything is allocated, so an over-large panel fails with the knob to turn rather than with
+/// about 0.7 GiB, affordable in RAM and not on a shared GPU; chunks go to the device only for
+/// legacy held-period diagnostics. The size is asserted against [`BELIEF_CACHE_LIMIT_BYTES`]
+/// before anything is allocated, so an over-large panel fails with the knob to turn rather than
 /// an allocation error.
 pub struct PanelBeliefs {
     /// Row-major `[rows, BAR_MODEL_DIM]`.
@@ -392,6 +391,11 @@ pub struct PanelBeliefs {
     /// through that lossy representation.
     pub mean_simple: Vec<Vec<f64>>,
     pub second_simple: Vec<Vec<f64>>,
+    /// Exact fitted categorical first and raw-second moments of the six direct cumulative
+    /// SIMPLE-return laws. Indexed `[horizon][instant][symbol slot]` in
+    /// [`FORECAST_HORIZONS`] order.
+    pub direct_mean_simple: [Vec<Vec<f64>>; DIRECT_RETURN_COUNT],
+    pub direct_second_simple: [Vec<Vec<f64>>; DIRECT_RETURN_COUNT],
     /// Mean of the same law's LOG return, per panel entry, in nats.
     pub mu_log: Vec<Vec<f64>>,
     /// Variance of the same law's LOG return, per panel entry, in nats squared.
@@ -418,13 +422,13 @@ impl PanelBeliefs {
     }
 }
 
-/// One block pass over every panel bar: the belief, the prefix-free one-bar law of `r`,
-/// and both of that law's moment reductions.
+/// One block pass over every panel bar: the causal belief, the prefix-free one-bar bar-emission
+/// law, and all six direct cumulative-return laws.
 ///
-/// Structurally [`super::portfolio::model_forecasts`], and deliberately so — the `k = 1` row
-/// of this sweep has to be the portfolio bench's own number or the sweep is measuring a
-/// different model. It differs only in keeping the belief (which the rollout needs) and the
-/// LOG moments (which the aggregate closure needs) beside the simple-return reduction.
+/// The direct head consumes the exact same causal belief as the existing one-bar reduction plus
+/// the last daily bar already complete at that decision. Its fitted per-bin simple-return moments
+/// are reduced analytically with autocast disabled; no sample or future observation enters a
+/// candidate forecast.
 pub fn scan_panel(
     model: &BarWorldModel,
     corpus: &BarCorpus,
@@ -488,6 +492,20 @@ pub fn scan_panel(
             .iter()
             .map(|s| vec![f64::NAN; s.symbols.len()])
             .collect(),
+        direct_mean_simple: std::array::from_fn(|_| {
+            panel
+                .slices()
+                .iter()
+                .map(|s| vec![f64::NAN; s.symbols.len()])
+                .collect()
+        }),
+        direct_second_simple: std::array::from_fn(|_| {
+            panel
+                .slices()
+                .iter()
+                .map(|s| vec![f64::NAN; s.symbols.len()])
+                .collect()
+        }),
         mu_log: panel
             .slices()
             .iter()
@@ -556,6 +574,7 @@ pub fn scan_panel(
             let input_dof = batch.dof.narrow(1, 0, len);
             let current_time = batch.time_ids.narrow(1, 0, len);
             let target_time = batch.time_ids.narrow(1, 1, len);
+            let current_daily = batch.adjusted_daily.narrow(1, 0, len);
             let beliefs = model.beliefs(&input_dof, &current_time);
             let conditioning = model
                 .trunk()
@@ -573,43 +592,62 @@ pub fn scan_panel(
                 .narrow(1, len - emit, emit)
                 .reshape([emit, latent])
                 .contiguous();
+            let daily_block = current_daily
+                .narrow(1, len - emit, emit)
+                .reshape([
+                    emit,
+                    crate::torch::adjusted_daily::ADJUSTED_DAILY_CONTEXT_FEATURES as i64,
+                ])
+                .contiguous();
 
             let mut start = 0i64;
             while start < emit {
                 let rows = ROW_CHUNK.min(emit - start);
                 let chunk = block.narrow(0, start, rows);
                 let chunk_conditioning = conditioning_block.narrow(0, start, rows);
-                // The decision law and its moments with autocast OFF: `mu = sum_i p_i c_i` is
-                // a cancelling sum whose value is ~1e-4 against a term spread of ~1e-3, and
-                // bf16's eight mantissa bits would destroy exactly the quantity this sweep is
-                // about. The BELIEF above is computed under the ambient autocast on purpose —
-                // that is the regime the checkpoint was trained and selected under.
-                let (kelly, mean, second, var, mu_l, var_l) = tch::autocast(false, || {
-                    let probs = forecast_r_probs(model.head(), &chunk, &chunk_conditioning);
-                    let kelly = host_f64(&kelly_fractions(
-                        &probs,
-                        &returns,
-                        &second_returns,
-                        FREE_LEVERAGE,
-                    ));
-                    let probs = probs.to_kind(Kind::Double);
-                    let mean = probs
-                        .matmul(&returns.reshape([NUM_BAR_BINS, 1]).to_kind(Kind::Double))
-                        .reshape([-1]);
-                    let second = probs.matmul(&second_returns).reshape([-1]);
-                    let var = (&second - &mean * &mean).clamp_min(0.0);
-                    let mu_l = probs.matmul(&centers).reshape([-1]);
-                    let second_l = probs.matmul(&centers_sq).reshape([-1]);
-                    let var_l = (&second_l - &mu_l * &mu_l).clamp_min(0.0);
-                    (
-                        kelly,
-                        host_f64(&mean),
-                        host_f64(&second),
-                        host_f64(&var),
-                        host_f64(&mu_l),
-                        host_f64(&var_l),
-                    )
-                });
+                let chunk_daily = daily_block.narrow(0, start, rows);
+                // Every moment reduction runs with autocast OFF. The one-bar mean is a
+                // cancelling sum, and the direct raw moments are the exact categorical law used
+                // by the book rather than a training-precision approximation or sampled path.
+                let (kelly, mean, second, var, mu_l, var_l, direct_mean, direct_second) =
+                    tch::no_grad(|| {
+                        tch::autocast(false, || {
+                            let probs = forecast_r_probs(model.head(), &chunk, &chunk_conditioning);
+                            let kelly = host_f64(&kelly_fractions(
+                                &probs,
+                                &returns,
+                                &second_returns,
+                                FREE_LEVERAGE,
+                            ));
+                            let probs = probs.to_kind(Kind::Double);
+                            let mean = probs
+                                .matmul(&returns.reshape([NUM_BAR_BINS, 1]).to_kind(Kind::Double))
+                                .reshape([-1]);
+                            let second = probs.matmul(&second_returns).reshape([-1]);
+                            let var = (&second - &mean * &mean).clamp_min(0.0);
+                            let mu_l = probs.matmul(&centers).reshape([-1]);
+                            let second_l = probs.matmul(&centers_sq).reshape([-1]);
+                            let var_l = (&second_l - &mu_l * &mu_l).clamp_min(0.0);
+                            let direct_logits = model.modules().direct_return_head.logits(
+                                &chunk,
+                                &chunk_daily,
+                                model.direct_return_context_mode(),
+                            );
+                            let (direct_mean, direct_second) = model
+                                .direct_return_supports()
+                                .simple_expectation_second_moment(&direct_logits);
+                            (
+                                kelly,
+                                host_f64(&mean),
+                                host_f64(&second),
+                                host_f64(&var),
+                                host_f64(&mu_l),
+                                host_f64(&var_l),
+                                host_f64(&direct_mean),
+                                host_f64(&direct_second),
+                            )
+                        })
+                    });
                 let flat = host_f32(&chunk);
                 let dim = BAR_MODEL_DIM as usize;
                 for row in 0..rows as usize {
@@ -625,6 +663,12 @@ pub fn scan_panel(
                     out.second_simple[t][k] = second[row];
                     out.mu_log[t][k] = mu_l[row];
                     out.var_log[t][k] = var_l[row];
+                    for h in 0..DIRECT_RETURN_COUNT {
+                        out.direct_mean_simple[h][t][k] =
+                            direct_mean[row * DIRECT_RETURN_COUNT + h];
+                        out.direct_second_simple[h][t][k] =
+                            direct_second[row * DIRECT_RETURN_COUNT + h];
+                    }
                     let at = out.row_of[t][k] as usize * dim;
                     out.beliefs[at..at + dim].copy_from_slice(&flat[row * dim..(row + 1) * dim]);
                 }
@@ -640,9 +684,17 @@ pub fn scan_panel(
                 && out.mean_simple[t].iter().all(|m| m.is_finite())
                 && out.second_simple[t].iter().all(|m| m.is_finite())
                 && out.mu_log[t].iter().all(|m| m.is_finite())
-                && out.var_log[t].iter().all(|v| v.is_finite()),
+                && out.var_log[t].iter().all(|v| v.is_finite())
+                && out
+                    .direct_mean_simple
+                    .iter()
+                    .all(|horizon| horizon[t].iter().all(|m| m.is_finite()))
+                && out
+                    .direct_second_simple
+                    .iter()
+                    .all(|horizon| horizon[t].iter().all(|m| m.is_finite() && *m >= 0.0)),
             "instant {t} has a symbol the belief pass never reached, so its position would be \
-             sized from a NaN"
+             sized from a non-finite direct or one-bar moment"
         );
     }
     Ok(out)
@@ -1345,7 +1397,8 @@ pub struct ForecastMoment {
     pub frictionless_kelly: f64,
 }
 
-/// One common ancestral rollout, exposed at every production prefix.
+/// Exact analytic moments of the direct head's six fitted categorical laws on one common
+/// max-horizon decision population.
 #[derive(Clone, Debug)]
 pub struct RecedingForecasts {
     /// `moments[h][p][k]` aligns with the kth symbol in `periods[p]`'s panel slice.
@@ -1353,50 +1406,73 @@ pub struct RecedingForecasts {
 }
 
 impl RecedingForecasts {
-    pub fn from_common_rollout(
+    pub fn from_direct_panel(
         panel: &Panel,
         beliefs: &PanelBeliefs,
         periods: &[Period],
-        laws: &[Vec<AggregateLaw>],
     ) -> Result<Self> {
         ensure!(
-            laws.len() == periods.len(),
-            "the common rollout has {} rows for {} eligible decisions",
-            laws.len(),
-            periods.len()
+            beliefs.row_of.len() == panel.slices().len()
+                && beliefs
+                    .direct_mean_simple
+                    .iter()
+                    .all(|rows| rows.len() == panel.slices().len())
+                && beliefs
+                    .direct_second_simple
+                    .iter()
+                    .all(|rows| rows.len() == panel.slices().len()),
+            "direct panel moments do not cover every panel instant"
         );
-        let mut moments = vec![Vec::with_capacity(periods.len()); FORECAST_HORIZONS.len()];
+        let mut moments = vec![Vec::with_capacity(periods.len()); DIRECT_RETURN_COUNT];
         for (p, period) in periods.iter().enumerate() {
             let t = period.instant;
-            let slice = &panel.slices()[t];
+            let slice = panel.slices().get(t).with_context(|| {
+                format!("direct forecast row {p} names absent panel instant {t}")
+            })?;
             ensure!(
-                laws[p].len() == slice.symbols.len(),
-                "rollout row {p} does not align with panel instant {t}"
+                period.ts_ms == slice.ts_ms,
+                "direct forecast row {p} timestamp {} does not match panel instant {t} timestamp {}",
+                period.ts_ms,
+                slice.ts_ms
+            );
+            ensure!(
+                period.legs.len() == slice.symbols.len(),
+                "direct forecast row {p} has {} symbols for panel instant {t}'s {}",
+                period.legs.len(),
+                slice.symbols.len()
             );
             ensure!(
                 period
                     .legs
                     .iter()
                     .all(|leg| leg.steps == DEFAULT_FORECAST_HORIZON),
-                "common rollout row {p} silently shortened H={DEFAULT_FORECAST_HORIZON}"
+                "common direct row {p} silently shortened H={DEFAULT_FORECAST_HORIZON}"
             );
-            for (h, _) in FORECAST_HORIZONS.iter().enumerate() {
+            for (k, leg) in period.legs.iter().enumerate() {
+                ensure!(
+                    leg.slot == k && leg.id == slice.symbols[k] && leg.row == beliefs.row_of[t][k],
+                    "direct forecast row {p} symbol {k} does not align with panel instant {t}"
+                );
+            }
+            for h in 0..DIRECT_RETURN_COUNT {
+                ensure!(
+                    beliefs.direct_mean_simple[h][t].len() == slice.symbols.len()
+                        && beliefs.direct_second_simple[h][t].len() == slice.symbols.len(),
+                    "direct H={} row {p} does not align with panel instant {t}",
+                    FORECAST_HORIZONS[h]
+                );
                 let mut row = Vec::with_capacity(slice.symbols.len());
-                for (k, law) in laws[p].iter().enumerate() {
-                    let (mean, second, frictionless) = if h == 0 {
-                        let mean = beliefs.mean_simple[t][k];
-                        let second = beliefs.second_simple[t][k].max(0.0);
-                        let fraction = if second > 0.0 { mean / second } else { 0.0 };
-                        (mean, second, fraction)
-                    } else {
-                        let mean = law.prefix_mean_simple[h];
-                        let second = law.prefix_second_simple[h].max(0.0);
-                        let fraction = if second > 0.0 { mean / second } else { 0.0 };
-                        (mean, second, fraction)
-                    };
+                for k in 0..slice.symbols.len() {
+                    let mean = beliefs.direct_mean_simple[h][t][k];
+                    let second = beliefs.direct_second_simple[h][t][k];
+                    let frictionless = if second > 0.0 { mean / second } else { 0.0 };
                     ensure!(
-                        mean.is_finite() && second.is_finite() && frictionless.is_finite(),
-                        "non-finite forecast moment at horizon {} row {p} (panel instant {t})",
+                        mean.is_finite()
+                            && second.is_finite()
+                            && second >= 0.0
+                            && frictionless.is_finite(),
+                        "non-finite direct forecast moment at horizon {} row {p} \
+                         (panel instant {t}, symbol slot {k})",
                         FORECAST_HORIZONS[h]
                     );
                     row.push(ForecastMoment {
@@ -1449,6 +1525,48 @@ pub fn marginal_horizon_moment(supports: &BarSupports, horizon: usize) -> Result
         mean_simple: mean,
         second_simple: second,
         frictionless_kelly: if second > 0.0 { mean / second } else { 0.0 },
+    })
+}
+
+/// Train-fitted unconditional marginal of the direct cumulative-return law at one exact
+/// production horizon. This uses that horizon's own fitted masses and within-bin simple-return
+/// moments; it never compounds the one-bar marginal.
+pub fn direct_marginal_horizon_moment(
+    supports: &DirectReturnSupports,
+    horizon: usize,
+) -> Result<ForecastMoment> {
+    let index = FORECAST_HORIZONS
+        .iter()
+        .position(|candidate| *candidate == horizon)
+        .with_context(|| {
+            format!("direct marginal horizon {horizon} is not in {FORECAST_HORIZONS:?}")
+        })?;
+    let masses = supports.bin_probabilities(index);
+    let first_by_bin = supports.bin_simple_means(index);
+    let second_by_bin = supports.bin_simple_second_moments(index);
+    ensure!(
+        masses.len() == first_by_bin.len() && masses.len() == second_by_bin.len(),
+        "direct H={horizon} support masses and simple-return moments do not align"
+    );
+    let mean = masses
+        .iter()
+        .zip(first_by_bin)
+        .map(|(probability, moment)| probability * moment)
+        .sum::<f64>();
+    let second = masses
+        .iter()
+        .zip(second_by_bin)
+        .map(|(probability, moment)| probability * moment)
+        .sum::<f64>();
+    let frictionless = if second > 0.0 { mean / second } else { 0.0 };
+    ensure!(
+        mean.is_finite() && second.is_finite() && second >= 0.0 && frictionless.is_finite(),
+        "direct H={horizon} marginal has non-finite simple-return moments"
+    );
+    Ok(ForecastMoment {
+        mean_simple: mean,
+        second_simple: second,
+        frictionless_kelly: frictionless,
     })
 }
 
@@ -4087,7 +4205,7 @@ pub fn write_receding_reports(
         dir,
         RECEDING_KELLY_BASE,
         format!(
-            "Every-Bar Receding-Horizon Kelly - {label} - SELECTED production H={selected_horizon}"
+            "Every-Bar Direct-Law Receding-Horizon Kelly - {label} - SELECTED production H={selected_horizon}"
         ),
         "forecast horizon index (rebalance interval is always one bar)",
         "economic result",
@@ -4183,14 +4301,10 @@ pub struct RecedingArgs {
     pub device: Device,
     pub split_bounds: (i64, i64),
     pub split: Split,
-    /// Required in addition to `split == Test`; prevents an accidental locked-test read.
-    pub allow_test: bool,
     pub max_symbols: usize,
     pub max_instants: usize,
     pub capital_usd: f64,
     pub forecast_horizon: usize,
-    pub samples: usize,
-    pub seed: i64,
     pub cost_threads: usize,
     /// Optional one-candidate selected-H mean-sign hysteresis margin, in basis points.
     pub mean_sign_hysteresis_bps: Option<f64>,
@@ -4209,13 +4323,10 @@ impl RecedingArgs {
             device: Device::cuda_if_available(),
             split_bounds: crate::data::ingest::PINNED_SPLIT_BOUNDS,
             split: Split::Val,
-            allow_test: false,
             max_symbols: 48,
             max_instants: 7_800,
             capital_usd: config.capital_usd,
             forecast_horizon: DEFAULT_FORECAST_HORIZON,
-            samples: DEFAULT_SAMPLES,
-            seed: 0x5EED,
             cost_threads: 4,
             config,
             label: "receding-kelly".to_owned(),
@@ -4230,7 +4341,6 @@ pub struct RecedingBench {
     pub split: Split,
     pub instants: usize,
     pub symbols: usize,
-    pub samples: usize,
     pub selected_horizon: usize,
     pub checkpoint: String,
     pub lineage_sha256: String,
@@ -4239,12 +4349,12 @@ pub struct RecedingBench {
 impl RecedingBench {
     pub fn table(&self) -> String {
         let mut out = format!(
-            "every-bar receding Kelly: split={}, {} symbols, {} instants, {} paths, selected production H={} (marked *)\n\
+            "every-bar direct-return Kelly: split={}, {} symbols, {} instants, six exact \
+             categorical laws, selected production H={} (marked *)\n\
              sel policy                    H  reforecasts  actions  log-growth/yr  turnover  cost\n",
             self.split.as_str(),
             self.symbols,
             self.instants,
-            self.samples,
             self.selected_horizon,
         );
         for run in &self.runs {
@@ -4271,14 +4381,11 @@ impl RecedingBench {
     }
 }
 
-pub fn validate_receding_split(split: Split, allow_test: bool) -> Result<()> {
+pub fn validate_receding_split(split: Split) -> Result<()> {
     ensure!(
-        matches!(split, Split::Val | Split::Test),
-        "production evaluation is held-out only; choose validation or test"
-    );
-    ensure!(
-        split != Split::Test || allow_test,
-        "the test split is locked; pass --allow-test explicitly for the one final score"
+        split == Split::Val,
+        "the current Test population is spent; receding evaluation is validation-only until \
+         a fresh bounded chronological generation and campaign-final permit exist"
     );
     Ok(())
 }
@@ -4287,11 +4394,11 @@ pub fn validate_receding_split(split: Split, allow_test: bool) -> Result<()> {
 pub const fn should_write_receding_policy_frontier(split: Split) -> bool {
     matches!(split, Split::Val)
 }
-/// Production evaluator: one causal panel scan, one common max-H ancestral rollout, then an
-/// every-bar cost-aware solve for every horizon prefix and baseline.
+/// Production evaluator: one causal panel scan, analytic reduction of all six direct categorical
+/// laws on the common H100 decision population, then the unchanged every-bar cost-aware solve.
 pub fn run_receding_evaluation(args: &RecedingArgs) -> Result<RecedingBench> {
     crate::torch::cuda::cfg::configure_cuda();
-    validate_receding_split(args.split, args.allow_test)?;
+    validate_receding_split(args.split)?;
     if let Some(margin_bps) = args.mean_sign_hysteresis_bps {
         ensure!(
             margin_bps.is_finite() && margin_bps >= 0.0,
@@ -4299,10 +4406,6 @@ pub fn run_receding_evaluation(args: &RecedingArgs) -> Result<RecedingBench> {
         );
     }
 
-    ensure!(
-        args.samples >= 2,
-        "an ancestral forecast law needs at least two paths"
-    );
     ensure!(
         args.cost_threads > 0,
         "production evaluation requires PanelCost calibration; --cost-threads must be positive"
@@ -4313,12 +4416,7 @@ pub fn run_receding_evaluation(args: &RecedingArgs) -> Result<RecedingBench> {
         args.forecast_horizon,
         FORECAST_HORIZONS
     );
-    let (b0, b1) = args.split_bounds;
-    let span = match args.split {
-        Split::Val => (b0, b1),
-        Split::Test => (b1, i64::MAX),
-        Split::Train => unreachable!("held-out split checked above"),
-    };
+    let span = args.split_bounds;
     let panel_config = PanelConfig::new(span, args.max_symbols, args.max_instants);
     let corpus = BarCorpus::load_with_bounds(
         &args.bars_dir,
@@ -4338,13 +4436,6 @@ pub fn run_receding_evaluation(args: &RecedingArgs) -> Result<RecedingBench> {
         model.all_parameters_frozen(),
         "evaluation checkpoint is still trainable"
     );
-    let supports = model
-        .supports_for(args.res_secs)
-        .with_context(|| format!("checkpoint has no {}s supports", args.res_secs))?;
-    // Refuse legacy supports before doing the expensive rollout.
-    supports
-        .simple_return_bin_moments()
-        .context("checkpoint supports lack fitted simple-return moments; refit v6 supports")?;
     let beliefs = scan_panel(&model, &corpus, &panel, args.res_secs)?;
     let max_periods = receding_schedule(
         &corpus,
@@ -4352,20 +4443,11 @@ pub fn run_receding_evaluation(args: &RecedingArgs) -> Result<RecedingBench> {
         &beliefs,
         *FORECAST_HORIZONS.last().expect("horizon grid is non-empty"),
     )?;
-    tch::manual_seed(args.seed);
-    let laws = horizon_laws(
-        &model,
-        &corpus,
-        &panel,
-        &beliefs,
-        &max_periods,
-        args.res_secs,
-        args.samples,
-    )?;
-    let forecasts = RecedingForecasts::from_common_rollout(&panel, &beliefs, &max_periods, &laws)?;
+    let forecasts = RecedingForecasts::from_direct_panel(&panel, &beliefs, &max_periods)?;
+    let direct_supports = model.direct_return_supports();
 
-    // Validation is calibrated on training only; the locked test is calibrated on train+val.
-    // No bar at or after this evaluated split's first instant may affect any fallback or month.
+    // Validation is calibrated on training only. No bar at or after the evaluated split's first
+    // instant may affect any fallback or month.
     let calibration = Arc::new(
         CostCalibration::from_corpus(&corpus, args.cost_threads, span.0)
             .context("measuring causal per-symbol PanelCost calibration")?,
@@ -4378,7 +4460,7 @@ pub fn run_receding_evaluation(args: &RecedingArgs) -> Result<RecedingBench> {
         let moments = forecasts
             .horizon(horizon)
             .expect("the production horizon is present");
-        let marginal = marginal_horizon_moment(supports, horizon)?;
+        let marginal = direct_marginal_horizon_moment(direct_supports, horizon)?;
         let mut oracle = receding_schedule(&corpus, &panel, &beliefs, horizon)?;
         let common_last = max_periods
             .last()
@@ -4498,7 +4580,6 @@ pub fn run_receding_evaluation(args: &RecedingArgs) -> Result<RecedingBench> {
         split: args.split,
         instants: panel.instants(),
         symbols: panel.symbols().len(),
-        samples: args.samples,
         selected_horizon: args.forecast_horizon,
         checkpoint: args.checkpoint.display().to_string(),
         lineage_sha256: model.lineage_sha256().to_owned(),
@@ -5715,11 +5796,16 @@ pub fn write_horizon_frontier(dir: &Path, label: &str, frontier: &HorizonFrontie
 mod tests {
     use super::*;
     use crate::torch::bar_dist::{BAR_CHAIN, BAR_DOF};
+    use crate::torch::dataset::TimeRange;
+    use crate::torch::direct_return::DirectReturnSupportsProvenance;
     use crate::torch::test_rng;
     use crate::torch::train::portfolio::{
         backtest, BacktestConfig, PanelSlice, PolicyInputs, GROSS_CAPS,
     };
-    use crate::torch::world_model::{world_model_supports_path, BarModules, BarWorldModelMetadata};
+    use crate::torch::world_model::{
+        world_model_direct_return_supports_path, world_model_supports_path, BarModules,
+        BarWorldModelMetadata,
+    };
     use shared::bars::{write_bar_file, PackedBar, FILE_EXTENSION};
     use std::sync::atomic::{AtomicU64, Ordering};
     use tch::nn;
@@ -5746,6 +5832,31 @@ mod tests {
     const HISTORY_BARS: usize = BELIEF_PRE_CONTEXT as usize + 40;
     const VAL_BARS: usize = 48;
     const FIXTURE_SYMBOLS: usize = 3;
+
+    fn fixture_direct_supports() -> DirectReturnSupports {
+        let rows: Vec<[f64; DIRECT_RETURN_COUNT]> = (0..256)
+            .map(|row| {
+                std::array::from_fn(|horizon| {
+                    let simple = (horizon as f64 + 1.0) * 5.0e-4 + (row as f64 - 127.5) * 1.0e-6;
+                    simple.ln_1p()
+                })
+            })
+            .collect();
+        DirectReturnSupports::fit(
+            &rows,
+            DirectReturnSupportsProvenance {
+                corpus_fingerprint: "horizon-fixture".to_owned(),
+                fit: TimeRange::new(1, 2),
+                fold_plan_hash: "horizon-fixture-fold".to_owned(),
+                fold_index: 0,
+                admitted_universe_digest: "horizon-fixture-universe".to_owned(),
+                train_seed: 4_242,
+                support_sample_seed: 5,
+                row_count: rows.len(),
+            },
+        )
+        .expect("fit direct-return fixture supports")
+    }
 
     /// A synthetic bar series with a stated random walk. Deterministic in `seed` alone, so two
     /// fixtures built from the same seed hold byte-identical files.
@@ -5864,6 +5975,9 @@ mod tests {
                 .fit_supports(4_096, 5)
                 .save(&world_model_supports_path(&weights, RES))
                 .expect("save supports");
+            fixture_direct_supports()
+                .save(world_model_direct_return_supports_path(&weights))
+                .expect("save direct-return supports");
             // The seed goes BEFORE `BarModules::new`, not after: `new` runs `uniform_init` on
             // every projection and therefore consumes the GLOBAL torch RNG. Seeding after it
             // makes only the perturbation reproducible, leaves the base weights dependent on
@@ -6062,8 +6176,7 @@ mod tests {
     /// The report base has to exist on disk and hold finite values for every registered series,
     /// because a `MultiLine` report of all-NaN renders as a blank panel and nothing notices.
     ///
-    /// This is the test named in `pretrain_reports::tests::CYCLE_EXEMPT` for
-    /// `pretrain_horizon_frontier`.
+    /// Exercises the writer owned by `PretrainReportOwner::Horizon`.
     #[test]
     fn the_horizon_frontier_base_is_written_and_read_back() {
         let dir = scratch_dir("frontier");
@@ -7200,6 +7313,216 @@ mod tests {
             covariance_shrinkage: 0.25,
         };
         (panel, moments, oracle, config)
+    }
+    fn direct_panel_beliefs(panel: &Panel) -> PanelBeliefs {
+        let mut next_row = 0u32;
+        let row_of: Vec<Vec<u32>> = panel
+            .slices()
+            .iter()
+            .map(|slice| {
+                slice
+                    .symbols
+                    .iter()
+                    .map(|_| {
+                        let row = next_row;
+                        next_row += 1;
+                        row
+                    })
+                    .collect()
+            })
+            .collect();
+        let panel_rows = || {
+            panel
+                .slices()
+                .iter()
+                .map(|slice| vec![0.0; slice.symbols.len()])
+                .collect::<Vec<_>>()
+        };
+        let direct_mean_simple: [Vec<Vec<f64>>; DIRECT_RETURN_COUNT] =
+            std::array::from_fn(|horizon| {
+                panel
+                    .slices()
+                    .iter()
+                    .enumerate()
+                    .map(|(instant, slice)| {
+                        (0..slice.symbols.len())
+                            .map(|slot| {
+                                (horizon as f64 + 1.0) * 0.01
+                                    + instant as f64 * 0.001
+                                    + slot as f64 * 0.0001
+                            })
+                            .collect()
+                    })
+                    .collect()
+            });
+        let direct_second_simple: [Vec<Vec<f64>>; DIRECT_RETURN_COUNT] =
+            std::array::from_fn(|horizon| {
+                direct_mean_simple[horizon]
+                    .iter()
+                    .map(|row| row.iter().map(|mean| 0.1 + mean * mean).collect())
+                    .collect()
+            });
+        PanelBeliefs {
+            beliefs: vec![0.0; next_row as usize * BAR_MODEL_DIM as usize],
+            row_of,
+            one_bar: panel
+                .slices()
+                .iter()
+                .map(|slice| PanelForecast {
+                    kelly_f: vec![0.0; slice.symbols.len()],
+                    mean_r: vec![0.0; slice.symbols.len()],
+                    var_r: vec![0.0; slice.symbols.len()],
+                })
+                .collect(),
+            mean_simple: panel_rows(),
+            second_simple: panel_rows(),
+            direct_mean_simple,
+            direct_second_simple,
+            mu_log: panel_rows(),
+            var_log: panel_rows(),
+        }
+    }
+
+    #[test]
+    fn direct_forecasts_preserve_horizon_row_alignment_on_the_common_h100_schedule() {
+        let _torch_rng_guard = test_rng::exclusive();
+        let (panel, _, mut common_periods, config) = receding_fixture();
+        let book_periods = common_periods.clone();
+        for period in &mut common_periods {
+            for leg in &mut period.legs {
+                leg.steps = DEFAULT_FORECAST_HORIZON;
+            }
+        }
+        let beliefs = direct_panel_beliefs(&panel);
+        tch::manual_seed(7);
+        let first = RecedingForecasts::from_direct_panel(&panel, &beliefs, &common_periods)
+            .expect("aligned direct forecast construction");
+        tch::manual_seed(999_983);
+        let second = RecedingForecasts::from_direct_panel(&panel, &beliefs, &common_periods)
+            .expect("direct construction is independent of the torch RNG");
+        assert_eq!(first.moments, second.moments);
+        for (h, &horizon) in FORECAST_HORIZONS.iter().enumerate() {
+            let rows = first.horizon(horizon).expect("fixed direct horizon");
+            assert_eq!(rows.len(), common_periods.len());
+            for (instant, row) in rows.iter().enumerate() {
+                let expected = beliefs.direct_mean_simple[h][instant][0];
+                assert_eq!(row[0].mean_simple.to_bits(), expected.to_bits());
+                assert_eq!(
+                    row[0].second_simple.to_bits(),
+                    beliefs.direct_second_simple[h][instant][0].to_bits()
+                );
+                assert_eq!(
+                    row[0].frictionless_kelly.to_bits(),
+                    (expected / beliefs.direct_second_simple[h][instant][0]).to_bits()
+                );
+            }
+        }
+        let direct_h1 = first.horizon(1).expect("direct H1 moments");
+        let run = run_receding_book(
+            &panel,
+            direct_h1,
+            &book_periods,
+            ForecastMoment::default(),
+            RecedingPolicy::Model,
+            RecedingActionRule::Incumbent,
+            RecedingSignalRule::Raw,
+            1,
+            &FlatCost::new(0.0),
+            config,
+        )
+        .expect("direct moments enter the shared solver");
+        let realized = f64::from(panel.slices()[0].realized_r[0]).exp_m1();
+        let expected_weight = direct_h1[0][0].mean_simple / direct_h1[0][0].second_simple;
+        let expected_log_equity = (1.0 + expected_weight * realized).ln();
+        assert!(
+            (run.log_equity[1] - expected_log_equity).abs() <= 1.0e-8,
+            "the shared solver must receive direct E[R] and raw E[R²] unchanged"
+        );
+
+        common_periods[0].legs[0].steps = 78;
+        assert!(
+            RecedingForecasts::from_direct_panel(&panel, &beliefs, &common_periods).is_err(),
+            "a shortened common decision row must not create a mixed horizon population"
+        );
+    }
+
+    #[test]
+    fn direct_panel_scan_uses_exact_fitted_simple_moments_at_every_horizon() {
+        let _torch_rng_guard = test_rng::exclusive();
+        let fixture = Fixture::new("direct_moments", |_, _| {});
+        let beliefs = fixture.beliefs();
+        let (instant, slot) = (1usize, 0usize);
+        let belief = Tensor::from_slice(beliefs.belief_row(beliefs.row_of[instant][slot]))
+            .view([1, BAR_MODEL_DIM]);
+        let (mean, second) = tch::no_grad(|| {
+            tch::autocast(false, || {
+                let daily = Tensor::zeros(
+                    [
+                        1,
+                        crate::torch::adjusted_daily::ADJUSTED_DAILY_CONTEXT_FEATURES as i64,
+                    ],
+                    (Kind::Float, Device::Cpu),
+                );
+                let logits = fixture.model.modules().direct_return_head.logits(
+                    &belief,
+                    &daily,
+                    fixture.model.direct_return_context_mode(),
+                );
+                fixture
+                    .model
+                    .direct_return_supports()
+                    .simple_expectation_second_moment(&logits)
+            })
+        });
+        let mean = host_f64(&mean);
+        let second = host_f64(&second);
+        for horizon in 0..DIRECT_RETURN_COUNT {
+            let cached_mean = beliefs.direct_mean_simple[horizon][instant][slot];
+            let cached_second = beliefs.direct_second_simple[horizon][instant][slot];
+            assert!(
+                (cached_mean - mean[horizon]).abs() < 1.0e-8,
+                "H={} cached mean {cached_mean} != direct reduction {}",
+                FORECAST_HORIZONS[horizon],
+                mean[horizon]
+            );
+            assert!(
+                (cached_second - second[horizon]).abs() < 1.0e-8,
+                "H={} cached second moment {cached_second} != direct reduction {}",
+                FORECAST_HORIZONS[horizon],
+                second[horizon]
+            );
+        }
+    }
+
+    #[test]
+    fn direct_marginal_uses_each_horizons_actual_fitted_mass_law() {
+        let supports = fixture_direct_supports();
+        for (index, &horizon) in FORECAST_HORIZONS.iter().enumerate() {
+            let marginal =
+                direct_marginal_horizon_moment(&supports, horizon).expect("direct marginal");
+            let expected_mean = supports
+                .bin_probabilities(index)
+                .iter()
+                .zip(supports.bin_simple_means(index))
+                .map(|(probability, moment)| probability * moment)
+                .sum::<f64>();
+            let expected_second = supports
+                .bin_probabilities(index)
+                .iter()
+                .zip(supports.bin_simple_second_moments(index))
+                .map(|(probability, moment)| probability * moment)
+                .sum::<f64>();
+            assert_eq!(marginal.mean_simple.to_bits(), expected_mean.to_bits());
+            assert_eq!(marginal.second_simple.to_bits(), expected_second.to_bits());
+        }
+
+        let h1 = direct_marginal_horizon_moment(&supports, 1).unwrap();
+        let h4 = direct_marginal_horizon_moment(&supports, 4).unwrap();
+        let iid_h4_mean = (1.0 + h1.mean_simple).powi(4) - 1.0;
+        assert!(
+            (h4.mean_simple - iid_h4_mean).abs() > 1.0e-4,
+            "the H4 direct marginal must not be reconstructed by IID one-bar compounding"
+        );
     }
     #[test]
     fn mean_sign_hysteresis_is_causal_strict_and_preserves_moment_variance() {
@@ -8650,11 +8973,10 @@ mod tests {
     }
 
     #[test]
-    fn locked_test_split_is_opt_in() {
-        assert!(validate_receding_split(Split::Val, false).is_ok());
-        assert!(validate_receding_split(Split::Test, false).is_err());
-        assert!(validate_receding_split(Split::Test, true).is_ok());
-        assert!(validate_receding_split(Split::Train, true).is_err());
+    fn receding_evaluation_is_validation_only() {
+        assert!(validate_receding_split(Split::Val).is_ok());
+        assert!(validate_receding_split(Split::Test).is_err());
+        assert!(validate_receding_split(Split::Train).is_err());
     }
     #[test]
     fn receding_reports_persist_the_selected_run_and_keep_the_full_grid() {
@@ -8739,7 +9061,6 @@ mod tests {
             split: Split::Val,
             instants,
             symbols: panel.symbols().len(),
-            samples: 1,
             selected_horizon: 1,
             checkpoint: "fixture.ot".to_owned(),
             lineage_sha256: "fixture".to_owned(),
@@ -8777,6 +9098,11 @@ mod tests {
              report={report_model_h1}"
         );
         let table = summary.table();
+        assert!(table.contains("six exact categorical laws"));
+        assert!(
+            !table.contains(" paths"),
+            "analytic direct output must not report a sampled-path count"
+        );
         let selected_line = table
             .lines()
             .find(|line| line.starts_with('*'))

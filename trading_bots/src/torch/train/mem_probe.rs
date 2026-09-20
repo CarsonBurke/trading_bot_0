@@ -1589,13 +1589,9 @@ mod tests {
         }
     }
 
-    /// The writer named in `pretrain_reports::tests::CYCLE_EXEMPT` for all four `memprobe_*`
-    /// bases.
-    ///
-    /// The exemption is honest only if something EXECUTES the writer: this module shipped with
-    /// four registered bases, a stated reason, and no writer at all, in a file that was not in
-    /// the module tree. CPU-only and corpus-free by construction — the writer consumes measured
-    /// summaries, never a model — so it seeds no RNG, torch or otherwise.
+    /// Executes the writer for all four bases owned by
+    /// `PretrainReportOwner::MemorizationProbe`. CPU-only and corpus-free by construction:
+    /// the writer consumes measured summaries, never a model.
     #[test]
     fn the_mem_probe_writes_every_registered_base() {
         let gap_points: Vec<GapPoint> = [
@@ -1670,10 +1666,10 @@ mod tests {
             "memprobe_recency",
             "memprobe_bootstrap_stability",
         ] {
-            assert!(
-                shared::report::PRETRAIN_REPORT_BASES.contains(&base),
-                "{base} must be registered in shared::report::PRETRAIN_REPORT_BASES or the TUI \
-                 never scans for it"
+            assert_eq!(
+                shared::report::pretrain_report_owner(base),
+                Some(shared::report::PretrainReportOwner::MemorizationProbe),
+                "{base} must remain owned by the memorization-probe writer"
             );
             let path = dir.join(format!("{base}.report.bin"));
             assert!(path.exists(), "{base} was never written");

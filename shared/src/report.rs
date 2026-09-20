@@ -29,290 +29,188 @@ pub const RL_META_REPORT_BASES: &[&str] = &[
     "hl_gauss_return_range",
 ];
 
-/// Every chart base the DISTRIBUTIONAL PRETRAINER writes, and the single source of truth
-/// for it. The writer's own test asserts a full cycle produces each of these, and the TUI
-/// builds its meta-chart list by extending from this slice.
+/// Registered base for the Corpus-owned causal-admission audit.
+pub const PRETRAIN_UNIVERSE_INTEGRITY_REPORT_BASE: &str = "pretrain_universe_integrity";
+
+/// Component responsible for writing a registered pretraining report.
 ///
-/// It lives here rather than in either consumer because the two failure modes are silent
-/// in opposite directions and both shipped: a base registered with no writer renders as a
-/// permanently blank panel, and a base written but not registered is a chart nobody can
-/// see. One list makes both unrepresentable.
-pub const PRETRAIN_REPORT_BASES: &[&str] = &[
-    "pretrain_nll_bar",
-    "pretrain_nll_bar_diag896",
-    "pretrain_independent_marginal_nll",
-    "pretrain_nll_dof",
-    "pretrain_nll_vs_baselines",
-    "pretrain_crps_dof",
-    "pretrain_pit_hist",
-    "pretrain_dyn_loss",
-    "pretrain_kl_loss",
-    "pretrain_total_loss",
-    "pretrain_loss_shares",
-    "pretrain_growth_term",
-    "pretrain_belief_autocorr",
-    "pretrain_dyn_vs_identity",
-    "pretrain_teacher_forced_rollout_score",
-    "pretrain_ancestral_calibration",
-    "pretrain_ancestral_tails",
-    "pretrain_ancestral_bar_validity",
-    "pretrain_ancestral_distribution_drift",
-    "pretrain_dir_acc",
-    "pretrain_lr",
-    "pretrain_muon_momentum",
-    // Centered per-output-row outcome-LR controller diagnostics. These remain distinct
-    // panels because alpha allocation and the signed one-step evidence that trains it have
-    // different scales and failure signatures.
-    "pretrain_sdlr_alpha",
-    "pretrain_sdlr_evidence",
-    // Strictly opt-in batch-step Schraudolph SMD-IDBD diagnostics.
-    "pretrain_smd_idbd_gain",
-    "pretrain_smd_idbd_credit",
-    // Strictly opt-in categorical beta-NLL objective and detached variance weights.
-    "pretrain_beta_nll_objective",
-    "pretrain_beta_nll_weights",
-    "pretrain_grad_norm",
-    "pretrain_unique_bar_reuse",
-    "pretrain_stage_coverage",
-    "pretrain_pass_coverage",
-    "pretrain_pass_multiplicity",
-    "pretrain_pass_remainder",
-    "pretrain_stage_conditioning",
-    "pretrain_effective_rank",
-    "pretrain_promotions",
-    "pretrain_schedule",
-    "pretrain_capacity",
-    "pretrain_market_coverage",
-    "pretrain_candle_rollout_pit",
-    "pretrain_candle_rollout_dclose",
-    "pretrain_candle_rollout_band",
-    "pretrain_candle_rollout_coverage",
-    "pretrain_trade_growth",
-    "pretrain_trade_vs_baselines",
-    "pretrain_trade_cost_curve",
-    "pretrain_trade_sharpe",
-    "pretrain_trade_exposure",
-    "pretrain_trade_cap_curve",
-    "pretrain_trade_free_kelly",
-    "pretrain_trade_tail",
-    // The EPOCH-INDEXED panel. Distinct bases from the trade series above on purpose:
-    // those are the dense record-tick curves measured at every validation, these are one
-    // point per pass over the corpus. Neither is derivable from the other and neither
-    // overwrites the other.
-    "pretrain_epoch_trade_edge",
-    "pretrain_epoch_trade",
-    "pretrain_epoch_progress",
-    // Written once, at the end of a run, by `PretrainReporter::finish`.
-    "pretrain_test",
-    // Written by the corpus loader at startup rather than by the reporter, but it lands
-    // in the same directory and is read the same way, so it is registered the same way.
-    "pretrain_corpus_anomalies",
-    // Written by the AUXILIARY-resolution stream at every epoch boundary, for the same
-    // reason and by the same convention: the reporter's row schema is the deployment
-    // resolution's, and an auxiliary resolution has its own supports, its own ramp and its
-    // own held-out geometry, so its curve is a separate object rather than another column.
-    // One point per pass per auxiliary resolution. Absent from a run that named none.
-    "pretrain_auxiliary_nll",
-    // Written by `trading_bots::torch::train::portfolio::write_portfolio_bench`, which runs
-    // ONE book over a calendar-aligned panel of the held-out split rather than averaging
-    // per-window bets. Distinct from the `pretrain_trade_*` bases above and not derivable
-    // from them: those measure a single name's log-optimal bet, these measure a portfolio
-    // under one shared capital constraint.
-    "pretrain_portfolio_equity",
-    "pretrain_portfolio_metrics",
-    "pretrain_portfolio_gross_curve",
-    "pretrain_portfolio_frontier",
-    // The same writer's edge-versus-cost table: what one name-bar of forecast is worth in bps
-    // beside what one one-way trade in it costs, per liquidity decile of the traded panel. The
-    // two halves have to be measured on the same panel to be a comparison at all, which is why
-    // this base is the portfolio writer's and not `pretrain_cost_deciles`'.
-    "pretrain_portfolio_edge_vs_cost",
-    // Written by `trading_bots::torch::train::portfolio_cost::write_cost_capacity_reports`.
-    // Properties of the CORPUS rather than of a training step: a spread, an ADV and a
-    // realized cross-sectional covariance are measured from stored bars and do not move
-    // when a step does, so no in-run reporter cycle can produce them.
-    "pretrain_cost_deciles",
-    "pretrain_capacity_curve",
-    "pretrain_cross_correlation",
-    // Written by `trading_bots::torch::train::pretrain_reports::write_mean_calibration`, from
-    // the multi-checkpoint mean-calibration experiment. One point per CHECKPOINT rather than
-    // per step of one run: a Mincer-Zarnowitz slope needs a whole held-out pass, and the
-    // recalibrated policy beside it needs a second pass on a block-disjoint fit slice, so
-    // neither is producible from inside a training cycle.
-    "pretrain_mean_calibration",
-    "pretrain_shrunk_policy",
-    // Written by the same writer, from the same two passes: the COST-AWARE sizing axis.
-    // `trade_bench`'s Kelly solve maximizes `E[ln(1 + f R)]`, which carries no cost term, so
-    // the position is chosen frictionlessly and the charge is levied afterwards on whatever
-    // turnover that produced. Under proportional costs the optimal policy instead has a
-    // no-trade region, so this base is the band swept as an axis, under both fill rules, with
-    // the gain over the unbanded incumbent taken PAIRED window by window. Indexed by BAND
-    // WIDTH rather than by step or by cap, and not derivable from `pretrain_shrunk_policy`:
-    // that one varies the MEAN the solve is handed and this one varies how often the solve is
-    // acted on, and whether the two overlap is the third panel of this base.
-    "pretrain_no_trade_band",
-    // Written by the same writer, from the same two passes: WHERE the measured edge lives.
-    // A hit rate below a coin flip beside an edge whose interval excludes zero cannot be read
-    // as directional skill, so the arm table re-scores the identical windows with the model's
-    // MAGNITUDE destroyed at matched gross exposure, and again with its SIGN destroyed, each
-    // paired against the null and against the actual policy over the same blocks. Indexed by
-    // ARM, so it is not derivable from any base above: `pretrain_skill_profile` scores the
-    // predictor with no policy at all and every `pretrain_trade_*` base conditions on the
-    // undamaged Kelly policy.
-    "pretrain_edge_attribution",
-    // The panel underneath those arms, indexed by CHECKPOINT: `corr(f, R)`, `corr(|f|, |R|)`
-    // and the mean size of a winning bar against a losing one, which is the arithmetic a
-    // sub-coin-flip hit rate with positive growth has to satisfy.
-    "pretrain_edge_panel",
-    // The same panel cut by DECILE of the model's own uncapped `|f*|`. The confidence axis is
-    // the discriminator the arm table cannot supply on its own: a hit rate flat across every
-    // decile while growth concentrates in the top ones is a size-carried result, and a hit
-    // rate that rises with `|f*|` is a direction predictor that knows where its sign is good.
-    "pretrain_edge_confidence",
-    // The sign-hysteresis frontier, indexed by FLIP MARGIN in bps of predicted mean. On a book
-    // whose turnover is almost entirely sign flips, holding the sign longer is the only lever
-    // left that can move the cost, and margin zero is the sign-only arm exactly - so this base
-    // extends the arm table along an axis the arm table does not have. Not derivable from
-    // `pretrain_no_trade_band`: that dead-zones the MAGNITUDE of the target, which on a
-    // two-valued book suppresses re-sizings, while this one suppresses REVERSALS.
-    "pretrain_edge_hysteresis",
-    // The recalibration shrink crossed with sign hysteresis, indexed by CELL of a 2x2. Both
-    // levers cut the cost of the same book by trading less, so neither their gains nor their
-    // break-evens can be added, and the second difference that decides it is not recoverable
-    // from `pretrain_shrunk_policy` and `pretrain_edge_hysteresis` side by side - those score
-    // each lever against the incumbent, never against each other on the same windows. Distinct
-    // from the band-versus-shrink overlap for the same reason the frontier is distinct from the
-    // band: this crosses a REVERSAL rule with the shrink, not a magnitude dead-zone.
-    "pretrain_edge_composition",
-    // How fast the CURRENT one-bar signal's directional content decays with holding horizon,
-    // indexed by HORIZON in bars, with no policy and no cost anywhere in the measurement. It
-    // bounds what a one-bar signal HELD longer can be worth, and deliberately says nothing
-    // about a model TRAINED on a k-bar target, whose predictable component and noise floor are
-    // different quantities. Distinct from `pretrain_horizon_frontier`, which scores POLICIES
-    // under two constructions rather than the bare signal.
-    "pretrain_signal_decay",
-    // Written by `trading_bots::torch::train::skill::write_skill_profile`: the DIRECTIONAL
-    // skill of the predictor, scored with no trading policy anywhere in the measurement.
-    // Decile-indexed rather than step-indexed - the x axis is the model's own confidence, not
-    // training progress - so it is not producible from inside a training cycle and is not
-    // derivable from any `pretrain_trade_*` base, which all condition on a Kelly policy.
-    "pretrain_skill_profile",
-    // Written by `trading_bots::torch::train::horizon::write_horizon_frontier`. Break-even
-    // cost against the HOLDING HORIZON, for the model and its three baselines under both the
-    // stale-one-bar and the k-bar-aggregate construction. Not derivable from
-    // `pretrain_portfolio_frontier`: that curve varies a no-trade band on a one-bar forecast,
-    // which freezes stale positions, while this one varies the horizon the forecast is OF.
-    // A whole held-out panel and a sampled multi-bar rollout per point, so no in-run cycle
-    // can produce it.
-    "pretrain_horizon_frontier",
-    // Canonical production strategy evaluation. Forecast horizon varies while the decision
-    // clock remains one bar; costs, actual holdings and constraints are inside the action
-    // solve. The companion base records the strictly trailing shrunk one-factor covariance
-    // provenance and its realized constraint audit.
-    "pretrain_receding_kelly",
-    "pretrain_receding_covariance",
-    // Selected production-H attribution ladder. One cached forecast panel is held fixed while
-    // the shared receding book adds factor risk, measured non-impact costs and finally impact;
-    // stage zero is explicitly a non-self-financing scalar moment diagnostic.
-    "pretrain_receding_attribution",
-    // Validation-only selected production-H solver-safe dead-zone frontier. It reuses the
-    // cached all-in Model incumbent at width zero and reruns only the same constrained action
-    // solver at the fixed trade_bench::BAND_FRACTIONS widths; locked test never writes this
-    // grid, and no marginal arm or additional inference is involved.
-    "pretrain_receding_policy_frontier",
-    // Optional selected-H two-row evidence for one predeclared causal mean-sign hysteresis
-    // margin against the cached raw incumbent. It is absent unless explicitly requested and
-    // never expands into a locked-test policy-selection grid.
-    "pretrain_receding_hysteresis",
-    // Written by `trading_bots::torch::train::support_moments::fit_support_moments` via
-    // `pretrain_reports::write_support_decode`. Properties of the SUPPORT ARTIFACT alone: the
-    // fitted per-bin conditional means measured against the persisted bin geometry, beside the
-    // EDGE decode that every production first-moment consumer actually reads, beside the
-    // hardcoded two-bin stand-in that preceded the measurement. No model, no checkpoint and no
-    // step is involved, so an in-run reporter cycle cannot produce them and they do not move
-    // when a step does. Registered here rather than only in the TUI because `meta_chart_bases`
-    // extends from THIS slice, which is what makes a written-but-unregistered base
-    // unrepresentable.
-    "support_decode_moments",
-    "support_decode_bins",
-    // Written by `PretrainReporter::record_epoch`, and the ONLY run-scoped coverage bases in
-    // this list. Every `pretrain_pass_*` and `pretrain_stage_*` base above is a PER-PASS census:
-    // `CoverageAudit::require_full_pass` pins within-pass multiplicity to exactly one, so those
-    // panels read "every bar once, twice: 0" on the third pass of a three-pass run exactly as on
-    // the first. That is correct within a pass and it was read as a claim about the RUN for an
-    // entire analysis session, in preference to `pretrain_unique_bar_reuse` showing 2.85 on the
-    // same screen. These two carry the cross-pass fact — passes delivered, projected and asked
-    // for, and bars by how many times the RUN has targeted them — and are the only bases that
-    // can answer "how many times has the model seen this bar".
-    "cover_effective_epochs",
-    "cover_run_bar_exposure",
-    // Written by `trading_bots::torch::train::mem_probe::mem_probe` via
-    // `pretrain_reports::write_mem_probe`. The multi-epoch MEMORIZATION test: held-out NLL
-    // against TRAIN-split NLL along the epoch spine, and the within-checkpoint contrast between
-    // bars the run had trained on three times and bars it had trained on twice at the same
-    // step. Neither is producible from inside a training cycle - the spine needs several
-    // checkpoints and the contrast needs the training pass partition reconstructed at a
-    // checkpoint's own step - and the two are deliberately separate bases because one is
-    // contaminated by calendar and by learning rate while the other is randomized by
-    // construction, and a reader must never mistake the first for a discriminator.
-    "memprobe_epoch_spine",
-    "memprobe_one_repetition",
-    "memprobe_recency",
-    "memprobe_bootstrap_stability",
-    // Written by `trading_bots::torch::train::bar_family::fit_bar_families` via
-    // `pretrain_reports::write_bar_family`. The offline GATE on replacing the 128-way discrete bar
-    // support with a continuous per-DOF mixed likelihood: fitted density against the empirical
-    // histogram per DOF, the `r` tail on log-log axes with the measured pairwise-slope band, the
-    // component sweep, the marginal NLL against the discrete competitor on one stated footing, the
-    // atom census with the u/v lattice probe, and the truncation bound a ruin licence implies.
-    // Every panel is a property of a DRAW and a fitted family rather than of an optimizer step, so
-    // no in-run reporter cycle can produce any of them and none moves when a step does. Registered
-    // here rather than only in the TUI because `meta_chart_bases` extends from THIS slice, which
-    // is what makes a written-but-unregistered base unrepresentable.
-    "bar_family_density_r",
-    "bar_family_density_s",
-    "bar_family_density_u",
-    "bar_family_density_v",
-    "bar_family_density_w",
-    "bar_family_tail_r",
-    "bar_family_k_sweep",
-    "bar_family_nll",
-    "bar_family_atoms",
-    "bar_family_ruin_bound",
-    // Written by `trading_bots::torch::train::split_seams::audit_split_seams` via
-    // `pretrain_reports::write_bar_seams`. The corporate-action SEAM audit: whether the extreme `r`
-    // bars in the corpus are market moves or unadjusted split seams, and what the seams contaminate.
-    // The exceedance census over all 451,507,140 bars, the nearest-simple-rational
-    // cross-tabulation of `exp(r)` that decides the split hypothesis, the `s`/`w` comparison
-    // against matched ordinary bars, the six pairwise tail slopes with and without the seams, the
-    // catch-all bin contamination, and the ruin licence on both sides of the book. Every panel is a
-    // property of the STORED BARS and of a support artifact read from disk, so no in-run reporter
-    // cycle can produce any of them and none moves when a step does. Registered here rather than
-    // only in the TUI because `meta_chart_bases` extends from THIS slice, which is what makes a
-    // written-but-unregistered base unrepresentable.
-    "bar_seam_census",
-    "bar_seam_ratios",
-    "bar_seam_context",
-    "bar_seam_tail_r",
-    "bar_seam_bin_mass",
-    "bar_seam_ruin_licence",
-    // Written by `trading_bots::torch::train::pretrain_reports::write_heldout_power`, from the
-    // window draw that `pretrain-calibration` performs BEFORE it opens a checkpoint. The census
-    // of every split at one context — bars, near-disjoint windows, symbols — and the interval a
-    // traded prefix of the addressed split can support, as a function of the `(symbol, calendar
-    // month)` BLOCK count counted over the real draw. Properties of the CORPUS and of a
-    // seed-pinned draw, never of a model: no checkpoint is loaded and nothing is scored, which
-    // is the point. `Split::Test` is scored once for the whole campaign, so whether it has the
-    // power to resolve the effect being looked for has to be a chart that exists before the draw
-    // is spent. Registered here rather than only in the TUI because `meta_chart_bases` extends
-    // from THIS slice, which is what makes a written-but-unregistered base unrepresentable.
-    "pretrain_heldout_census",
-    "pretrain_heldout_power",
-    // Written by the frozen-checkpoint fixed recirculation experiment. It contains the
-    // serialized-alpha0 control, Stage-A screen, disjoint Stage-B confirmation, and the
-    // gated test result in one discoverable artifact.
-    "pretrain_recirculation_sweep",
-];
+/// Ownership is part of the registry contract rather than a parallel exemption list in a
+/// writer test. A base can therefore be discovered by the TUI and attributed to exactly one
+/// production writer from the same declaration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PretrainReportOwner {
+    Run,
+    Corpus,
+    Auxiliary,
+    Portfolio,
+    CostCapacity,
+    Calibration,
+    SkillProfile,
+    Horizon,
+    SupportDecode,
+    MemorizationProbe,
+    BarFamily,
+    FeatureScreen,
+    SplitSeams,
+    HeldoutPower,
+    Recirculation,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PretrainReportSpec {
+    pub base: &'static str,
+    pub owner: PretrainReportOwner,
+}
+
+macro_rules! pretrain_report_registry {
+    ($( $base:literal => $owner:ident, )+) => {
+        /// Every chart base in the pretraining reporting domain.
+        ///
+        /// The TUI consumes this exact slice. [`PRETRAIN_REPORT_SPECS`] is generated from the
+        /// same declarations, so discovery names and writer ownership cannot drift.
+        pub const PRETRAIN_REPORT_BASES: &[&str] = &[$($base,)+];
+
+        pub const PRETRAIN_REPORT_SPECS: &[PretrainReportSpec] = &[
+            $(PretrainReportSpec {
+                base: $base,
+                owner: PretrainReportOwner::$owner,
+            },)+
+        ];
+    };
+}
+
+pretrain_report_registry! {
+    "pretrain_nll_bar" => Run,
+    "pretrain_nll_bar_diag896" => Run,
+    "pretrain_independent_marginal_nll" => Run,
+    "pretrain_nll_dof" => Run,
+    "pretrain_nll_vs_baselines" => Run,
+    "pretrain_crps_dof" => Run,
+    "pretrain_pit_hist" => Run,
+    "pretrain_dyn_loss" => Run,
+    "pretrain_kl_loss" => Run,
+    "pretrain_total_loss" => Run,
+    "pretrain_loss_shares" => Run,
+    "pretrain_growth_term" => Run,
+    "pretrain_belief_autocorr" => Run,
+    "pretrain_dyn_vs_identity" => Run,
+    "pretrain_teacher_forced_rollout_score" => Run,
+    "pretrain_ancestral_calibration" => Run,
+    "pretrain_ancestral_tails" => Run,
+    "pretrain_ancestral_bar_validity" => Run,
+    "pretrain_ancestral_distribution_drift" => Run,
+    "pretrain_dir_acc" => Run,
+    "pretrain_lr" => Run,
+    "pretrain_muon_momentum" => Run,
+    "pretrain_sdlr_alpha" => Run,
+    "pretrain_sdlr_evidence" => Run,
+    "pretrain_smd_idbd_gain" => Run,
+    "pretrain_smd_idbd_credit" => Run,
+    "pretrain_direct_return_nll" => Run,
+    "pretrain_direct_return_valid_coverage" => Run,
+    "pretrain_direct_return_gain" => Run,
+    "pretrain_direct_return_calibration" => Run,
+    "pretrain_grad_norm" => Run,
+    "pretrain_unique_bar_reuse" => Run,
+    "pretrain_stage_coverage" => Run,
+    "pretrain_pass_coverage" => Run,
+    "pretrain_pass_multiplicity" => Run,
+    "pretrain_pass_remainder" => Run,
+    "pretrain_stage_conditioning" => Run,
+    "pretrain_effective_rank" => Run,
+    "pretrain_promotions" => Run,
+    "pretrain_schedule" => Run,
+    "pretrain_capacity" => Run,
+    "pretrain_market_coverage" => Run,
+    "pretrain_candle_rollout_pit" => Run,
+    "pretrain_candle_rollout_dclose" => Run,
+    "pretrain_candle_rollout_band" => Run,
+    "pretrain_candle_rollout_coverage" => Run,
+    "pretrain_trade_growth" => Run,
+    "pretrain_trade_vs_baselines" => Run,
+    "pretrain_trade_cost_curve" => Run,
+    "pretrain_trade_sharpe" => Run,
+    "pretrain_trade_exposure" => Run,
+    "pretrain_trade_cap_curve" => Run,
+    "pretrain_trade_free_kelly" => Run,
+    "pretrain_trade_tail" => Run,
+    "pretrain_epoch_trade_edge" => Run,
+    "pretrain_epoch_trade" => Run,
+    "pretrain_epoch_progress" => Run,
+    "pretrain_corpus_anomalies" => Corpus,
+    "pretrain_universe_integrity" => Corpus,
+    "pretrain_feature_screen_ic" => FeatureScreen,
+    "pretrain_feature_screen_spread" => FeatureScreen,
+    "pretrain_feature_screen_controls" => FeatureScreen,
+    "pretrain_auxiliary_nll" => Auxiliary,
+    "pretrain_portfolio_equity" => Portfolio,
+    "pretrain_portfolio_metrics" => Portfolio,
+    "pretrain_portfolio_gross_curve" => Portfolio,
+    "pretrain_portfolio_frontier" => Portfolio,
+    "pretrain_portfolio_edge_vs_cost" => Portfolio,
+    "pretrain_cost_deciles" => CostCapacity,
+    "pretrain_capacity_curve" => CostCapacity,
+    "pretrain_cross_correlation" => CostCapacity,
+    "pretrain_mean_calibration" => Calibration,
+    "pretrain_shrunk_policy" => Calibration,
+    "pretrain_no_trade_band" => Calibration,
+    "pretrain_edge_attribution" => Calibration,
+    "pretrain_edge_panel" => Calibration,
+    "pretrain_edge_confidence" => Calibration,
+    "pretrain_edge_hysteresis" => Calibration,
+    "pretrain_edge_composition" => Calibration,
+    "pretrain_signal_decay" => Calibration,
+    "pretrain_skill_profile" => SkillProfile,
+    "pretrain_horizon_frontier" => Horizon,
+    "pretrain_receding_kelly" => Horizon,
+    "pretrain_receding_covariance" => Horizon,
+    "pretrain_receding_attribution" => Horizon,
+    "pretrain_receding_policy_frontier" => Horizon,
+    "pretrain_receding_hysteresis" => Horizon,
+    "support_decode_moments" => SupportDecode,
+    "support_decode_bins" => SupportDecode,
+    "cover_effective_epochs" => Run,
+    "cover_run_bar_exposure" => Run,
+    "memprobe_epoch_spine" => MemorizationProbe,
+    "memprobe_one_repetition" => MemorizationProbe,
+    "memprobe_recency" => MemorizationProbe,
+    "memprobe_bootstrap_stability" => MemorizationProbe,
+    "bar_family_density_r" => BarFamily,
+    "bar_family_density_s" => BarFamily,
+    "bar_family_density_u" => BarFamily,
+    "bar_family_density_v" => BarFamily,
+    "bar_family_density_w" => BarFamily,
+    "bar_family_tail_r" => BarFamily,
+    "bar_family_k_sweep" => BarFamily,
+    "bar_family_nll" => BarFamily,
+    "bar_family_atoms" => BarFamily,
+    "bar_family_ruin_bound" => BarFamily,
+    "bar_seam_census" => SplitSeams,
+    "bar_seam_ratios" => SplitSeams,
+    "bar_seam_context" => SplitSeams,
+    "bar_seam_tail_r" => SplitSeams,
+    "bar_seam_bin_mass" => SplitSeams,
+    "bar_seam_ruin_licence" => SplitSeams,
+    "pretrain_heldout_census" => HeldoutPower,
+    "pretrain_heldout_power" => HeldoutPower,
+    "pretrain_recirculation_sweep" => Recirculation,
+}
+
+pub fn pretrain_report_bases_owned_by(
+    owner: PretrainReportOwner,
+) -> impl Iterator<Item = &'static str> {
+    PRETRAIN_REPORT_SPECS
+        .iter()
+        .filter(move |spec| spec.owner == owner)
+        .map(|spec| spec.base)
+}
+
+pub fn pretrain_report_owner(base: &str) -> Option<PretrainReportOwner> {
+    PRETRAIN_REPORT_SPECS
+        .iter()
+        .find(|spec| spec.base == base)
+        .map(|spec| spec.owner)
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Report {
@@ -671,6 +569,80 @@ mod tests {
             std::process::id(),
             TEMP_FILE_SEQUENCE.fetch_add(1, Ordering::Relaxed)
         ))
+    }
+
+    #[test]
+    fn pretrain_registry_names_and_writer_ownership_share_one_complete_contract() {
+        assert_eq!(PRETRAIN_REPORT_BASES.len(), PRETRAIN_REPORT_SPECS.len());
+        let mut unique = std::collections::BTreeSet::new();
+        for (base, spec) in PRETRAIN_REPORT_BASES.iter().zip(PRETRAIN_REPORT_SPECS) {
+            assert_eq!(base, &spec.base);
+            assert!(
+                unique.insert(spec.base),
+                "duplicate pretrain report base {}",
+                spec.base
+            );
+        }
+        let direct_bases = PRETRAIN_REPORT_BASES
+            .iter()
+            .copied()
+            .filter(|base| base.starts_with("pretrain_direct_return_"))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            direct_bases,
+            [
+                "pretrain_direct_return_nll",
+                "pretrain_direct_return_valid_coverage",
+                "pretrain_direct_return_gain",
+                "pretrain_direct_return_calibration",
+            ],
+            "every direct-return base is registry-owned by the run reporter"
+        );
+    }
+
+    #[test]
+    fn multiline_report_round_trips_series_order_labels_and_nonfinite_gaps() {
+        let path = temp_path("multiline-roundtrip");
+        let report = Report {
+            title: "objective diagnostics".to_owned(),
+            x_label: Some("record".to_owned()),
+            y_label: Some("nats/bar".to_owned()),
+            scale: ScaleKind::Symlog,
+            kind: ReportKind::MultiLine {
+                series: vec![
+                    ReportSeries {
+                        label: "production".to_owned(),
+                        values: vec![1.0, f32::NAN, 3.0],
+                    },
+                    ReportSeries {
+                        label: "ablation".to_owned(),
+                        values: vec![2.0, 4.0, f32::INFINITY],
+                    },
+                ],
+            },
+        };
+        write_report(&path, &report).unwrap();
+        let decoded = read_report(&path).unwrap();
+        assert_eq!(decoded.title, report.title);
+        assert_eq!(decoded.x_label, report.x_label);
+        assert_eq!(decoded.y_label, report.y_label);
+        assert_eq!(decoded.scale, report.scale);
+        let ReportKind::MultiLine { series } = decoded.kind else {
+            panic!("multiline schema changed kind");
+        };
+        assert_eq!(
+            series
+                .iter()
+                .map(|item| item.label.as_str())
+                .collect::<Vec<_>>(),
+            vec!["production", "ablation"]
+        );
+        assert_eq!(series[0].values[0], 1.0);
+        assert!(series[0].values[1].is_nan());
+        assert_eq!(series[0].values[2], 3.0);
+        assert_eq!(series[1].values[..2], [2.0, 4.0]);
+        assert!(series[1].values[2].is_infinite());
+        fs::remove_file(path).unwrap();
     }
 
     #[test]
