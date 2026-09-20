@@ -1052,19 +1052,11 @@ pub(super) fn evaluate(
     // calibration-block gain is non-positive or absent is sized to zero rather than traded on
     // its neighbours' evidence, and the value that gated it is reported rather than clipped.
     // Sizing is affine in the mean, so a zero mean is a zero position at every name.
-    let gated = !applied.tradable(horizon) || !applied.tradable(entry);
-    // Named at its own value, or named as unmeasured: "the block measured -0.04 here" and "the
-    // block measured nothing here" are different findings, and one sentinel for both is how a
-    // gate stops being legible.
-    let measured = |bars: usize| match applied.measured_anchor[bars - 1] {
-        Some(gain) => format!("{gain}"),
-        None => "unmeasured".to_owned(),
-    };
-    if gated {
+    let refusal = applied.sizing_refusal(&[horizon, entry]);
+    let gated = refusal.is_some();
+    if let Some(refusal) = &refusal {
         prepared.assumptions.push(format!(
-            "SIZED TO ZERO BY THE AMPLITUDE GATE: the checkpoint's calibration block measured a non-positive or unidentifiable close-anchor gain at h{horizon} ({}) or at the h1 entry anchor ({}), so this account takes no position. The fitted curve is positive everywhere by construction and cannot express this; the signed measurement is what gates. Reported, never clipped: an all-zero book with no stated reason is indistinguishable from a broken pipeline.",
-            measured(horizon),
-            measured(entry)
+            "SIZED TO ZERO BY THE AMPLITUDE GATE: the checkpoint's calibration block measured no usable close-anchor amplitude at {refusal} (h{horizon} is the exit anchor, h1 the entry anchor), so this account takes no position. The fitted curve is positive everywhere by construction and cannot express this; the signed measurement is what gates. Reported, never clipped: an all-zero book with no stated reason is indistinguishable from a broken pipeline."
         ));
     }
     // Measured under the projected-calendar covariates inference runs on, reported, never

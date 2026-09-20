@@ -65,6 +65,305 @@ pub const OCCUPANCY_BASE: &str = "timexer_segment_supervision_occupancy";
 /// because the shuffle consumed a different number of draws would be unreproducible.
 const SELECTION_STREAM: u64 = 0x726f_775f_7365_6c65;
 
+/// The chart bases the horizon-decimation diagnostic is written to. Two, because they carry
+/// two units: the share base is a multiple of the undecimated lattice count and the count base
+/// is supervised mask elements per optimizer step. A curve at 1/12 rendered beside one at
+/// 92,160 is a flat line, which is the same reason the horizon family is split at all.
+pub const DECIMATION_BASE: &str = "timexer_segment_horizon_decimation";
+pub const DECIMATION_COUNT_BASE: &str = "timexer_segment_horizon_decimation_count";
+
+/// Independent ChaCha8 stream for the per-step decimation phases, independent for the reason
+/// [`SELECTION_STREAM`] is: the phase sequence must be a function of `--seed` alone and not of
+/// how many draws the row selection or the per-epoch shuffle happened to consume before it.
+const DECIMATION_STREAM: u64 = 0x6465_6369_6d5f_7068;
+
+/// Whether the TRAINING supervision mask is decimated along the sub-origin lattice, per
+/// horizon, with importance compensation.
+///
+/// The head is supervised at every causal sub-origin - `origins_per_row` of them per row at
+/// stride `patch_len` bars - and two sub-origins `d` lattice steps apart are `stride·d` bars
+/// apart, so their `h`-bar targets OVERLAP whenever `stride·d < h`. At `h = pred_len` the
+/// twelve neighbouring sub-origins share at least 91.7% of their target bars. Counted as
+/// INDEPENDENT per-ticker outcomes over the 142,346-bar training span that is 8,896 at `h = 1`
+/// against 741 at `h = 192`, a factor of twelve, and both columns receive the same number of
+/// gradient updates. The `h = 192` gradient is therefore an average of ~12 near-duplicates and
+/// is ~√12 = 3.5x LESS noisy per independent observation than `h = 1`'s. With dropout 0, no
+/// augmentation and no gradient clipping, SGD noise is the only regularizer in this stack, so
+/// the long horizons run at a much colder effective temperature - which is exactly the measured
+/// pattern, `h = 1` still UNDERFIT (IC holding, MSE-optimal gain above 1 at 5000 steps) while
+/// `h >= 64` is OVERFIT in the SAME run, and a rank correlation of -1.00 over six arms between
+/// long-horizon degradation and train-versus-heldout gap collapse.
+///
+/// [`Self::Lattice`] keeps sub-origin `i` at horizon index `j` iff
+/// `(i + phase[j]) % ceil((j + 1) / stride) == 0`, with `phase[j]` drawn uniformly afresh every
+/// step on the HOST, and multiplies every survivor by that same factor. Three properties, each
+/// of which is the reason an obvious alternative is wrong:
+///
+/// - Survivors at horizon `h` are at least `h` bars apart, so their targets do not overlap AT
+///   ALL. Deterministic strided decimation with a random phase is preferred over i.i.d.
+///   Bernoulli precisely because Bernoulli delivers neither exact non-overlap nor a fixed
+///   survivor count: it would inject the same decorrelation plus nuisance variance nobody
+///   asked for.
+/// - The compensation factor is what makes this a VARIANCE intervention rather than a WEIGHT
+///   one. The reduction is self-normalizing - `Σ w·m·L / (Σ w·m·CHANNELS)` - so without the
+///   factor numerator and denominator both shrink by the keep rate and the objective becomes a
+///   keep-rate-weighted horizon average, which is arithmetically what `--horizon-loss` already
+///   does in expectation and is a deliberately closed axis.
+/// - WITH the factor and a uniform phase the kept set is a uniform `1/decim` subsample, so
+///   numerator and denominator are SEPARATELY unbiased for their full-lattice counterparts.
+///   The expected gradient is unchanged and only its variance at the long horizons rises, by
+///   the factor that equalizes gradient SNR per independent observation across the horizon
+///   axis. That is the entire intended mechanism.
+///
+/// [`Self::None`] allocates no buffer and emits no multiply at all, so the control arm is
+/// bit-for-bit the pre-knob objective rather than merely equal to it.
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, ValueEnum, Hash,
+)]
+#[serde(rename_all = "kebab-case")]
+pub enum HorizonDecimation {
+    #[default]
+    None,
+    Lattice,
+}
+
+impl HorizonDecimation {
+    pub fn enabled(self) -> bool {
+        self != Self::None
+    }
+}
+
+impl fmt::Display for HorizonDecimation {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::None => "none",
+            Self::Lattice => "lattice",
+        })
+    }
+}
+
+/// The resolved per-horizon decimation factors and the lattice they were derived from.
+///
+/// Nothing here hardcodes the stride: it is read off [`SupervisionGeometry`], which is the same
+/// value `future_windows` unfolds the sub-origin lattice at, so a change to `--patch-len` moves
+/// the profile with it instead of silently invalidating it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DecimationPlan {
+    /// Sub-origin lattice stride in bars: `patch_len`.
+    pub stride: usize,
+    /// Sub-origins per row - the full lattice the keep mask is shaped on, INCLUDING the ones
+    /// `--min-history` masks off, because the mask is indexed by lattice position.
+    pub origins: usize,
+    /// First sub-origin `Statistics::mask` leaves active. The ones below it contribute zero
+    /// whatever this plan says, so every realized share the diagnostic reports excludes them.
+    pub first_active: usize,
+    /// `factors[j]` for horizon `h = j + 1`: `ceil(h / stride)`.
+    pub factors: Vec<usize>,
+}
+
+impl DecimationPlan {
+    pub fn new(geometry: &SupervisionGeometry, seq_len: usize) -> Result<Self> {
+        ensure!(
+            geometry.stride > 0 && seq_len % geometry.stride == 0,
+            "the sub-origin lattice must cover the {seq_len}-bar context exactly at stride {}",
+            geometry.stride
+        );
+        let origins = seq_len / geometry.stride;
+        ensure!(
+            geometry.origins_per_row > 0 && geometry.origins_per_row <= origins,
+            "{} active sub-origins do not fit a {origins}-point lattice",
+            geometry.origins_per_row
+        );
+        Ok(Self {
+            stride: geometry.stride,
+            origins,
+            first_active: origins - geometry.origins_per_row,
+            factors: (1..=geometry.pred_len)
+                .map(|horizon| horizon.div_ceil(geometry.stride))
+                .collect(),
+        })
+    }
+
+    pub fn pred_len(&self) -> usize {
+        self.factors.len()
+    }
+
+    pub fn active_origins(&self) -> usize {
+        self.origins - self.first_active
+    }
+
+    /// Fill `values` - `[origins, pred_len]` row-major, the exact contents of the device keep
+    /// buffer - for one draw of `phases`, and ADD each horizon's surviving ACTIVE sub-origins
+    /// into `kept`.
+    ///
+    /// Survivors carry the compensation factor itself rather than 1: the mask this multiplies
+    /// is the only per-element weight channel the reduction has, so the factor has to ride it.
+    pub fn fill(&self, phases: &[usize], values: &mut [f32], kept: &mut [f64]) {
+        let pred_len = self.pred_len();
+        assert_eq!(phases.len(), pred_len, "one phase per horizon");
+        assert_eq!(values.len(), self.origins * pred_len, "keep mask shape");
+        assert_eq!(kept.len(), pred_len, "one survivor count per horizon");
+        for origin in 0..self.origins {
+            let active = origin >= self.first_active;
+            let row = &mut values[origin * pred_len..(origin + 1) * pred_len];
+            for (index, slot) in row.iter_mut().enumerate() {
+                let factor = self.factors[index];
+                if (origin + phases[index]) % factor == 0 {
+                    *slot = factor as f32;
+                    if active {
+                        kept[index] += 1.;
+                    }
+                } else {
+                    *slot = 0.;
+                }
+            }
+        }
+    }
+
+    /// The `h` ranges and their factors, for the one startup line that records the geometry.
+    pub fn summary(&self) -> String {
+        let mut runs = Vec::new();
+        let mut start = 0usize;
+        for index in 0..self.factors.len() {
+            if index + 1 == self.factors.len() || self.factors[index + 1] != self.factors[start] {
+                runs.push(format!(
+                    "h {}-{} /{}",
+                    start + 1,
+                    index + 1,
+                    self.factors[start]
+                ));
+                start = index + 1;
+            }
+        }
+        format!(
+            "origin stride {} bars, {} sub-origins per row ({} active after --min-history); {}",
+            self.stride,
+            self.origins,
+            self.active_origins(),
+            runs.join(", ")
+        )
+    }
+}
+
+/// The per-step keep mask, generated on the HOST.
+///
+/// Host and not device because from [`super::compute::CAPTURE_AFTER_STEPS`] the training step
+/// is a REPLAYED CUDA graph: a device RNG placed inside it would be frozen at capture and
+/// replay one draw forever. The host rewrites the contents of a fixed-address resident buffer
+/// before every replay, which is exactly the contract the resident batch already runs under.
+pub struct DecimationSampler {
+    plan: DecimationPlan,
+    rng: ChaCha8Rng,
+    /// `[origins, pred_len]` row-major.
+    values: Vec<f32>,
+    phases: Vec<usize>,
+    /// Survivors among the ACTIVE sub-origins, per horizon, since the last drain.
+    kept: Vec<f64>,
+    steps: usize,
+}
+
+impl DecimationSampler {
+    pub fn new(plan: DecimationPlan, seed: u64) -> Self {
+        let (origins, pred_len) = (plan.origins, plan.pred_len());
+        Self {
+            rng: ChaCha8Rng::seed_from_u64(seed ^ DECIMATION_STREAM),
+            values: vec![0.; origins * pred_len],
+            phases: vec![0; pred_len],
+            kept: vec![0.; pred_len],
+            steps: 0,
+            plan,
+        }
+    }
+
+    pub fn plan(&self) -> &DecimationPlan {
+        &self.plan
+    }
+
+    /// Draw this step's phases and refill [`Self::values`]. ~72,000 host writes at the
+    /// production geometry, against a 168 ms step.
+    pub fn draw(&mut self) {
+        let Self {
+            plan,
+            rng,
+            values,
+            phases,
+            kept,
+            steps,
+        } = self;
+        for (phase, factor) in phases.iter_mut().zip(&plan.factors) {
+            *phase = if *factor > 1 {
+                rng.random_range(0..*factor)
+            } else {
+                0
+            };
+        }
+        plan.fill(phases, values, kept);
+        *steps += 1;
+    }
+
+    pub fn values(&self) -> &[f32] {
+        &self.values
+    }
+
+    /// The interval's realized pattern, and reset. Exact counts of the masks the host actually
+    /// uploaded, not an expectation of them.
+    pub fn drain(&mut self) -> DecimationInterval {
+        let interval = DecimationInterval {
+            steps: self.steps,
+            kept: std::mem::replace(&mut self.kept, vec![0.; self.plan.pred_len()]),
+            active_origins: self.plan.active_origins(),
+            factors: self.plan.factors.clone(),
+            stride: self.plan.stride,
+        };
+        self.steps = 0;
+        interval
+    }
+}
+
+/// What the decimation actually did over one report interval.
+#[derive(Clone, Debug)]
+pub struct DecimationInterval {
+    pub steps: usize,
+    /// Surviving active sub-origins per horizon, summed over the interval's steps.
+    pub kept: Vec<f64>,
+    pub active_origins: usize,
+    pub factors: Vec<usize>,
+    pub stride: usize,
+}
+
+impl DecimationInterval {
+    /// Undecimated active sub-origins the interval would have supervised per horizon.
+    pub fn full(&self) -> f64 {
+        self.active_origins as f64 * self.steps as f64
+    }
+
+    /// Realized survivors per horizon as a share of the undecimated lattice.
+    pub fn keep_fraction(&self) -> Vec<f64> {
+        let full = self.full();
+        self.kept.iter().map(|kept| kept / full).collect()
+    }
+
+    /// The intended keep fraction `1/decim`, which [`Self::keep_fraction`] must track.
+    pub fn intended_keep_fraction(&self) -> Vec<f64> {
+        self.factors
+            .iter()
+            .map(|factor| (*factor as f64).recip())
+            .collect()
+    }
+
+    /// `decim · kept / full`: 1.0 exactly when the compensation restores the full-lattice
+    /// element count. This is the unbiasedness the knob rests on, MEASURED rather than assumed,
+    /// and it is the one series on the panel that has a right answer.
+    pub fn compensated_share(&self) -> Vec<f64> {
+        let full = self.full();
+        self.kept
+            .iter()
+            .zip(&self.factors)
+            .map(|(kept, factor)| kept * *factor as f64 / full)
+            .collect()
+    }
+}
+
 /// Where the patch grid of a row starts, relative to the row's own final origin.
 ///
 /// `fixed` is the historical corpus: every row's final origin is congruent to the same residue
@@ -697,6 +996,71 @@ mod tests {
         row_stride: 192,
         pred_len: 192,
     };
+
+    /// The geometric claim the whole knob rests on: at every horizon, and at every phase the
+    /// sampler can draw, two surviving sub-origins are at least `h` bars apart - so their
+    /// `h`-bar target windows do not overlap AT ALL, which is what turns 12 near-duplicate
+    /// gradient contributions at `h = 192` into 12 independent ones.
+    #[test]
+    fn surviving_sub_origins_never_share_a_target_bar() {
+        let plan = DecimationPlan::new(&PRODUCTION, 6000).unwrap();
+        assert_eq!(plan.stride, 16);
+        assert_eq!(plan.origins, 375);
+        assert_eq!(plan.first_active, 15);
+        assert_eq!(plan.factors[0], 1);
+        assert_eq!(plan.factors[15], 1);
+        assert_eq!(plan.factors[16], 2);
+        assert_eq!(plan.factors[191], 12);
+        let mut values = vec![0f32; plan.origins * plan.pred_len()];
+        let mut kept = vec![0f64; plan.pred_len()];
+        for horizon_index in 0..plan.pred_len() {
+            let horizon = horizon_index + 1;
+            for phase in 0..plan.factors[horizon_index] {
+                let phases: Vec<usize> = (0..plan.pred_len())
+                    .map(|index| if index == horizon_index { phase } else { 0 })
+                    .collect();
+                kept.iter_mut().for_each(|count| *count = 0.);
+                plan.fill(&phases, &mut values, &mut kept);
+                let survivors: Vec<usize> = (0..plan.origins)
+                    .filter(|origin| values[origin * plan.pred_len() + horizon_index] > 0.)
+                    .collect();
+                assert!(
+                    survivors.len() >= plan.origins / plan.factors[horizon_index],
+                    "h {horizon} phase {phase} kept {} of {} sub-origins",
+                    survivors.len(),
+                    plan.origins
+                );
+                for pair in survivors.windows(2) {
+                    let bars = (pair[1] - pair[0]) * plan.stride;
+                    assert!(
+                        bars >= horizon,
+                        "h {horizon} phase {phase}: survivors {} and {} are {bars} bars apart, \
+                         so their targets overlap",
+                        pair[0],
+                        pair[1]
+                    );
+                }
+                // Every survivor carries the compensation factor, and nothing else does.
+                assert!(survivors.iter().all(|origin| (values
+                    [origin * plan.pred_len() + horizon_index]
+                    - plan.factors[horizon_index] as f32)
+                    .abs()
+                    < f32::EPSILON));
+                assert_eq!(
+                    kept[horizon_index] as usize,
+                    survivors.iter().filter(|o| **o >= plan.first_active).count(),
+                    "the realized survivor count must be the mask the host uploaded"
+                );
+            }
+        }
+        assert_eq!(
+            plan.summary(),
+            "origin stride 16 bars, 375 sub-origins per row (360 active after --min-history); \
+             h 1-16 /1, h 17-32 /2, h 33-48 /3, h 49-64 /4, h 65-80 /5, h 81-96 /6, \
+             h 97-112 /7, h 113-128 /8, h 129-144 /9, h 145-160 /10, h 161-176 /11, \
+             h 177-192 /12"
+        );
+    }
 
     #[test]
     fn the_production_geometry_is_derived_from_the_model_config_and_not_restated() {

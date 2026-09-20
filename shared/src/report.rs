@@ -26,8 +26,11 @@ pub const TIMEXER_SEGMENT_REPORT_BASES: &[&str] = &[
     // whether the per-horizon within-timestamp information coefficient grows or decays over
     // training, and it was previously the one quantity thrown away at every evaluation. The
     // rest exist to explain a move in it: `_gain` is the MSE-optimal amplitude `β̂`, whose
-    // distance from 1 is exactly how much a rank-preserving forecast can lose on MSE;
-    // `_best_scale` pairs the achieved close ratio with the one an amplitude fix would reach;
+    // distance from 1 is exactly how much a rank-preserving forecast can lose on MSE, carried
+    // both as emitted and after the run's own fitted gain so a calibration that did not
+    // transfer is legible; `_best_scale` carries three amplitudes of one forecast - as emitted,
+    // at the fitted gain, and at the per-horizon optimum - because the deltas between them are
+    // what separate an over-amplified mean from a mean that lost its signal;
     // `_decomposition` splits the close gain into tilt, conditional signal and mis-scaling;
     // `_calibration` is per-horizon σ coverage, which the aggregate `timexer_segment_
     // calibration` above cannot show because every horizon contributes the same bar count to
@@ -211,6 +214,23 @@ pub const TIMEXER_SEGMENT_REPORT_BASES: &[&str] = &[
     // mean exposure COUNT is the epoch-progress series times the mean multiplicity the title
     // states, which keeps a count off an axis of fractions.
     "timexer_segment_supervision_occupancy",
+    // What `--horizon-decimation lattice` actually did to the supervision mask, per horizon.
+    // The knob thins the sub-origin lattice at horizon `h` down to survivors at least `h`
+    // bars apart - so their targets stop overlapping - and multiplies each survivor by the
+    // thinning factor. That compensation is the whole difference between a VARIANCE
+    // intervention and a horizon REWEIGHTING: the objective's reduction is self-normalizing,
+    // so an uncompensated thinning would cancel out of numerator and denominator alike and
+    // reduce to `timexer_segment_horizon_loss_weight` under another name.
+    //
+    // Two bases because there are two units and they differ by five orders of magnitude.
+    // `_decimation` is dimensionless: the intended keep fraction `1/decim`, the realized one,
+    // and the compensated share - the last of which MUST hold at 1.0, because it is the
+    // unbiasedness the knob rests on, measured every interval rather than assumed.
+    // `_decimation_count` is the same three quantities as supervised mask elements per
+    // optimizer step, which is what says whether the surviving sample is large enough for the
+    // extra gradient noise to be the intended temperature rather than an accident.
+    "timexer_segment_horizon_decimation",
+    "timexer_segment_horizon_decimation_count",
     // The one panel that separates OVERFITTING from NON-STATIONARITY, which every other
     // explanation of a held-out peak hangs on. Chronological splits make every other
     // `held-out *` draw out-of-sample in ORIGIN IDENTITY and out-of-period in MARKET REGIME
@@ -242,6 +262,90 @@ pub const TIMEXER_SEGMENT_REPORT_BASES: &[&str] = &[
     // produced was one wall clock covering three populations, a corpus load and a `finish`,
     // which is why a 75 ms batch was read as a 189 ms one.
     "timexer_segment_eval_phases",
+    // Fixed-budget forecasting/temporal-objective research, frozen CUDA probes, and
+    // separately learned synthetic delayed-cue evidence. Synthetic panels are not markets.
+    // Paired actual forecasts on one authenticated panel; no latent/probe loss substitutes.
+    "timexer_accuracy_close_ratio",
+    "timexer_accuracy_close_ratio_delta",
+    "timexer_accuracy_delayed_ratio",
+    "timexer_accuracy_delayed_ratio_delta",
+    "timexer_accuracy_close_hit",
+    "timexer_accuracy_close_hit_delta",
+    "timexer_accuracy_delayed_hit",
+    "timexer_accuracy_delayed_hit_delta",
+    "timexer_accuracy_pearson",
+    "timexer_accuracy_pearson_delta",
+    "timexer_accuracy_cross_ic",
+    "timexer_accuracy_cross_ic_delta",
+    "timexer_accuracy_neutral_ohlc",
+    "timexer_accuracy_neutral_ohlc_delta",
+    "timexer_accuracy_raw_ohlc",
+    "timexer_accuracy_raw_ohlc_delta",
+    "timexer_accuracy_nll",
+    "timexer_accuracy_nll_delta",
+    "timexer_accuracy_coverage_1",
+    "timexer_accuracy_coverage_1_delta",
+    "timexer_accuracy_coverage_95",
+    "timexer_accuracy_coverage_95_delta",
+    "timexer_accuracy_valid_elements",
+    "timexer_accuracy_cross_sections",
+    "timexer_accuracy_cross_ic_se",
+    "timexer_segment_jepa_forecast",
+    "timexer_segment_jepa_objective",
+    "timexer_segment_jepa_runtime",
+    "timexer_segment_jepa_geometry",
+    "timexer_segment_jepa_panel",
+    "timexer_segment_jepa_probe_ratio",
+    "timexer_segment_jepa_probe_correlation",
+    "timexer_segment_jepa_probe_error",
+    "timexer_segment_jepa_probe_count",
+    "timexer_segment_jepa_probe_gap",
+    "timexer_segment_jepa_probe_penalty",
+    "timexer_segment_jepa_probe_population",
+    "timexer_segment_jepa_reconstruction",
+    "timexer_segment_jepa_reconstruction_correlation",
+    "timexer_segment_jepa_reconstruction_count",
+    "timexer_segment_jepa_token_variance",
+    // Fixed characteristic targets, scored against a frozen train-only empirical mean.
+    "timexer_segment_jepa_conditional_cf_error",
+    "timexer_segment_jepa_conditional_cf_ratio",
+    "timexer_segment_jepa_conditional_cf_count",
+    // Frozen temporal SIGReg populations and patch-only autograd; never training updates.
+    "timexer_segment_sigreg_covariance_trace",
+    "timexer_segment_sigreg_covariance_rank",
+    "timexer_segment_sigreg_covariance_share",
+    "timexer_segment_sigreg_covariance_roundoff",
+    "timexer_segment_sigreg_population",
+    "timexer_segment_sigreg_population_score",
+    "timexer_segment_sigreg_prediction_moments",
+    "timexer_segment_sigreg_prediction_identity",
+    "timexer_segment_sigreg_prediction_population",
+    "timexer_segment_sigreg_prediction_covariance_trace",
+    "timexer_segment_sigreg_prediction_covariance_rank",
+    "timexer_segment_sigreg_prediction_covariance_share",
+    "timexer_segment_sigreg_target_moments",
+    "timexer_segment_sigreg_paired_population_score",
+    "timexer_segment_sigreg_paired_population",
+    "timexer_segment_sigreg_gradient_packet",
+    "timexer_segment_sigreg_gradient_norm",
+    "timexer_segment_sigreg_gradient_cosine",
+    "timexer_segment_sigreg_accuracy_gradient_norm",
+    "timexer_segment_sigreg_accuracy_gradient_cosine",
+    "timexer_segment_sigreg_gradient_identity",
+    "timexer_segment_jepa_memory_ratio",
+    "timexer_segment_jepa_memory_error",
+    "timexer_segment_jepa_memory_correlation",
+    "timexer_segment_jepa_memory_bayes_regret",
+    "timexer_segment_jepa_memory_pair_error",
+    "timexer_segment_jepa_memory_pair_effect",
+    "timexer_segment_jepa_memory_pair_sign",
+    "timexer_segment_jepa_memory_state",
+    "timexer_segment_jepa_memory_input_equality",
+    "timexer_segment_jepa_memory_objective",
+    "timexer_segment_jepa_memory_train_nll",
+    "timexer_segment_jepa_memory_train_mse",
+    "timexer_segment_jepa_memory_population",
+    "timexer_segment_jepa_memory_runtime",
 ];
 
 pub const RL_META_REPORT_BASES: &[&str] = &[

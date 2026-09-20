@@ -1,6 +1,8 @@
 use std::{collections::BTreeSet, fs, path::Path, time::Instant};
 
 use anyhow::{ensure, Context, Result};
+use rand::{seq::SliceRandom, Rng, SeedableRng};
+use rand_chacha::ChaCha8Rng;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use shared::{
@@ -13,8 +15,8 @@ use super::{
     cache,
     data::{audit_bars, filtered_contract, retained_partition_end, valid_ohlc, DataContract},
     features::{
-        market_steps, single_series, AuxiliaryCursor, Exogenous, Feature, FeatureSet, Grid,
-        MarketSteps, MarketSummary, SPY,
+        cross_section_ranks, market_steps, single_series, AuxiliaryCursor, Exogenous, Feature,
+        FeatureSet, Grid, MarketSteps, MarketSummary, SPY,
     },
 };
 use crate::torch::hashing::file_sha256;
@@ -31,6 +33,85 @@ const SCHEMA: &str = "timexer-pooled-mmap-v5;independent-ticker-rows;all-valid-s
 pub struct WindowRef {
     pub ticker: usize,
     pub origin: usize,
+}
+
+/// A prefix mask, not an inferred calendar duration: horizons count valid observed bars.
+#[derive(Clone, Debug, Serialize)]
+pub struct ResearchOrigin {
+    pub ticker: String,
+    pub origin: usize,
+    pub origin_ms: i64,
+    pub common_source_ms: i64,
+    pub context_first_ms: i64,
+    pub target_first_ms: i64,
+    pub target_last_ms: i64,
+    pub valid_target_prefix: usize,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct ResearchCoverage {
+    pub ticker: String,
+    pub population_origins: usize,
+    pub selected_origins: usize,
+    pub chronology_excluded_origins: usize,
+    pub population_origin_range_ms: Option<[i64; 2]>,
+    pub selected_origin_range_ms: Option<[i64; 2]>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct ResearchDraw {
+    pub partition: String,
+    pub requested_rows: usize,
+    pub population_origins: usize,
+    pub origins_sha256: String,
+    pub target_mask_sha256: String,
+    pub coverage: Vec<ResearchCoverage>,
+    pub origins: Vec<ResearchOrigin>,
+}
+
+/// Ordinal endpoint certificates cover EVERY possible dense training sub-origin: all of its
+/// unmasked targets are no later than `train_end - 1`. Earlier held-out context is legal;
+/// only scored targets, not context or origin timestamps, belong to the reserved UTC bands.
+#[derive(Clone, Debug, Serialize)]
+pub struct SplitChronology {
+    pub ticker: String,
+    pub boundary_ordinals: [usize; 3],
+    pub last_before_boundary_ms: [Option<i64>; 3],
+    pub first_at_or_after_boundary_ms: [Option<i64>; 3],
+    pub dense_training_target_envelope_ms: [i64; 2],
+    pub calibration_target_envelope_ms: Option<[i64; 2]>,
+    pub validation_target_envelope_ms: Option<[i64; 2]>,
+    pub terminal_test_first_ms: Option<i64>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct ResearchSampleManifest {
+    pub schema: String,
+    pub seed: u64,
+    pub selection: String,
+    pub corpus_sha256: String,
+    pub training_origins_sha256: String,
+    pub training_population_origins: usize,
+    pub boundary_timestamps_ms: [i64; 3],
+    pub context: usize,
+    pub pred_len: usize,
+    pub source_lookback_bars: usize,
+    pub training_last_target_ms: i64,
+    pub validation_chronology_excluded_origins: usize,
+    pub target_mask_encoding: String,
+    pub chronology: Vec<SplitChronology>,
+    pub validation: ResearchDraw,
+    pub probe_fit: ResearchDraw,
+}
+
+pub struct ResearchSamplePlan {
+    pub validation_refs: Vec<WindowRef>,
+    /// Full validation population after the SAME global decision-time guard; a separate
+    /// bounded synchronized cross-section draw may be selected from this without changing
+    /// the ticker-balanced routine panel or admitting an earlier decision clock.
+    pub validation_population_refs: Vec<WindowRef>,
+    pub probe_fit_refs: Vec<WindowRef>,
+    pub manifest: ResearchSampleManifest,
 }
 
 /// Trained rows that must BRACKET the in-period hole on each side for the hole's period to be
@@ -462,6 +543,9 @@ pub struct CorpusTicker {
     /// anchors are shared WALL CLOCKS and a stride over ordinals is exactly the construction
     /// that failed.
     in_period: Vec<usize>,
+    /// [`cross_section_ranks`] for this ticker, one entry per VALID bar; empty when
+    /// `Feature::CrossSectionRank` is off.
+    ranks: Vec<u16>,
 }
 
 impl CorpusTicker {
@@ -966,7 +1050,25 @@ impl Corpus {
             .collect();
         let bounds_cache = cache::BoundsCache::open(directory, SCHEMA, &universe);
         let mut cache_write = std::time::Duration::ZERO;
-        let stored_bounds = bounds_cache.get(files.len());
+        // Content keys authenticate lineage, but a decoded cache must also describe the actual
+        // partition edges. Six adjacent records per source prove the monotone timestamp split
+        // without repeating three binary searches or a full-corpus scan on a warm startup.
+        let stored_bounds = bounds_cache.get(files.len()).filter(|(bounds, edges)| {
+            let verified = io_pool.install(|| {
+                files.par_iter().zip(edges).try_for_each(|(file, edge)| {
+                    verify_split_edges(file.symbol(), file.bars(), *edge, *bounds)
+                })
+            });
+            if let Err(error) = verified {
+                // A corrupt artifact does not tell us whether its timestamps or its ordinal
+                // edges changed. Rebuild the union quantiles, not just new edges at suspect
+                // timestamps. Unchanged bar audits stay authenticated and need no rehash.
+                eprintln!("Discarding unusable shared split cache; rebuilding bounds: {error:#}");
+                false
+            } else {
+                true
+            }
+        });
         timing.cache_read_ms += phase.elapsed().as_secs_f64() * 1000.;
         let (bounds, edges) = match stored_bounds {
             Some((bounds, edges)) => {
@@ -1091,6 +1193,7 @@ impl Corpus {
                         file,
                         hole: None,
                         in_period: Vec::new(),
+                        ranks: Vec::new(),
                     })
                 })
                 .collect::<Result<_>>()
@@ -1163,11 +1266,24 @@ impl Corpus {
                 stored.first_ts,
                 stored.min_cross_section,
                 stored.population,
-                stored.sums,
-                stored.squares,
-                stored.counts,
+                stored.returns,
+                stored.log_volume,
+                stored.log_range,
             )
         });
+        let sources: Vec<_> = tickers
+            .iter()
+            .map(|ticker| {
+                (
+                    ticker.file.bars(),
+                    ticker.contract.invalid_ohlc_indices.as_slice(),
+                )
+            })
+            .collect();
+        let source_bars: u64 = tickers
+            .iter()
+            .map(|ticker| ticker.contract.source_bars as u64)
+            .sum();
         let steps = match stored_grid {
             Some(steps) => {
                 timing.market_reused = true;
@@ -1175,41 +1291,88 @@ impl Corpus {
                 steps
             }
             None => {
-                let sources: Vec<_> = tickers
-                    .iter()
-                    .map(|ticker| {
-                        (
-                            ticker.file.bars(),
-                            ticker.contract.invalid_ohlc_indices.as_slice(),
-                        )
-                    })
-                    .collect();
                 let steps =
                     gather_pool.install(|| market_steps(&sources, grid, market_min_cross_section));
                 // Two traversals of every eligible ticker: one to count each slot's cross
                 // section, and one to walk returns between consecutive DEFINING slots. The second
                 // cannot join the first - "defining" is a property of the completed population
                 // vector - which is why this layer is cached rather than folded away.
-                timing.bars_rescanned += 2 * tickers
-                    .iter()
-                    .map(|ticker| ticker.contract.source_bars as u64)
-                    .sum::<u64>();
+                timing.bars_rescanned += 2 * source_bars;
                 timing.market_grid_ms = phase.elapsed().as_secs_f64() * 1000.;
                 let phase = Instant::now();
-                let (first_ts, min_cross_section, population, sums, squares, counts) =
+                let (first_ts, min_cross_section, population, returns, log_volume, log_range) =
                     steps.parts();
                 market_cache.store(&cache::MarketGrid {
                     first_ts,
                     min_cross_section,
                     population: population.to_vec(),
-                    sums: sums.to_vec(),
-                    squares: squares.to_vec(),
-                    counts: counts.to_vec(),
+                    returns: returns.clone(),
+                    log_volume: log_volume.clone(),
+                    log_range: log_range.clone(),
                 })?;
                 cache_write += phase.elapsed();
                 steps
             }
         };
+        // The rank channel is the one member of the cross-section family that needs each
+        // slot's whole distribution rather than its moments, so it gets its own artifact: an
+        // arm toggling only this channel neither invalidates the market grid nor waits on it.
+        let mut ranks: Option<Vec<Vec<u16>>> = None;
+        if features.cross_section_rank {
+            let phase = Instant::now();
+            let valid_bars: Vec<usize> = tickers
+                .iter()
+                .map(|ticker| ticker.contract.valid_bars)
+                .collect();
+            let rank_cache = cache::RankCache::open(
+                directory,
+                SCHEMA,
+                &eligible,
+                grid.first_ts(),
+                grid.slots(),
+                market_min_cross_section,
+            );
+            ranks = Some(match rank_cache.get(&valid_bars) {
+                Some(stored) => {
+                    timing.cache_read_ms += phase.elapsed().as_secs_f64() * 1000.;
+                    stored
+                }
+                None => {
+                    let built =
+                        gather_pool.install(|| cross_section_ranks(&sources, grid, &steps));
+                    // Three more traversals: one to count each slot's contributions, one to
+                    // scatter the contributing returns into their slot segments, and one to
+                    // place every bar's own return inside its sorted segment. Charged to the
+                    // market grid phase - same inputs, same derivation.
+                    timing.bars_rescanned += 3 * source_bars;
+                    let ms = phase.elapsed().as_secs_f64() * 1000.;
+                    timing.market_grid_ms = if timing.market_grid_ms.is_nan() {
+                        ms
+                    } else {
+                        timing.market_grid_ms + ms
+                    };
+                    let phase = Instant::now();
+                    rank_cache.store(&built)?;
+                    cache_write += phase.elapsed();
+                    built
+                }
+            });
+        }
+        drop(sources);
+        if let Some(ranks) = ranks {
+            ensure!(
+                ranks.len() == tickers.len(),
+                "cross-section ranks do not cover the eligible universe"
+            );
+            for (ticker, row) in tickers.iter_mut().zip(ranks) {
+                ensure!(
+                    row.len() == ticker.contract.valid_bars,
+                    "cross-section ranks for {} do not align with its valid bars",
+                    ticker.contract.ticker
+                );
+                ticker.ranks = row;
+            }
+        }
         let phase = Instant::now();
         let (exogenous, market) =
             gather_pool.install(|| exogenous_series(directory, features, grid, steps))?;
@@ -1397,6 +1560,223 @@ impl Corpus {
             .iter()
             .map(|byte| format!("{byte:02x}"))
             .collect()
+    }
+
+    /// Bounded, reproducible draws; this never mutates or thins the training universe.
+    ///
+    /// Quotas are balanced over eligible tickers with available rows (seeded ticker order
+    /// resolves a budget smaller than the universe). Each ticker's quota is stratified over
+    /// its full chronological origin list. This is a ticker-balanced diagnostic estimand,
+    /// NOT an unbiased estimate of the row-weighted full validation loss. Zero-coverage names
+    /// and the actual origin dates are explicit in the manifest.
+    pub fn research_sample_plan(
+        &self,
+        seed: u64,
+        validation_rows: usize,
+        probe_fit_rows: usize,
+        source_lookback_bars: usize,
+    ) -> Result<ResearchSamplePlan> {
+        ensure!(source_lookback_bars < self.contract.context,
+            "research source lookback must fit inside the causal context");
+        let chronology = self.split_chronology()?;
+        let training_last_target_ms = chronology.iter()
+            .map(|ticker| ticker.dense_training_target_envelope_ms[1])
+            .max().context("research corpus has no training targets")?;
+        let mut thresholds = vec![None; self.tickers.len()];
+        let mut excluded = vec![0usize; self.tickers.len()];
+        let validation_population: Vec<_> = self.validation_refs.iter().copied().filter(|reference| {
+            let minimum = *thresholds[reference.ticker].get_or_insert_with(|| {
+                let ticker = self.ticker(*reference);
+                if reference.origin >= source_lookback_bars
+                    && ticker.timestamp(reference.origin - source_lookback_bars) > training_last_target_ms
+                {
+                    0
+                } else {
+                    ticker.valid_ordinal_at_or_before(training_last_target_ms)
+                        .map_or(source_lookback_bars, |ordinal| ordinal + 1 + source_lookback_bars)
+                }
+            });
+            let keep = reference.origin >= minimum;
+            if !keep {
+                excluded[reference.ticker] += 1;
+            }
+            keep
+        }).collect();
+        let (validation_refs, mut validation) = self.research_draw(
+            &validation_population, validation_rows, seed ^ 0x76616c70616e656c, false,
+            source_lookback_bars,
+        )?;
+        for (coverage, count) in validation.coverage.iter_mut().zip(&excluded) {
+            coverage.chronology_excluded_origins = *count;
+        }
+        let (probe_fit_refs, probe_fit) = self.research_draw(
+            &self.train_refs, probe_fit_rows, seed ^ 0x66697470616e656c, true,
+            source_lookback_bars,
+        )?;
+        let corpus_sha256 = sha256_bytes(&serde_json::to_vec(&self.contract)?);
+        Ok(ResearchSamplePlan {
+            validation_refs,
+            validation_population_refs: validation_population,
+            probe_fit_refs,
+            manifest: ResearchSampleManifest {
+                schema: "causalpatch-research-panel-v1".into(),
+                seed,
+                selection: "ticker-balanced;seeded-without-replacement;per-ticker-origin-quantile-strata;full-training-pool-unchanged".into(),
+                corpus_sha256,
+                training_origins_sha256: self.origins_sha256(&self.train_refs),
+                training_population_origins: self.train_refs.len(),
+                boundary_timestamps_ms: self.contract.boundary_timestamps,
+                context: self.contract.context,
+                pred_len: self.contract.pred_len,
+                source_lookback_bars,
+                training_last_target_ms,
+                validation_chronology_excluded_origins: excluded.iter().sum(),
+                target_mask_encoding: "forecast horizon h in 1..=pred_len is valid iff h<=valid_target_prefix;held-out scoring final-origin-only;dense training validity is bounded by train_end".into(),
+                chronology,
+                validation,
+                probe_fit,
+            },
+        })
+    }
+
+    fn research_draw(
+        &self,
+        population: &[WindowRef],
+        requested: usize,
+        seed: u64,
+        training: bool,
+        source_lookback_bars: usize,
+    ) -> Result<(Vec<WindowRef>, ResearchDraw)> {
+        ensure!(requested > 0 && !population.is_empty(), "research draws require a nonempty population and positive budget");
+        ensure!(
+            population.windows(2).all(|rows|
+                (rows[0].ticker, rows[0].origin) < (rows[1].ticker, rows[1].origin)),
+            "research population must be unique and ticker-major chronological"
+        );
+        let mut ranges = vec![0..0; self.tickers.len()];
+        let mut cursor = 0;
+        for (ticker, range) in ranges.iter_mut().enumerate() {
+            let start = cursor;
+            while cursor < population.len() && population[cursor].ticker == ticker {
+                cursor += 1;
+            }
+            *range = start..cursor;
+        }
+        ensure!(cursor == population.len(), "research population has an unknown ticker");
+        let wanted = requested.min(population.len());
+        let mut order: Vec<_> = (0..ranges.len()).filter(|&i| !ranges[i].is_empty()).collect();
+        let mut rng = ChaCha8Rng::seed_from_u64(seed);
+        order.shuffle(&mut rng);
+        let mut quotas = vec![0usize; ranges.len()];
+        let mut remaining = wanted;
+        while remaining > 0 {
+            for &ticker in &order {
+                if remaining > 0 && quotas[ticker] < ranges[ticker].len() {
+                    quotas[ticker] += 1;
+                    remaining -= 1;
+                }
+            }
+        }
+        let mut selected = Vec::with_capacity(wanted);
+        let mut coverage = Vec::with_capacity(ranges.len());
+        for (ticker, range) in ranges.iter().enumerate() {
+            let start = selected.len();
+            let quota = quotas[ticker];
+            for stratum in 0..quota {
+                let lo = stratum * range.len() / quota;
+                let hi = (stratum + 1) * range.len() / quota;
+                selected.push(population[range.start + rng.random_range(lo..hi)]);
+            }
+            let stamps = |refs: &[WindowRef]| {
+                refs.first().zip(refs.last()).map(|(first, last)| [
+                    self.ticker(*first).timestamp(first.origin),
+                    self.ticker(*last).timestamp(last.origin),
+                ])
+            };
+            coverage.push(ResearchCoverage {
+                ticker: self.tickers[ticker].contract.ticker.clone(),
+                population_origins: range.len(),
+                selected_origins: quota,
+                chronology_excluded_origins: 0,
+                population_origin_range_ms: stamps(&population[range.clone()]),
+                selected_origin_range_ms: stamps(&selected[start..]),
+            });
+        }
+        // Independent ticker rows in each batch, not long contiguous runs of one ticker.
+        selected.shuffle(&mut rng);
+        let origins = selected.iter().map(|reference| {
+            let ticker = self.ticker(*reference);
+            let targets = if training {
+                self.training_target_count(reference.ticker, reference.origin)
+                    .context("probe fit escaped the training population")?
+            } else {
+                ensure!(ticker.owns_partition_targets(reference.origin, 1),
+                    "research validation escaped its reserved target partition");
+                self.contract.pred_len
+            };
+            Ok(ResearchOrigin {
+                ticker: ticker.contract.ticker.clone(),
+                origin: reference.origin,
+                origin_ms: ticker.timestamp(reference.origin),
+                common_source_ms: ticker.timestamp(reference.origin - source_lookback_bars),
+                context_first_ms: ticker.timestamp(reference.origin + 1 - self.contract.context),
+                target_first_ms: ticker.timestamp(reference.origin + 1),
+                target_last_ms: ticker.timestamp(reference.origin + targets),
+                valid_target_prefix: targets,
+            })
+        }).collect::<Result<Vec<_>>>()?;
+        let mut mask_digest = ring::digest::Context::new(&ring::digest::SHA256);
+        mask_digest.update(&(self.contract.pred_len as u64).to_le_bytes());
+        for row in &origins {
+            mask_digest.update(&(row.valid_target_prefix as u64).to_le_bytes());
+        }
+        let draw = ResearchDraw {
+            partition: if training { "train-only-probe-fit" } else { "validation-final-origin" }.into(),
+            requested_rows: requested,
+            population_origins: population.len(),
+            origins_sha256: self.origins_sha256(&selected),
+            target_mask_sha256: digest_hex(mask_digest.finish()),
+            coverage,
+            origins,
+        };
+        Ok((selected, draw))
+    }
+
+    pub fn split_chronology(&self) -> Result<Vec<SplitChronology>> {
+        self.tickers.iter().map(|ticker| {
+            let c = &ticker.contract;
+            ensure!(c.boundary_timestamps == self.contract.boundary_timestamps,
+                "{} does not share the corpus UTC split", c.ticker);
+            let before = c.boundaries.map(|edge| edge.checked_sub(1).map(|i| ticker.timestamp(i)));
+            let after = c.boundaries.map(|edge| (edge < c.valid_bars).then(|| ticker.timestamp(edge)));
+            for i in 0..3 {
+                ensure!(before[i].is_none_or(|stamp| stamp < c.boundary_timestamps[i])
+                    && after[i].is_none_or(|stamp| stamp >= c.boundary_timestamps[i]),
+                    "{} logical edge {i} disagrees with its UTC split", c.ticker);
+            }
+            ensure!(c.train_end > c.common_context && c.train_end <= c.boundaries[0],
+                "{} training target reach crosses calibration", c.ticker);
+            let envelope = |first: usize| {
+                let start = c.boundaries[first].max(c.common_context);
+                let end = retained_partition_end(c.boundaries[first + 1], c.valid_bars, c.purge);
+                (start < end).then(|| [ticker.timestamp(start), ticker.timestamp(end - 1)])
+            };
+            Ok(SplitChronology {
+                ticker: c.ticker.clone(),
+                boundary_ordinals: c.boundaries,
+                last_before_boundary_ms: before,
+                first_at_or_after_boundary_ms: after,
+                // Conservative earliest dense target: even the first possible sub-origin
+                // cannot predict a bar before the second context bar.
+                dense_training_target_envelope_ms: [
+                    ticker.timestamp(c.common_context + 1 - c.context),
+                    ticker.timestamp(c.train_end - 1),
+                ],
+                calibration_target_envelope_ms: envelope(0),
+                validation_target_envelope_ms: envelope(1),
+                terminal_test_first_ms: after[2],
+            })
+        }).collect()
     }
 
     /// Replace the STRIDED calibration and validation placements with the anchored ones, in
@@ -1610,11 +1990,13 @@ impl Corpus {
             output.par_chunks_mut(width).zip(sources.par_iter()).for_each(
                 |(row, &(ticker, origin, targets))| {
                     fill_row::<true, true>(
-                        row, ticker.file.bars(), &ticker.contract, features, &self.exogenous, origin, targets,
+                        row, ticker.file.bars(), &ticker.contract, features, &self.exogenous, &ticker.ranks, origin, targets,
                     );
                     let length = context + pred_len;
                     let aux = &mut row[length * 5..length * (5 + features.channels())];
-                    let mut cursor = AuxiliaryCursor::new(features, &self.exogenous, Some(ticker.bar(origin)));
+                    // Projected bars only: every channel the ranks feed reads `[0, 0]` beyond
+                    // the context, so this cursor needs none of them.
+                    let mut cursor = AuxiliaryCursor::new(features, &self.exogenous, Some(ticker.bar(origin)), &[]);
                     for (bar, &timestamp) in schedules[&ticker.timestamp(origin)].iter().enumerate() {
                         let scheduled = PackedBar { ts_ms: timestamp, ..PackedBar::default() };
                         let offset = (context + bar) * features.channels();
@@ -1673,6 +2055,7 @@ impl Corpus {
                         &ticker.contract,
                         features,
                         &self.exogenous,
+                        &ticker.ranks,
                         origin,
                         targets,
                     );
@@ -1720,6 +2103,7 @@ impl Corpus {
                         &ticker.contract,
                         features,
                         &self.exogenous,
+                        &ticker.ranks,
                         origin,
                         targets,
                     );
@@ -1842,6 +2226,9 @@ fn one_feature(feature: Feature) -> FeatureSet {
         Feature::Spy => set.spy = true,
         Feature::Dispersion => set.dispersion = true,
         Feature::CrossSectionZ => set.cross_section_z = true,
+        Feature::CrossSectionRank => set.cross_section_rank = true,
+        Feature::RelativeVolume => set.relative_volume = true,
+        Feature::RangeZ => set.range_z = true,
     }
     set
 }
@@ -1856,6 +2243,32 @@ fn empty_host_rows(rows: usize, width: usize, device: Device) -> Result<Tensor> 
     } else {
         Ok(Tensor::empty(size, (Kind::Float, Device::Cpu)))
     }
+}
+
+fn digest_hex(digest: ring::digest::Digest) -> String {
+    digest.as_ref().iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+fn sha256_bytes(bytes: &[u8]) -> String {
+    digest_hex(ring::digest::digest(&ring::digest::SHA256, bytes))
+}
+
+fn verify_split_edges(
+    symbol: &str,
+    bars: &[PackedBar],
+    edges: [u64; 3],
+    bounds: [i64; 3],
+) -> Result<()> {
+    ensure!(bounds.windows(2).all(|pair| pair[0] < pair[1]),
+        "shared UTC split bounds must increase");
+    for (edge, bound) in edges.into_iter().zip(bounds) {
+        let edge = usize::try_from(edge).context("cached split edge exceeds address space")?;
+        ensure!(edge <= bars.len()
+            && (edge == 0 || bars[edge - 1].ts() < bound)
+            && (edge == bars.len() || bars[edge].ts() >= bound),
+            "{symbol}: cached split edge {edge} does not bracket UTC bound {bound}; refusing stale or corrupt lineage");
+    }
+    Ok(())
 }
 
 fn market_fingerprint(tickers: &[CorpusTicker], bounds: [i64; 3], min_cross_section: usize) -> String {
@@ -1952,6 +2365,8 @@ fn fill_row<const LOG: bool, const MARKET_CUM: bool>(
     contract: &DataContract,
     features: &FeatureSet,
     exogenous: &Exogenous,
+    // The ticker's whole per-valid-bar rank array; the row's own window is sliced off here.
+    ranks: &[u16],
     origin: usize,
     targets: usize,
 ) {
@@ -1980,6 +2395,7 @@ fn fill_row<const LOG: bool, const MARKET_CUM: bool>(
         start
             .checked_sub(1)
             .map(|i| &bars[raw_index(i, invalid)]),
+        ranks.get(start..).unwrap_or_default(),
     );
     for (position, bar) in ValidBars::new(bars, invalid, start, written).enumerate() {
         for (channel, value) in [bar.open, bar.high, bar.low, bar.close]
@@ -2320,7 +2736,7 @@ mod tests {
         // element it reads WAS assigned. A pre-zeroed row would pass whether or not it was.
         let mut row = vec![f32::NAN; Batch::row_width(4, 3, 2)];
         assert_eq!(row.len(), 57);
-        fill_row::<true, true>(&mut row, &bars, &contract, &volume, &exogenous, 6, 2);
+        fill_row::<true, true>(&mut row, &bars, &contract, &volume, &exogenous, &[], 6, 2);
         assert_eq!(row[3], (5.0f64 / 8.0).ln() as f32);
         assert_eq!(row[0], (4.0f64 / 8.0).ln() as f32);
         assert_eq!(row[15], 0.0);
@@ -2372,6 +2788,7 @@ mod tests {
             &contract,
             &volume,
             &exogenous,
+            &[],
             6,
             2,
         );
@@ -2391,6 +2808,7 @@ mod tests {
             &contract,
             &volume,
             &exogenous,
+            &[],
             6,
             2,
         );
@@ -2413,6 +2831,7 @@ mod tests {
             &contract,
             &volume,
             &exogenous,
+            &[],
             6,
             2,
         );
@@ -2576,9 +2995,9 @@ mod tests {
             assert!((f64::from(log_prices[position * 4 + 3]) - expected).abs() <= 1e-7);
         }
         let auxiliary: Vec<f32> = Vec::try_from(selected.aux.reshape([-1])).unwrap();
-        assert_eq!(auxiliary.len(), 23 * 14);
+        assert_eq!(auxiliary.len(), 23 * 20);
         for (position, &raw) in valid_raw[31..54].iter().enumerate() {
-            let channels = &auxiliary[position * 14..position * 14 + 14];
+            let channels = &auxiliary[position * 20..position * 20 + 20];
             assert!(channels[..4].iter().all(|value| value.abs() <= 1.0));
             let gap = if raw == 50 { [1.0, 4.0f32.ln()] } else { [0.0, 0.0] };
             assert_eq!(&channels[4..6], &gap);
@@ -2593,8 +3012,16 @@ mod tests {
                 // the four-interval gap carries none even though its slot has a dispersion.
                 assert!(channels[10] < 0.0 && channels[11] == 1.0);
                 assert_eq!(channels[13], if raw == 50 { 0.0 } else { 1.0 });
+                // The rank carries the z's validity rule exactly. Every contributor here
+                // prints the SAME return, so each takes the middle plotting position and the
+                // score is zero WHERE DEFINED - not merely blank.
+                assert!(channels[14].abs() < 1e-6 && channels[15] == channels[13]);
+                // Every ticker in this fixture prints the identical tape and the identical
+                // range, so both level cross-sections have zero spread and neither is a
+                // measurement: [0, 0], never a zero z a head could read as "average".
+                assert_eq!(&channels[16..20], &[0.0; 4]);
             } else {
-                assert_eq!(&channels[6..14], &[0.0; 8], "future history channels must be blank");
+                assert_eq!(&channels[6..20], &[0.0; 14], "future history channels must be blank");
             }
         }
         let minimal = corpus
@@ -2727,7 +3154,8 @@ mod tests {
         let cold = load(7, 1);
         assert_eq!(cold.timing.audits_computed, 3, "a cold ledger audits every ticker");
         assert_eq!(cold.timing.audits_reused, 0);
-        assert_eq!(cold.timing.bars_rescanned, 3 * 4_000 + 2 * 3 * 4_000);
+        // One audit pass, two market-grid passes, three more for the cross-section ranks.
+        assert_eq!(cold.timing.bars_rescanned, 3 * 4_000 + 2 * 3 * 4_000 + 3 * 3 * 4_000);
         assert!(!cold.timing.bounds_reused && !cold.timing.market_reused);
 
         let warm = load(7, 1);
@@ -2739,6 +3167,24 @@ mod tests {
         assert!(warm.timing.bar_audit_ms.is_nan(), "a phase that did not run is NaN, not zero");
         assert!(warm.timing.shared_bounds_ms.is_nan());
         assert!(warm.timing.market_grid_ms.is_nan());
+
+        // A shape-valid cached edge can still point at the wrong wall clock. It is a miss,
+        // not a fatal startup error or a request for the operator to delete a cache directory.
+        let universe: Vec<_> = warm.tickers.iter()
+            .map(|ticker| (ticker.contract.ticker.as_str(), ticker.contract.fingerprint.as_str()))
+            .collect();
+        let bounds = warm.contract.boundary_timestamps;
+        let mut corrupt_edges: Vec<_> = warm.tickers.iter()
+            .map(|ticker| bounds.map(|bound| ticker.file.index_at_or_after(bound) as u64))
+            .collect();
+        corrupt_edges[0][1] += 1;
+        cache::BoundsCache::open(&directory.0, SCHEMA, &universe)
+            .store(bounds, &corrupt_edges).unwrap();
+        let repaired = load(7, 1);
+        assert_eq!(repaired.contract, warm.contract);
+        assert!(!repaired.timing.bounds_reused);
+        assert_eq!(repaired.timing.audits_computed, 0);
+        assert!(load(7, 1).timing.bounds_reused);
 
         // Axis 1: the bytes change. `write_bar_file` publishes by rename, so the inode the
         // stored audit was taken from no longer exists and its digest cannot be reused.
@@ -3028,6 +3474,185 @@ mod tests {
         assert_eq!(batch.valid_target_bars, 2 * pred_len);
     }
 
+    /// WHAT the reserved bands actually guarantee, on the real construction path.
+    ///
+    /// `boundaries[k]` is each ticker's own valid-bar ordinal at a SHARED boundary timestamp
+    /// (`index_at_or_after`), so the guarantee is per ticker: its calibration targets stop
+    /// `purge` bars before `boundaries[1]` and its first validation origin is `boundaries[1] -
+    /// 1`. The realized wall clocks of those ordinals are NOT comparable across tickers - a
+    /// ticker that stops trading before the boundary has its own band edge at its last bar,
+    /// which can be years earlier - so the two populations' global extrema interleave.
+    ///
+    /// The fixture is the real corpus's shape at 1/500th of the scale: one continuously
+    /// traded name and one that goes quiet for 1,400 slots across the `[80%, 90%)` boundary.
+    /// It reproduces the interleave that refused job 5998 - the pooled guard fails on it - and
+    /// per ticker the ordering is exact.
+    #[test]
+    fn the_reserved_bands_are_disjoint_per_ticker_and_interleave_globally() {
+        use super::super::calibration::Blocks;
+        use shared::bars::{bar_file_path, write_bar_file};
+        struct Scratch(std::path::PathBuf);
+        impl Drop for Scratch {
+            fn drop(&mut self) {
+                let _ = fs::remove_dir_all(&self.0);
+            }
+        }
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = Scratch(std::path::PathBuf::from(format!(
+            "/var/tmp/timexer-interleave-test-{}-{nonce}",
+            std::process::id()
+        )));
+        fs::create_dir(&directory.0).unwrap();
+        let bar = |slot: i64| {
+            let price = 100.0 + slot as f32 * 0.001;
+            PackedBar {
+                ts_ms: 1_500_000_000_000 + slot * RESOLUTION_MS,
+                open: price,
+                high: price + 1.0,
+                low: price - 1.0,
+                close: price + 0.5,
+                volume: 1_000.0,
+                vwap: price,
+                trades: 10,
+            }
+        };
+        let full: Vec<_> = (0..12_000).map(bar).collect();
+        // Quiet from slot 9,000 to slot 10,400: the shared `[80%, 90%)` boundary at slot 9,600
+        // falls inside the hole, so this ticker's own boundary ordinal resolves to its first
+        // bar after the hole and its first validation origin is the bar BEFORE it - slot 8,999,
+        // 600 slots before the continuously traded name's last calibration target.
+        let gappy: Vec<_> = (0..9_000).chain(10_400..12_000).map(bar).collect();
+        write_bar_file(&bar_file_path(&directory.0, "FULL", 300), "FULL", 300, &full).unwrap();
+        write_bar_file(
+            &bar_file_path(&directory.0, "GAPPY", 300),
+            "GAPPY",
+            300,
+            &gappy,
+        )
+        .unwrap();
+        let features = FeatureSet {
+            spy: false,
+            ..FeatureSet::ALL
+        };
+        let (context, pred_len, common_context) = (16usize, 7usize, 32usize);
+        let corpus =
+            Corpus::load(&directory.0, &[], context, pred_len, common_context, &features, 1, 0)
+                .unwrap();
+        let dated = |refs: &[WindowRef]| -> Vec<(usize, i64, i64)> {
+            refs.iter()
+                .map(|reference| {
+                    let ticker = corpus.ticker(*reference);
+                    (
+                        reference.ticker,
+                        ticker.timestamp(reference.origin),
+                        ticker.timestamp(reference.origin + pred_len),
+                    )
+                })
+                .collect()
+        };
+        let calibration = dated(&corpus.calibration_refs);
+        let validation = dated(&corpus.validation_refs);
+        // Both names carry origins on both sides, or the per-ticker claim below is vacuous.
+        for ticker in 0..corpus.contract.tickers.len() {
+            assert!(
+                calibration.iter().any(|(owner, _, _)| *owner == ticker)
+                    && validation.iter().any(|(owner, _, _)| *owner == ticker),
+                "{} carries no origins on one side of the split",
+                corpus.contract.tickers[ticker].ticker
+            );
+        }
+        // ---- the invariant: per ticker, exact ------------------------------------------
+        let mut tightest = i64::MAX;
+        for (ticker, contract) in corpus.contract.tickers.iter().enumerate() {
+            let reach = calibration
+                .iter()
+                .filter(|(owner, _, _)| *owner == ticker)
+                .map(|(_, _, target)| *target)
+                .max()
+                .unwrap();
+            let opens = validation
+                .iter()
+                .filter(|(owner, _, _)| *owner == ticker)
+                .map(|(_, origin, _)| *origin)
+                .min()
+                .unwrap();
+            assert!(
+                reach < opens,
+                "{}'s calibration targets reach {reach} but its own validation block opens at \
+                 {opens}",
+                contract.ticker
+            );
+            tightest = tightest.min(opens - reach);
+        }
+        // ---- and globally the extrema interleave, which is why they must not be compared -
+        let global_reach = calibration.iter().map(|(_, _, t)| *t).max().unwrap();
+        let global_open = validation.iter().map(|(_, o, _)| *o).min().unwrap();
+        assert!(
+            global_reach > global_open,
+            "the fixture must reproduce the interleave: reach {global_reach}, open {global_open}"
+        );
+        println!(
+            "measured on the fixture: boundaries {:?} for {} and {:?} for {}; the pooled \
+             calibration reach is {global_reach} and the pooled first validation origin is \
+             {global_open}, {} ms EARLIER, while the tightest per-ticker separation is \
+             {tightest} ms",
+            corpus.contract.tickers[0].boundaries,
+            corpus.contract.tickers[0].ticker,
+            corpus.contract.tickers[1].boundaries,
+            corpus.contract.tickers[1].ticker,
+            global_reach - global_open
+        );
+        let pooled = |rows: &[(usize, i64, i64)]| -> Vec<(i64, i64)> {
+            rows.iter().map(|(_, origin, target)| (*origin, *target)).collect()
+        };
+        let refusal = Blocks::spanning(&pooled(&calibration), &pooled(&validation))
+            .unwrap_err()
+            .to_string();
+        assert!(refusal.contains("share bars"), "{refusal}");
+        let blocks = Blocks::per_ticker(&calibration, &validation, pred_len, |ticker| {
+            corpus.contract.tickers[ticker].ticker.clone()
+        })
+        .unwrap();
+        assert_eq!(blocks.purge_gap_ms, tightest);
+        assert_eq!(blocks.calibration_last_target_ms, global_reach);
+        assert_eq!(blocks.evaluation_first_origin_ms, global_open);
+
+        let plan = corpus.research_sample_plan(71, 23, 17, pred_len).unwrap();
+        let repeat = corpus.research_sample_plan(71, 23, 17, pred_len).unwrap();
+        assert_eq!(plan.validation_refs, repeat.validation_refs);
+        assert_eq!(plan.probe_fit_refs, repeat.probe_fit_refs);
+        assert_eq!(plan.validation_refs.len(), 23);
+        assert_eq!(plan.probe_fit_refs.len(), 17);
+        for reference in &plan.validation_refs {
+            let ticker = corpus.ticker(*reference);
+            assert!(ticker.timestamp(reference.origin - pred_len)
+                > plan.manifest.training_last_target_ms);
+            assert!(ticker.timestamp(reference.origin + 1)
+                >= corpus.contract.boundary_timestamps[1]);
+            assert!(ticker.timestamp(reference.origin + pred_len)
+                < corpus.contract.boundary_timestamps[2]);
+        }
+        for reference in &plan.probe_fit_refs {
+            assert!(corpus.training_target_count(reference.ticker, reference.origin).is_some());
+        }
+        for coverage in &plan.manifest.validation.coverage {
+            assert!(coverage.selected_origins > 0);
+        }
+        // A warm cache cannot quietly move an edge even when the stored shape still fits.
+        let ticker = &corpus.tickers[0];
+        let actual = corpus.contract.boundary_timestamps
+            .map(|bound| ticker.file.index_at_or_after(bound) as u64);
+        verify_split_edges(&ticker.contract.ticker, ticker.file.bars(), actual,
+            corpus.contract.boundary_timestamps).unwrap();
+        let mut wrong = actual;
+        wrong[1] += 1;
+        assert!(verify_split_edges(&ticker.contract.ticker, ticker.file.bars(), wrong,
+            corpus.contract.boundary_timestamps).is_err());
+    }
+
     /// The corpus SCHEMA is the stamp both derived caches are keyed on, so a bump to it is a
     /// MISS at every layer below it - and the bar audits, keyed on `data::SCHEMA` instead,
     /// correctly survive. A cached corpus paired with a changed partition schema is the exact
@@ -3069,13 +3694,18 @@ mod tests {
             "a corpus schema bump must reject the stored boundaries"
         );
 
+        let moment = |value: f64| super::super::features::SlotMoment {
+            sums: vec![value, value],
+            squares: vec![value * value, value * value],
+            counts: vec![1, 1],
+        };
         let grid = cache::MarketGrid {
             first_ts: 0,
             min_cross_section: 1,
             population: vec![1, 1],
-            sums: vec![0.5, 0.5],
-            squares: vec![0.25, 0.25],
-            counts: vec![1, 1],
+            returns: moment(0.5),
+            log_volume: moment(7.0),
+            log_range: moment(-6.0),
         };
         cache::MarketCache::open(&directory.0, SCHEMA, &universe, 0, 2, 1)
             .store(&grid)

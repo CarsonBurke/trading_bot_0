@@ -46,6 +46,7 @@ use serde::{Deserialize, Serialize};
 use shared::bars::BarIdentity;
 
 use super::data::BarAudit;
+use super::features::SlotMoment;
 
 /// Bumped whenever a cached value's MEANING changes without its inputs changing - a new field,
 /// a different derivation, a fixed bug. Part of every key below, so an old entry is a miss
@@ -56,6 +57,7 @@ const CACHE_DIRECTORY: &str = ".timexer-cache";
 const AUDITS_FILE: &str = "bar-audits.bin";
 const BOUNDS_FILE: &str = "shared-bounds.bin";
 const MARKET_FILE: &str = "market-steps.bin";
+const RANKS_FILE: &str = "cross-section-ranks.bin";
 
 fn cache_directory(data_dir: &Path) -> PathBuf {
     data_dir.join(CACHE_DIRECTORY)
@@ -251,15 +253,17 @@ impl BoundsCache {
     }
 }
 
-/// The four per-slot vectors [`super::features::MarketSteps`] is made of.
+/// The per-slot vectors [`super::features::MarketSteps`] is made of.
 #[derive(Debug, Serialize, Deserialize)]
 pub(super) struct MarketGrid {
     pub first_ts: i64,
     pub min_cross_section: u32,
     pub population: Vec<u32>,
-    pub sums: Vec<f64>,
-    pub squares: Vec<f64>,
-    pub counts: Vec<u32>,
+    /// Contributing log close returns, `ln(volume)` and `ln((high - low) / close)` over the
+    /// same contributing set, in that order.
+    pub returns: SlotMoment,
+    pub log_volume: SlotMoment,
+    pub log_range: SlotMoment,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -277,6 +281,18 @@ pub(super) struct MarketCache {
     key: String,
 }
 
+/// The grid geometry and cross-section floor every derived market artifact is keyed on, after
+/// its own tag. Shared so the market grid and the cross-section ranks cannot drift apart on
+/// what "the same grid" means.
+fn grid_key(tag: &[u8], first_ts: i64, slots: usize, min_cross_section: usize) -> Vec<u8> {
+    let mut extra = Vec::with_capacity(tag.len() + 24);
+    extra.extend_from_slice(tag);
+    extra.extend_from_slice(&first_ts.to_le_bytes());
+    extra.extend_from_slice(&(slots as u64).to_le_bytes());
+    extra.extend_from_slice(&(min_cross_section as u64).to_le_bytes());
+    extra
+}
+
 impl MarketCache {
     pub(super) fn open(
         data_dir: &Path,
@@ -286,14 +302,15 @@ impl MarketCache {
         slots: usize,
         min_cross_section: usize,
     ) -> Self {
-        let mut extra = Vec::with_capacity(64);
         // The tag names the vector SET, not just the construction: an artifact written before
-        // the per-slot second moment existed decodes to nothing here rather than being probed
-        // for a field it does not carry.
-        extra.extend_from_slice(b"market-steps-second-moment");
-        extra.extend_from_slice(&first_ts.to_le_bytes());
-        extra.extend_from_slice(&(slots as u64).to_le_bytes());
-        extra.extend_from_slice(&(min_cross_section as u64).to_le_bytes());
+        // the per-slot volume and range moments existed decodes to nothing here rather than
+        // being probed for fields it does not carry.
+        let extra = grid_key(
+            b"market-steps-return-volume-range-moments",
+            first_ts,
+            slots,
+            min_cross_section,
+        );
         Self {
             path: cache_directory(data_dir).join(MARKET_FILE),
             key: universe_key(schema, universe, &extra),
@@ -305,12 +322,17 @@ impl MarketCache {
     /// different build being indexed out of bounds at every bar lookup.
     pub(super) fn get(&self, slots: usize) -> Option<MarketGrid> {
         let stored = read_artifact::<MarketArtifact>(&self.path)?;
+        let aligned = |moment: &SlotMoment| {
+            moment.sums.len() == slots
+                && moment.squares.len() == slots
+                && moment.counts.len() == slots
+        };
         (stored.key == self.key
             && stored.grid.population.len() == slots
-            && stored.grid.sums.len() == slots
-            && stored.grid.squares.len() == slots
-            && stored.grid.counts.len() == slots)
-            .then_some(stored.grid)
+            && aligned(&stored.grid.returns)
+            && aligned(&stored.grid.log_volume)
+            && aligned(&stored.grid.log_range))
+        .then_some(stored.grid)
     }
 
     pub(super) fn store(&self, grid: &MarketGrid) -> Result<()> {
@@ -322,10 +344,93 @@ impl MarketCache {
                     first_ts: grid.first_ts,
                     min_cross_section: grid.min_cross_section,
                     population: grid.population.clone(),
-                    sums: grid.sums.clone(),
-                    squares: grid.squares.clone(),
-                    counts: grid.counts.clone(),
+                    returns: grid.returns.clone(),
+                    log_volume: grid.log_volume.clone(),
+                    log_range: grid.log_range.clone(),
                 },
+            },
+        )
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct RankArtifact {
+    key: String,
+    /// One entry per eligible ticker, in universe order: its doubled mid-ranks as raw
+    /// little-endian `u16`. Bytes rather than `Vec<u16>` because postcard varint-encodes
+    /// integers, and this is the largest artifact the cache holds by two orders of magnitude.
+    ranks: Vec<Vec<u8>>,
+}
+
+/// [`super::features::cross_section_ranks`]: one `u16` per valid bar of every eligible ticker.
+///
+/// Its own file and its own tag, so an arm that only toggles the rank channel neither
+/// invalidates the market grid nor is invalidated by it. Keyed on the same universe
+/// fingerprints and grid scalars as the market grid, because that is exactly what it is a
+/// function of.
+pub(super) struct RankCache {
+    path: PathBuf,
+    key: String,
+}
+
+impl RankCache {
+    pub(super) fn open(
+        data_dir: &Path,
+        schema: &str,
+        universe: &[(&str, &str)],
+        first_ts: i64,
+        slots: usize,
+        min_cross_section: usize,
+    ) -> Self {
+        let extra = grid_key(
+            b"cross-section-doubled-mid-ranks",
+            first_ts,
+            slots,
+            min_cross_section,
+        );
+        Self {
+            path: cache_directory(data_dir).join(RANKS_FILE),
+            key: universe_key(schema, universe, &extra),
+        }
+    }
+
+    /// The stored ranks, rejected unless the key matches and every ticker's row is exactly as
+    /// long as that ticker's valid bar count.
+    pub(super) fn get(&self, valid_bars: &[usize]) -> Option<Vec<Vec<u16>>> {
+        let stored = read_artifact::<RankArtifact>(&self.path)?;
+        if stored.key != self.key || stored.ranks.len() != valid_bars.len() {
+            return None;
+        }
+        if stored
+            .ranks
+            .iter()
+            .zip(valid_bars)
+            .any(|(row, bars)| row.len() != bars * 2)
+        {
+            return None;
+        }
+        Some(
+            stored
+                .ranks
+                .iter()
+                .map(|row| {
+                    row.chunks_exact(2)
+                        .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+                        .collect()
+                })
+                .collect(),
+        )
+    }
+
+    pub(super) fn store(&self, ranks: &[Vec<u16>]) -> Result<()> {
+        write_artifact(
+            &self.path,
+            &RankArtifact {
+                key: self.key.clone(),
+                ranks: ranks
+                    .iter()
+                    .map(|row| bytemuck::cast_slice::<u16, u8>(row).to_vec())
+                    .collect(),
             },
         )
     }
@@ -594,13 +699,18 @@ mod tests {
             "an edge list that does not cover the universe must be refused, not indexed into"
         );
 
+        let moment = |sums: Vec<f64>, squares: Vec<f64>| SlotMoment {
+            sums,
+            squares,
+            counts: vec![1, 1],
+        };
         let grid = MarketGrid {
             first_ts: 0,
             min_cross_section: 20,
             population: vec![1, 2],
-            sums: vec![0.5, 0.25],
-            squares: vec![0.25, 0.0625],
-            counts: vec![1, 1],
+            returns: moment(vec![0.5, 0.25], vec![0.25, 0.0625]),
+            log_volume: moment(vec![7.0, 8.0], vec![49.0, 64.0]),
+            log_range: moment(vec![-6.0, -5.5], vec![36.0, 30.25]),
         };
         let market = MarketCache::open(&directory, "schema-a", &universe, 0, 2, 20);
         market.store(&grid).unwrap();
@@ -626,6 +736,30 @@ mod tests {
                 .get(3)
                 .is_none(),
             "a grid of a different length must reject the stored market grid"
+        );
+        let ranks = RankCache::open(&directory, "schema-a", &universe, 0, 2, 20);
+        ranks.store(&[vec![2u16, 0, 7], vec![4]]).unwrap();
+        assert_eq!(
+            ranks.get(&[3, 1]),
+            Some(vec![vec![2u16, 0, 7], vec![4]]),
+            "the doubled mid-ranks must round-trip through the artifact unchanged"
+        );
+        assert_eq!(
+            ranks.get(&[3, 2]),
+            None,
+            "a ticker whose valid bar count moved must reject the stored ranks"
+        );
+        assert_eq!(
+            RankCache::open(&directory, "schema-a", &universe, 0, 2, 40).get(&[3, 1]),
+            None,
+            "a different cross-section floor must reject the stored ranks"
+        );
+        // The two artifacts are keyed independently: the rank pass may miss while the market
+        // grid it was derived from still hits, and vice versa.
+        assert!(
+            MarketCache::open(&directory, "schema-a", &universe, 0, 2, 20)
+                .get(2)
+                .is_some()
         );
     }
 

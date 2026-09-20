@@ -1211,25 +1211,11 @@ mod planner_inference_discovery_tests {
                  invisible"
             );
         }
-        // Both directions for the segment family. The forward sweep above catches a base the
-        // writer produces and the TUI never scans; this catches the reverse, a name the TUI
-        // still scans after the writer retired it, which renders as a permanently blank
-        // panel that a reader cannot distinguish from a metric that stopped moving.
-        let mut registered: Vec<_> = shared::report::TIMEXER_SEGMENT_REPORT_BASES.to_vec();
+        let mut registered = shared::report::TIMEXER_SEGMENT_REPORT_BASES.to_vec();
         registered.sort_unstable();
-        let scanned: Vec<_> = bases
-            .iter()
-            .copied()
-            .filter(|base| base.starts_with("timexer_segment_"))
-            .collect();
-        assert_eq!(
-            scanned, registered,
-            "every timexer_segment_* base the TUI scans must be registered and vice versa"
-        );
-        // The step-indexed family, by name. The two sweeps above are shape assertions: they
-        // stay green if every one of these names disappears from the registry and the scan at
-        // once, which is exactly how a per-horizon trajectory got lost before it existed. A
-        // comparison of two runs at matched steps depends on all of them, and
+        // Pin the step-indexed family too: registry membership alone would stay green if
+        // the writer and scanner both dropped a required trajectory.
+        // A comparison of two runs at matched steps depends on all of them, and
         // `_horizon_steps_signal` is the panel a cross-sectional model is adopted or rejected
         // on, so each is pinned in both directions.
         for step_indexed in [

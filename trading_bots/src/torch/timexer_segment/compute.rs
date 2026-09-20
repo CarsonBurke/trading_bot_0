@@ -93,7 +93,8 @@ impl RecipeKnobs {
 /// forward pass, and under `quadratic_lr_weight_decay` it carries the same weight-decay factor
 /// upstream's `lr_mul` carries, because both enter the decay through exactly one of its two
 /// learning-rate factors (`optim/muon.rs:141-146`).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, clap::ValueEnum)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
+#[serde(rename_all = "kebab-case")]
 pub enum MlpDownLr {
     /// The rate our transposed storage implies on its own: aspect 1, no override.
     #[default]
@@ -508,7 +509,9 @@ fn polar_express(named: &[(String, Tensor)], learning_rate: f64, knobs: RecipeKn
 
 use super::{
     corpus::Batch,
+    jepa::JepaRandom,
     model::{CausalPatchModel, Losses, ModelConfig, X0Lambdas},
+    supervision::{DecimationInterval, DecimationPlan, DecimationSampler},
 };
 
 const MIB: f64 = 1048576.;
@@ -591,8 +594,8 @@ pub struct CaptureBudget {
 /// time those GEMMs ever ran on that stream.
 ///
 /// The input is the engine's resident batch, refilled in place before every replay. The
-/// outputs are the two loss scalars: they live in the capture's private mempool, which the
-/// optimizer's own captured bodies share and replay into later in the same step, so a pool
+/// outputs are forecast metrics, objective and diagnostics: they live in the private mempool,
+/// which the optimizer's captured bodies share and replay into later in the same step, so a pool
 /// address is only meaningful between one replay and the next and they are copied out the
 /// instant the replay is issued.
 struct StepGraph {
@@ -600,35 +603,29 @@ struct StepGraph {
     /// The scalars the captured body writes, held for the graph's life. `None` until the
     /// capture; dropping them afterwards would return their blocks to the pool for a later
     /// capture to reuse while this graph still writes to them.
-    outputs: Option<(Tensor, Tensor)>,
+    outputs: Option<Losses>,
 }
 
 impl StepGraph {
     /// One forward and backward: the replay once captured, the same body eagerly on the
     /// capture stream until then.
-    fn run(&self, model: &CausalPatchModel, batch: &Batch) -> Result<Losses> {
+    fn run(&self, model: &CausalPatchModel, batch: &Batch, keep: Option<&Tensor>, random: Option<&JepaRandom>) -> Result<Losses> {
         match &self.outputs {
-            Some((nll, mse)) => {
+            Some(outputs) => {
                 self.graph
                     .with_stream_scope(CudaGraph::replay)
                     .and_then(|inner| inner)
                     .map_err(|err| {
                         anyhow::anyhow!("replaying the captured training step: {err}")
                     })?;
-                Ok(Losses {
-                    nll: nll.detach().copy(),
-                    mse: mse.detach().copy(),
-                })
+                Ok(outputs.copied())
             }
             None => self
                 .graph
                 .with_stream_scope(|_| {
-                    let losses = Engine::forward_loss(model, batch, true);
-                    losses.nll.backward();
-                    Losses {
-                        nll: losses.nll.detach(),
-                        mse: losses.mse,
-                    }
+                    let losses = Engine::forward_loss_with_random(model, batch, true, keep, random);
+                    losses.objective.backward();
+                    losses.detached()
                 })
                 .map_err(|err| anyhow::anyhow!("warming the capture stream: {err}")),
         }
@@ -648,6 +645,73 @@ enum Optimizer {
     PolarExpress(Box<Muon>),
     Native(nn::Optimizer),
     Fused(Py<PyAny>),
+}
+
+/// The per-horizon sub-origin keep mask: a host sampler beside the ONE device buffer the
+/// training step reads it from.
+///
+/// The buffer is allocated once and never moves, for the reason [`Batch::resident`] does not
+/// move: from [`CAPTURE_AFTER_STEPS`] the forward and backward are a replayed CUDA graph and
+/// a replay reads the addresses the capture recorded. Device-side randomness inside that body
+/// would be captured too and would replay one frozen draw forever, so the randomness is drawn
+/// on the host and copied in - `H2D into a fixed address before the replay` is exactly the
+/// contract the resident batch already runs under, and [`Engine::upload`] is the single place
+/// both of them are refilled so they cannot get out of order.
+struct Decimation {
+    sampler: DecimationSampler,
+    /// `[1, origins, 1, pred_len]` fp32, broadcast over rows and channels against the
+    /// `[rows, origins, 1, pred_len]` supervision mask. 288 KiB at the production geometry.
+    resident: Tensor,
+    device: Device,
+}
+
+impl Decimation {
+    fn new(plan: DecimationPlan, seed: u64, device: Device) -> Self {
+        let shape = [1, plan.origins as i64, 1, plan.pred_len() as i64];
+        Self {
+            sampler: DecimationSampler::new(plan, seed),
+            resident: Tensor::zeros(shape, (Kind::Float, device)),
+            device,
+        }
+    }
+
+    /// Draw this step's phases and copy them into the resident buffer.
+    ///
+    /// The pinned staging block is minted per step rather than held, which is what makes the
+    /// non-blocking copy safe against the host overwriting bytes the previous copy has not yet
+    /// read: libtorch's caching HOST allocator keeps a freed block out of circulation until
+    /// the copy that read it retires. It is the same guarantee `Corpus::host_batch` relies on
+    /// for the 114 MB packed block, at 288 KiB.
+    fn refresh(&mut self) -> Result<()> {
+        self.sampler.draw();
+        let staged = Tensor::from_slice(self.sampler.values()).reshape(self.resident.size());
+        let staged = if self.device.is_cuda() {
+            staged.pin_memory(self.device)
+        } else {
+            staged
+        };
+        cuda::copy_nonblocking(&mut self.resident, &staged)
+            .map_err(|err| anyhow::anyhow!("uploading the horizon keep mask: {err}"))
+    }
+}
+
+/// The decimated supervision mask: `mask * keep`, or `mask` untouched where no decimation is
+/// armed.
+///
+/// The multiply lands at the TRAINING call sites and not inside
+/// [`CausalPatchModel::targets`], which is the whole point of the placement: `targets` has two
+/// other consumers - evaluation scoring at `last_only = true` and
+/// `target_basis::fit_statistics` - and NEITHER may be decimated. Doing it here makes that
+/// correct by construction rather than by a flag test inside a shared function.
+///
+/// `keep` is `[1, origins, 1, pred_len]`, carrying the compensation factor on survivors and
+/// zero elsewhere, and broadcasts over the mask's row and channel axes. `None` emits no
+/// kernel at all, so the control arm's mask is bit-identical to the pre-knob one.
+fn decimate(mask: Tensor, keep: Option<&Tensor>) -> Tensor {
+    match keep {
+        Some(keep) => mask * keep,
+        None => mask,
+    }
 }
 
 pub struct Engine {
@@ -673,6 +737,10 @@ pub struct Engine {
     capture_budget: Option<CaptureBudget>,
     /// Allocator state before any step ran, for the capture's memory budget.
     before_warmup: MemorySnapshot,
+    /// The horizon decimation, `None` on the control arm - where no buffer is allocated and
+    /// no multiply is emitted, so the objective is bit-for-bit the pre-knob one.
+    decimation: Option<Decimation>,
+    jepa_random: Option<JepaRandom>,
 }
 
 impl Engine {
@@ -695,7 +763,7 @@ impl Engine {
         // One pool for the whole process, minted before anything can capture into a pool
         // of its own. Every body that captures here - the optimizer's two, and the step
         // graph - allocates only tensors that are transient WITHIN its own replay, and the
-        // step graph copies its two output scalars out before the optimizer replays, so
+        // step graph copies every output tensor out before the optimizer replays, so
         // the bodies may safely hold the same addresses.
         let graph_pool = if device.is_cuda() && CudaGraph::is_available() {
             Some(Arc::new(CudaGraphPool::new().map_err(|err| {
@@ -764,9 +832,24 @@ impl Engine {
             step_graph,
             capture_budget: None,
             before_warmup,
+            decimation: None,
+            jepa_random: None,
         };
         engine.apply_schedule()?;
         Ok(engine)
+    }
+
+    /// Arm the per-horizon sub-origin decimation. Called once, before the first step; an
+    /// engine that is never armed allocates nothing and emits nothing.
+    pub fn arm_horizon_decimation(&mut self, plan: DecimationPlan, seed: u64) {
+        self.decimation = Some(Decimation::new(plan, seed, self.device));
+    }
+
+    /// The interval's realized decimation, and reset. `None` on the control arm.
+    pub fn drain_horizon_decimation(&mut self) -> Option<DecimationInterval> {
+        self.decimation
+            .as_mut()
+            .map(|decimation| decimation.sampler.drain())
     }
 
     /// The AdamW-family rate the last step actually ran at, read back rather than recomputed.
@@ -899,10 +982,33 @@ impl Engine {
         Ok(())
     }
 
-    pub fn forward_loss(model: &CausalPatchModel, batch: &Batch, train: bool) -> Losses {
+    /// One forward and the objective, with `keep` the optional per-horizon sub-origin keep
+    /// mask; see [`decimate`] for why the multiply lands here.
+    pub fn forward_loss(
+        model: &CausalPatchModel,
+        batch: &Batch,
+        train: bool,
+        keep: Option<&Tensor>,
+    ) -> Losses {
+        let mut random = model.config().jepa_mode.needs_random()
+            .then(|| JepaRandom::new(model.config(), batch.log_prices.device()));
+        if let Some(random) = &mut random {
+            random.refresh().expect("uploading the standalone JEPA draw");
+        }
+        Self::forward_loss_with_random(model, batch, train, keep, random.as_ref())
+    }
+
+    fn forward_loss_with_random(
+        model: &CausalPatchModel, batch: &Batch, train: bool,
+        keep: Option<&Tensor>, random: Option<&JepaRandom>,
+    ) -> Losses {
+        if model.config().jepa_mode.enabled() {
+            return model.jepa_losses(batch, train, keep, random);
+        }
         let stats = model.statistics(batch);
         let head = model.forward(batch, &stats, train, false);
         let (targets, mask) = model.targets(batch, &stats, false);
+        let mask = decimate(mask, keep);
         model.losses(&head, &stats, &targets, &mask)
     }
 
@@ -913,11 +1019,25 @@ impl Engine {
     /// asynchronous, so the host does not wait for the outstanding step to drain. The
     /// destination address is fixed for the run, which is what a captured graph needs and
     /// what keeps `to_device`'s 114 MB allocate-and-free off every step.
-    fn upload(&mut self, source: &Batch) -> Result<()> {
+    ///
+    /// Both fixed-address device buffers the step reads are refilled here, in this order, and
+    /// this is the only place either is written: whatever runs next - an eager body, the
+    /// capture, or a replay - sees this step's batch beside this step's keep mask.
+    fn upload(&mut self, model: &CausalPatchModel, source: &Batch) -> Result<()> {
         if self.resident.is_none() {
             self.resident = Some(source.resident(self.device));
         }
-        source.upload(self.resident.as_mut().expect("just allocated"))
+        source.upload(self.resident.as_mut().expect("just allocated"))?;
+        if let Some(decimation) = &mut self.decimation {
+            decimation.refresh()?;
+        }
+        if model.config().jepa_mode.needs_random() {
+            if self.jepa_random.is_none() {
+                self.jepa_random = Some(JepaRandom::new(model.config(), self.device));
+            }
+            self.jepa_random.as_mut().expect("created above").refresh()?;
+        }
+        Ok(())
     }
 
     /// The captured replay once armed, the same body on the capture stream until then, and
@@ -931,15 +1051,13 @@ impl Engine {
             .resident
             .as_ref()
             .context("no batch has been uploaded to the engine")?;
+        let keep = self.decimation.as_ref().map(|state| &state.resident);
         match &self.step_graph {
-            Some(graph) => graph.run(model, batch),
+            Some(graph) => graph.run(model, batch, keep, self.jepa_random.as_ref()),
             None => {
-                let losses = Self::forward_loss(model, batch, true);
-                losses.nll.backward();
-                Ok(Losses {
-                    nll: losses.nll.detach(),
-                    mse: losses.mse,
-                })
+                let losses = Self::forward_loss_with_random(model, batch, true, keep, self.jepa_random.as_ref());
+                losses.objective.backward();
+                Ok(losses.detached())
             }
         }
     }
@@ -951,7 +1069,7 @@ impl Engine {
     /// step; the runner now accumulates the indicator on device and reads it once per report
     /// interval alongside the interval's mean loss.
     pub fn step(&mut self, model: &CausalPatchModel, batch: &Batch) -> Result<Losses> {
-        self.upload(batch)?;
+        self.upload(model, batch)?;
         self.zero_grad()?;
         let losses = self.forward_backward(model)?;
         self.optimizer_step()?;
@@ -1008,7 +1126,7 @@ impl Engine {
             self.step_graph.is_some(),
             "capturing the training step needs a CUDA device with graph support"
         );
-        self.upload(batch)?;
+        self.upload(model, batch)?;
         self.zero_grad()?;
         tch::Cuda::synchronize(0);
         let after_warmup = memory_snapshot()?;
@@ -1019,12 +1137,16 @@ impl Engine {
         let mut captured = None;
         {
             let batch = self.resident.as_ref().expect("uploaded above");
+            // Recorded as a kernel argument, exactly like the batch: the capture bakes in the
+            // buffer's ADDRESS, and `upload` above has already written this step's draw into
+            // it. Every later replay reads whatever the host most recently wrote there.
+            let keep = self.decimation.as_ref().map(|state| &state.resident);
             let graph = &self.step_graph.as_ref().expect("checked above").graph;
             graph
                 .with_stream_scope(|graph| {
                     graph.capture(|| {
-                        let losses = Self::forward_loss(model, batch, true);
-                        losses.nll.backward();
+                        let losses = Self::forward_loss_with_random(model, batch, true, keep, self.jepa_random.as_ref());
+                        losses.objective.backward();
                         captured = Some(losses);
                     })?;
                     graph.replay()
@@ -1057,14 +1179,11 @@ impl Engine {
             budget.at_capture_end.reserved_mib,
             budget.device_total_mib
         );
-        let out = Losses {
-            nll: losses.nll.detach().copy(),
-            mse: losses.mse.detach().copy(),
-        };
+        let out = losses.copied();
         self.step_graph
             .as_mut()
             .expect("checked above")
-            .outputs = Some((losses.nll, losses.mse));
+            .outputs = Some(losses);
         self.capture_budget = Some(budget);
         self.optimizer_step()?;
         Ok(out)
@@ -1112,14 +1231,15 @@ impl Engine {
             started.elapsed().as_secs_f64() * 1000.
         };
         let started = Instant::now();
-        self.upload(batch)?;
+        self.upload(model, batch)?;
         let upload_ms = phase(started);
         self.zero_grad()?;
+        let keep = self.decimation.as_ref().map(|state| &state.resident);
         let (losses, phases) = if self.step_graph_captured() {
             let graph = self.step_graph.as_ref().expect("captured");
             let resident = self.resident.as_ref().expect("uploaded above");
             let started = Instant::now();
-            let losses = graph.run(model, resident)?;
+            let losses = graph.run(model, resident, keep, self.jepa_random.as_ref())?;
             let replay_ms = phase(started);
             (losses, [f64::NAN, f64::NAN, f64::NAN, replay_ms])
         } else {
@@ -1130,6 +1250,16 @@ impl Engine {
             // Split into phases, and on the capture stream wherever one exists, so that a
             // sampled step before the capture still warms the stream the capture will use.
             let body = || {
+                if model.config().jepa_mode.enabled() {
+                    let started = Instant::now();
+                    let losses = Self::forward_loss_with_random(model, resident, true, keep, self.jepa_random.as_ref());
+                    let forward_ms = phase(started);
+                    let started = Instant::now();
+                    losses.objective.backward();
+                    let backward_ms = phase(started);
+                    // Shared forward cannot be split without a second backbone pass.
+                    return (losses.detached(), [forward_ms, f64::NAN, backward_ms, f64::NAN]);
+                }
                 let started = Instant::now();
                 let stats = model.statistics(resident);
                 let state = model.backbone(resident, &stats, true, false);
@@ -1137,16 +1267,14 @@ impl Engine {
                 let started = Instant::now();
                 let head = model.head(resident, &state, false);
                 let (targets, mask) = model.targets(resident, &stats, false);
+                let mask = decimate(mask, keep);
                 let losses = model.losses(&head, &stats, &targets, &mask);
                 let head_ms = phase(started);
                 let started = Instant::now();
-                losses.nll.backward();
+                losses.objective.backward();
                 let backward_ms = phase(started);
                 (
-                    Losses {
-                        nll: losses.nll.detach(),
-                        mse: losses.mse,
-                    },
+                    losses.detached(),
                     [backbone_ms, head_ms, backward_ms, f64::NAN],
                 )
             };

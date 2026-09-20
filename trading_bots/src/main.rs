@@ -94,6 +94,16 @@ enum Commands {
     EvaluateTimexerSegment(torch::timexer_segment::runner::EvaluateArgs),
     /// Probe a frozen checkpoint's trunk latent for long-horizon information the head misses.
     ProbeTimexerSegment(torch::timexer_segment::runner::ProbeArgs),
+    /// Re-evaluate authenticated fixed-step LeJEPA research weights and their frozen panel.
+    EvaluateJepa(torch::timexer_segment::jepa_runner::EvaluateArgs),
+    /// Diagnose temporal SIGReg geometry and patch gradients on authenticated held-out sources.
+    DiagnoseTemporalSigreg(torch::timexer_segment::jepa_diagnostics::DiagnoseArgs),
+    /// Compare actual forecast accuracy on identical authenticated held-out research panels.
+    CompareTimexerAccuracy(torch::timexer_segment::accuracy::CompareArgs),
+    /// Measure delayed-cue memory against known futures and an irrelevant-cue null.
+    BenchmarkJepaMemory(torch::timexer_segment::jepa_memory::MemoryArgs),
+    /// Authenticate the research corpus and fixed panels without loading a model.
+    PrepareJepa(torch::timexer_segment::runner::TrainArgs),
     /// Measure the per-horizon predictable-information ceiling and the gap to a checkpoint.
     CeilingTimexerSegment(torch::timexer_segment::runner::CeilingArgs),
     /// Fit the per-coefficient target-basis statistics an orthonormal-basis arm needs.
@@ -1909,6 +1919,31 @@ async fn run() {
             let args = args.clone();
             tokio::task::spawn_blocking(move || torch::timexer_segment::runner::probe(args))
                 .await.expect("TimeXer segment latent probe panicked").expect("TimeXer segment latent probe failed");
+        }
+        Some(Commands::EvaluateJepa(args)) => {
+            let args = args.clone();
+            tokio::task::spawn_blocking(move || torch::timexer_segment::jepa_runner::evaluate(args))
+                .await.expect("LeJEPA evaluation task panicked").expect("LeJEPA evaluation failed");
+        }
+        Some(Commands::DiagnoseTemporalSigreg(args)) => {
+            let args = args.clone();
+            tokio::task::spawn_blocking(move || torch::timexer_segment::jepa_diagnostics::diagnose(args))
+                .await.expect("Temporal SIGReg diagnostic panicked").expect("Temporal SIGReg diagnostic failed");
+        }
+        Some(Commands::CompareTimexerAccuracy(args)) => {
+            let args = args.clone();
+            tokio::task::spawn_blocking(move || torch::timexer_segment::accuracy::compare(args))
+                .await.expect("TimeXer accuracy comparison panicked").expect("TimeXer accuracy comparison failed");
+        }
+        Some(Commands::BenchmarkJepaMemory(args)) => {
+            let args = args.clone();
+            tokio::task::spawn_blocking(move || torch::timexer_segment::jepa_memory::run(args))
+                .await.expect("LeJEPA memory task panicked").expect("LeJEPA memory benchmark failed");
+        }
+        Some(Commands::PrepareJepa(args)) => {
+            let args = args.clone();
+            tokio::task::spawn_blocking(move || torch::timexer_segment::jepa_runner::prepare(args))
+                .await.expect("LeJEPA corpus preparation panicked").expect("LeJEPA corpus preparation failed");
         }
         Some(Commands::CeilingTimexerSegment(args)) => {
             let args = args.clone();

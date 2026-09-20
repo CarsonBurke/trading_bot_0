@@ -195,8 +195,13 @@ pub struct Metrics {
     /// ([`Metrics::validation_is_full`]), not of the field, so the `validation_` prefix is
     /// retained as the internal spelling of "the held-out split scored here".
     pub validation_nll: f64,
-    /// Held-out NLL with the training objective's horizon weighting.
+    /// Held-out NLL with the training objective's horizon weighting. Reported, not selected on.
     pub validation_objective_nll: f64,
+    /// THE selection scalar: the horizon-weighted close MSE ratio at each horizon's own best
+    /// scale, which is what `weights/best` and both patience rules minimize. A ratio, so it
+    /// charts on the headline `timexer_segment_skill` axis beside the ratios it is chosen
+    /// against rather than on a base of its own.
+    pub validation_scale_free_objective: f64,
     pub persistence_nll: f64,
     pub validation_mse: f64,
     pub persistence_mse: f64,
@@ -515,6 +520,17 @@ pub struct HorizonPoint {
     pub best_scale_ratio: f64,
     /// [`TradingCurve::optimal_gain`]: `β̂`, 1 = perfect amplitude calibration.
     pub optimal_gain: f64,
+    /// [`TradingCurve::close_mse_ratio`] recomputed at the per-horizon mean amplitude
+    /// calibration the run fitted at this same evaluation, in closed form from the same
+    /// moments. Carried BESIDE the achieved ratio and never instead of it: the delta between
+    /// the two IS the amplitude diagnostic, and a long-horizon ratio that crosses 1 while its
+    /// calibrated twin stays below is an over-amplified mean, not a mean that lost its signal.
+    /// NaN on a pass scored with no calibration to apply.
+    pub calibrated_close_ratio: f64,
+    /// `β̂` of that calibrated emission, `optimal_gain / g`: 1 exactly where the applied gain
+    /// is the amplitude this draw measures, so a fitted curve that does not move this toward 1
+    /// is legible as a calibration that did not transfer. NaN with no calibration.
+    pub calibrated_optimal_gain: f64,
     /// [`TradingCurve::offset_gain`]: what a constant forecast equal to the population mean
     /// already earns, as a share of the persistence MSE.
     pub offset_gain: f64,
@@ -545,11 +561,41 @@ pub struct HorizonPoint {
 /// One evaluation's slice through the per-horizon curves at every [`DECISION_HORIZONS`] entry
 /// the evaluated window reaches. The ratios are formed here rather than in the caller so the
 /// step-indexed series and the horizon-indexed ones divide the same two numbers.
-pub fn horizon_track(horizon: &HorizonCurve, trading: &TradingCurve) -> Vec<HorizonPoint> {
+///
+/// `anchor_gain` is the per-horizon mean amplitude calibration to report this UN-GAINED
+/// emission against - [`super::calibration::FrozenGain::anchor`], fitted on the reserved
+/// partition at this same evaluation. `None` where there is nothing to add: a pass scored
+/// through an already-calibrated model emits the gained mean, so its achieved ratio IS the
+/// calibrated one and the un-gained comparand is the inverted panel
+/// [`write_amplitude`] draws rather than a second series here.
+pub fn horizon_track(
+    horizon: &HorizonCurve,
+    trading: &TradingCurve,
+    anchor_gain: Option<&[f64]>,
+) -> Vec<HorizonPoint> {
     DECISION_HORIZONS
         .iter()
         .filter_map(|&h| {
             let i = h.checked_sub(1)?;
+            let (mean_forecast, mean_target) =
+                (*trading.mean_forecast.get(i)?, *trading.mean_target.get(i)?);
+            let persistence = *trading.persistence.get(i)?;
+            // `E[f·y]` and `E[f²]` rebuilt from the curve's own centered moments, which is
+            // every term `1 - (2g·E[fy] - g²·E[f²])/E[y²]` needs: a per-horizon gain is a
+            // closed-form rescale of two numbers this pass already reduced, so reporting what
+            // the calibration did to the ratio costs no second scoring pass and cannot
+            // disagree with the achieved ratio beside it.
+            let joint = *trading.covariance.get(i)? + mean_forecast * mean_target;
+            let square = *trading.forecast_variance.get(i)? + mean_forecast * mean_forecast;
+            let optimal_gain = *trading.optimal_gain.get(i)?;
+            let (calibrated_close_ratio, calibrated_optimal_gain) =
+                match anchor_gain.and_then(|curve| curve.get(i)) {
+                    Some(&gain) => (
+                        1. - (2. * gain * joint - gain * gain * square) / persistence,
+                        optimal_gain / gain,
+                    ),
+                    None => (f64::NAN, f64::NAN),
+                };
             // Every field is read through `get`, so a curve shorter than the horizon drops the
             // whole point instead of contributing a row of gaps.
             Some(HorizonPoint {
@@ -558,7 +604,9 @@ pub fn horizon_track(horizon: &HorizonCurve, trading: &TradingCurve) -> Vec<Hori
                 raw_ratio: horizon.absolute_mse.get(i)? / horizon.absolute_persistence_mse.get(i)?,
                 close_ratio: *trading.close_mse_ratio.get(i)?,
                 best_scale_ratio: *trading.best_scale_mse_ratio.get(i)?,
-                optimal_gain: *trading.optimal_gain.get(i)?,
+                optimal_gain,
+                calibrated_close_ratio,
+                calibrated_optimal_gain,
                 offset_gain: *trading.offset_gain.get(i)?,
                 demeaned_gain: *trading.demeaned_gain.get(i)?,
                 scaling_gain: *trading.scaling_gain.get(i)?,
@@ -921,6 +969,20 @@ pub fn write_metrics(output: &Path, points: &[Metrics]) -> Result<()> {
                 true,
                 |p| p.median_window_ratio,
             ),
+            // The scalar `weights/best` and both patience rules are actually decided on, on
+            // the headline base beside the ratios a reader would otherwise assume decided
+            // them. It belongs here and not on a base of its own: it is a dimensionless ratio
+            // against the same persistence prior and it reads against the same parity line.
+            scored(
+                &format!("{SAMPLE} selection objective (horizon-weighted close best-scale MSE ratio)"),
+                false,
+                |p| p.validation_scale_free_objective,
+            ),
+            scored(
+                &format!("{FULL} selection objective (horizon-weighted close best-scale MSE ratio)"),
+                true,
+                |p| p.validation_scale_free_objective,
+            ),
             series("parity 1.0", |_| 1.),
         ],
     )?;
@@ -1161,17 +1223,39 @@ pub fn write_metrics(output: &Path, points: &[Metrics]) -> Result<()> {
             &scope,
             decomposition,
         )?;
-        let mut gain = per_horizon("close MSE-optimal forecast gain", |p| p.optimal_gain);
+        // Both amplitudes, on one axis. The un-gained `β̂` is what the calibration is fitted
+        // AGAINST and the gained one is what the run would actually deploy, and only the pair
+        // separates "the fit transferred" from "the fit moved the number on the fit block
+        // alone": a calibrated gain still far from 1 on a held-out draw is a curve fitted out
+        // of period, which no single series can say.
+        let mut gain = per_horizon("uncalibrated close MSE-optimal forecast gain", |p| {
+            p.optimal_gain
+        });
+        gain.extend(per_horizon("calibrated close MSE-optimal forecast gain", |p| {
+            p.calibrated_optimal_gain
+        }));
         gain.push(series("perfect amplitude calibration 1.0", |_| 1.));
         chart(
             "timexer_segment_horizon_steps_gain",
-            "is the conditional mean's amplitude right, per horizon, over training?",
+            "is the conditional mean's amplitude right, per horizon, over training, before and \
+             after the run's own calibration?",
             OPTIMAL_GAIN_UNIT,
             ScaleKind::Linear,
             &scope,
             gain,
         )?;
-        let mut best_scale = per_horizon(&format!("{NEUTRAL} close MSE ratio"), |p| p.close_ratio);
+        // Three amplitudes of ONE forecast: as emitted, at the gain this run fitted out of
+        // sample, and at the unattainable per-horizon optimum. The first two are the arm's
+        // real choices and the third is the ceiling they are read against, so a long-horizon
+        // ratio that crosses parity while the other two stay under it is an amplitude failure
+        // stated in one panel instead of inferred across three.
+        let mut best_scale = per_horizon(&format!("{NEUTRAL} uncalibrated close MSE ratio"), |p| {
+            p.close_ratio
+        });
+        best_scale.extend(per_horizon(
+            &format!("{NEUTRAL} calibrated close MSE ratio"),
+            |p| p.calibrated_close_ratio,
+        ));
         best_scale.extend(per_horizon(
             &format!("{NEUTRAL} close MSE ratio at the best scale"),
             |p| p.best_scale_ratio,
@@ -1179,7 +1263,8 @@ pub fn write_metrics(output: &Path, points: &[Metrics]) -> Result<()> {
         best_scale.push(series("parity 1.0", |_| 1.));
         chart(
             "timexer_segment_horizon_steps_best_scale",
-            "is a close MSE ratio above 1 absent signal, or signal at the wrong amplitude?",
+            "is a close MSE ratio above 1 absent signal, or signal at the wrong amplitude, and \
+             does the run's own calibration recover it?",
             BEST_SCALE_UNIT,
             ScaleKind::Linear,
             &scope,
@@ -2644,10 +2729,12 @@ fn write_gain_panel(output: &Path, panels: &AmplitudePanels<'_>, horizon: usize)
     Ok(())
 }
 
-/// Named, never clipped: a horizon whose own measured amplitude is non-positive or absent is
-/// gated out of position sizing by [`FrozenGain::tradable`], and this is where a reader finds
-/// out which ones and at what value. A gate that does not appear in the panel is how an
-/// all-zero trading result stays unexplained.
+/// Named, never clipped: a horizon whose own measured amplitude is non-positive or absent, or
+/// whose pure-gain parameterization the fit refused, is gated out of position sizing by
+/// [`FrozenGain::tradable`], and this is where a reader finds out which ones and under which of
+/// the three reasons. A gate that does not appear in the panel is how an all-zero trading
+/// result stays unexplained, and three reasons collapsed into one is how it stays unexplained
+/// after someone looks.
 fn gated_note(applied: &FrozenGain) -> String {
     let gated = applied.gated();
     if gated.is_empty() {
@@ -2656,14 +2743,11 @@ fn gated_note(applied: &FrozenGain) -> String {
     let listed = gated
         .iter()
         .take(8)
-        .map(|(horizon, measured)| match measured {
-            Some(value) => format!("h={horizon} at {value:.4}"),
-            None => format!("h={horizon} unmeasured"),
-        })
+        .map(|(horizon, gate)| format!("h={horizon} {gate}"))
         .collect::<Vec<_>>()
         .join(", ");
     format!(
-        " | {} of {} horizons GATED OUT OF SIZING on a non-positive or absent measured gain ({listed}{}), scored but never traded",
+        " | {} of {} horizons GATED OUT OF SIZING on a non-positive or absent measured gain or a refused parameterization ({listed}{}), scored but never traded",
         gated.len(),
         applied.measured_anchor.len(),
         if gated.len() > 8 { ", …" } else { "" }
@@ -2681,14 +2765,8 @@ fn gain_title(panels: &AmplitudePanels<'_>, horizon: usize) -> String {
         );
     };
     let blocks = &fit.calibration.blocks;
-    let refusal = fit
-        .calibration
-        .anchor
-        .unidentifiable
-        .as_deref()
-        .map_or_else(String::new, |reason| format!(" | NO GAIN APPLIED: {reason}"));
     format!(
-        "CausalPatch epoch {epoch} step {step} | is the forecast's over-amplitude an out-of-sample shrinkage problem or an in-sample objective one? | fitted on {} reserved calibration-partition origins to {} ({} ms before the first scored origin, over a {horizon}-bar reach), {} in-sample training origins measured beside them, {tickers} tickers, {:.1} anchor and {:.1} offset effective degrees of freedom{refusal}{gated}",
+        "CausalPatch epoch {epoch} step {step} | is the forecast's over-amplitude an out-of-sample shrinkage problem or an in-sample objective one? | fitted on {} reserved calibration-partition origins to {} ({} ms of tightest per-ticker separation from that ticker's own first scored origin, over a {horizon}-bar reach), {} in-sample training origins measured beside them, {tickers} tickers, {:.1} anchor and {:.1} offset effective degrees of freedom{gated}",
         blocks.calibration_origins,
         blocks.calibration_last_origin_ms,
         blocks.purge_gap_ms,
@@ -2818,7 +2896,9 @@ fn write_calibration_moments(
                 .collect(),
         });
         series.push(ReportSeries {
-            label: format!("{CALIBRATION} constant-forecast ceiling, the whole intercept opportunity"),
+            label: format!(
+                "{CALIBRATION} close-channel constant-forecast ceiling, the whole intercept opportunity"
+            ),
             values: fit
                 .calibration
                 .intercept_ceiling
@@ -3322,6 +3402,13 @@ mod tests {
         }
     }
 
+    /// The per-horizon anchor gain the fixtures report against. Per-index and crossing 1, so a
+    /// mis-sliced calibration is a wrong number rather than a wrong shape, and both the
+    /// shrinking and the amplifying direction are exercised.
+    fn anchor_gain(width: usize) -> Vec<f64> {
+        (1..=width).map(|h| 0.5 + 0.01 * h as f64).collect()
+    }
+
     /// The `held-out cross-section` draw's curve: whole timestamp blocks, so the IC that the
     /// sample draw leaves undefined is measured here. Per-index values, so a series that reads
     /// the wrong horizon or the wrong split is a wrong number rather than a wrong shape.
@@ -3346,6 +3433,7 @@ mod tests {
             train_mse: Some(0.9),
             validation_nll: 2.0,
             validation_objective_nll: 1.9,
+            validation_scale_free_objective: 0.985,
             persistence_nll: 2.4,
             validation_mse: 0.98,
             persistence_mse: 1.,
@@ -3369,8 +3457,16 @@ mod tests {
             validation_origins: 256,
             tickers: 42,
             step_phases: None,
-            horizons: horizon_track(&horizon_curve(width), &trading_curve(width)),
-            cross_horizons: horizon_track(&horizon_curve(width), &cross_curve(width)),
+            horizons: horizon_track(
+                &horizon_curve(width),
+                &trading_curve(width),
+                Some(&anchor_gain(width)),
+            ),
+            cross_horizons: horizon_track(
+                &horizon_curve(width),
+                &cross_curve(width),
+                Some(&anchor_gain(width)),
+            ),
             in_period_horizons: Vec::new(),
             in_period_origins: 0,
             in_period_purged_row_share: 0.,
@@ -3383,7 +3479,8 @@ mod tests {
     /// to be readable as "this run never scored h = 192", which a written gap cannot say.
     #[test]
     fn the_horizon_track_slices_one_based_horizons_and_skips_the_unevaluated_ones() {
-        let track = horizon_track(&horizon_curve(64), &trading_curve(64));
+        let gain = anchor_gain(64);
+        let track = horizon_track(&horizon_curve(64), &trading_curve(64), Some(&gain));
         assert_eq!(
             track.iter().map(|p| p.horizon).collect::<Vec<_>>(),
             vec![1, 8, 16, 32, 64]
@@ -3405,15 +3502,42 @@ mod tests {
         assert!((h64.within_2_sigma - (0.96 - 0.0002 * 64.)).abs() < 1e-12);
         assert_eq!(h64.valid_elements, (4096 - 4 * 64) as f64);
         assert!((h64.pooled_pearson - (0.02 - 0.00005 * 64.)).abs() < 1e-12);
+        // The calibrated pair, against the closed form the fixture makes exact: with a
+        // mean-zero forecast the gained close ratio is `1 - 2g·Cov/P + g²·Var/P` and the gained
+        // amplitude is `β̂/g`. At h = 64 the fixture's `Cov/P = 0.004`, `Var/P = 0.01` and
+        // `g = 1.14`, so the gain AMPLIFIES an already over-amplified forecast and the ratio
+        // moves the wrong way - which is the state a report has to be able to show.
+        let g = 0.5 + 0.01 * 64.;
+        assert!(
+            (h64.calibrated_close_ratio - (1. - 2. * g * 0.004 + g * g * 0.01)).abs() < 1e-12,
+            "h = 64 calibrated close ratio {}",
+            h64.calibrated_close_ratio
+        );
+        assert!((h64.calibrated_optimal_gain - (1. - 0.004 * 64.) / g).abs() < 1e-12);
         // The sample draw never fires a cross-section: NaN and a population count of 0, which
         // is a different statement from "the IC was measured at 0".
         assert!(h64.cross_sectional_ic.is_nan() && h64.cross_sectional_ic_se.is_nan());
         assert_eq!(h64.cross_sections, 0.);
-        let measured = horizon_track(&horizon_curve(64), &cross_curve(64));
+        let measured = horizon_track(&horizon_curve(64), &cross_curve(64), Some(&gain));
         let h64 = measured.last().unwrap();
         assert!((h64.cross_sectional_ic - (0.08 - 0.0001 * 64.)).abs() < 1e-12);
         assert_eq!(h64.cross_sections, 40.);
-        assert_eq!(horizon_track(&horizon_curve(4), &trading_curve(4)).len(), 1);
+        // No calibration to report against - an already-gained emission - reads as ABSENT, not
+        // as the identity gain: a 1.0 there would be bit-identical to a measured unit amplitude
+        // and the chart would claim a calibration the pass never had.
+        let ungained = horizon_track(&horizon_curve(64), &trading_curve(64), None);
+        let h64 = ungained.last().unwrap();
+        assert!(h64.calibrated_close_ratio.is_nan() && h64.calibrated_optimal_gain.is_nan());
+        assert!((h64.close_ratio - (0.995 + 0.0002 * 64.)).abs() < 1e-12);
+        // A gain curve shorter than the horizon leaves the calibrated pair absent at the
+        // horizons it does not reach, and leaves the achieved ratio intact.
+        let short = horizon_track(&horizon_curve(64), &trading_curve(64), Some(&gain[..32]));
+        assert!(short.last().unwrap().calibrated_close_ratio.is_nan());
+        assert!(short[3].calibrated_close_ratio.is_finite());
+        assert_eq!(
+            horizon_track(&horizon_curve(4), &trading_curve(4), Some(&anchor_gain(4))).len(),
+            1
+        );
     }
 
     /// The step family is indexed on the endpoint-utility grid, by construction of this
@@ -3437,12 +3561,45 @@ mod tests {
     fn the_step_indexed_horizon_and_gap_panels_carry_matched_step_values() {
         let root = std::env::temp_dir()
             .join(format!("timexer-horizon-steps-{}", uuid::Uuid::new_v4()));
-        let points = vec![
+        let mut points = vec![
             point(1000, false, 2.25, 192),
             point(2000, false, 2.08, 192),
             point(3000, true, 2.05, 192),
         ];
+        // Distinct per point, so the selection scalar's split routing is proved rather than
+        // satisfied by every row carrying the same number.
+        for (index, value) in [0.991_f64, 0.984, 0.979].into_iter().enumerate() {
+            points[index].validation_scale_free_objective = value;
+        }
         write_metrics(&root, &points).unwrap();
+
+        // The scalar `weights/best` is decided on has to be READABLE, on the headline base and
+        // routed to its own split: a selection rule whose scalar is not charted is a rule no
+        // run-versus-run comparison can check.
+        let skill = read_report(root.join("timexer_segment_skill.report.bin")).unwrap();
+        let ReportKind::IndexedLines { series, .. } = &skill.kind else {
+            panic!("the headline panel must be step-indexed");
+        };
+        let selection = |split: &str| -> Vec<f32> {
+            let label =
+                format!("{split} selection objective (horizon-weighted close best-scale MSE ratio)");
+            series
+                .iter()
+                .find(|s| s.label == label)
+                .unwrap_or_else(|| panic!("{label} missing from the headline panel"))
+                .values
+                .clone()
+        };
+        let sample_selection = selection(SAMPLE);
+        assert!((sample_selection[0] - 0.991).abs() < 1e-6);
+        assert!((sample_selection[1] - 0.984).abs() < 1e-6);
+        assert!(sample_selection[2].is_nan(), "the sample series leaked the epoch-end point");
+        let full_selection = selection(FULL);
+        assert!(full_selection[0].is_nan() && full_selection[1].is_nan());
+        assert!((full_selection[2] - 0.979).abs() < 1e-6);
+        // No `=` in any label: `report_cli --var` splits a rendered token on its first `=`, so
+        // a series carrying one cannot be named on the command line.
+        assert!(series.iter().all(|s| !s.label.contains('=')));
 
         let gap = read_report(root.join("timexer_segment_generalization_gap.report.bin")).unwrap();
         let ReportKind::IndexedLines { steps, series } = &gap.kind else {
@@ -3633,12 +3790,16 @@ mod tests {
             .into_iter()
             .map(|(step, scale)| {
                 let mut metrics = point(step, false, 2.2, 192);
-                metrics.cross_horizons = horizon_track(&horizon_curve(192), &{
-                    let mut curve = cross_curve(192);
-                    curve.cross_sectional_ic =
-                        curve.cross_sectional_ic.iter().map(|ic| ic * scale).collect();
-                    curve
-                });
+                metrics.cross_horizons = horizon_track(
+                    &horizon_curve(192),
+                    &{
+                        let mut curve = cross_curve(192);
+                        curve.cross_sectional_ic =
+                            curve.cross_sectional_ic.iter().map(|ic| ic * scale).collect();
+                        curve
+                    },
+                    Some(&anchor_gain(192)),
+                );
                 metrics
             })
             .collect();
@@ -3679,13 +3840,26 @@ mod tests {
         for (base, label, expected) in [
             (
                 "timexer_segment_horizon_steps_gain",
-                format!("{CROSS} close MSE-optimal forecast gain at horizon 192"),
+                format!("{CROSS} uncalibrated close MSE-optimal forecast gain at horizon 192"),
                 1. - 0.004 * 192.,
+            ),
+            (
+                "timexer_segment_horizon_steps_gain",
+                format!("{CROSS} calibrated close MSE-optimal forecast gain at horizon 192"),
+                (1. - 0.004 * 192.) / (0.5 + 0.01 * 192.),
             ),
             (
                 "timexer_segment_horizon_steps_best_scale",
                 format!("{CROSS} {NEUTRAL} close MSE ratio at the best scale at horizon 192"),
                 0.999 - 0.0001 * 192.,
+            ),
+            (
+                "timexer_segment_horizon_steps_best_scale",
+                format!("{CROSS} {NEUTRAL} calibrated close MSE ratio at horizon 192"),
+                {
+                    let g = 0.5 + 0.01 * 192.;
+                    1. - 2. * g * 0.004 + g * g * 0.01
+                },
             ),
             (
                 "timexer_segment_horizon_steps_calibration",
@@ -3901,7 +4075,7 @@ mod lr_trajectory_tests {
         MlpDownLr, OptimizerKind, RecipeKnobs, NANOGPT_COOLDOWN_FLOOR, NANOGPT_COOLDOWN_FRAC,
     };
     use crate::torch::timexer_segment::model::{CausalPatchModel, ModelConfig};
-    use shared::report::{read_report, TIMEXER_SEGMENT_REPORT_BASES};
+    use shared::report::read_report;
     use std::fs;
     use tch::{nn, Device};
 
@@ -3995,13 +4169,24 @@ mod lr_trajectory_tests {
         }
         fs::remove_dir_all(&root).unwrap();
     }
+}
 
-    /// An uncalibrated run's gain panel is the honest 1.0, never NaN and never absent.
-    ///
-    /// "No calibration was fitted" and "the applied calibration was the identity" are different
-    /// observable states. The report must preserve the latter as an explicit curve.
+/// The amplitude-calibration panels. A separate module because every test here is CPU-only -
+/// no model, no device, no corpus - so the whole family runs under one narrow filter in
+/// milliseconds, which is what makes it usable as the reduction's own self-check.
+#[cfg(test)]
+mod amplitude_report_tests {
+    use super::*;
+    use shared::report::{read_report, TIMEXER_SEGMENT_REPORT_BASES};
+    use std::fs;
+
+    /// A checkpoint whose MEASURED gain is 1 charts it as an explicit 1.0 at every horizon,
+    /// never as NaN and never as an absent series: a unit gain is a measurement about what the
+    /// model multiplied by, and the `evaluate` path has to render it as one. It is the only
+    /// way a unit curve can reach a chart now - the estimator aborts rather than freezing one -
+    /// so the series must not be mistaken for a missing calibration.
     #[test]
-    fn an_uncalibrated_run_writes_identity_gain_and_split_moments() {
+    fn a_measured_unit_gain_is_charted_as_1_and_not_as_a_missing_series() {
         use crate::torch::timexer_segment::calibration::{Blocks, FrozenGain, Moments};
         let root = std::env::temp_dir().join(format!(
             "timexer-identity-gain-{}",
@@ -4036,6 +4221,7 @@ mod lr_trajectory_tests {
             },
             anchor: vec![1.; horizon],
             offset: vec![1.; horizon],
+            intercept_refused: Vec::new(),
             measured_anchor: vec![Some(1.); horizon],
         };
         let panels = AmplitudePanels {
@@ -4062,6 +4248,394 @@ mod lr_trajectory_tests {
         assert_eq!(series[1].values, vec![1.0f32; horizon]);
         assert!(report.title.contains("checkpoint's own curves"));
         assert!(TIMEXER_SEGMENT_REPORT_BASES.contains(&"timexer_segment_calibration_gain"));
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// The fitted panels, on the three questions they exist to separate: what gain was applied,
+    /// whether the amplitude error is out-of-sample shrinkage or an in-sample objective
+    /// artifact, and whether applying the gain moves the MSE ratio below persistence.
+    ///
+    /// Also the presentation contract that makes them readable: the dimensionless gains and the
+    /// MSE ratios are different units and live on different bases, so neither axis can be
+    /// rescaled by the other; and a horizon the sizing gate would zero is NAMED in the title
+    /// with its own measured value, because a gate that appears only in a log line is how an
+    /// all-zero book stays unexplained.
+    #[test]
+    fn the_fitted_amplitude_panels_separate_training_from_held_out_gain_and_name_the_gate() {
+        use crate::torch::timexer_segment::calibration::{Blocks, MeanCalibration, Moments};
+        let root = std::env::temp_dir().join(format!("timexer-fitted-gain-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let horizon = 8;
+        let cells = horizon * 4;
+        // An orthogonal two-coordinate population whose exact solve is `anchor_gain(h)` on the
+        // anchor and 1 on the offset, with the anchor's energy growing like a cumulative
+        // return's, which is what makes the two coordinates' weights differ by orders of
+        // magnitude the way the real block's do.
+        let build = |anchor_gain: &dyn Fn(usize) -> f64| -> Moments {
+            let mut moments = Moments {
+                pred_len: horizon,
+                channels: 4,
+                bars: vec![4096.; horizon],
+                target: vec![0.; cells],
+                target_square: vec![0.; cells],
+                anchor_square: vec![0.; cells],
+                anchor_offset: vec![0.; cells],
+                offset_square: vec![0.; cells],
+                anchor_target: vec![0.; cells],
+                offset_target: vec![0.; cells],
+            };
+            for bar in 0..horizon {
+                for channel in 0..4 {
+                    let cell = bar * 4 + channel;
+                    let anchor_square = 4096. * (bar + 1) as f64;
+                    let offset_square = if channel == CLOSE_CHANNEL { 0. } else { 1024. };
+                    moments.anchor_square[cell] = anchor_square;
+                    moments.offset_square[cell] = offset_square;
+                    moments.anchor_target[cell] = anchor_square * anchor_gain(bar);
+                    moments.offset_target[cell] = offset_square;
+                    let forecast_square = anchor_square + offset_square;
+                    let forecast_target =
+                        moments.anchor_target[cell] + moments.offset_target[cell];
+                    moments.target_square[cell] =
+                        (forecast_target / 0.1).powi(2) / forecast_square;
+                }
+            }
+            moments
+        };
+        // The measured signature: a held-out amplitude that sweeps across the horizon axis
+        // against a training amplitude that sits flat near 1. That contrast IS the finding the
+        // panel is built to make legible, so the fixture has to carry it.
+        let fit_moments = build(&|bar| 3.0 * ((bar + 1) as f64).powf(-0.6));
+        let training_moments = build(&|_| 1.02);
+        let scored_moments = build(&|bar| 2.6 * ((bar + 1) as f64).powf(-0.55));
+        let blocks = Blocks {
+            calibration_first_origin_ms: 1,
+            calibration_last_origin_ms: 2,
+            calibration_last_target_ms: 3,
+            calibration_origins: 4096,
+            evaluation_first_origin_ms: 9,
+            evaluation_last_origin_ms: 10,
+            evaluation_origins: 2048,
+            purge_gap_ms: 6,
+        };
+        let calibration = MeanCalibration::fit(blocks.clone(), &fit_moments).unwrap();
+        let mut applied = calibration.frozen();
+        // Two gated horizons, one of each kind: the panel has to distinguish a measured
+        // sign inversion from an absent measurement.
+        applied.measured_anchor[3] = Some(-0.07);
+        applied.measured_anchor[7] = None;
+        let panels = AmplitudePanels {
+            epoch: 2,
+            step: 2000,
+            tickers: 256,
+            applied: &applied,
+            fit: Some(AmplitudeFit {
+                calibration: &calibration,
+                moments: &fit_moments,
+                training: Some(&training_moments),
+                training_origins: 512,
+            }),
+            scored: vec![AmplitudeSplit {
+                split: SAMPLE,
+                origins: 2048,
+                emission: Emission::Uncalibrated,
+                moments: &scored_moments,
+            }],
+        };
+        write_amplitude(&root, &panels).unwrap();
+
+        let gain = read_report(root.join("timexer_segment_calibration_gain.report.bin")).unwrap();
+        assert_eq!(gain.y_label.as_deref(), Some(OPTIMAL_GAIN_UNIT));
+        let ReportKind::IndexedLines { steps, series } = &gain.kind else {
+            panic!("the gain panel is horizon-indexed");
+        };
+        assert_eq!(steps, &(1..=horizon as u64).collect::<Vec<u64>>());
+        let label = |needle: &str| {
+            series
+                .iter()
+                .find(|line| line.label.contains(needle))
+                .unwrap_or_else(|| panic!("the gain panel is missing a {needle:?} series"))
+        };
+        assert_eq!(
+            label("close-anchor gain applied while scoring").values,
+            applied.anchor.iter().map(|g| *g as f32).collect::<Vec<f32>>()
+        );
+        assert_eq!(
+            label("intrabar-offset gain applied while scoring").values,
+            applied.offset.iter().map(|g| *g as f32).collect::<Vec<f32>>()
+        );
+        // All four DECODED channels' own optima, which is what generalizing the close-only fit
+        // to every channel is visible as.
+        for channel in ["open", "high", "low", "close"] {
+            let series = label(&format!("{CALIBRATION} {channel} MSE-optimal gain (fitted on)"));
+            assert!(series.values.iter().all(|value| value.is_finite()));
+        }
+        // THE mechanism series, and it must be the ONLY one carrying the training split word:
+        // a second in-sample series on this axis would make the contrast unreadable.
+        let training = label(&format!("{TRAINING} close MSE-optimal gain"));
+        assert!(training
+            .values
+            .iter()
+            .all(|value| (*value - 1.02).abs() < 1e-4));
+        assert_eq!(
+            series
+                .iter()
+                .filter(|line| line.label.starts_with(TRAINING))
+                .count(),
+            1
+        );
+        // The held-out sweep against that flat training curve, on the same base and the same
+        // unit, which is the only reason they may share an axis.
+        let held_out = label(&format!("{SAMPLE} close MSE-optimal gain on the emitted mean"));
+        assert!(held_out.values[0] / held_out.values[horizon - 1] > 2.);
+        let ceiling = label("amplification ceiling");
+        assert!(ceiling.values.iter().all(|value| *value >= 1.));
+        assert!(applied
+            .anchor
+            .iter()
+            .zip(&ceiling.values)
+            .all(|(applied, bound)| *applied as f32 <= *bound));
+        assert_eq!(label("perfect amplitude calibration 1.0").values, vec![1.0f32; horizon]);
+        // The gate, in the title, at its own value and with the unmeasured horizon named as
+        // unmeasured rather than as a zero.
+        assert!(
+            gain.title.contains("2 of 8 horizons GATED OUT OF SIZING")
+                && gain.title.contains("h=4 at -0.0700")
+                && gain.title.contains("h=8 unmeasured"),
+            "{}",
+            gain.title
+        );
+        assert!(gain.title.contains("out-of-sample shrinkage problem or an in-sample objective one"));
+
+        // The ratio panel: its own base, its own unit, and both readings of one pass.
+        let ratio =
+            read_report(root.join("timexer_segment_amplitude_calibration.report.bin")).unwrap();
+        assert_eq!(ratio.y_label.as_deref(), Some(BEST_SCALE_UNIT));
+        assert_ne!(gain.y_label, ratio.y_label, "a gain and an MSE ratio are different units");
+        let ReportKind::IndexedLines { series, .. } = &ratio.kind else {
+            panic!("the ratio panel is horizon-indexed");
+        };
+        let line = |needle: &str| {
+            series
+                .iter()
+                .find(|line| line.label.contains(needle))
+                .unwrap_or_else(|| panic!("the ratio panel is missing a {needle:?} series"))
+        };
+        // Exact algebra on the one pass, not a second scoring pass: the calibrated series is
+        // the same moments evaluated at the applied gain.
+        for bar in 0..horizon {
+            let expected =
+                scored_moments.pooled_gained_ratio(bar, applied.anchor[bar], applied.offset[bar]);
+            assert!(
+                (line(&format!("{SAMPLE} {NEUTRAL} four-channel ratio, calibrated")).values[bar]
+                    - expected as f32)
+                    .abs()
+                    < 1e-6
+            );
+            assert!(
+                (line(&format!("{SAMPLE} {NEUTRAL} four-channel ratio, uncalibrated")).values[bar]
+                    - scored_moments.pooled_ratio(bar) as f32)
+                    .abs()
+                    < 1e-6
+            );
+        }
+        assert_eq!(line("persistence 1.0").values, vec![1.0f32; horizon]);
+        for base in [
+            "timexer_segment_calibration_gain",
+            "timexer_segment_amplitude_calibration",
+            "timexer_segment_calibration_moments",
+        ] {
+            assert!(
+                TIMEXER_SEGMENT_REPORT_BASES.contains(&base),
+                "{base} is written but unregistered, so the TUI never scans for it"
+            );
+        }
+        // A split whose horizon count disagrees with the applied curve is a pairing fault, not
+        // a chart to draw with one axis silently truncated.
+        let short = build(&|_| 1.);
+        let mut short = short;
+        short.pred_len = horizon - 1;
+        short.bars.truncate(horizon - 1);
+        assert!(write_amplitude(
+            &root,
+            &AmplitudePanels {
+                scored: vec![AmplitudeSplit {
+                    split: SAMPLE,
+                    origins: 1,
+                    emission: Emission::Uncalibrated,
+                    moments: &short,
+                }],
+                fit: None,
+                ..panels
+            }
+        )
+        .is_err());
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// The `calibrated` series must DIFFER from the `uncalibrated` one by exactly the amount
+    /// the applied gain implies, and the difference is asserted against longhand arithmetic on
+    /// the moment fields rather than against `pooled_gained_ratio`, which would be checking the
+    /// reduction against itself.
+    ///
+    /// This is the test job 6004 needed and did not have. Every `..., calibrated` series in
+    /// that arm was BIT-IDENTICAL to its `..., uncalibrated` twin at all 192 horizons - `held-out
+    /// sample` market-neutral close ratio 0.99558365 in both at h=192 - because the fit had
+    /// refused and frozen a gain of 1, and at `anchor = offset = 1` the two branches of
+    /// [`AmplitudeSplit::ratios`] are the same call. Pinning the closed-form DELTA is what makes
+    /// a unit gain unable to masquerade as a calibration.
+    #[test]
+    fn the_calibrated_ratio_differs_from_the_uncalibrated_one_by_the_applied_gain() {
+        use crate::torch::timexer_segment::calibration::{Blocks, FrozenGain, Moments};
+        let root = std::env::temp_dir().join(format!("timexer-gain-delta-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let horizon = 6;
+        let cells = horizon * 4;
+        let mut moments = Moments {
+            pred_len: horizon,
+            channels: 4,
+            bars: vec![2048.; horizon],
+            target: vec![0.; cells],
+            target_square: vec![0.; cells],
+            anchor_square: vec![0.; cells],
+            anchor_offset: vec![0.; cells],
+            offset_square: vec![0.; cells],
+            anchor_target: vec![0.; cells],
+            offset_target: vec![0.; cells],
+        };
+        // Every moment distinct per (horizon, channel), and the offset column empty on the
+        // close channel exactly as `decode_joint` leaves it, so no term can cancel by accident.
+        for bar in 0..horizon {
+            for channel in 0..4 {
+                let cell = bar * 4 + channel;
+                let intrabar = channel != CLOSE_CHANNEL;
+                moments.anchor_square[cell] = 100. * (bar + 1) as f64;
+                moments.offset_square[cell] = if intrabar { 7. + channel as f64 } else { 0. };
+                moments.anchor_offset[cell] = if intrabar { 3. + bar as f64 } else { 0. };
+                moments.anchor_target[cell] = 60. * (bar + 1) as f64;
+                moments.offset_target[cell] = if intrabar { 5. } else { 0. };
+                moments.target_square[cell] = 500. * (bar + 1) as f64 + 20.;
+            }
+        }
+        // A hand-built curve, never a fitted one: the point is the ARITHMETIC the report layer
+        // applies, and both coordinates are away from 1 at every horizon in both directions.
+        let applied = FrozenGain {
+            estimator: "closed-form delta fixture".into(),
+            blocks: Blocks {
+                calibration_first_origin_ms: 1,
+                calibration_last_origin_ms: 2,
+                calibration_last_target_ms: 3,
+                calibration_origins: 32_768,
+                evaluation_first_origin_ms: 5,
+                evaluation_last_origin_ms: 6,
+                evaluation_origins: 7,
+                purge_gap_ms: 8,
+            },
+            anchor: (0..horizon).map(|h| 0.4 + 0.05 * h as f64).collect(),
+            offset: (0..horizon).map(|h| 1.3 - 0.05 * h as f64).collect(),
+            intercept_refused: Vec::new(),
+            measured_anchor: vec![Some(0.6); horizon],
+        };
+        let panels = AmplitudePanels {
+            epoch: 1,
+            step: 2500,
+            tickers: 4873,
+            applied: &applied,
+            fit: None,
+            scored: vec![AmplitudeSplit {
+                split: SAMPLE,
+                origins: 2048,
+                emission: Emission::Uncalibrated,
+                moments: &moments,
+            }],
+        };
+        write_amplitude(&root, &panels).unwrap();
+        let report =
+            read_report(root.join("timexer_segment_amplitude_calibration.report.bin")).unwrap();
+        let ReportKind::IndexedLines { series, .. } = &report.kind else {
+            panic!("the ratio panel is horizon-indexed");
+        };
+        let line = |needle: String| {
+            series
+                .iter()
+                .find(|line| line.label == needle)
+                .unwrap_or_else(|| panic!("the ratio panel is missing {needle:?}"))
+        };
+        let calibrated = line(format!("{SAMPLE} {NEUTRAL} four-channel ratio, calibrated"));
+        let uncalibrated = line(format!("{SAMPLE} {NEUTRAL} four-channel ratio, uncalibrated"));
+        for bar in 0..horizon {
+            let (mut anchor_square, mut offset_square, mut anchor_offset) = (0., 0., 0.);
+            let (mut anchor_target, mut offset_target, mut persistence) = (0., 0., 0.);
+            for channel in 0..4 {
+                let cell = bar * 4 + channel;
+                anchor_square += moments.anchor_square[cell];
+                offset_square += moments.offset_square[cell];
+                anchor_offset += moments.anchor_offset[cell];
+                anchor_target += moments.anchor_target[cell];
+                offset_target += moments.offset_target[cell];
+                persistence += moments.target_square[cell];
+            }
+            let (gain_a, gain_o) = (applied.anchor[bar], applied.offset[bar]);
+            let expected_uncalibrated = (anchor_square
+                + 2. * anchor_offset
+                + offset_square
+                - 2. * (anchor_target + offset_target)
+                + persistence)
+                / persistence;
+            let expected_calibrated = (gain_a * gain_a * anchor_square
+                + gain_o * gain_o * offset_square
+                + 2. * gain_a * gain_o * anchor_offset
+                - 2. * gain_a * anchor_target
+                - 2. * gain_o * offset_target
+                + persistence)
+                / persistence;
+            let delta = expected_calibrated - expected_uncalibrated;
+            assert!(
+                delta.abs() > 0.02,
+                "the fixture's own gain moves the ratio by only {delta} at h={}, so the \
+                 assertions below would pass on an identity gain too",
+                bar + 1
+            );
+            assert!(
+                (uncalibrated.values[bar] - expected_uncalibrated as f32).abs() < 2e-6,
+                "h={}: uncalibrated {} against {expected_uncalibrated}",
+                bar + 1,
+                uncalibrated.values[bar]
+            );
+            assert!(
+                (calibrated.values[bar] - expected_calibrated as f32).abs() < 2e-6,
+                "h={}: calibrated {} against {expected_calibrated}",
+                bar + 1,
+                calibrated.values[bar]
+            );
+            assert_ne!(
+                calibrated.values[bar],
+                uncalibrated.values[bar],
+                "h={}: the calibrated series is bit-identical to the uncalibrated one, which is \
+                 what a frozen gain of 1 produces - the calibration was a no-op",
+                bar + 1
+            );
+        }
+        // The other emission direction, on the same moments and the same curve: a pass whose
+        // mean already carried the gain reports the un-gained ratio at `1/g`. Both series must
+        // still move, or a calibrated pass would report its own emission twice.
+        let inverted = AmplitudeSplit {
+            split: SAMPLE,
+            origins: 2048,
+            emission: Emission::Calibrated,
+            moments: &moments,
+        };
+        let (removed, as_emitted) = inverted.ratios(&applied, Some(CLOSE_CHANNEL));
+        for bar in 0..horizon {
+            let expected = moments.channel_gained_ratio(
+                bar,
+                CLOSE_CHANNEL,
+                applied.anchor[bar].recip(),
+                applied.offset[bar].recip(),
+            );
+            assert!((removed[bar] - expected).abs() < 1e-12, "h={}", bar + 1);
+            assert_ne!(removed[bar], as_emitted[bar], "h={}", bar + 1);
+        }
         fs::remove_dir_all(&root).unwrap();
     }
 }
@@ -4321,6 +4895,133 @@ pub fn write_supervision_occupancy(
             y_label: Some(OCCUPANCY_UNIT.to_owned()),
             scale: ScaleKind::Linear,
             kind: ReportKind::IndexedLines { steps: axis, series },
+        },
+    )?;
+    Ok(())
+}
+
+/// What the per-horizon sub-origin decimation actually did over one report interval.
+///
+/// Two bases, because the panel answers its question in two units five orders of magnitude
+/// apart: the shares say whether the realized pattern is the intended one, and the counts say
+/// whether what survived is still a large enough sample for the added gradient noise to be the
+/// intended temperature. The load-bearing series is `compensated`, which MUST sit at 1.0: it
+/// is the unbiasedness the whole knob rests on, measured from the masks the host actually
+/// uploaded rather than assumed from the construction.
+///
+/// Horizon-indexed and rewritten in place at every interval, like the rest of the per-horizon
+/// family: the profile is constant within a run and only the realized draw moves.
+pub fn write_horizon_decimation(
+    output: &Path,
+    epoch: usize,
+    step: usize,
+    batch_size: usize,
+    interval: &super::supervision::DecimationInterval,
+) -> Result<()> {
+    ensure!(
+        interval.steps > 0 && batch_size > 0 && interval.active_origins > 0,
+        "a decimation interval with no step, no row or no active sub-origin has nothing to chart"
+    );
+    let axis: Vec<u64> = (1..=interval.factors.len() as u64).collect();
+    let (intended, realized, compensated) = (
+        interval.intended_keep_fraction(),
+        interval.keep_fraction(),
+        interval.compensated_share(),
+    );
+    // Mask elements one step supervises at a horizon: rows times surviving sub-origins. The
+    // channel axis is a constant factor 4 the reduction applies afterwards, so it is left out
+    // rather than folded in and quietly multiplying every curve.
+    let per_step = batch_size as f64 / interval.steps as f64;
+    let elements = |share: &[f64]| -> Vec<f32> {
+        share
+            .iter()
+            .map(|value| (value * interval.active_origins as f64 * batch_size as f64) as f32)
+            .collect()
+    };
+    let worst = compensated
+        .iter()
+        .map(|share| (share - 1.).abs())
+        .fold(0., f64::max);
+    let title = format!(
+        "CausalPatch epoch {epoch} step {step} | what did the horizon decimation keep? | origin \
+         stride {} bars, {} active sub-origins per row, batch {batch_size}, {} steps in this \
+         interval; factors /{} at h = 1 to /{} at h = {}; realized surviving elements {:.0} to \
+         {:.0} per step, compensated to {:.0} and {:.0} against an undecimated {:.0}; worst \
+         compensated deviation from 1.0 is {worst:.3e}",
+        interval.stride,
+        interval.active_origins,
+        interval.steps,
+        interval.factors[0],
+        interval.factors[interval.factors.len() - 1],
+        interval.factors.len(),
+        interval.kept[0] * per_step,
+        interval.kept[interval.kept.len() - 1] * per_step,
+        interval.kept[0] * per_step * interval.factors[0] as f64,
+        interval.kept[interval.kept.len() - 1] * per_step
+            * interval.factors[interval.factors.len() - 1] as f64,
+        interval.active_origins as f64 * batch_size as f64,
+    );
+    write_report(
+        output.join(super::supervision::DECIMATION_BASE.to_owned() + ".report.bin"),
+        &Report {
+            title: title.clone(),
+            x_label: Some("forecast horizon h, bars".to_owned()),
+            y_label: Some(
+                "share of the undecimated active sub-origin lattice at this horizon; the \
+                 compensated series is the unbiasedness check and must read 1.0"
+                    .to_owned(),
+            ),
+            scale: ScaleKind::Linear,
+            kind: ReportKind::IndexedLines {
+                steps: axis.clone(),
+                series: vec![
+                    ReportSeries {
+                        label: "intended keep fraction 1/decim".to_owned(),
+                        values: intended.iter().map(|value| *value as f32).collect(),
+                    },
+                    ReportSeries {
+                        label: "realized keep fraction".to_owned(),
+                        values: realized.iter().map(|value| *value as f32).collect(),
+                    },
+                    ReportSeries {
+                        label: "realized compensated share (1.0 is unbiased)".to_owned(),
+                        values: compensated.iter().map(|value| *value as f32).collect(),
+                    },
+                ],
+            },
+        },
+    )?;
+    write_report(
+        output.join(super::supervision::DECIMATION_COUNT_BASE.to_owned() + ".report.bin"),
+        &Report {
+            title,
+            x_label: Some("forecast horizon h, bars".to_owned()),
+            y_label: Some(
+                "supervised mask elements per optimizer step (rows x sub-origins), before the \
+                 constant 4-channel factor"
+                    .to_owned(),
+            ),
+            scale: ScaleKind::Linear,
+            kind: ReportKind::IndexedLines {
+                steps: axis,
+                series: vec![
+                    ReportSeries {
+                        label: "undecimated lattice elements".to_owned(),
+                        values: vec![
+                            (interval.active_origins as f64 * batch_size as f64) as f32;
+                            interval.factors.len()
+                        ],
+                    },
+                    ReportSeries {
+                        label: "surviving elements".to_owned(),
+                        values: elements(&realized),
+                    },
+                    ReportSeries {
+                        label: "compensated effective elements".to_owned(),
+                        values: elements(&compensated),
+                    },
+                ],
+            },
         },
     )?;
     Ok(())

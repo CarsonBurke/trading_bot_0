@@ -58,11 +58,28 @@
 //! residual, not four).
 //!
 //! **Pure gain, no offset.** Refusing an intercept is not an assumption, it is a measured
-//! refusal enforced by [`MeanCalibration::fit`]: `ȳ²/E[y²]` is the ENTIRE share of persistence
-//! MSE any constant forecast could earn at that horizon, and the fit declines to apply any gain
-//! unless that is small against the amplitude cost it would compete with. An intercept is also
-//! the least stationary thing in the data - a bet on the next block's mean drift - and it is
-//! the one part of an affine map that a within-timestamp IC cannot see.
+//! refusal enforced by [`MeanCalibration::fit`], PER HORIZON and on the CLOSE channel:
+//! `ȳ_close²/E[y_close²]` is the ENTIRE share of persistence MSE any constant forecast could
+//! earn at that horizon, and the fit declines that horizon unless it is small against the
+//! amplitude cost a gain competes for THERE. Two things it deliberately is not. It is not
+//! pooled over the four DECODED channels: a bar's high is never below its close, so the high
+//! and low target means are structurally nonzero on any candle data whatsoever, and their
+//! pooled share measures the INTRABAR OFFSET - it goes as `1/h`, the signature of a
+//! non-accumulating per-bar constant, where market drift would have to GROW as `h·µ²` - which
+//! is the quantity the offset COORDINATE exists to absorb. It is also not a max-over-horizon
+//! comparison: the intercept share peaks at h = 1 and the amplitude cost past h = 170, so
+//! worst-against-worst lets one short horizon blank the other 191. A refused horizon is
+//! dropped from both curves, carried by its neighbours through the roughness prior, and gated
+//! out of SIZING under its own named reason.
+//!
+//! Only the anchor carries this ceiling, because only the anchor's column can be beaten by a
+//! constant: within a timestamp it is market-neutral, so no gain on it reaches any constant at
+//! all. The offset column's mean IS the structural spread - `0 ≤ a ≤ r` fixes the sign of every
+//! intrabar offset - so a strictly positive `g_offset` already spans the constant it would be
+//! tested against, and testing it there would refuse the estimator on the very structure its
+//! second coordinate models. An intercept is also the least stationary thing in the data - a
+//! bet on the next block's mean drift - and it is the one part of an affine map that a
+//! within-timestamp IC cannot see; a mean intrabar range is neither.
 //!
 //! **The shape prior.** Adjacent horizons' true gains cannot jump: `g` is a smooth functional
 //! of the joint law of `(f_h, y_h)` and neighbouring cumulative returns overlap in 191 of 192
@@ -100,14 +117,18 @@
 //! training loss never reads the gain buffers, so a run's gradient is untouched by its own
 //! calibration.
 //!
-//! # Why the identity is a legible outcome and not a failure
+//! # Why a refusal ABORTS instead of producing the identity
 //!
-//! The fit now runs inside the run, where an untrained head is a normal state: a zero-init head
-//! emits a constant, a constant has no amplitude, and there is nothing to calibrate. So a
-//! refusal is a per-coordinate VALUE - gain identically 1 with the reason recorded in
-//! [`CurveFit::unidentifiable`] and printed - not an error that would abort a 4000-step run at
-//! its first evaluation. The pre-registered refusals keep their teeth: no gain is applied and
-//! the report says why.
+//! Every failure path here returns `Err`. A gain of 1 is a legitimate MEASURED result - the
+//! block says this coordinate is already at the right amplitude - and it is written to the
+//! chart as 1.0 for exactly that reason. An unfittable amplitude rendered as a gain of 1 is
+//! the same bits, so the two would be indistinguishable on every downstream artifact: the
+//! `calibrated` MSE ratio is produced by applying `g` in closed form
+//! ([`super::reports`]), so `g = 1` makes it bit-identical to the `uncalibrated` series and a
+//! run reports a calibration it never performed. That is what job 6004 shipped. A refusal is
+//! therefore fatal at the evaluation that measured it, with the numbers that refused it in the
+//! message, and the arm is rerun under an estimator the block admits rather than read as if it
+//! had been calibrated.
 //!
 //! # Cost
 //!
@@ -118,18 +139,24 @@
 //! `2·pred_len` f64 (≈ 8 KB of JSON at pred_len = 192).
 
 use super::model::CHANNELS;
-use anyhow::{ensure, Result};
+use crate::torch::dataset::iso_ms;
+use anyhow::{bail, ensure, Result};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
+use std::fmt;
 
 /// Decoded channel index of the close coordinate: `decode_joint` emits `(open, high, low,
 /// close)`, so the anchor is last and its offset is identically zero.
 pub const CLOSE_CHANNEL: usize = CHANNELS as usize - 1;
 
-/// The pre-registered refusal threshold on the intercept: the best constant forecast may not be
-/// able to earn more than this share of what the amplitude error costs, or a pure gain is the
-/// wrong parameterization and the fit applies none. Measured margin on the control checkpoint
-/// is 65x below this.
-const OFFSET_CEILING_SHARE: f64 = 0.1;
+/// The pre-registered refusal threshold on the intercept: at any horizon, the best constant
+/// forecast may not be able to earn more than this share of what the amplitude error costs
+/// THERE, or a pure gain is the wrong parameterization at that horizon and the fit applies none
+/// to it. The value is registered and unchanged; what was wrong was the quantity it read - four
+/// pooled channels, not the close channel it was pinned against - and the axis it read it on.
+/// Measured close-channel margin on the control checkpoint is `4.63e-5` against a `2.995e-2`
+/// amplitude cost, i.e. 65x below this.
+pub const INTERCEPT_CEILING_SHARE: f64 = 0.1;
 /// Standard errors of its OWN estimate that an amplification must clear before any of it is
 /// applied. Shrinkage is unbounded below by the fit; amplification is bounded above by
 /// `exp(ln ĝ - AMPLIFICATION_SIGMAS·SE(ln ĝ))`, floored at 1.
@@ -187,25 +214,37 @@ pub struct Blocks {
     pub evaluation_first_origin_ms: i64,
     pub evaluation_last_origin_ms: i64,
     pub evaluation_origins: usize,
-    /// How long after the last bar any calibration target reads the first evaluation origin
-    /// starts. Strictly positive by [`Self::spanning`]'s refusal, and it is the whole of the
-    /// disjointness claim: a gap of zero would mean the two blocks share a bar. Stated in
-    /// milliseconds rather than as an origin count because the corpus's reserved purge band
-    /// holds no origins at all - counting them would report 0 for a separation of many days.
+    /// The tightest separation the constructor PROVED, and the whole of the disjointness
+    /// claim: [`Self::spanning`] proves one pooled block pair and reports that pair's gap;
+    /// [`Self::per_ticker`] proves every ticker's own pair and reports the smallest of them.
+    /// Strictly positive either way - a gap of zero would mean a fit target and a scored
+    /// origin read the same bar. Stated in milliseconds rather than as an origin count because
+    /// the corpus's reserved purge band holds no origins at all - counting them would report 0
+    /// for a separation of many days.
     pub purge_gap_ms: i64,
 }
 
+/// `(ticker index, origin timestamp, timestamp of the last bar this origin's `pred_len`
+/// cumulative targets read)`.
+///
+/// The ticker index is load-bearing for [`Blocks::per_ticker`]: the corpus cuts its held-out
+/// blocks on each ticker's OWN valid-bar ordinals, so disjointness is a per-ticker claim and
+/// the index is what makes it checkable.
+pub type DatedOrigin = (usize, i64, i64);
+
 impl Blocks {
-    /// Date the two populations and PROVE they are disjoint in the bars their targets read.
+    /// Date two POOLED populations and prove they are disjoint on the global wall clock.
     ///
     /// Each entry is `(origin timestamp, timestamp of the last bar this origin's `pred_len`
-    /// cumulative targets read)`. The blocks come from the corpus's own reserved partitions -
-    /// the calibration band and a held-out band, separated by the corpus purge - so this does
-    /// not CUT anything; it measures the separation and refuses a pair that does not have one.
-    /// That refusal is the load-bearing part: a calibration fitted on bars the scoring block
-    /// also reads is leakage no matter which partition produced it, and the check has to run
-    /// against the realized timestamps rather than against the boundary arithmetic that was
-    /// supposed to guarantee them.
+    /// cumulative targets read)`. The comparison is a max over one population's target
+    /// timestamps against a min over the other's origin timestamps, so it is a claim about the
+    /// whole universe at once, and it holds only where the caller has CUT the scored block to
+    /// earn it - [`super::probe::Partitions::split`] does exactly that and pays a measured 1%
+    /// of its scored population for it.
+    ///
+    /// The corpus's own reserved bands are not such a pair. They are cut per ticker and their
+    /// global extrema interleave; proving them is [`Self::per_ticker`]'s job, and pointing
+    /// this function at them refuses every corpus this universe can produce.
     pub fn spanning(calibration: &[(i64, i64)], evaluation: &[(i64, i64)]) -> Result<Self> {
         ensure!(
             !calibration.is_empty(),
@@ -243,6 +282,117 @@ impl Blocks {
              gain fitted on the first would be scored on data it has already seen",
         );
         Ok(blocks)
+    }
+
+    /// PROVE the disjointness the pooled corpus actually guarantees: per ticker, exactly, for
+    /// every ticker, never on global extrema.
+    ///
+    /// `corpus.rs` cuts both reserved bands at `boundaries[k]`, which is each ticker's OWN
+    /// valid-bar ordinal at the shared boundary timestamp (`index_at_or_after`). Within one
+    /// ticker the ordering is exact: the calibration band stops at `retained_partition_end`,
+    /// `purge >= 100` bars before `boundaries[1]`, while the validation band's first origin is
+    /// `boundaries[1] - 1`. ACROSS tickers those ordinals are different wall clocks - a ticker
+    /// that stops trading, or thins out, long before the shared boundary has its own band edge
+    /// years earlier than a continuously traded one - so the two populations' global timestamp
+    /// extrema interleave and comparing them proves nothing and refuses everything. Measured on
+    /// the 4,873-ticker corpus by
+    /// `probe::tests::the_real_reserved_partitions_are_dated_and_their_ordering_is_measured`:
+    /// fit targets reach 2024-08-15 while the earliest scored origin is 2019-02-14, and 0 of
+    /// 4,498 tickers violate their own ordering.
+    ///
+    /// RESIDUAL ASSUMPTION, stated because it is real and deliberately not fixed here: with
+    /// per-ticker bands the two populations DO overlap in absolute wall-clock time across
+    /// DIFFERENT tickers. No ticker shares a bar, an origin or an instant with itself across
+    /// the split - and on the real corpus not one scored origin shares even a TIMESTAMP with a
+    /// fit origin - but the fit period and the scoring period are the same calendar span, so
+    /// the gain sees market-wide contemporaneous information. For `pred_len` amplitude scalars
+    /// that is a weak leak; it is not a nil one, and closing it would cost a global wall-clock
+    /// cut of the scored block, which is a different experiment.
+    pub fn per_ticker(
+        calibration: &[DatedOrigin],
+        evaluation: &[DatedOrigin],
+        horizons: usize,
+        name: impl Fn(usize) -> String,
+    ) -> Result<Self> {
+        ensure!(
+            !calibration.is_empty(),
+            "the calibration partition produced no origins; there is nothing to fit a gain \
+             curve on"
+        );
+        ensure!(
+            !evaluation.is_empty(),
+            "the evaluation partition produced no origins; there is nothing to score"
+        );
+        // Ordered, not hashed: the ticker a refusal names has to be the same ticker on every
+        // run, and ties in the tightest separation are common on a purged grid.
+        let mut reach: BTreeMap<usize, i64> = BTreeMap::new();
+        let mut calibration_span = (i64::MAX, i64::MIN, i64::MIN);
+        for &(ticker, origin, target) in calibration {
+            calibration_span.0 = calibration_span.0.min(origin);
+            calibration_span.1 = calibration_span.1.max(origin);
+            calibration_span.2 = calibration_span.2.max(target);
+            let entry = reach.entry(ticker).or_insert(i64::MIN);
+            *entry = (*entry).max(target);
+        }
+        let mut opens: BTreeMap<usize, i64> = BTreeMap::new();
+        let mut evaluation_span = (i64::MAX, i64::MIN);
+        for &(ticker, origin, _) in evaluation {
+            evaluation_span.0 = evaluation_span.0.min(origin);
+            evaluation_span.1 = evaluation_span.1.max(origin);
+            let entry = opens.entry(ticker).or_insert(i64::MAX);
+            *entry = (*entry).min(origin);
+        }
+        // Every ticker that carries origins on BOTH sides, which is the complete set of ways
+        // this split can leak: a ticker on one side alone shares nothing with itself.
+        let mut shared = 0usize;
+        let mut violations = 0usize;
+        let mut tightest: Option<(usize, i64, i64)> = None;
+        for (&ticker, &first_origin) in &opens {
+            let Some(&last_target) = reach.get(&ticker) else {
+                continue;
+            };
+            shared += 1;
+            if last_target >= first_origin {
+                violations += 1;
+            }
+            if tightest.is_none_or(|(_, target, origin)| first_origin - last_target < origin - target)
+            {
+                tightest = Some((ticker, last_target, first_origin));
+            }
+        }
+        let Some((offender, last_target, first_origin)) = tightest else {
+            bail!(
+                "no ticker carries origins in both the calibration block ({} origins over {} \
+                 tickers) and the evaluation block ({} origins over {} tickers), so the fit is \
+                 scored on instruments it never saw",
+                calibration.len(),
+                reach.len(),
+                evaluation.len(),
+                opens.len()
+            );
+        };
+        ensure!(
+            violations == 0,
+            "{violations} of {shared} tickers fit and score a gain on their own data: {} is the \
+             worst - its calibration block's last {horizons}-step target completes at {} \
+             ({last_target} ms epoch) but its own first evaluation origin is at {} \
+             ({first_origin} ms epoch), {} ms EARLIER, so every one of those {horizons} \
+             horizons is fitted on bars that ticker is then scored on",
+            name(offender),
+            iso_ms(last_target),
+            iso_ms(first_origin),
+            last_target - first_origin
+        );
+        Ok(Self {
+            calibration_first_origin_ms: calibration_span.0,
+            calibration_last_origin_ms: calibration_span.1,
+            calibration_last_target_ms: calibration_span.2,
+            calibration_origins: calibration.len(),
+            evaluation_first_origin_ms: evaluation_span.0,
+            evaluation_last_origin_ms: evaluation_span.1,
+            evaluation_origins: evaluation.len(),
+            purge_gap_ms: first_origin - last_target,
+        })
     }
 }
 
@@ -342,6 +492,12 @@ impl Moments {
                 .chain(&self.offset_target)
                 .all(|value| value.is_finite()),
             "nonfinite amplitude moment"
+        );
+        ensure!(
+            self.channels > CLOSE_CHANNEL,
+            "the close channel is index {CLOSE_CHANNEL} of a decoded candle and the intercept \
+             refusal is measured on it alone, so {} channels of moments cannot carry it",
+            self.channels
         );
         Ok(())
     }
@@ -487,33 +643,49 @@ impl Moments {
         pooled
     }
 
-    /// `ȳ²/mean(y²)` pooled over channels: the whole share of the persistence MSE that the best
-    /// constant forecast could earn at this horizon, which is what justifies a pure gain over an
-    /// affine map.
+    /// `ȳ_close²/E[y_close²]`: the whole share of the persistence MSE that the best constant
+    /// forecast could earn at this horizon, on the CLOSE channel alone.
+    ///
+    /// The close channel and not the four decoded ones, because that is the population the
+    /// refusal is a statement about. `O_close ≡ 0`, so the close row carries the ANCHOR alone,
+    /// and the anchor is the only coordinate a constant can compete with: it is market-neutral
+    /// within a timestamp, so no gain on it reaches a constant. Pooling the four channels
+    /// instead measures the intrabar spread - `ȳ_high` and `ȳ_low` are structurally nonzero on
+    /// candle data, and the pooled share then goes as `1/h` rather than growing as `h·µ²` the
+    /// way a drift intercept must - which is what the offset coordinate absorbs, so charging it
+    /// here refuses the estimator on its own second degree of freedom. Measured on the control
+    /// block: `4.63e-5` on this channel against `7.535e-2` pooled, a factor of 1600.
+    ///
+    /// `NaN` where the block measured nothing at this horizon - no valid target bars, or no
+    /// persistence to be a share of. NOT 0: zero is the most permissive value this quantity
+    /// has, so an unmeasured horizon folded to 0 would pass the refusal gate below on evidence
+    /// that does not exist, and would draw on the moment panel as a measured absence of drift.
     fn intercept_ceiling(&self, horizon: usize) -> f64 {
         let bars = self.bars[horizon];
         if bars <= 0. {
-            return 0.;
+            return f64::NAN;
         }
-        let (mut earnable, mut persistence) = (0., 0.);
-        for channel in 0..self.channels {
-            let cell = self.cell(horizon, channel);
-            earnable += self.target[cell] * self.target[cell] / bars;
-            persistence += self.target_square[cell];
-        }
+        let cell = self.cell(horizon, CLOSE_CHANNEL);
+        let persistence = self.target_square[cell];
         if persistence > 0. {
-            (earnable / persistence).clamp(0., 1.)
+            (self.target[cell] * self.target[cell] / bars / persistence).clamp(0., 1.)
         } else {
-            0.
+            f64::NAN
         }
     }
 }
 
-/// One horizon's exact two-coordinate least-squares solution, or the reason it has none.
+/// One horizon's two-coordinate least-squares solution.
+///
+/// Each coordinate is `None` where the block's design carries no energy in it - a decode whose
+/// intrabar range has collapsed leaves the offset column identically zero, and a zero-init head
+/// leaves the anchor column identically zero - which is a different fact from a measured zero
+/// and is why it is an option rather than a `0.`.
 struct Solved {
-    anchor: f64,
-    offset: f64,
-    /// Inverse delta-method variance of `ln g`, per coordinate.
+    anchor: Option<f64>,
+    offset: Option<f64>,
+    /// Inverse delta-method variance of `ln g`, per coordinate; 0 where that coordinate has no
+    /// energy or the residual leaves it no precision.
     anchor_weight: f64,
     offset_weight: f64,
     /// What fixing the amplitude at this horizon is worth, as a share of the persistence MSE.
@@ -544,34 +716,24 @@ pub struct CurveFit {
     pub effective_dof: f64,
     /// Horizons whose amplitude the block identified.
     pub identified: usize,
-    /// Why NO gain is applied on this coordinate, `None` when a curve was fitted. The gain is
-    /// then identically 1 - a legible outcome, not a failure: an untrained head has no
-    /// amplitude to calibrate.
-    pub unidentifiable: Option<String>,
 }
 
-impl CurveFit {
-    /// The identity curve, with the block's own signed measurement kept.
-    ///
-    /// The measurement survives every refusal on purpose: "no gain was applied" and "the
-    /// amplitude could not be measured" are different facts, and a consumer that has to decide
-    /// whether a horizon may be SIZED on needs the second one. `NaN` entries are horizons that
-    /// really had no solve.
-    fn identity(coordinate: Coordinate, measured_gain: Vec<f64>, reason: String) -> Self {
-        let horizons = measured_gain.len();
-        Self {
-            coordinate,
-            gain: vec![1.; horizons],
-            measured_gain,
-            standard_error: vec![f64::NAN; horizons],
-            amplification_ceiling: vec![1.; horizons],
-            weight: vec![0.; horizons],
-            penalty: f64::NAN,
-            effective_dof: 0.,
-            identified: 0,
-            unidentifiable: Some(reason),
-        }
-    }
+/// One horizon whose pure-gain parameterization the calibration block refused, with both
+/// competing quantities.
+///
+/// Named rather than counted: the gate's whole content is a comparison of two measured shares
+/// at one horizon, and a reader who cannot see which two numbers refused it cannot tell a real
+/// refusal from a mis-keyed reduction - which is exactly what happened when a four-channel
+/// intercept was compared against a different horizon's amplitude cost.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct InterceptRefusal {
+    /// 1-based horizon.
+    pub horizon: usize,
+    /// `ȳ_close²/E[y_close²]` here: what the best constant forecast could earn.
+    pub intercept: f64,
+    /// What fixing the amplitude here is worth, as a share of the same persistence MSE. The
+    /// comparand.
+    pub amplitude_cost: f64,
 }
 
 /// A fitted amplitude calibration: two curves, their diagnostics, and the blocks they were
@@ -583,11 +745,14 @@ pub struct MeanCalibration {
     pub blocks: Blocks,
     pub anchor: CurveFit,
     pub offset: CurveFit,
-    /// `ȳ²/mean(y²)` per horizon: the whole gain any constant forecast could earn.
+    /// `ȳ_close²/mean(y_close²)` per horizon: the whole gain any constant forecast could earn.
     pub intercept_ceiling: Vec<f64>,
     /// What the amplitude error costs per horizon, as a share of the persistence MSE - the
-    /// quantity the intercept ceiling is compared against.
+    /// quantity the intercept ceiling is compared against, at the SAME horizon.
     pub amplitude_cost: Vec<f64>,
+    /// The horizons that comparison refused, in order, with the two shares that refused each.
+    /// Empty on a block the pure-gain parameterization fits everywhere.
+    pub intercept_refused: Vec<InterceptRefusal>,
 }
 
 impl MeanCalibration {
@@ -595,9 +760,10 @@ impl MeanCalibration {
     /// else. `blocks` is stored, not consulted: disjointness is [`Blocks::spanning`]'s job and
     /// is proven there.
     ///
-    /// `Err` is reserved for a structurally impossible input - wrong shapes, nonfinite sums, an
-    /// axis too short to have curvature. A population that simply does not identify an
-    /// amplitude is not an error: it produces the identity with its reason attached.
+    /// `Err` on every input this estimator cannot fit, structural or measured: wrong shapes,
+    /// nonfinite sums, an axis too short to have curvature, a block that identifies no
+    /// amplitude, a refused parameterization. There is no identity fallback - see the module
+    /// docs for why a refusal cannot be allowed to look like a fitted unit gain.
     pub fn fit(blocks: Blocks, moments: &Moments) -> Result<Self> {
         moments.validate()?;
         let horizons = moments.pred_len;
@@ -613,53 +779,104 @@ impl MeanCalibration {
             .collect();
         let amplitude_cost: Vec<f64> = solved
             .iter()
-            .map(|row| row.as_ref().map_or(0., |solved| solved.amplitude_cost))
+            .map(|row| row.as_ref().map_or(f64::NAN, |solved| solved.amplitude_cost))
             .collect();
         let estimator = format!(
             "exact 2x2 least squares in (close anchor, intrabar offset) pooled over {} channels, \
-             no intercept; ln g smoothed on ln h under a natural-spline roughness penalty \
-             selected by GCV over {PENALTY_GRID} geometric strengths, weighted by the solve's \
-             own inverse delta-method variance with the channel multiplicity charged as a \
-             design effect; two-sided: shrinkage as fitted, amplification bounded by \
+             no intercept, and a horizon whose close-channel constant-forecast share exceeds \
+             {INTERCEPT_CEILING_SHARE} of its OWN amplitude cost is refused at that horizon and \
+             carried by the prior; ln g smoothed on ln h under a natural-spline roughness \
+             penalty selected by GCV over {PENALTY_GRID} geometric strengths, weighted by the \
+             solve's own inverse delta-method variance with the channel multiplicity charged as \
+             a design effect; two-sided: shrinkage as fitted, amplification bounded by \
              exp(ln ĝ - {AMPLIFICATION_SIGMAS}·SE(ln ĝ)) floored at 1",
             moments.channels
         );
-        let worst_intercept = intercept_ceiling.iter().cloned().fold(0., f64::max);
-        let worst_amplitude = amplitude_cost.iter().cloned().fold(0., f64::max);
-        if worst_intercept > OFFSET_CEILING_SHARE * worst_amplitude {
-            // Pre-registered and unchanged, only non-fatal: a pure gain is refused rather than
-            // applied where a constant forecast could earn a comparable share of the same MSE.
-            let reason = format!(
-                "a pure gain is the wrong parameterization on this block: the best constant \
-                 forecast could earn {worst_intercept:.3e} of the persistence MSE at its best \
-                 horizon against the {worst_amplitude:.3e} the amplitude error costs at its \
-                 worst, which is above the {OFFSET_CEILING_SHARE} share this estimator is \
-                 allowed to leave on the table"
-            );
-            let measured = |read: fn(&Solved) -> f64| -> Vec<f64> {
-                solved
-                    .iter()
-                    .map(|row| row.as_ref().map_or(f64::NAN, read))
-                    .collect()
-            };
-            return Ok(Self {
-                estimator,
-                blocks,
-                anchor: CurveFit::identity(
-                    Coordinate::CloseAnchor,
-                    measured(|solved| solved.anchor),
-                    reason.clone(),
-                ),
-                offset: CurveFit::identity(
-                    Coordinate::IntrabarOffset,
-                    measured(|solved| solved.offset),
-                    reason,
-                ),
-                intercept_ceiling,
-                amplitude_cost,
-            });
-        }
-        let curve = |coordinate: Coordinate| -> CurveFit {
+        // Unmeasured horizons are `NaN`, and `f64::max` SKIPS them, so the refusal below would
+        // silently read a short axis as a clean one. Named here instead.
+        let unmeasured: Vec<usize> = intercept_ceiling
+            .iter()
+            .enumerate()
+            .filter(|(_, ceiling)| !ceiling.is_finite())
+            .map(|(horizon, _)| horizon + 1)
+            .collect();
+        ensure!(
+            unmeasured.is_empty(),
+            "the calibration block carries no target bars or no close-channel persistence at {} \
+             of {horizons} horizons (h={:?}), so the intercept refusal cannot be evaluated there",
+            unmeasured.len(),
+            &unmeasured[..unmeasured.len().min(8)]
+        );
+        // Distinct from the intercept refusal below and never folded into it: a block that
+        // solved no horizon at all has no amplitude cost for an intercept to be compared
+        // against, so a parameterization verdict there would be a verdict on a population that
+        // identified nothing to parameterize.
+        ensure!(
+            amplitude_cost.iter().any(|cost| cost.is_finite()),
+            "not one of {horizons} horizons in the calibration block identified a two-\
+             coordinate amplitude, so there is nothing to fit a gain curve on. This aborts \
+             rather than applying the identity: a gain of 1 here would be indistinguishable \
+             from a measured unit amplitude on every chart and in every checkpoint"
+        );
+        // THE INTERCEPT REFUSAL. Pre-registered and unchanged in its THRESHOLD: a pure gain is
+        // the wrong parameterization wherever a constant forecast could earn more than
+        // `INTERCEPT_CEILING_SHARE` of what the amplitude error costs. What was wrong was the
+        // aggregation, twice. The comparison is PER HORIZON, because that is what the
+        // registration states and because the two quantities live at opposite ends of the axis:
+        // the intercept share peaks at h = 1 and the amplitude cost past h = 170, so
+        // worst-against-worst let one short horizon refuse all 192. And the intercept is the
+        // CLOSE channel's, which is the population the registered margin was pinned on - see
+        // `Moments::intercept_ceiling` for why the pooled quantity is the intrabar spread.
+        //
+        // A refused horizon keeps its measurement and loses its WEIGHT: both curves carry it
+        // from its neighbours through the roughness prior exactly as they carry an unidentified
+        // one, its amplification ceiling is the identity, and [`FrozenGain`] gates it out of
+        // sizing under its own reason. BOTH coordinates, because one joint solve produces both
+        // gains at that horizon and the columns are coupled through `ΣC·O`, so a
+        // misparameterized anchor contaminates the offset estimate beside it.
+        // `intercept_ceiling > 0` is not redundant with the comparison beside it. The
+        // amplitude cost is `uncalibrated - residual` over the persistence, non-negative in
+        // exact arithmetic - the unit gain is feasible for the same solve - so it can only go
+        // negative by cancellation rounding, and a horizon whose constant forecast could earn
+        // NOTHING must not be refused by the sign of a 1e-16 residue. An intercept that earns
+        // nothing dominates nothing.
+        let refused: Vec<bool> = (0..horizons)
+            .map(|horizon| {
+                amplitude_cost[horizon].is_finite()
+                    && intercept_ceiling[horizon] > 0.
+                    && intercept_ceiling[horizon]
+                        > INTERCEPT_CEILING_SHARE * amplitude_cost[horizon]
+            })
+            .collect();
+        let intercept_refused: Vec<InterceptRefusal> = (0..horizons)
+            .filter(|horizon| refused[*horizon])
+            .map(|horizon| InterceptRefusal {
+                horizon: horizon + 1,
+                intercept: intercept_ceiling[horizon],
+                amplitude_cost: amplitude_cost[horizon],
+            })
+            .collect();
+        ensure!(
+            horizons - intercept_refused.len() >= 3,
+            "the intercept refusal declined the pure-gain parameterization at {} of {horizons} \
+             horizons ({}), leaving fewer than the three a curvature-penalized fit needs. Each \
+             pair is that horizon's own close-channel constant-forecast share against what its \
+             own amplitude error costs, and {INTERCEPT_CEILING_SHARE} of the second is the \
+             registered share this estimator may leave on the table. This aborts rather than \
+             applying the identity: a gain of 1 here would be indistinguishable from a measured \
+             unit amplitude on every chart and in every checkpoint",
+            intercept_refused.len(),
+            intercept_refused
+                .iter()
+                .take(4)
+                .map(|refusal| format!(
+                    "h={} {:.3e} against {:.3e}",
+                    refusal.horizon, refusal.intercept, refusal.amplitude_cost
+                ))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        let curve = |coordinate: Coordinate| -> Result<CurveFit> {
             let read = |solved: &Solved| match coordinate {
                 Coordinate::CloseAnchor => (solved.anchor, solved.anchor_weight),
                 Coordinate::IntrabarOffset => (solved.offset, solved.offset_weight),
@@ -667,23 +884,40 @@ impl MeanCalibration {
             fit_curve(
                 coordinate,
                 horizons,
+                intercept_refused.len(),
                 // Recorded whatever its sign: a negative solve is a measurement of a horizon
                 // with no usable amplitude, and it is the number a sizing consumer gates on.
-                |horizon| solved[horizon].as_ref().map_or(f64::NAN, |row| read(row).0),
+                // `NaN` is the OTHER fact - this coordinate carried no energy to measure - and
+                // the two must not collapse into one number. A refused horizon is recorded too:
+                // the refusal is about the parameterization, not about the measurement.
                 |horizon| {
-                    solved[horizon].as_ref().map(read).filter(|(gain, weight)| {
-                        gain.is_finite() && *gain > 0. && weight.is_finite() && *weight > 0.
-                    })
+                    solved[horizon]
+                        .as_ref()
+                        .and_then(|row| read(row).0)
+                        .unwrap_or(f64::NAN)
+                },
+                |horizon| {
+                    solved[horizon]
+                        .as_ref()
+                        .filter(|_| !refused[horizon])
+                        .and_then(|row| {
+                            let (gain, weight) = read(row);
+                            gain.map(|gain| (gain, weight))
+                        })
+                        .filter(|(gain, weight)| {
+                            gain.is_finite() && *gain > 0. && weight.is_finite() && *weight > 0.
+                        })
                 },
             )
         };
         Ok(Self {
             estimator,
             blocks,
-            anchor: curve(Coordinate::CloseAnchor),
-            offset: curve(Coordinate::IntrabarOffset),
+            anchor: curve(Coordinate::CloseAnchor)?,
+            offset: curve(Coordinate::IntrabarOffset)?,
             intercept_ceiling,
             amplitude_cost,
+            intercept_refused,
         })
     }
 
@@ -701,6 +935,42 @@ impl MeanCalibration {
                 .iter()
                 .map(|gain| gain.is_finite().then_some(*gain))
                 .collect(),
+            intercept_refused: self.intercept_refused.clone(),
+        }
+    }
+}
+
+/// Why a horizon is gated out of position SIZING.
+///
+/// Three findings with three causes, and they never merge: a measured non-positive amplitude
+/// (the forecast does not point the right way there), no measurement at all (the horizon is
+/// carried by its neighbours through the roughness prior), and a refused parameterization (a
+/// constant forecast could earn more of that horizon's MSE than a tenth of what its amplitude
+/// error costs). Sizing is affine in the mean, so all three produce the same all-zero book,
+/// and one sentinel for all three is how that book stops being explicable.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum SizingGate {
+    /// The calibration block identified no amplitude at this horizon.
+    Unmeasured,
+    /// The measured amplitude, non-positive, signed and unmodified.
+    NonPositiveGain(f64),
+    /// The intercept refusal, with the two shares that decided it.
+    InterceptDominates { intercept: f64, amplitude_cost: f64 },
+}
+
+impl fmt::Display for SizingGate {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Unmeasured => write!(formatter, "unmeasured"),
+            Self::NonPositiveGain(gain) => write!(formatter, "at {gain:.4}"),
+            Self::InterceptDominates {
+                intercept,
+                amplitude_cost,
+            } => write!(
+                formatter,
+                "intercept dominates, a constant forecast earning {intercept:.3e} against the \
+                 {amplitude_cost:.3e} its amplitude error costs"
+            ),
         }
     }
 }
@@ -731,6 +1001,12 @@ pub struct FrozenGain {
     /// is not its own. [`Self::tradable`] is the gate; this vector is why it can exist without
     /// a second fit, and it is reported signed and unmodified so a gated horizon is legible.
     pub measured_anchor: Vec<Option<f64>>,
+    /// The horizons whose pure-gain parameterization the calibration block refused, with the
+    /// two shares that refused each. Rides in the manifest because it is a SIZING gate and
+    /// nothing else downstream could reconstruct it: the applied curve is positive and smooth
+    /// at a refused horizon - the roughness prior carries it from its neighbours - so the
+    /// curve cannot say that the horizon's own evidence was declined.
+    pub intercept_refused: Vec<InterceptRefusal>,
 }
 
 impl FrozenGain {
@@ -768,70 +1044,148 @@ impl FrozenGain {
             "a nonfinite measured anchor gain is a broken reduction, not a measurement; an \
              unmeasured horizon is null, which is a different statement from a measured zero"
         );
+        ensure!(
+            self.intercept_refused.iter().all(|refusal| {
+                (1..=pred_len).contains(&refusal.horizon)
+                    && refusal.intercept.is_finite()
+                    && refusal.amplitude_cost.is_finite()
+            }),
+            "an intercept refusal must name a horizon of the {pred_len} forecast and both \
+             shares that refused it; a refusal with no numbers gates a horizon for no stated \
+             reason: {:?}",
+            self.intercept_refused
+        );
         Ok(())
     }
 
     /// Whether horizon `h` bars ahead (1-based) may be SIZED on, as opposed to merely scored.
     ///
-    /// The applied curve is positive everywhere; the measurement is not. A horizon whose own
-    /// calibration-block amplitude is non-positive or unidentified has no out-of-sample
-    /// evidence that its forecast points the right way, and a position taken there is taken on
-    /// its neighbours' evidence through the roughness prior. Scoring such a horizon is honest -
-    /// the MSE ratio is a measurement either way - and trading it is not.
+    /// The applied curve is positive and defined everywhere; the evidence behind it is not. A
+    /// horizon whose own calibration-block amplitude is non-positive or unidentified has no
+    /// out-of-sample evidence that its forecast points the right way, and one whose
+    /// parameterization was refused has evidence the estimator declined to use; a position
+    /// taken at either is taken on its neighbours' evidence through the roughness prior.
+    /// Scoring such a horizon is honest - the MSE ratio is a measurement either way - and
+    /// trading it is not.
     pub fn tradable(&self, horizon: usize) -> bool {
-        self.measured_anchor
-            .get(horizon - 1)
-            .and_then(|gain| *gain)
-            .is_some_and(|gain| gain > 0.)
+        self.gate(horizon).is_none()
     }
 
-    /// The 1-based horizons whose measurement gates them out of sizing, with the value that
-    /// gated them - `None` where there was no measurement at all, which is its own reason - for
-    /// the report that has to name them.
-    pub fn gated(&self) -> Vec<(usize, Option<f64>)> {
+    /// The one reason horizon `h` (1-based) cannot be sized, or `None` where it carries its
+    /// own positive out-of-sample amplitude under a parameterization the block admitted.
+    ///
+    /// The intercept refusal is reported ahead of the measurement, because it is the stronger
+    /// statement: the fit declined that horizon's own solve entirely, so whatever the
+    /// measurement says there was not what determined the applied gain.
+    pub fn gate(&self, horizon: usize) -> Option<SizingGate> {
+        if let Some(refusal) = self
+            .intercept_refused
+            .iter()
+            .find(|refusal| refusal.horizon == horizon)
+        {
+            return Some(SizingGate::InterceptDominates {
+                intercept: refusal.intercept,
+                amplitude_cost: refusal.amplitude_cost,
+            });
+        }
+        match horizon
+            .checked_sub(1)
+            .and_then(|index| self.measured_anchor.get(index))
+        {
+            Some(Some(gain)) if *gain > 0. => None,
+            Some(Some(gain)) => Some(SizingGate::NonPositiveGain(*gain)),
+            _ => Some(SizingGate::Unmeasured),
+        }
+    }
+
+    /// The 1-based horizons that cannot be sized, each with the reason that gated it, for the
+    /// report that has to name them.
+    pub fn gated(&self) -> Vec<(usize, SizingGate)> {
         (1..=self.measured_anchor.len())
-            .filter(|horizon| !self.tradable(*horizon))
-            .map(|horizon| (horizon, self.measured_anchor[horizon - 1]))
+            .filter_map(|horizon| self.gate(horizon).map(|gate| (horizon, gate)))
             .collect()
     }
 
-    /// Whether both curves are the identity, i.e. this checkpoint's block identified no
-    /// amplitude to correct.
-    pub fn is_identity(&self) -> bool {
-        self.anchor
+    /// Why an account reading `horizons` (1-based) must be SIZED TO ZERO, or `None` when every
+    /// horizon it reads carries its own positive out-of-sample amplitude.
+    ///
+    /// Prose and not a boolean, because the three gating reasons are different findings - a
+    /// measured non-positive gain, no measurement at all, and a refused parameterization - and
+    /// one sentinel for all three is how a gate stops being legible. Sizing is affine in the
+    /// mean, so a zero mean is a zero position at every name; this string is the only thing
+    /// that keeps the resulting all-zero book from being indistinguishable from a broken
+    /// pipeline.
+    pub fn sizing_refusal(&self, horizons: &[usize]) -> Option<String> {
+        let named: Vec<String> = horizons
             .iter()
-            .chain(&self.offset)
-            .all(|gain| *gain == 1.)
+            .filter_map(|horizon| self.gate(*horizon).map(|gate| format!("h{horizon} {gate}")))
+            .collect();
+        (!named.is_empty()).then(|| named.join(", "))
     }
 }
 
-/// One horizon's exact 2x2 solve, `None` where the block identifies no amplitude there.
+/// One horizon's least-squares solve over the coordinates the block actually identifies, `None`
+/// where it identifies neither.
 ///
 /// The normal equations are pooled over channels because the four channels of one bar share the
 /// anchor: `f_c = C + O_c`, so the design is `[C, O_c]` with `O_close ≡ 0` and the four rows of
 /// one bar constrain both coordinates jointly. That pooling is what makes the anchor gain
 /// minimize the FOUR-CHANNEL squared error rather than the close channel's alone.
+///
+/// Either column can be EMPTY, and the solve degrades to rank 1 rather than refusing the
+/// horizon. `O_close ≡ 0` by construction, so a decode whose intrabar range has collapsed - a
+/// head early in training, or one scored on the close channel alone - leaves the offset column
+/// identically zero at every channel and the 2x2 Gram matrix singular. The anchor amplitude is
+/// still exactly measurable there, and dropping it because the SECOND coordinate is unmeasurable
+/// would blank the calibration at precisely the checkpoints whose amplitude is most wrong.
+/// A column with no energy has no target covariance either (`Σ O² = 0 ⇒ O ≡ 0 ⇒ Σ O·y = 0`), so
+/// the residual and the amplitude cost below are exact with its term omitted.
 fn solve_horizon(moments: &Moments, horizon: usize) -> Option<Solved> {
     let pooled = moments.pooled(horizon);
     let bars = moments.bars[horizon];
     let elements = bars * moments.channels as f64;
-    if bars <= 0. || elements <= 2. || pooled.persistence <= 0. {
+    let coordinates =
+        usize::from(pooled.anchor_square > 0.) + usize::from(pooled.offset_square > 0.);
+    if bars <= 0. || coordinates == 0 || elements <= coordinates as f64 || pooled.persistence <= 0.
+    {
         return None;
     }
-    let determinant =
-        pooled.anchor_square * pooled.offset_square - pooled.anchor_offset * pooled.anchor_offset;
+    // The Gram determinant at full rank, and the identified coordinate's own energy at rank 1.
+    // Both are the quantity the delta-method cofactors below divide by, which is what lets one
+    // weight expression serve both cases.
+    let determinant = if coordinates == 2 {
+        pooled.anchor_square * pooled.offset_square - pooled.anchor_offset * pooled.anchor_offset
+    } else {
+        pooled.anchor_square.max(pooled.offset_square)
+    };
     if !(determinant > 0.) {
         return None;
     }
-    let anchor = (pooled.offset_square * pooled.anchor_target
-        - pooled.anchor_offset * pooled.offset_target)
-        / determinant;
-    let offset = (pooled.anchor_square * pooled.offset_target
-        - pooled.anchor_offset * pooled.anchor_target)
-        / determinant;
+    let (anchor, offset, anchor_cofactor, offset_cofactor) = if coordinates == 2 {
+        (
+            Some(
+                (pooled.offset_square * pooled.anchor_target
+                    - pooled.anchor_offset * pooled.offset_target)
+                    / determinant,
+            ),
+            Some(
+                (pooled.anchor_square * pooled.offset_target
+                    - pooled.anchor_offset * pooled.anchor_target)
+                    / determinant,
+            ),
+            pooled.offset_square,
+            pooled.anchor_square,
+        )
+    } else if pooled.anchor_square > 0. {
+        (Some(pooled.anchor_target / determinant), None, 1., 0.)
+    } else {
+        (None, Some(pooled.offset_target / determinant), 0., 1.)
+    };
     // `SSE(g) = Σy² - g'b` at the optimum, and the uncalibrated `SSE(1, 1)` minus it is what
     // fixing the amplitude is worth. Both in the same σ² units as the persistence they divide.
-    let residual = pooled.persistence - anchor * pooled.anchor_target - offset * pooled.offset_target;
+    let residual = pooled.persistence
+        - anchor.unwrap_or(0.) * pooled.anchor_target
+        - offset.unwrap_or(0.) * pooled.offset_target;
     let uncalibrated = pooled.anchor_square
         + 2. * pooled.anchor_offset
         + pooled.offset_square
@@ -840,26 +1194,25 @@ fn solve_horizon(moments: &Moments, horizon: usize) -> Option<Solved> {
     if !(residual > 0.) {
         return None;
     }
-    // `Var(ĝ) = k·s²·G⁻¹` with `s² = SSE/(elements - 2)` and `k = channels`: the four candle
+    // `Var(ĝ) = k·s²·G⁻¹` with `s² = SSE/(elements - rank)` and `k = channels`: the four candle
     // channels of one bar share one anchor error, so one BAR is one independent residual, not
     // four, and charging the multiplicity as a design effect doubles the standard error rather
     // than pretending to four times the sample. A constant factor on every weight cannot move
     // the smoother - the penalty grid is in units of the mean weight - so this only widens the
     // three-sigma amplification bound, which is the conservative direction.
-    let variance = moments.channels as f64 * residual / (elements - 2.);
-    let log_weight = |gain: f64, cofactor: f64| -> f64 {
+    let variance = moments.channels as f64 * residual / (elements - coordinates as f64);
+    let log_weight = |gain: Option<f64>, cofactor: f64| -> f64 {
         let gain_variance = variance * cofactor / determinant;
-        if gain > 0. && gain_variance > 0. {
-            gain * gain / gain_variance
-        } else {
-            0.
+        match gain {
+            Some(gain) if gain > 0. && gain_variance > 0. => gain * gain / gain_variance,
+            _ => 0.,
         }
     };
     Some(Solved {
         anchor,
         offset,
-        anchor_weight: log_weight(anchor, pooled.offset_square),
-        offset_weight: log_weight(offset, pooled.anchor_square),
+        anchor_weight: log_weight(anchor, anchor_cofactor),
+        offset_weight: log_weight(offset, offset_cofactor),
         amplitude_cost: (uncalibrated - residual) / pooled.persistence,
     })
 }
@@ -868,17 +1221,19 @@ fn solve_horizon(moments: &Moments, horizon: usize) -> Option<Solved> {
 ///
 /// `measured(h)` is the block's raw signed solve at `h`, recorded whatever its sign, and
 /// `identified(h)` yields `(ĝ_h, weight_h)` only where that solve is a usable positive
-/// amplitude. Unidentified horizons keep weight zero: they are then determined by the roughness
-/// penalty alone - interpolated from their neighbours, which is the only defensible thing a
-/// smoothness prior can say about them - and their amplification ceiling is the identity, so a
-/// neighbour's evidence can shrink them but never amplify them. Trading them is a separate
-/// question, answered by [`FrozenGain::tradable`] off the measurement this records.
+/// amplitude AT A HORIZON THE INTERCEPT REFUSAL ADMITS. Unidentified and refused horizons keep
+/// weight zero: they are then determined by the roughness penalty alone - interpolated from
+/// their neighbours, which is the only defensible thing a smoothness prior can say about
+/// them - and their amplification ceiling is the identity, so a neighbour's evidence can shrink
+/// them but never amplify them. Trading them is a separate question, answered by
+/// [`FrozenGain::tradable`] off the measurement and the refusal list this records.
 fn fit_curve(
     coordinate: Coordinate,
     horizons: usize,
+    intercept_refused: usize,
     measured: impl Fn(usize) -> f64,
     identified: impl Fn(usize) -> Option<(f64, f64)>,
-) -> CurveFit {
+) -> Result<CurveFit> {
     let mut log_gain = vec![0.; horizons];
     let mut measured_gain = vec![f64::NAN; horizons];
     let mut weight = vec![0.; horizons];
@@ -890,17 +1245,14 @@ fn fit_curve(
         }
     }
     let usable = weight.iter().filter(|value| **value > 0.).count();
-    if usable < 3 {
-        return CurveFit::identity(
-            coordinate,
-            measured_gain,
-            format!(
-                "only {usable} of {horizons} horizons carry a calibratable {} amplitude; there \
-                 is nothing to fit a gain curve on",
-                coordinate.label()
-            ),
-        );
-    }
+    ensure!(
+        usable >= 3,
+        "only {usable} of {horizons} horizons carry a calibratable {} amplitude the intercept \
+         refusal admits ({intercept_refused} were declined as misparameterized), so there is \
+         nothing to fit a gain curve on. This aborts rather than applying the identity: a gain \
+         of 1 here would be indistinguishable from a measured unit amplitude",
+        coordinate.label()
+    );
     let axis: Vec<f64> = (1..=horizons).map(|h| (h as f64).ln()).collect();
     let roughness = roughness_matrix(&axis);
     let scale = weight.iter().sum::<f64>() / horizons as f64;
@@ -930,13 +1282,10 @@ fn fit_curve(
         }
     }
     let Some((_, penalty, effective_dof, fitted)) = best else {
-        return CurveFit::identity(
-            coordinate,
-            measured_gain,
-            format!(
-                "no roughness penalty produced a solvable {} fit",
-                coordinate.label()
-            ),
+        bail!(
+            "no roughness penalty in the {PENALTY_GRID}-point grid produced a solvable {} fit \
+             over the {usable} horizons that identified an amplitude",
+            coordinate.label()
         );
     };
     let standard_error: Vec<f64> = weight
@@ -965,14 +1314,15 @@ fn fit_curve(
         .zip(&amplification_ceiling)
         .map(|(value, ceiling)| value.exp().min(*ceiling))
         .collect();
-    if !gain.iter().all(|value| value.is_finite() && *value > 0.) {
-        return CurveFit::identity(
-            coordinate,
-            measured_gain,
-            format!("the fitted {} gain left the positive range", coordinate.label()),
-        );
-    }
-    CurveFit {
+    ensure!(
+        gain.iter().all(|value| value.is_finite() && *value > 0.),
+        "the fitted {} gain left the positive range at {} of {horizons} horizons",
+        coordinate.label(),
+        gain.iter()
+            .filter(|value| !(value.is_finite() && **value > 0.))
+            .count()
+    );
+    Ok(CurveFit {
         coordinate,
         gain,
         measured_gain,
@@ -982,8 +1332,7 @@ fn fit_curve(
         penalty,
         effective_dof,
         identified: usable,
-        unidentifiable: None,
-    }
+    })
 }
 
 /// `R` such that `uᵀRu` is the natural-cubic-spline roughness `∫(u'')²` of the piecewise
@@ -1192,20 +1541,182 @@ mod tests {
         let moments = injected(horizons, channels, 400_000., anchor_error, |_| 1.4, 0.14);
         for horizon in 0..horizons {
             let solved = solve_horizon(&moments, horizon).expect("an identified horizon");
+            let anchor = solved.anchor.expect("an identified anchor");
+            let offset = solved.offset.expect("an identified offset");
             assert!(
-                (solved.anchor - 1. / anchor_error(horizon)).abs() < 1e-9,
-                "anchor gain {} at h={} against the injected {}",
-                solved.anchor,
+                (anchor - 1. / anchor_error(horizon)).abs() < 1e-9,
+                "anchor gain {anchor} at h={} against the injected {}",
                 horizon + 1,
                 1. / anchor_error(horizon)
             );
             assert!(
-                (solved.offset - 1. / 1.4).abs() < 1e-9,
-                "offset gain {} at h={}",
-                solved.offset,
+                (offset - 1. / 1.4).abs() < 1e-9,
+                "offset gain {offset} at h={}",
                 horizon + 1
             );
         }
+        // A collapsed intrabar range empties the OFFSET column at every channel, so the 2x2
+        // Gram matrix is singular - and the anchor amplitude is still exactly measurable. This
+        // is the state a head early in training is in, which is the state whose amplitude is
+        // most wrong, so refusing the horizon here would blank the calibration exactly where it
+        // is needed.
+        let mut flat = moments.clone();
+        for cell in 0..horizons * channels {
+            flat.offset_square[cell] = 0.;
+            flat.offset_target[cell] = 0.;
+        }
+        for horizon in 0..horizons {
+            let solved = solve_horizon(&flat, horizon).expect("a rank-1 design still identifies");
+            let anchor = solved.anchor.expect("the anchor column carries energy");
+            assert!((anchor - 1. / anchor_error(horizon)).abs() < 1e-9, "{anchor}");
+            assert_eq!(solved.offset, None);
+            assert!(solved.anchor_weight > 0. && solved.offset_weight == 0.);
+        }
+        // Both columns empty is the one case with nothing to solve.
+        let mut silent = flat.clone();
+        for cell in 0..horizons * channels {
+            silent.anchor_square[cell] = 0.;
+            silent.anchor_target[cell] = 0.;
+        }
+        assert!(solve_horizon(&silent, 0).is_none());
+    }
+
+    /// The fit reproduces a KNOWN gain curve of its own family, to a tolerance that leaves no
+    /// room for a wrong axis, a wrong weight or a penalty that does not vanish.
+    ///
+    /// The injected amplitude error is the reciprocal of the curve the fit has to return, so
+    /// what comes back must BE that curve - smooth in `ln h`, inside the fitted family, and with
+    /// no per-horizon perturbation at all. Any deviation here is the estimator's own bias rather
+    /// than sampling error, which is what makes the tolerance meaningful: the previous test
+    /// proves it averages noise out, this one proves it does not distort the signal while doing
+    /// so. Both coordinates, because the offset curve is fitted from the same solve and a
+    /// smoother that leaked the anchor's sweep into the intrabar spread would pass the anchor
+    /// half alone.
+    ///
+    /// Both injected curves sit strictly BELOW 1, and deliberately: the amplifying direction is
+    /// bounded by `exp(ln ĝ - 3·SE)`, so a gain above 1 is reproduced only as far as its own
+    /// standard error proves and a reproduction tolerance there would be a tolerance on the
+    /// bound instead of on the fit. The two ceiling tests cover that half. `measured_shape`
+    /// itself crosses 1 in a band around h = 5..25, which is exactly why it is scaled here.
+    #[test]
+    fn the_fit_reproduces_a_noiseless_injected_gain_curve_to_a_tight_tolerance() {
+        let horizons = 192;
+        let anchor_gain = |horizon: usize| 0.85 * measured_shape(horizon + 1);
+        let offset_gain = |horizon: usize| 0.8 + 0.0005 * horizon as f64;
+        let moments = injected(
+            horizons,
+            CHANNELS as usize,
+            400_000.,
+            |h| anchor_gain(h).recip(),
+            |h| offset_gain(h).recip(),
+            0.06,
+        );
+        let fit = MeanCalibration::fit(blocks(), &moments).unwrap();
+        assert!(fit.anchor.amplification_ceiling.iter().all(|c| *c == 1.));
+        for horizon in 0..horizons {
+            for (coordinate, curve, injected_gain) in [
+                ("anchor", &fit.anchor, anchor_gain(horizon)),
+                ("offset", &fit.offset, offset_gain(horizon)),
+            ] {
+                // The raw solve first: the smoother cannot be credited for a measurement it
+                // never received.
+                assert!(
+                    (curve.measured_gain[horizon] / injected_gain - 1.).abs() < 1e-9,
+                    "the measured {coordinate} gain {} at h={} is not the injected {injected_gain}",
+                    curve.measured_gain[horizon],
+                    horizon + 1
+                );
+                assert!(
+                    (curve.gain[horizon] / injected_gain - 1.).abs() < 2e-3,
+                    "the fitted {coordinate} gain {} at h={} left the injected {injected_gain} by \
+                     more than 0.2%",
+                    curve.gain[horizon],
+                    horizon + 1
+                );
+            }
+        }
+        // And the recovered anchor curve carries the whole measured sweep, so the tolerance
+        // above is tight against something with real dynamic range rather than against a line.
+        assert!(fit.anchor.gain[0] / fit.anchor.gain[191] > 2.);
+    }
+
+    /// A horizon whose own block measured a non-positive amplitude is GATED and NAMED, and its
+    /// applied gain is neither clamped to zero nor reported as a measurement it is not.
+    ///
+    /// Three facts have to hold at once and each one fails a different plausible bug: the
+    /// APPLIED curve stays strictly positive there (the fit runs on `ln g`, and a negative
+    /// applied gain would invert every position at that horizon rather than shrink it); the
+    /// MEASUREMENT survives signed and unrounded, because that is the only evidence a sizing
+    /// consumer has; and the sizing decision is a refusal that names the horizon and its value,
+    /// because an all-zero book with no stated reason is indistinguishable from a broken
+    /// pipeline. A silent clamp would satisfy the first and destroy the other two.
+    #[test]
+    fn a_nonpositive_measured_gain_gates_its_horizon_to_zero_size_and_is_named_not_clamped() {
+        let horizons = 64;
+        let mut moments = injected(
+            horizons,
+            CHANNELS as usize,
+            400_000.,
+            |h| measured_shape(h + 1).recip(),
+            |_| 1.,
+            0.06,
+        );
+        // A sign-inverted anchor at h = 41..44: the forecast points the wrong way there, which
+        // is a measurement and not a magnitude error.
+        for horizon in 40..44 {
+            for channel in 0..moments.channels {
+                let cell = horizon * moments.channels + channel;
+                moments.anchor_target[cell] = -moments.anchor_target[cell];
+            }
+        }
+        // And h = 50 identifies nothing at all: a constant forecast, so there is no amplitude
+        // to have a sign. Unmeasured and negative are different findings and the gate has to
+        // keep them apart.
+        for channel in 0..moments.channels {
+            let cell = 50 * moments.channels + channel;
+            moments.anchor_square[cell] = 0.;
+            moments.anchor_target[cell] = 0.;
+            moments.offset_square[cell] = 0.;
+            moments.offset_target[cell] = 0.;
+        }
+        let frozen = MeanCalibration::fit(blocks(), &moments).unwrap().frozen();
+        // A negative measurement is not a broken checkpoint: it authenticates.
+        frozen.validate(horizons).unwrap();
+        for horizon in 41..=44 {
+            let measured = frozen.measured_anchor[horizon - 1].expect("a signed measurement");
+            assert!(
+                measured < 0.,
+                "h={horizon} lost its negative measurement to a clamp: {measured}"
+            );
+            assert!(
+                frozen.anchor[horizon - 1] > 0.,
+                "the applied gain at h={horizon} left the positive range: {}",
+                frozen.anchor[horizon - 1]
+            );
+            assert!(!frozen.tradable(horizon));
+        }
+        assert_eq!(frozen.measured_anchor[50], None);
+        assert!(!frozen.tradable(51));
+        // Every OTHER horizon is untouched: a gate that swallowed its neighbours would zero the
+        // whole book on four bad horizons.
+        for horizon in [1, 40, 45, 50, 52, 64] {
+            assert!(frozen.tradable(horizon), "h={horizon} was gated by a neighbour");
+        }
+        assert_eq!(
+            frozen.gated().iter().map(|(h, _)| *h).collect::<Vec<_>>(),
+            [41, 42, 43, 44, 51]
+        );
+        // The deployed decision, on the deployed call: named with its own value, and `None`
+        // wherever nothing gates.
+        let refusal = frozen
+            .sizing_refusal(&[42, 1])
+            .expect("a gated exit horizon must refuse to size");
+        assert!(
+            refusal.starts_with("h42 at -") && !refusal.contains("h1"),
+            "the refusal must name the gated horizon at its measured value: {refusal}"
+        );
+        assert_eq!(frozen.sizing_refusal(&[51, 1]).as_deref(), Some("h51 unmeasured"));
+        assert_eq!(frozen.sizing_refusal(&[45, 1]), None);
     }
 
     #[test]
@@ -1221,7 +1732,6 @@ mod tests {
         };
         let moments = injected(horizons, CHANNELS as usize, 400_000., noisy, |_| 1., 0.06);
         let fit = MeanCalibration::fit(blocks(), &moments).unwrap();
-        assert!(fit.anchor.unidentifiable.is_none());
         let error = |curve: &[f64]| -> f64 {
             (0..horizons)
                 .map(|i| (curve[i] - measured_shape(i + 1)).powi(2))
@@ -1345,6 +1855,18 @@ mod tests {
         }
         let fit = MeanCalibration::fit(blocks(), &moments).unwrap();
         assert!(fit.anchor.weight[30..40].iter().all(|weight| *weight == 0.));
+        // The unsolved horizons' amplitude cost is a GAP on the moment panel, never 0.0: a
+        // zero there is a measurement - "fixing this horizon's amplitude is worth nothing" -
+        // and it is also the value that would pass the intercept gate on evidence that does
+        // not exist. The intercept ceiling stays measured, because the TARGET moments are
+        // untouched at these horizons; only the forecast's amplitude vanished.
+        assert!(
+            fit.amplitude_cost[30..40].iter().all(|cost| cost.is_nan()),
+            "an unmeasured amplitude cost was folded to a value: {:?}",
+            &fit.amplitude_cost[30..40]
+        );
+        assert!(fit.amplitude_cost[..30].iter().all(|cost| *cost > 0.));
+        assert!(fit.intercept_ceiling.iter().all(|share| share.is_finite()));
         for horizon in 30..40 {
             let (low, high) = (
                 fit.anchor.gain[29].min(fit.anchor.gain[40]) * 0.7,
@@ -1359,8 +1881,54 @@ mod tests {
         }
     }
 
+    /// The measured shares of job 6004, as a fixture: a NEGLIGIBLE close-channel intercept
+    /// under a large POOLED four-channel one.
+    ///
+    /// `close_share` and `intrabar_share` are each set as `bars·ȳ_c²/Σy_c²` exactly, so the two
+    /// competing quantities are stated rather than approached. Only `target` is touched, and
+    /// `target` enters nothing but the intercept ceiling, so the solve, the weights and the
+    /// amplitude cost are bit-identical to the population the fit was already tested on: the
+    /// gate is the only thing under test.
+    fn with_intercept(moments: &mut Moments, close_share: f64, intrabar_share: f64) {
+        for horizon in 0..moments.pred_len {
+            for channel in 0..moments.channels {
+                let cell = horizon * moments.channels + channel;
+                let share = if channel == CLOSE_CHANNEL {
+                    close_share
+                } else {
+                    intrabar_share
+                };
+                moments.target[cell] =
+                    (share * moments.target_square[cell] * moments.bars[horizon]).sqrt();
+            }
+        }
+    }
+
+    /// `Σ_c bars·ȳ_c²/Σ_c Σy_c²` - the four-channel pooled intercept the gate used to read.
+    /// Computed here from the moment fields, so what the test calls "the quantity that produced
+    /// the bad run" is arithmetic in the test and not a call into the code under test.
+    fn pooled_intercept(moments: &Moments, horizon: usize) -> f64 {
+        let (mut earnable, mut persistence) = (0., 0.);
+        for channel in 0..moments.channels {
+            let cell = horizon * moments.channels + channel;
+            earnable += moments.target[cell] * moments.target[cell] / moments.bars[horizon];
+            persistence += moments.target_square[cell];
+        }
+        earnable / persistence
+    }
+
+    /// THE CASE THAT PRODUCED THE BAD RUN. A block whose close-channel intercept is negligible
+    /// and whose POOLED four-channel intercept is two orders of magnitude larger must be
+    /// FITTED, at every horizon.
+    ///
+    /// The pooled quantity is nonzero on any candle data whatsoever - a bar's high is never
+    /// below its close - and it is the intrabar spread, which is what the offset COORDINATE
+    /// absorbs. Job 6004 charged it to the intercept and blanked all 192 horizons in both
+    /// coordinates. The fixture states both shares at the run's own measured values, and the
+    /// test asserts the discriminating fact in both directions: the pooled quantity WOULD have
+    /// refused, and the registered close-channel one does not.
     #[test]
-    fn an_intercept_worth_more_than_a_tenth_of_the_amplitude_error_applies_no_gain() {
+    fn a_large_pooled_intercept_over_a_negligible_close_one_is_fitted_at_every_horizon() {
         let horizons = 32;
         let mut moments = injected(
             horizons,
@@ -1370,22 +1938,156 @@ mod tests {
             |_| 1.,
             0.06,
         );
-        // A target mean large enough that a constant forecast would earn a comparable share of
-        // the same MSE: the pure-gain parameterization is refused, and refused as a VALUE - the
-        // identity with its reason - rather than as an error that would abort the run.
+        // 4.63e-5 is the control checkpoint's own close-channel margin; 0.1 per intrabar
+        // channel reproduces the 7.535e-2 the pooled quantity read at h = 1 on job 6004.
+        with_intercept(&mut moments, 4.63e-5, 0.1);
+        let fit = MeanCalibration::fit(blocks(), &moments)
+            .expect("a negligible close-channel intercept must not refuse a pure gain");
+        assert!(
+            fit.intercept_refused.is_empty(),
+            "refused {:?} on an intercept the close channel does not carry",
+            fit.intercept_refused
+        );
         for horizon in 0..horizons {
-            for channel in 0..moments.channels {
-                let cell = horizon * moments.channels + channel;
-                moments.target[cell] =
-                    (0.5 * moments.target_square[cell] * moments.bars[horizon]).sqrt();
-            }
+            let (close, pooled) = (fit.intercept_ceiling[horizon], pooled_intercept(&moments, horizon));
+            let cost = fit.amplitude_cost[horizon];
+            assert!(
+                (close - 4.63e-5).abs() < 1e-9,
+                "the ceiling must be the close channel's stated share, got {close} at h={}",
+                horizon + 1
+            );
+            assert!(
+                pooled > 1e3 * close && pooled > INTERCEPT_CEILING_SHARE * cost,
+                "the fixture must actually carry the defect: pooled {pooled} against close \
+                 {close} and cost {cost} at h={}",
+                horizon + 1
+            );
+            assert!(
+                close <= INTERCEPT_CEILING_SHARE * cost,
+                "close intercept {close} against {INTERCEPT_CEILING_SHARE} of the {cost} \
+                 amplitude cost at h={}",
+                horizon + 1
+            );
         }
-        let fit = MeanCalibration::fit(blocks(), &moments).unwrap();
-        let reason = fit.anchor.unidentifiable.clone().expect("a named refusal");
-        assert!(reason.contains("pure gain is the wrong parameterization"), "{reason}");
-        assert!(fit.frozen().is_identity());
-        // And the measured population passes it: the control checkpoint's worst intercept
-        // ceiling is 4.63e-5 against a 2.995e-2 worst amplitude cost.
+        // And the fit is a real one, not the identity a refusal used to ship: the injected
+        // amplitude error is 1/0.6, so every horizon must come back at 0.6.
+        assert_eq!(fit.anchor.identified, horizons);
+        assert!(
+            fit.anchor.gain.iter().all(|gain| (gain - 0.6).abs() < 1e-3),
+            "{:?}",
+            fit.anchor.gain
+        );
+    }
+
+    /// A genuinely dominant close intercept at ONE horizon refuses THAT horizon and leaves the
+    /// others fitted.
+    ///
+    /// This is the whole content of the per-horizon axis: the registered statement is "could
+    /// earn at that horizon", the two quantities peak at opposite ends of the axis (h = 1 for
+    /// the intercept, past h = 170 for the amplitude cost), and a max-against-max comparison
+    /// let one short horizon blank the other 191.
+    #[test]
+    fn a_dominant_intercept_refuses_its_own_horizon_and_leaves_the_rest_fitted() {
+        let horizons = 32;
+        let refused_index = 10;
+        let mut moments = injected(
+            horizons,
+            CHANNELS as usize,
+            400_000.,
+            |_| 1. / 0.6,
+            |_| 1.,
+            0.06,
+        );
+        with_intercept(&mut moments, 4.63e-5, 0.1);
+        // One horizon where a constant forecast really could earn half the persistence MSE.
+        let cell = refused_index * moments.channels + CLOSE_CHANNEL;
+        moments.target[cell] = (0.5 * moments.target_square[cell] * moments.bars[refused_index]).sqrt();
+        let fit = MeanCalibration::fit(blocks(), &moments)
+            .expect("one refused horizon must not refuse the fit");
+        assert_eq!(
+            fit.intercept_refused,
+            vec![InterceptRefusal {
+                horizon: refused_index + 1,
+                intercept: fit.intercept_ceiling[refused_index],
+                amplitude_cost: fit.amplitude_cost[refused_index],
+            }],
+            "exactly one horizon carries a dominant intercept and it must be named with both \
+             of its competing quantities"
+        );
+        assert!((fit.intercept_ceiling[refused_index] - 0.5).abs() < 1e-9);
+        // Its own evidence is dropped from BOTH curves - one joint solve produces both gains -
+        // and every other horizon keeps its weight.
+        assert_eq!(fit.anchor.weight[refused_index], 0.);
+        assert_eq!(fit.offset.weight[refused_index], 0.);
+        assert_eq!(fit.anchor.identified, horizons - 1);
+        assert_eq!(fit.offset.identified, horizons - 1);
+        for horizon in 0..horizons {
+            if horizon == refused_index {
+                continue;
+            }
+            assert!(fit.anchor.weight[horizon] > 0., "h={} lost its weight", horizon + 1);
+            assert!(
+                (fit.anchor.gain[horizon] - 0.6).abs() < 1e-3,
+                "h={} was blanked by another horizon's refusal: {}",
+                horizon + 1,
+                fit.anchor.gain[horizon]
+            );
+        }
+        // The refused horizon is still SCORED, under the gain its neighbours' evidence gives
+        // it through the roughness prior and bounded above by the identity. Not 1, which is
+        // what a whole-axis refusal used to ship and what `AmplitudeSplit::ratios` cannot tell
+        // from a measured unit amplitude.
+        assert!(
+            (fit.anchor.gain[refused_index] - 0.6).abs() < 1e-3
+                && (fit.anchor.gain[refused_index] - 1.).abs() > 0.1,
+            "the refused horizon must be carried by its neighbours, not frozen at 1: {}",
+            fit.anchor.gain[refused_index]
+        );
+        // Its measurement survives unmodified - the refusal is about the parameterization, not
+        // about the number - and it is the SIZING gate that names it.
+        let frozen = fit.frozen();
+        assert!((fit.anchor.measured_gain[refused_index] - 0.6).abs() < 1e-9);
+        assert_eq!(frozen.measured_anchor[refused_index], Some(0.6));
+        assert!(!frozen.tradable(refused_index + 1));
+        assert!(frozen.tradable(refused_index) && frozen.tradable(refused_index + 2));
+        assert_eq!(frozen.gated().len(), 1);
+        let refusal = frozen
+            .sizing_refusal(&[refused_index + 1, 1])
+            .expect("a refused exit horizon must refuse to size");
+        assert!(
+            refusal.starts_with(&format!("h{} intercept dominates", refused_index + 1))
+                && refusal.contains("5.000e-1")
+                && !refusal.contains("h1 "),
+            "{refusal}"
+        );
+        frozen.validate(horizons).unwrap();
+    }
+
+    /// An axis on which EVERY horizon's intercept dominates has no pure-gain parameterization
+    /// to fit, and that aborts - naming the count and the refusing pairs - rather than shipping
+    /// a curve of ones that no downstream artifact can tell from a measurement.
+    #[test]
+    fn an_intercept_that_dominates_every_horizon_aborts_the_fit() {
+        let horizons = 32;
+        let mut moments = injected(
+            horizons,
+            CHANNELS as usize,
+            400_000.,
+            |_| 1. / 0.6,
+            |_| 1.,
+            0.06,
+        );
+        with_intercept(&mut moments, 0.5, 0.1);
+        let error = MeanCalibration::fit(blocks(), &moments)
+            .expect_err("an intercept above the pre-registered share at every horizon must refuse")
+            .to_string();
+        assert!(
+            error.contains("declined the pure-gain parameterization at 32 of 32 horizons")
+                && error.contains("h=1 5.000e-1 against")
+                && error.contains("indistinguishable from a measured unit amplitude"),
+            "{error}"
+        );
+        // And a zero-mean population leaves nothing to earn at all.
         let control = injected(
             horizons,
             CHANNELS as usize,
@@ -1395,15 +2097,93 @@ mod tests {
             0.06,
         );
         let fit = MeanCalibration::fit(blocks(), &control).unwrap();
-        assert!(fit.anchor.unidentifiable.is_none());
         assert!(
             fit.intercept_ceiling.iter().all(|ceiling| *ceiling == 0.),
             "a zero-mean target population must leave no intercept to earn"
         );
+        assert!(fit.intercept_refused.is_empty());
     }
 
+    /// The three SIZING refusals stay THREE findings in the emitted record: a refused
+    /// parameterization, a measured non-positive amplitude, and no measurement at all.
+    ///
+    /// All three produce the same all-zero book - sizing is affine in the mean - so one
+    /// sentinel for all three is how that book stops being explicable. Each is built out of the
+    /// moments rather than edited into the frozen gain afterwards, so the record under test is
+    /// one the estimator actually produces.
     #[test]
-    fn a_constant_forecast_yields_the_identity_with_its_reason_rather_than_an_error() {
+    fn the_three_sizing_refusals_remain_distinguishable_in_the_frozen_record() {
+        let horizons = 32;
+        let (dominated, inverted, silent) = (10usize, 20usize, 25usize);
+        let mut moments = injected(
+            horizons,
+            CHANNELS as usize,
+            400_000.,
+            |_| 1. / 0.6,
+            |_| 1.,
+            0.06,
+        );
+        with_intercept(&mut moments, 4.63e-5, 0.1);
+        let close = |horizon: usize| horizon * moments.channels + CLOSE_CHANNEL;
+        moments.target[close(dominated)] =
+            (0.5 * moments.target_square[close(dominated)] * moments.bars[dominated]).sqrt();
+        for channel in 0..moments.channels {
+            let cell = inverted * moments.channels + channel;
+            // A measured NEGATIVE amplitude: the forecast points the wrong way here, which is a
+            // measurement and not a failure, and it may never be clamped.
+            moments.anchor_target[cell] = -moments.anchor_target[cell];
+            let empty = silent * moments.channels + channel;
+            // No anchor energy at all: the solve degrades to rank 1 and the anchor is honestly
+            // unmeasured. Its intercept goes with it - a horizon with no anchor to gain has no
+            // amplitude cost either, and an intercept that earns nothing dominates nothing.
+            moments.anchor_square[empty] = 0.;
+            moments.anchor_target[empty] = 0.;
+            moments.target[empty] = 0.;
+        }
+        let frozen = MeanCalibration::fit(blocks(), &moments)
+            .expect("three gated horizons out of 32 leave a fittable curve")
+            .frozen();
+        let gated = frozen.gated();
+        assert_eq!(gated.len(), 3, "{gated:?}");
+        assert_eq!(gated[0].0, dominated + 1);
+        assert!(
+            matches!(gated[0].1, SizingGate::InterceptDominates { intercept, .. } if (intercept - 0.5).abs() < 1e-9),
+            "{:?}",
+            gated[0].1
+        );
+        assert_eq!(gated[1].0, inverted + 1);
+        assert!(
+            matches!(gated[1].1, SizingGate::NonPositiveGain(gain) if gain < 0.),
+            "{:?}",
+            gated[1].1
+        );
+        assert_eq!(gated[2], (silent + 1, SizingGate::Unmeasured));
+        // Distinguishable as TEXT too, which is the only form a report or an account's
+        // assumption list carries them in.
+        let named: Vec<String> = gated
+            .iter()
+            .map(|(horizon, gate)| format!("h{horizon} {gate}"))
+            .collect();
+        assert!(named[0].contains("intercept dominates") && named[0].contains("5.000e-1"));
+        assert!(named[1].contains(" at -"));
+        assert!(named[2].ends_with("unmeasured"));
+        assert_eq!(
+            frozen.sizing_refusal(&[dominated + 1, inverted + 1, silent + 1]),
+            Some(named.join(", "))
+        );
+        // Every OTHER horizon is untouched: three gated horizons may not zero the book.
+        assert_eq!(frozen.sizing_refusal(&[1, horizons]), None);
+        frozen.validate(horizons).unwrap();
+    }
+
+    /// A block with no calibratable amplitude ABORTS. It used to produce the identity with a
+    /// reason attached, which is the defect this test exists to keep out: the reason lives in
+    /// a struct field nothing on a chart reads, while the gain of 1 it ships is bit-identical
+    /// to a measured unit amplitude - so `AmplitudeSplit::ratios` renders the `calibrated`
+    /// series as an exact copy of the `uncalibrated` one and the run reports a calibration it
+    /// never performed.
+    #[test]
+    fn a_constant_forecast_aborts_the_fit_instead_of_freezing_the_identity() {
         let horizons = 8;
         let moments = Moments {
             pred_len: horizons,
@@ -1417,14 +2197,14 @@ mod tests {
             anchor_target: vec![0.; horizons * CHANNELS as usize],
             offset_target: vec![0.; horizons * CHANNELS as usize],
         };
-        let fit = MeanCalibration::fit(blocks(), &moments).unwrap();
-        for curve in [&fit.anchor, &fit.offset] {
-            let reason = curve.unidentifiable.clone().expect("a named refusal");
-            assert!(reason.contains("nothing to fit a gain curve on"), "{reason}");
-            assert!(curve.gain.iter().all(|gain| *gain == 1.));
-        }
-        fit.frozen().validate(horizons).unwrap();
-        assert!(fit.frozen().is_identity());
+        let error = MeanCalibration::fit(blocks(), &moments)
+            .expect_err("a constant forecast has no amplitude to fit")
+            .to_string();
+        assert!(
+            error.contains("nothing to fit a gain curve on")
+                && error.contains("indistinguishable from a measured unit amplitude"),
+            "{error}"
+        );
     }
 
     #[test]
@@ -1507,9 +2287,15 @@ mod tests {
             (gained_rho - raw_rho).abs() < 1e-15,
             "a per-horizon gain moved the correlation from {raw_rho} to {gained_rho}"
         );
-        // And the MSE-optimal gain is exactly the correction the solve returns.
+        // And the MSE-optimal gain is exactly the correction the solve returns. This population
+        // is close-anchor only, so the design is rank 1 and the offset coordinate is honestly
+        // unmeasured rather than a fabricated zero.
         let solved = solve_horizon(&moments, 0).expect("an identified horizon");
-        assert!((solved.anchor - dot(&forecast, &target) / dot(&forecast, &forecast)).abs() < 1e-12);
+        assert_eq!(solved.offset, None);
+        assert!(
+            (solved.anchor.unwrap() - dot(&forecast, &target) / dot(&forecast, &forecast)).abs()
+                < 1e-12
+        );
     }
 
     #[test]
@@ -1559,5 +2345,66 @@ mod tests {
         assert!(refusal.contains("calibration partition"), "{refusal}");
         let refusal = Blocks::spanning(&calibration, &[]).unwrap_err().to_string();
         assert!(refusal.contains("evaluation partition"), "{refusal}");
+    }
+
+    /// The refusal that stopped job 5998, and the proof that the per-ticker formulation admits
+    /// it while still refusing a real overlap.
+    ///
+    /// Two names of different history length: `LONG` trades through the whole span, `SHORT`
+    /// goes quiet across the shared boundary so its own band edges land 40 slots earlier. Each
+    /// name's calibration targets complete before its OWN first evaluation origin, and the two
+    /// blocks nevertheless interleave on the global wall clock - `SHORT` is scored while `LONG`
+    /// is still being fitted. That is the corpus's real shape, and the pooled guard cannot pass
+    /// it no matter how the corpus is drawn.
+    #[test]
+    fn per_ticker_blocks_that_interleave_globally_are_proven_rather_than_refused() {
+        let step = 300_000i64;
+        let base = 1_700_000_000_000i64;
+        let at = |slot: i64| base + slot * step;
+        let block = |ticker: usize, first: i64, last: i64| -> Vec<DatedOrigin> {
+            (first..last).map(|slot| (ticker, at(slot), at(slot + 2))).collect()
+        };
+        // LONG: fit [100, 140), scored [155, 200). SHORT: fit [60, 100), scored [110, 130).
+        let calibration = [block(0, 100, 140), block(1, 60, 100)].concat();
+        let evaluation = [block(0, 155, 200), block(1, 110, 130)].concat();
+        // The pooled guard compares LONG's last target (slot 141) against SHORT's first scored
+        // origin (slot 110) and refuses a split in which no ticker shares a bar with itself.
+        let pooled = |rows: &[DatedOrigin]| -> Vec<(i64, i64)> {
+            rows.iter().map(|(_, origin, target)| (*origin, *target)).collect()
+        };
+        let refusal = Blocks::spanning(&pooled(&calibration), &pooled(&evaluation))
+            .unwrap_err()
+            .to_string();
+        assert!(refusal.contains("share bars"), "{refusal}");
+        let name = |ticker: usize| ["LONG", "SHORT"][ticker].to_owned();
+        let blocks = Blocks::per_ticker(&calibration, &evaluation, 2, name).unwrap();
+        assert_eq!(blocks.calibration_origins, 80);
+        assert_eq!(blocks.evaluation_origins, 65);
+        assert_eq!(blocks.calibration_first_origin_ms, at(60));
+        assert_eq!(blocks.calibration_last_target_ms, at(141));
+        assert_eq!(blocks.evaluation_first_origin_ms, at(110));
+        // SHORT's own separation, 110 - 101, is tighter than LONG's 155 - 141, and the
+        // smallest per-ticker gap is the only number in this pair that claims anything.
+        assert_eq!(blocks.purge_gap_ms, 9 * step);
+
+        // A ticker whose own targets reach its own scored block is still refused, by name.
+        let leaking = [block(0, 100, 140), block(1, 60, 110)].concat();
+        let refusal = Blocks::per_ticker(&leaking, &evaluation, 2, name)
+            .unwrap_err()
+            .to_string();
+        assert!(refusal.contains("SHORT"), "{refusal}");
+        assert!(!refusal.contains("LONG"), "{refusal}");
+        assert!(refusal.contains("1 of 2 tickers"), "{refusal}");
+        assert!(refusal.contains("2-step target"), "{refusal}");
+        // Both dates, in a unit a human can read and in the epoch milliseconds a log grep
+        // needs: the old message printed two bare integers and no ticker at all.
+        assert!(refusal.contains(&iso_ms(at(111))), "{refusal}");
+        assert!(refusal.contains(&format!("{}", at(110))), "{refusal}");
+
+        // A split whose two sides share no instrument is not a scored fit either.
+        let refusal = Blocks::per_ticker(&block(0, 100, 140), &block(1, 150, 200), 2, name)
+            .unwrap_err()
+            .to_string();
+        assert!(refusal.contains("no ticker carries origins in both"), "{refusal}");
     }
 }

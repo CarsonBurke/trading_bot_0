@@ -1,6 +1,9 @@
 use super::{
     benchmark::{self, HardwareSampler},
-    calibration::{Blocks, FrozenGain, MeanCalibration, Moments, Pairing, CLOSE_CHANNEL},
+    calibration::{
+        Blocks, DatedOrigin, FrozenGain, InterceptRefusal, MeanCalibration, Moments, Pairing,
+        SizingGate, CLOSE_CHANNEL, INTERCEPT_CEILING_SHARE,
+    },
     compute::{
         Engine, LrSchedule, LrTrajectory, MlpDownLr, OptimizerKind, RecipeKnobs,
         CAPTURE_AFTER_STEPS, NANOGPT_COOLDOWN_FLOOR, NANOGPT_COOLDOWN_FRAC,
@@ -17,7 +20,7 @@ use super::{
         StepPhases, TradingCurve, TradingSplit,
     },
     teacher,
-    supervision::{self, PatchPhase, RowSelection, SupervisionGeometry},
+    supervision::{self, DecimationPlan, PatchPhase, RowSelection, SupervisionGeometry},
     target_basis::{self, TargetBasis},
     utility,
 };
@@ -49,6 +52,30 @@ const AMPLITUDE_ROWS: i64 = 8;
 /// standard error. 512 strided training origins carry ~512 independent long windows per
 /// horizon at a tenth of the sample pass's cost.
 const AMPLITUDE_TRAINING_ORIGINS: usize = 512;
+/// Origins in the calibration-partition FIT draw - the population the applied gain curves are
+/// least-squares-fitted on.
+///
+/// Its own constant and NOT `--eval-origins`, which is what it used to be. That default is
+/// 2048, chosen as the held-out PREVIEW size and inherited here for no reason but that the two
+/// passes cost the same; nothing about the estimator's variance was ever charged against it,
+/// and it is measurably too small. Job 6004 scored the same held-out split twice at step 2500,
+/// once on a 2048-origin strided draw and once on all 433,303 origins, and the close channel's
+/// MSE-optimal gain came back 0.7185 against 1.5407 at h = 1 and 0.5822 against 0.3066 at
+/// h = 192. A gain applied at 0.72 where the population's own answer is 1.54 does not reduce
+/// the amplitude error, it inverts it: the residual cross term `-(β - g)²·Var(f)/P` costs
+/// `(1.54 - 0.72)² = 0.67` against the `(1.54 - 1)² = 0.29` that leaving the gain at 1 costs,
+/// so at 2048 origins the correction is worse than no correction at the short end. The
+/// one-sided three-sigma bound cannot catch it - the error there is a SHRINK, and shrinkage is
+/// unbounded by construction.
+///
+/// 32,768 is 16x that draw, so the standard error of every fitted gain falls by 4 and the
+/// measured h = 1 discrepancy above falls to ~0.21, comfortably inside the 0.54 the correction
+/// is worth. The cost is linear in origins and measured: job 6004 logged 833 ms of scoring for
+/// the step-1000 fit over 2048 calibration plus 512 training origins, i.e. 0.325 ms per
+/// origin, so this adds 30,720 origins ≈ 10.0 s per evaluation - 833 ms becomes ~10.8 s. On
+/// that arm's three evaluations that is +30 s against an 11-minute run, and it is 7.6% of the
+/// full-split pass the same evaluation already pays for.
+const AMPLITUDE_FIT_ORIGINS: usize = 32_768;
 /// A cross-section is only usable if it holds enough tickers for a within-timestamp
 /// correlation and a decile split to mean anything. Visible to [`super::reports`] because the
 /// census panel draws this threshold as a reference line, and a second copy of the number
@@ -164,10 +191,11 @@ pub struct TrainArgs {
     /// TRAINING losses are not step-comparable to a control's.
     #[arg(long, default_value_t = 0)]
     pub in_period_sections: usize,
-    /// Completed full-corpus epochs without improved full-validation NLL.
+    /// Completed full-corpus epochs without an improved held-out full selection objective.
     #[arg(long, default_value_t = 3)]
     pub patience: usize,
-    /// Consecutive held-out sample evaluations (after the first two) without improved NLL.
+    /// Consecutive held-out sample evaluations (after the first two) without an improved
+    /// selection objective.
     #[arg(long, default_value_t = 3)]
     pub preview_patience: usize,
     #[arg(long, default_value_t=true, action=clap::ArgAction::Set)]
@@ -175,13 +203,17 @@ pub struct TrainArgs {
     /// Tickers that must hold a valid bar at a grid timestamp for it to define a market step.
     #[arg(long, default_value_t = 2000)]
     pub market_min_cross_section: usize,
-    /// Optimizer steps the learning-rate warmdown is shaped against, INDEPENDENT of how many
-    /// steps the run takes; 0 shapes it against the whole run (`steps_per_epoch * epochs`),
-    /// which is what every arm did before this knob existed. The cooldown occupies the last
-    /// 60% of the budget and ends at 0.15 of the base rate, so a 5,000-step budget starts
-    /// cooling at step 2,000 and holds 0.15 afterwards, while the 9,590-step epoch that has
-    /// been running holds the full rate until step 3,836 - long after the measured held-out
-    /// NLL optimum at step 2,000.
+    /// Optimizer steps the learning-rate warmdown is shaped against. 0 resolves it: to
+    /// `--max-steps` where a cap is set, and to the whole planned run (`steps_per_epoch *
+    /// epochs`) otherwise. The cooldown occupies the last 60% of the budget and ends at 0.15 of
+    /// the base rate, so a 5,000-step budget starts cooling at step 2,000 and holds 0.15
+    /// afterwards, while a 9,590-step budget holds the full rate until step 3,836.
+    ///
+    /// Stating it OVERRIDES the coupling, which is the only reason the knob still exists:
+    /// `--max-steps 4000 --schedule-budget 9590` runs the first 4,000 steps of exactly the
+    /// trajectory a 9,590-step arm ran, so their curves are step-matched. Leaving it at 0 with a
+    /// cap set means "anneal into the cap", which is what a capped arm read as a finished run
+    /// has to have done.
     #[arg(long, default_value_t = 0)]
     pub schedule_budget: usize,
     /// Hard stop, in optimizer steps: the run shuts down CLEANLY at exactly this step - the
@@ -189,10 +221,13 @@ pub struct TrainArgs {
     /// report base and the manifest all flushed - instead of running to `--epochs` or
     /// `--preview-patience`. 0 is no cap.
     ///
-    /// A run length and nothing else. The warmdown is shaped by `--schedule-budget` alone, so
-    /// `--max-steps 4000 --schedule-budget 9590` runs the first 4,000 steps of exactly the
-    /// trajectory a 9,590-step arm ran and its curves are step-matched against them; a cap
-    /// that also reshaped the schedule would make every short arm a different experiment.
+    /// It is also the default learning-rate budget: with `--schedule-budget` left at 0 the
+    /// warmdown is shaped against the cap, so a capped arm anneals to the 0.15 floor at its
+    /// last step instead of stopping at multiplier 1.0. Six arms were run the other way - the
+    /// cap deliberately absent from the schedule - and at a 2,500-step cap against a 9,590-step
+    /// budget whose cooldown starts at 3,836, every one of them spent EVERY step at the full
+    /// rate and none of them measured an annealed weight state. Pass `--schedule-budget` to get
+    /// the old shape back deliberately.
     ///
     /// A cap at or below the CUDA-graph capture warmup is refused: such an arm never runs a
     /// single captured step, so it does not measure the execution path every baseline ran.
@@ -242,6 +277,12 @@ pub struct TrainArgs {
     /// against tokenization-specific memorization and not a data fix.
     #[arg(long, value_enum, default_value_t = PatchPhase::Fixed)]
     pub patch_phase: PatchPhase,
+    /// Fixed-step research protocol with bounded panels and frozen probes, not full-split promotion.
+    #[arg(long)]
+    pub research_panel: bool,
+    /// Training origins reserved for the research protocol's frozen readout fit.
+    #[arg(long, default_value_t = 2048)]
+    pub probe_fit_origins: usize,
 }
 impl TrainArgs {
     /// Every argument check the run can make before it touches the device or the corpus, and
@@ -325,6 +366,8 @@ impl Default for TrainArgs {
             row_stride_multiple: 1,
             row_fraction: 1.,
             patch_phase: PatchPhase::Fixed,
+            research_panel: false,
+            probe_fit_origins: 2048,
         }
     }
 }
@@ -445,9 +488,9 @@ pub fn evaluate_portfolio(args: PortfolioEvaluateArgs) -> Result<()> {
 /// an uncalibrated head under a calibrated build's labels. New into old: a build that predates
 /// this field reads `v11` in `format` and refuses it by name, which is what stops it from
 /// loading the weights, ignoring the gain, and reporting an over-amplitudinal forecast as
-/// though it were the calibrated one. A checkpoint whose block identified no amplitude carries
-/// the identity explicitly ([`FrozenGain::is_identity`]) - that is a measurement, and it is not
-/// the same statement as a missing field.
+/// though it were the calibrated one. A `v11` checkpoint's curves are always FITTED curves -
+/// the estimator aborts the run rather than freezing an unfittable amplitude as a gain of 1 -
+/// so every coefficient in the field is a measurement.
 const FORMAT_X0_LEARNED: &str =
     "causal-patch-ohlc-universe-v11-head-channel-major-folded-mup-rmsnorm-relu2-lambdas-unet-vres-mean-gain-x0-learned";
 const FORMAT_X0_NONE: &str =
@@ -463,11 +506,10 @@ fn format_stamp(x0_lambdas: X0Lambdas, horizon_mean: HorizonMean) -> String {
     format!("{base}-mean-{}", horizon_mean.stamp())
 }
 /// `_v5`: the objective no longer weights the 192 horizons equally - it weights them by
-/// [`HorizonLoss`](super::model::HorizonLoss), and CHECKPOINT SELECTION now minimizes that same weighted NLL on the
-/// held-out sample instead of the equal-weighted aggregate. Both halves change what a `_v4`
-/// curve is comparable to: a `_v4` point is an equal-weighted objective selected on an
-/// equal-weighted scalar, which is exactly the configuration jobs 5190-5193 refuted. The
-/// targets, the mask and the per-element NLL are unchanged.
+/// [`HorizonLoss`](super::model::HorizonLoss). The targets, the mask and the per-element NLL
+/// are unchanged, and this stamp names the TRAINED quantity only: what a checkpoint was
+/// SELECTED on is [`selection_criterion`]'s own authenticated string, because the two are no
+/// longer the same quantity.
 const OBJECTIVE: &str = "causal_patch_market_neutral_nll_v5";
 const NUMERICS: &str =
     "fp32-masters-fp32-causal-origin-statistics-bf16-causal-SDPA-rope-fp32-decoder-fp64-prices-nanogpt-lr-cooldown-frac=.60-floor=.15";
@@ -482,18 +524,21 @@ const NUMERICS: &str =
 enum Termination {
     /// `--max-steps` reached. Implies nothing about the fit.
     StepCap,
-    /// `--preview-patience` consecutive held-out sample evaluations without improvement.
+    /// `--preview-patience` consecutive held-out sample evaluations without an improved
+    /// selection objective.
     PreviewPatience,
-    /// `--patience` complete epochs without improved held-out full NLL.
+    /// `--patience` complete epochs without an improved held-out full selection objective.
     EpochPatience,
     /// `--epochs` epochs completed: the run length the arm asked for.
     EpochLimit,
 }
 /// Every run-length rule in one place, so the step loop carries no stopping policy of its own
 /// and the policy is testable without a device: which steps report, and which of the four
-/// exits an evaluation has reached.
+/// exits an evaluation has reached. The scalar the patience counters are fed from is
+/// [`scale_free_objective`]; nothing in here reads any NLL.
 ///
-/// The learning-rate schedule is deliberately NOT in here - see [`schedule_budget`].
+/// The learning-rate schedule is deliberately NOT in here - see [`schedule_budget`], which
+/// does now read `--max-steps`.
 #[derive(Clone, Copy, Debug)]
 struct StopRules {
     /// `--max-steps`, `None` when the run is uncapped.
@@ -535,8 +580,9 @@ impl StopRules {
     }
     /// The exit this evaluation has reached, `None` to keep training. Precedence is the order
     /// the reasons are checked: a stalled arm is an early stop even when the cap lands on the
-    /// same evaluation, because "the held-out NLL stopped improving" is the stronger statement
-    /// about the arm, and the cap outranks both epoch exits for the same reason.
+    /// same evaluation, because "the held-out selection objective stopped improving" is the
+    /// stronger statement about the arm, and the cap outranks both epoch exits for the same
+    /// reason.
     fn termination(self, at: Progress) -> Option<Termination> {
         if at.stale_previews >= self.preview_patience {
             return Some(Termination::PreviewPatience);
@@ -553,15 +599,24 @@ impl StopRules {
         (at.epoch >= self.planned_epochs).then_some(Termination::EpochLimit)
     }
 }
-/// The learning-rate schedule's endpoint, in optimizer steps: `--schedule-budget` where it is
-/// stated, and the whole planned run where it is 0, which is what every arm before that knob
-/// existed did by accident. `--max-steps` is absent from the inputs on purpose, and a test
-/// pins the absence: the cap is a run length, and a run length that reshaped the warmdown
-/// would make a short arm's first N steps a different trajectory from the long arms' first N.
+/// The learning-rate schedule's endpoint, in optimizer steps. Three cases, in precedence order:
+/// an explicit `--schedule-budget N` is the budget; a `--max-steps N` cap with no explicit
+/// budget makes the CAP the budget; neither leaves the whole planned run.
+///
+/// The cap used to be absent from these inputs, and a test pinned the absence so a capped arm's
+/// first N steps were the first N steps of a 9,590-step arm's own trajectory. That comparability
+/// was bought at the price of never annealing: the cooldown occupies the last 60% of the budget,
+/// so at the production geometry it starts at step 3,836 and a 2,500-step capped arm spent EVERY
+/// step at multiplier 1.0. Every such arm measured an un-annealed weight state, which is not the
+/// arm anyone intended to run and is the one state a final held-out number must not be read off.
+/// A short arm that wants the long arm's trajectory still gets it by SAYING so -
+/// `--max-steps 4000 --schedule-budget 9590` - which is the shape the step-matched comparison
+/// needs and is now the stated case rather than the silent default.
 fn schedule_budget(args: &TrainArgs, steps_per_epoch: usize) -> usize {
-    match args.schedule_budget {
-        0 => steps_per_epoch * args.epochs,
-        budget => budget,
+    match (args.schedule_budget, args.max_steps) {
+        (0, 0) => steps_per_epoch * args.epochs,
+        (0, cap) => cap,
+        (budget, _) => budget,
     }
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -621,13 +676,15 @@ pub(super) struct Manifest {
     validation_nll: f64,
     validation_mse: f64,
     validation_is_full: bool,
-    /// Step and held-out sample OBJECTIVE-weighted NLL of the checkpoint `weights/best` points
-    /// at; `None` before the first held-out sample evaluation. Renamed from `best_preview_nll`
-    /// with `_v5`: the quantity minimized here is the training objective's weighted NLL, not
-    /// the equal-weighted aggregate the old name meant, and a silently redefined field is
-    /// worse than a renamed one.
+    /// Step and held-out sample SELECTION objective of the checkpoint `weights/best` points
+    /// at; `None` before the first held-out sample evaluation. Renamed from
+    /// `best_objective_nll`: the minimized quantity is no longer any NLL but the horizon-
+    /// weighted close MSE ratio at each horizon's own best scale
+    /// ([`scale_free_objective`]), and a silently redefined field is worse than a renamed one.
+    /// The held-out NLLs are still written - `validation_nll` above, and the reports - they
+    /// are simply not what chose this checkpoint.
     best_step: Option<usize>,
-    best_objective_nll: Option<f64>,
+    best_scale_free_objective: Option<f64>,
     /// The selection criterion, spelled out. `horizon_loss` lives in `model`; this states what
     /// was DONE with it, so a manifest answers "what was this checkpoint chosen to be good at"
     /// without the reader having to know the build.
@@ -639,10 +696,12 @@ pub(super) struct Manifest {
     /// digest below authenticates the curve along with everything else, so a gain cannot be
     /// re-aimed at another checkpoint by editing a file.
     ///
-    /// NOT part of the selection criterion. `best_objective_nll` above is the UN-GAINED
-    /// model's held-out sample NLL, because a mean gain with no matching σ refit makes NLL
-    /// worse even where it makes MSE better, and moving the selection scalar mid-experiment
-    /// would break comparability against every checkpoint already on disk.
+    /// NOT part of the selection criterion, and now for a sharper reason than before: the
+    /// selection scalar divides out amplitude already. Its conditional term `ρ²` is exactly
+    /// invariant to any positive per-horizon gain, and the only part a gain touches is the
+    /// unconditional tilt, measured at `4.63e-5` of the close persistence MSE on the control
+    /// checkpoint against a `2.995e-2` amplitude cost. So scoring the selection pass through
+    /// this curve could not change which step is chosen, and the pass stays un-gained.
     mean_gain: FrozenGain,
     weights_sha256: String,
     manifest_sha256: String,
@@ -659,7 +718,7 @@ impl Manifest {
                 .collect(),
         )
     }
-    fn read(directory: &Path) -> Result<Self> {
+    pub(super) fn read(directory: &Path) -> Result<Self> {
         let raw: serde_json::Value =
             serde_json::from_slice(&fs::read(directory.join("manifest.json"))?)?;
         let field = |name: &str| {
@@ -687,6 +746,10 @@ impl Manifest {
         );
         let manifest: Self = serde_json::from_value(raw)?;
         manifest.model.validate()?;
+        ensure!(
+            !manifest.model.jepa_mode.enabled() && manifest.model.future_calendar,
+            "research parameter contracts require the authenticated LeJEPA research loader"
+        );
         ensure!(
             stamp == format_stamp(manifest.model.x0_lambdas, manifest.model.horizon_mean),
             "checkpoint format {stamp:?} does not match the {:?} x0 mode and {} mean its own \
@@ -738,7 +801,7 @@ impl Manifest {
     /// half is a digest over the whole contract because a calibration fitted against one
     /// universe, split boundary or market construction describes a different `β̂` even at
     /// identical weights.
-    fn pairing(&self, corpus: &CorpusContract) -> Result<Pairing> {
+    pub(super) fn pairing(&self, corpus: &CorpusContract) -> Result<Pairing> {
         Ok(Pairing {
             checkpoint_format: self.format.clone(),
             objective: self.objective.clone(),
@@ -757,23 +820,107 @@ impl Manifest {
             .collect(),
         })
     }
+
+    /// Attribution only: deliberately excludes historical evaluation/selection metric values.
+    pub(super) fn accuracy_identity(&self) -> serde_json::Value {
+        serde_json::json!({
+            "format": self.format,
+            "model": self.model,
+            "objective": self.objective,
+            "numerics": self.numerics,
+            "seed": self.seed,
+            "step": self.step,
+            "epoch": self.epoch,
+            "completed_origins": self.completed_origins,
+            "batch_size": self.batch_size,
+            "max_steps": self.max_steps,
+            "planned_epochs": self.planned_epochs,
+            "termination": self.termination,
+            "base_learning_rate": self.base_learning_rate,
+            "scalar_lr_mult": self.scalar_lr_mult,
+            "optimizer": self.optimizer,
+            "optimizer_recipe": self.optimizer_recipe,
+            "selection": self.selection,
+            "mean_gain": {
+                "status": "authenticated frozen curves applied",
+                "estimator": self.mean_gain.estimator,
+                "calibration_blocks": self.mean_gain.blocks,
+            },
+            "weights_sha256": self.weights_sha256,
+            "manifest_sha256": self.manifest_sha256,
+        })
+    }
+
+    pub(super) fn calibration_last_target_ms(&self) -> i64 {
+        self.mean_gain.blocks.calibration_last_target_ms
+    }
+
+    /// The same authenticated, calibrated loading path as `load_checkpoint`, with an already
+    /// authenticated corpus so comparison consumers do not reload the whole universe.
+    pub(super) fn load_model(
+        &self,
+        checkpoint: &Path,
+        corpus: &Corpus,
+        device: Device,
+    ) -> Result<(nn::VarStore, CausalPatchModel)> {
+        ensure!(
+            corpus.contract == self.data,
+            "dataset differs from authenticated universe/splits"
+        );
+        ensure!(
+            self.weights_sha256 == file_sha256(checkpoint.join("model.safetensors"))?,
+            "checkpoint weights changed after authentication"
+        );
+        let mut store = nn::VarStore::new(device);
+        let mut model = CausalPatchModel::new(&store.root(), &self.model);
+        store
+            .load(checkpoint.join("model.safetensors"))
+            .context("loading universe checkpoint")?;
+        check_head_layout(
+            store
+                .variables()
+                .get("head.output.weight")
+                .context("checkpoint has no head output weight")?,
+        )?;
+        model.set_mean_gain(&self.mean_gain)?;
+        println!(
+            "CausalPatch applying the checkpoint's own mean calibration, fitted on {} reserved calibration-partition origins ending {}: anchor gain {:.4} at h=1 and {:.4} at h={}, intrabar offset gain {:.4} and {:.4}",
+            self.mean_gain.blocks.calibration_origins,
+            self.mean_gain.blocks.calibration_last_origin_ms,
+            self.mean_gain.anchor[0],
+            self.mean_gain.anchor[self.data.pred_len - 1],
+            self.data.pred_len,
+            self.mean_gain.offset[0],
+            self.mean_gain.offset[self.data.pred_len - 1]
+        );
+        store.freeze();
+        Ok((store, model))
+    }
 }
 /// What `weights/best` is chosen to minimize, stamped into every manifest. Selection and the
 /// gradient read the SAME horizon weighting by construction: both come from
-/// `model.horizon_weights()`, so no arm can be selected on an objective it was not trained on.
+/// `model.horizon_weights()`, so no arm can be selected on horizons its own loss weights at
+/// zero. What they no longer share is the QUANTITY - the gradient minimizes a predictive NLL
+/// and selection minimizes [`scale_free_objective`], a ratio of the mean alone - and that is
+/// the whole point of the change: the NLL's learned `log_scale` absorbs exactly the mean error
+/// a checkpoint is wanted for.
 ///
-/// The amplitude prior is part of the minimized quantity, so it is named here too - and only
-/// when it is on, so a control manifest written before the knob existed still authenticates
-/// against the identical string. `Manifest::read` cross-checks this against the manifest's own
-/// `model`, which is what makes a penalized arm impossible to read as an unpenalized one.
+/// Every checkpoint on disk carries the old `objective-weighted NLL` string, and
+/// [`Manifest::read`] cross-checks this against the manifest's own `model`, so those
+/// checkpoints are refused by name rather than loaded as if this build had chosen them.
+///
+/// The amplitude prior is named here even though it is a TRAINING loss term and not part of the
+/// selection scalar: this string is also the authentication that a penalized arm cannot be read
+/// as an unpenalized one, and it is only appended when the prior is on, so a control manifest
+/// authenticates against the identical string whether or not the knob exists.
 fn selection_criterion(model: &ModelConfig) -> String {
     let base = format!(
-        "min held-out sample objective-weighted NLL (horizon-loss={})",
+        "min held-out sample horizon-weighted close best-scale MSE ratio (horizon-loss={})",
         model.horizon_loss
     );
     if model.amplitude_prior > 0. {
         format!(
-            "{base} plus mean-amplitude prior (amplitude-prior lambda {})",
+            "{base}, trained with a mean-amplitude prior (amplitude-prior lambda {})",
             model.amplitude_prior
         )
     } else {
@@ -996,33 +1143,87 @@ impl Drop for Prefetcher {
 /// targets while the model's forecast stays `ŷ` (market forecast zero), so its MSE ratio is
 /// comparable with runs trained on raw returns. NLL, calibration, and the per-horizon
 /// robustness diagnostics are relative only.
-struct Evaluation {
-    nll: f64,
+pub(super) struct Evaluation {
+    pub(super) nll: f64,
+    /// The existing Gaussian NLL reduction retained by horizon for paired accuracy reports.
+    pub(super) horizon_nll: Vec<f64>,
+    pub(super) horizon_persistence_nll: Vec<f64>,
     /// The held-out NLL under the TRAINING objective's horizon weighting, `Σ w·mask·nll /
-    /// Σ w·mask·CHANNELS`. This is what selects checkpoints and drives early stopping; `nll`
-    /// above stays the equal-weighted aggregate every report charts, so the two are the same
-    /// number under `--horizon-loss uniform` and deliberately different otherwise.
+    /// Σ w·mask·CHANNELS`. REPORTED, never selected on - see
+    /// [`Self::scale_free_objective`] for what replaced it and why; `nll` above stays the
+    /// equal-weighted aggregate every report charts, so the two are the same number under
+    /// `--horizon-loss uniform` and deliberately different otherwise.
     objective_nll: f64,
-    persistence_nll: f64,
-    mse: f64,
-    persistence_mse: f64,
-    absolute_mse: f64,
-    absolute_persistence_mse: f64,
-    within_1_sigma: f64,
-    within_2_sigma: f64,
+    /// What `weights/best`, `--preview-patience` and `--patience` minimize: the training
+    /// objective's own horizon weighting applied to the close channel's MSE ratio AT ITS OWN
+    /// BEST SCALE, computed by [`scale_free_objective`] from [`Self::trading`]. Free: one host
+    /// weighted mean over a curve the pass already produced.
+    scale_free_objective: f64,
+    pub(super) persistence_nll: f64,
+    pub(super) mse: f64,
+    pub(super) persistence_mse: f64,
+    pub(super) absolute_mse: f64,
+    pub(super) absolute_persistence_mse: f64,
+    pub(super) within_1_sigma: f64,
+    pub(super) within_2_sigma: f64,
     rmse_price: f64,
     mae_price: f64,
     invalid_fraction: f64,
     tail_loss_share: f64,
     median_window_ratio: f64,
-    horizon: HorizonCurve,
-    trading: TradingCurve,
-    portfolio: PortfolioCurve,
+    pub(super) horizon: HorizonCurve,
+    pub(super) trading: TradingCurve,
+    pub(super) portfolio: PortfolioCurve,
     /// Per-(horizon, channel) amplitude moments of this split's own emitted mean. Everything
     /// the calibration fit, the un-gained MSE ratio and the GAINED MSE ratio are functions of,
     /// which is why no split needs a second scoring pass to report what a gain would do to it.
     amplitude: Moments,
     timing: EvalTiming,
+}
+/// THE selection scalar: the training objective's own per-horizon weighting applied to the
+/// close channel's MSE ratio against persistence AT ITS OWN BEST SCALE, as a weighted mean.
+///
+/// # Why not the held-out NLL
+///
+/// The NLL is a function of the learned input-dependent `log_scale` as much as of the mean, and
+/// the scale absorbs exactly the mean's error: two states whose h = 1 information coefficient
+/// differed by 2.3x were observed to differ in held-out NLL only in the fourth decimal, and the
+/// selection rule picked the wrong one of them. The best-scale ratio is a statement about the
+/// MEAN alone with the one degree of freedom a positive per-horizon gain can repair divided
+/// out, so a checkpoint is chosen on the information its mean carries rather than on how
+/// honestly its σ confesses to missing it.
+///
+/// This is also why the long-horizon "degradation" never belonged in a selection scalar. The
+/// best-scale ratio is flat or improving at every h ≥ 16 in the six-arm sweep while the achieved
+/// ratio crosses 1 exactly where the MSE-optimal gain crosses 0.5: an amplitude failure, not
+/// lost information, and a rule that minimizes the achieved quantity selects against amplitude
+/// and for nothing else.
+///
+/// # The close channel
+///
+/// Per-horizon best-scale ratios exist on the close ANCHOR only - it is the coordinate
+/// [`decode_joint`](super::model::decode_joint) builds every other channel from, and the one
+/// the whole per-horizon report family is keyed on - so this is the close channel's ratio, the
+/// same series `timexer_segment_horizon_steps_best_scale` charts.
+///
+/// # Weighting and undefined horizons
+///
+/// `weight` is `model.horizon_weights()`, the same vector the gradient reads, so the aggregate
+/// emphasizes the horizons the arm was trained to emphasize and a `cutoff:K` arm is not selected
+/// on horizons its loss assigns weight zero. A horizon whose ratio is undefined - no target
+/// energy at all, which no real draw produces and a degenerate fixture can - is dropped and the
+/// remaining weight renormalized, so one degenerate horizon cannot NaN the scalar the whole run
+/// is selected on. NaN only where nothing at all was measured, which is the one state no
+/// checkpoint may be selected from.
+fn scale_free_objective(weight: &[f64], best_scale: &[f64]) -> f64 {
+    let (mut mass, mut total) = (0., 0.);
+    for (share, ratio) in weight.iter().zip(best_scale) {
+        if *share > 0. && ratio.is_finite() {
+            mass += share;
+            total += share * ratio;
+        }
+    }
+    if mass > 0. { total / mass } else { f64::NAN }
 }
 fn invalid_candles(prices: &Tensor) -> Tensor {
     let open = prices.select(-1, 0);
@@ -1087,6 +1288,10 @@ pub(super) fn final_origin(model: &CausalPatchModel, batch: &Batch) -> FinalOrig
         drift,
     }
 }
+/// Rows in the per-horizon trading moment matrix [`Scorer::moments`] assembles and
+/// [`Scorer::curve`] reads by position: twenty-six pooled and cross-sectional reductions
+/// followed by four apiece for the top and bottom conviction deciles.
+const TRADING_MOMENTS: usize = 34;
 /// Device-resident final-origin accumulators. Every batch adds masked tensor reductions: the
 /// twelve aggregate `sums`, eleven per-horizon rows, and per-(window, bar) close-channel state
 /// for the tail-trimmed ratio, the window medians and the whole trading-diagnostic family.
@@ -1104,6 +1309,10 @@ struct Scorer {
     /// the channel-last scoring layout. Selection reads the SAME vector the gradient does, so
     /// an arm is never selected on an objective it was not trained on.
     horizon_weight: Tensor,
+    /// The SAME weighting on the host, unnormalized. The scale-free selection scalar is a
+    /// weighted mean of per-horizon ratios over whichever horizons turned out to carry one, so
+    /// it needs the weights as values it can renormalize rather than as a device broadcast.
+    objective_weight: Vec<f64>,
     sums: Tensor,
     horizon_sums: Tensor,
     /// `[AMPLITUDE_ROWS, pred_len, CHANNELS]` f64: the eight masked column reductions the
@@ -1148,6 +1357,7 @@ impl Scorer {
         let bars = |kind| Tensor::zeros(shape, (kind, device));
         Self {
             pred_len,
+            objective_weight: horizon_weight.to_vec(),
             half_log_horizon: half_log_horizon.reshape([1, pred_len, 1]).to_device(device),
             horizon_weight: Tensor::from_slice(
                 &horizon_weight
@@ -1158,7 +1368,7 @@ impl Scorer {
             .reshape([1, pred_len, 1])
             .to_device(device),
             sums: Tensor::zeros([14], (Kind::Double, device)),
-            horizon_sums: Tensor::zeros([13, pred_len], (Kind::Double, device)),
+            horizon_sums: Tensor::zeros([15, pred_len], (Kind::Double, device)),
             amplitude: Tensor::zeros(
                 [AMPLITUDE_ROWS, pred_len, CHANNELS],
                 (Kind::Double, device),
@@ -1313,6 +1523,8 @@ impl Scorer {
                 // aggregate already reduced, two more column reductions per batch.
                 within_1.sum_dim_intlist([0i64, 2].as_slice(), false, Kind::Double),
                 within_2.sum_dim_intlist([0i64, 2].as_slice(), false, Kind::Double),
+                nll.sum_dim_intlist([0i64, 2].as_slice(), false, Kind::Double),
+                baseline.sum_dim_intlist([0i64, 2].as_slice(), false, Kind::Double),
             ],
             0,
         );
@@ -1370,25 +1582,35 @@ impl Scorer {
         } else {
             f64::NAN
         };
-        let counts = self.horizon_sums.get(2);
-        let tail_counts = ((counts / CHANNELS as f64).round() + 99.)
-            .floor_divide_scalar(100)
-            .to_kind(Kind::Int64);
-        let widest = tail_counts.max().int64_value(&[]);
+        let tail_counts = Vec::<i64>::try_from(
+            ((self.horizon_sums.get(2) / CHANNELS as f64).round() + 99.)
+                .floor_divide_scalar(100)
+                .to_kind(Kind::Int64)
+                .to_device(Device::Cpu),
+        )?;
         // |close target| with -1 on invalid bars, so an invalid bar never reaches a top-1%
         // threshold. Reconstructed rather than stored: the signed close target and its mask
-        // are already resident for the trading diagnostics.
-        let bar_close = self.bar_target.abs() * &self.bar_valid + &self.bar_valid - 1.;
-        let (top, _) = bar_close.topk(widest, 0, true, true);
-        let thresholds = top.gather(0, &(tail_counts - 1).reshape([1, pred_len]), false);
-        let keep = bar_close.lt_tensor(&thresholds).to_kind(Kind::Float);
-        let trimmed = Tensor::stack(
-            &[
-                (&self.bar_squared * &keep).sum_dim_intlist([0i64].as_slice(), false, Kind::Double),
-                (&self.bar_persistence * keep).sum_dim_intlist([0i64].as_slice(), false, Kind::Double),
-            ],
-            0,
-        );
+        // are already resident for the trading diagnostics. One horizon at a time, for the
+        // same reason [`Scorer::moments`] is: the dense `[origins, pred_len]` form held three
+        // 317.360 MiB fp32 temporaries at once at 433,303 origins.
+        let mut trimmed_rows = Vec::with_capacity(pred_len as usize);
+        for j in 0..pred_len {
+            let valid = self.bar_valid.select(1, j).contiguous();
+            let close = self.bar_target.select(1, j).abs() * &valid + &valid - 1.;
+            // ⌈n_h / 100⌉ ≥ 1 for a scored horizon; an unscored one is rejected below, after
+            // the host transfer that carries its count.
+            let k = tail_counts[j as usize].max(1);
+            let (top, _) = close.topk(k, 0, true, true);
+            let keep = close.lt_tensor(&top.get(k - 1)).to_kind(Kind::Float);
+            trimmed_rows.push(Tensor::stack(
+                &[
+                    (self.bar_squared.select(1, j) * &keep).sum(Kind::Double),
+                    (self.bar_persistence.select(1, j) * keep).sum(Kind::Double),
+                ],
+                0,
+            ));
+        }
+        let trimmed = Tensor::stack(&trimmed_rows, 1);
         let horizon_sums = Tensor::cat(&[&self.horizon_sums, &trimmed], 0);
         let sums = Vec::<f64>::try_from(self.sums.to_device(Device::Cpu))?;
         let horizon_sums = Vec::<f64>::try_from(horizon_sums.to_device(Device::Cpu).flatten(0, -1))?;
@@ -1397,12 +1619,13 @@ impl Scorer {
             "nonfinite universe validation outputs"
         );
         let mut rows = horizon_sums.chunks_exact(pred_len as usize);
-        let mut row = || rows.next().expect("fifteen per-horizon accumulator rows");
+        let mut row = || rows.next().expect("seventeen per-horizon accumulator rows");
         let (model_sums, persistence_sums, counts) = (row(), row(), row());
         let (absolute_sums, target_sums) = (row(), row());
         let (wins, predicted, hits, ups) = (row(), row(), row(), row());
         let (absolute_model_sums, absolute_persistence_sums) = (row(), row());
         let (within_1_sums, within_2_sums) = (row(), row());
+        let (nll_sums, persistence_nll_sums) = (row(), row());
         let (trimmed_squared, trimmed_persistence) = (row(), row());
         ensure!(
             counts.iter().all(|n| *n > 0.),
@@ -1495,7 +1718,13 @@ impl Scorer {
             invalid_fraction: sums[4] / bars as f64,
             tail_loss_share: if sums[0] > 0. { sums[5] / sums[0] } else { 0. },
             nll: sums[6] / elements,
+            horizon_nll: ratio(nll_sums, counts),
+            horizon_persistence_nll: ratio(persistence_nll_sums, counts),
             objective_nll: sums[12] / sums[13].max(f64::MIN_POSITIVE),
+            scale_free_objective: scale_free_objective(
+                &self.objective_weight,
+                &trading.best_scale_mse_ratio,
+            ),
             persistence_nll: sums[7] / elements,
             within_1_sigma: sums[8] / elements,
             within_2_sigma: sums[9] / elements,
@@ -1520,129 +1749,172 @@ impl Scorer {
             timing,
         })
     }
-    /// The trading diagnostics, all of them from the resident per-(window, bar) close
-    /// coordinate arrays and one host transfer. Every per-horizon reduction below is a
-    /// column reduction over dimension 0; the per-timestamp cross-sections are `index_add`
-    /// scatters keyed by `groups`; the decile thresholds and rank correlations are `topk`
-    /// and `argsort` over dimension 0. The scalar algebra that turns the 35 accumulated
-    /// sums into ratios, correlations and gain shares runs on the host over `pred_len`
-    /// elements, which is where readable arithmetic belongs.
+    /// The trading diagnostics: the per-horizon moment matrix, the host algebra over it, and
+    /// the fixed-policy pass.
     fn trading(&self) -> Result<(TradingCurve, PortfolioCurve)> {
+        let moments = self.moments()?;
+        let curve = self.curve(&moments)?;
+        Ok((curve, self.portfolio()?))
+    }
+    /// The [`TRADING_MOMENTS`] column reductions the trading diagnostics are built from, ONE
+    /// HORIZON AT A TIME, and one host transfer of the assembled `[TRADING_MOMENTS, pred_len]`
+    /// matrix. Every temporary here is `[origins]`, never `[origins, pred_len]`: the dense form
+    /// allocated 634.720 MiB for each of the two rank `argsort` outputs at 433,303 origins x
+    /// 192 horizons x 8 B, and the full-split pass died on exactly that growth request rounded
+    /// to the allocator's 2 MiB granularity. A horizon's reduction runs over the same origins
+    /// in the same row order as the dense column reduction did; only the launch shape moved.
+    ///
+    /// The per-timestamp cross-sections are `index_add` scatters keyed by `groups`; the decile
+    /// thresholds and rank correlations are `topk` and `argsort` over the origin axis. The
+    /// scalar algebra that turns the accumulated sums into ratios, correlations and gain shares
+    /// runs on the host in [`Scorer::curve`], which is where readable arithmetic belongs.
+    fn moments(&self) -> Result<Vec<f64>> {
         let h = self.pred_len;
         let device = self.bar_valid.device();
-        let m = &self.bar_valid;
-        let f = &self.bar_forecast;
-        let y = &self.bar_target;
-        let col = |t: &Tensor| t.sum_dim_intlist([0i64].as_slice(), false, Kind::Double);
-        let n = col(m);
-        let mu = (&n).clamp_min(1.).reciprocal() * col(f);
-        let mu_row = mu.to_kind(Kind::Float).reshape([1, h]);
-        // A bet is a bar where forecast and target both carry a nonzero sign; a flat forecast
-        // is not a directional claim and a flat target has no side to be right about.
-        let rate = |predicted: &Tensor, realized: &Tensor, valid: &Tensor| {
-            let (ps, rs) = (predicted.sign(), realized.sign());
-            let bet = ps.abs() * rs.abs() * valid;
-            let hit = (ps * rs).gt(0.).to_kind(Kind::Float) * valid;
-            (col(&hit), col(&bet))
-        };
-        let (close_hit, close_bet) = rate(f, y, m);
-        // Mid anchor: the model's error is unchanged, only persistence's denominator moves
-        // from the origin bar's trade close to its log high/low midpoint. Bid-ask bounce
-        // inflates the close-anchored denominator and nothing else.
-        let mid = self.window_mid.reshape([-1, 1]);
-        let mid_target = (y - &mid) * m;
-        let mid_forecast = (f - &mid) * m;
-        let (mid_hit, mid_bet) = rate(&mid_forecast, &mid_target, m);
-        // Delayed-coordinate forecast quality: the t+1 close to t+h close move in neutral
-        // sigma units, against zero persistence. This is not execution P&L.
-        // Identically zero at h = 1, so that column is undefined.
-        let delay_mask = m * m.narrow(1, 0, 1);
-        let delayed_target = (y - y.narrow(1, 0, 1)) * &delay_mask;
-        let delayed_forecast = (f - f.narrow(1, 0, 1)) * &delay_mask;
-        let (delayed_hit, delayed_bet) = rate(&delayed_forecast, &delayed_target, &delay_mask);
-        // Ordinal ranks for Spearman. Invalid bars are pushed past every valid one by the
-        // sentinel, so a column's valid entries hold exactly the ranks 0..n_h-1 among
-        // themselves and the masked Pearson over the ranks is the rank correlation.
-        const SENTINEL: f64 = 1e30;
-        let ranks = |t: &Tensor| {
-            ((t + (1.0_f64 - m) * SENTINEL).argsort(0, false).argsort(0, false)).to_kind(Kind::Float) * m
-        };
-        let (rf, ry) = (ranks(f), ranks(y));
-        // Conviction deciles on the demeaned signal |g|: invalid bars sit at -1 for the top
-        // threshold and at the sentinel for the bottom one, so neither can be selected.
-        let g = (f - &mu_row) * m;
-        let magnitude = g.abs();
-        let k = (&n / 10.).floor().to_kind(Kind::Int64).clamp_min(1);
-        let widest = k.max().int64_value(&[]);
-        let index = (&k - 1).reshape([1, h]);
-        let high = &magnitude * m + (m - 1.);
-        let (top, _) = high.topk(widest, 0, true, true);
-        let top_mask = high.ge_tensor(&top.gather(0, &index, false)).to_kind(Kind::Float) * m;
-        let low = &magnitude * m + (1.0_f64 - m) * SENTINEL;
-        let (bottom, _) = low.topk(widest, 0, false, true);
-        let bottom_mask = low.le_tensor(&bottom.gather(0, &index, false)).to_kind(Kind::Float) * m;
-        let side = g.sign() * y;
-        let decile = |selected: &Tensor| {
-            let (hit, bet) = rate(&g, y, selected);
-            [col(selected), col(&(&side * selected)), hit, bet]
-        };
-        // Per-timestamp cross-sections. One scatter per moment per horizon, no loop.
-        let group = |source: &Tensor| {
-            Tensor::zeros([self.group_count, h], (Kind::Float, device))
-                .index_add(0, &self.groups, source)
-        };
-        let (gn, gf, gy) = (group(m), group(f), group(y));
-        let (gff, gyy, gfy) = (group(&f.square()), group(&y.square()), group(&(f * y)));
-        let inverse = gn.clamp_min(1.).reciprocal();
-        let (mean_f, mean_y) = (&gf * &inverse, &gy * &inverse);
-        let covariance = &gfy * &inverse - &mean_f * &mean_y;
-        let spread = ((&gff * &inverse - mean_f.square()).clamp_min(0.)
-            * (&gyy * &inverse - mean_y.square()).clamp_min(0.))
-        .sqrt();
-        let usable = gn
-            .ge(CROSS_SECTION_MIN as f64)
-            .logical_and(&spread.gt(1e-12))
-            .to_kind(Kind::Double);
-        let ic = (covariance / spread.clamp_min(1e-30)).to_kind(Kind::Double) * &usable;
-        let stacked = Tensor::stack(
-            &[
-                n,
-                col(f),
-                col(y),
-                col(&f.square()),
-                col(&y.square()),
-                col(&(f * y)),
-                col(&((y - f) * m).square()),
-                col(&self.bar_squared),
-                col(&self.bar_persistence),
-                col(&mid_target.square()),
-                mid_hit,
-                mid_bet,
-                close_hit,
-                close_bet,
-                col(&(&delayed_target - &delayed_forecast).square()),
-                col(&delayed_target.square()),
-                delayed_hit,
-                delayed_bet,
-                col(&rf),
-                col(&ry),
-                col(&rf.square()),
-                col(&ry.square()),
-                col(&(&rf * &ry)),
-                col(&usable),
-                col(&ic),
-                col(&ic.square()),
-            ]
-            .into_iter()
-            .chain(decile(&top_mask))
-            .chain(decile(&bottom_mask))
-            .collect::<Vec<_>>(),
-            0,
+        // The delayed-coordinate anchor is the SAME entry column for every horizon, so it is
+        // materialized once. `contiguous` on a horizon column trades 1.7 MiB for a coalesced
+        // read of it: each of the ~15 reductions below would otherwise walk the bank with a
+        // 768 B stride and touch one sector per element. The copy is bit-exact - a reduction
+        // over a strided view and over its contiguous copy visit the same origins in the same
+        // order.
+        let entry_valid = self.bar_valid.select(1, 0).contiguous();
+        let entry_target = self.bar_target.select(1, 0).contiguous();
+        let entry_forecast = self.bar_forecast.select(1, 0).contiguous();
+        let mut rows = Vec::with_capacity(h as usize);
+        for j in 0..h {
+            let m = self.bar_valid.select(1, j).contiguous();
+            let f = self.bar_forecast.select(1, j).contiguous();
+            let y = self.bar_target.select(1, j).contiguous();
+            let col = |t: &Tensor| t.sum(Kind::Double);
+            let n = col(&m);
+            let count = n.double_value(&[]);
+            let mu = n.clamp_min(1.).reciprocal() * col(&f);
+            let mu_row = mu.to_kind(Kind::Float);
+            // A bet is a bar where forecast and target both carry a nonzero sign; a flat
+            // forecast is not a directional claim and a flat target has no side to be right
+            // about.
+            let rate = |predicted: &Tensor, realized: &Tensor, valid: &Tensor| {
+                let (ps, rs) = (predicted.sign(), realized.sign());
+                let bet = ps.abs() * rs.abs() * valid;
+                let hit = (ps * rs).gt(0.).to_kind(Kind::Float) * valid;
+                (col(&hit), col(&bet))
+            };
+            let (close_hit, close_bet) = rate(&f, &y, &m);
+            // Mid anchor: the model's error is unchanged, only persistence's denominator moves
+            // from the origin bar's trade close to its log high/low midpoint. Bid-ask bounce
+            // inflates the close-anchored denominator and nothing else.
+            let mid_target = (&y - &self.window_mid) * &m;
+            let mid_forecast = (&f - &self.window_mid) * &m;
+            let (mid_hit, mid_bet) = rate(&mid_forecast, &mid_target, &m);
+            // Delayed-coordinate forecast quality: the t+1 close to t+h close move in neutral
+            // sigma units, against zero persistence. This is not execution P&L.
+            // Identically zero at h = 1, so that column is undefined.
+            let delay_mask = &m * &entry_valid;
+            let delayed_target = (&y - &entry_target) * &delay_mask;
+            let delayed_forecast = (&f - &entry_forecast) * &delay_mask;
+            let (delayed_hit, delayed_bet) =
+                rate(&delayed_forecast, &delayed_target, &delay_mask);
+            // Ordinal ranks for Spearman. Invalid bars are pushed past every valid one by the
+            // sentinel, so a column's valid entries hold exactly the ranks 0..n_h-1 among
+            // themselves and the masked Pearson over the ranks is the rank correlation.
+            const SENTINEL: f64 = 1e30;
+            let ranks = |t: &Tensor| {
+                ((t + (1.0_f64 - &m) * SENTINEL)
+                    .argsort(0, false)
+                    .argsort(0, false))
+                .to_kind(Kind::Float)
+                    * &m
+            };
+            let (rf, ry) = (ranks(&f), ranks(&y));
+            // Conviction deciles on the demeaned signal |g|: invalid bars sit at -1 for the top
+            // threshold and at the sentinel for the bottom one, so neither can be selected.
+            let g = (&f - &mu_row) * &m;
+            let magnitude = g.abs();
+            let k = ((count / 10.).floor() as i64).max(1);
+            let high = &magnitude * &m + (&m - 1.);
+            let (top, _) = high.topk(k, 0, true, true);
+            let top_mask = high.ge_tensor(&top.get(k - 1)).to_kind(Kind::Float) * &m;
+            let low = &magnitude * &m + (1.0_f64 - &m) * SENTINEL;
+            let (bottom, _) = low.topk(k, 0, false, true);
+            let bottom_mask = low.le_tensor(&bottom.get(k - 1)).to_kind(Kind::Float) * &m;
+            let side = g.sign() * &y;
+            let decile = |selected: &Tensor| {
+                let (hit, bet) = rate(&g, &y, selected);
+                [col(selected), col(&(&side * selected)), hit, bet]
+            };
+            // This horizon's per-timestamp cross-sections. One scatter per moment.
+            let group = |source: &Tensor| {
+                Tensor::zeros([self.group_count], (Kind::Float, device))
+                    .index_add(0, &self.groups, source)
+            };
+            let (gn, gf, gy) = (group(&m), group(&f), group(&y));
+            let (gff, gyy, gfy) = (group(&f.square()), group(&y.square()), group(&(&f * &y)));
+            let inverse = gn.clamp_min(1.).reciprocal();
+            let (mean_f, mean_y) = (&gf * &inverse, &gy * &inverse);
+            let covariance = &gfy * &inverse - &mean_f * &mean_y;
+            let spread = ((&gff * &inverse - mean_f.square()).clamp_min(0.)
+                * (&gyy * &inverse - mean_y.square()).clamp_min(0.))
+            .sqrt();
+            let usable = gn
+                .ge(CROSS_SECTION_MIN as f64)
+                .logical_and(&spread.gt(1e-12))
+                .to_kind(Kind::Double);
+            let ic = (covariance / spread.clamp_min(1e-30)).to_kind(Kind::Double) * &usable;
+            rows.push(Tensor::stack(
+                &[
+                    n,
+                    col(&f),
+                    col(&y),
+                    col(&f.square()),
+                    col(&y.square()),
+                    col(&(&f * &y)),
+                    col(&((&y - &f) * &m).square()),
+                    col(&self.bar_squared.select(1, j)),
+                    col(&self.bar_persistence.select(1, j)),
+                    col(&mid_target.square()),
+                    mid_hit,
+                    mid_bet,
+                    close_hit,
+                    close_bet,
+                    col(&(&delayed_target - &delayed_forecast).square()),
+                    col(&delayed_target.square()),
+                    delayed_hit,
+                    delayed_bet,
+                    col(&rf),
+                    col(&ry),
+                    col(&rf.square()),
+                    col(&ry.square()),
+                    col(&(&rf * &ry)),
+                    col(&usable),
+                    col(&ic),
+                    col(&ic.square()),
+                ]
+                .into_iter()
+                .chain(decile(&top_mask))
+                .chain(decile(&bottom_mask))
+                .collect::<Vec<_>>(),
+                0,
+            ));
+        }
+        // The only tensors that outlive an iteration: `pred_len` scalar rows, 272 B each. A
+        // retained `[origins]` column here would give back the whole collapse.
+        let stacked = Tensor::stack(&rows, 1);
+        Ok(Vec::<f64>::try_from(
+            stacked.to_device(Device::Cpu).flatten(0, -1),
+        )?)
+    }
+    /// The host algebra over the moment matrix. Separated from the reduction so the collapsed
+    /// reduction can be proved bit-identical to the dense one it replaced without duplicating
+    /// the arithmetic that reads it.
+    fn curve(&self, flat: &[f64]) -> Result<TradingCurve> {
+        let width = self.pred_len as usize;
+        ensure!(
+            flat.len() == TRADING_MOMENTS * width,
+            "the trading moment matrix holds {} cells for {TRADING_MOMENTS} rows and {width} \
+             horizons",
+            flat.len()
         );
-        let flat = Vec::<f64>::try_from(stacked.to_device(Device::Cpu).flatten(0, -1))?;
-        let width = h as usize;
         let at = |row: usize, j: usize| flat[row * width + j];
-        let portfolio = self.portfolio()?;
         let mut curve = TradingCurve {
             total_gain: Vec::with_capacity(width),
             all_channel_gain: Vec::with_capacity(width),
@@ -1770,7 +2042,7 @@ impl Scorer {
             curve.top_decile_hit_rate.push(at(28, j) / at(29, j));
             curve.bottom_decile_hit_rate.push(at(32, j) / at(33, j));
         }
-        Ok((curve, portfolio))
+        Ok(curve)
     }
     /// Fixed-policy endpoint utility, separate from neutral-coordinate forecast quality.
     fn portfolio(&self) -> Result<PortfolioCurve> {
@@ -1801,7 +2073,7 @@ struct Curves {
 }
 /// Final-origin scores over `origins`, batched like training with the host loader one batch
 /// ahead; the forward and metric phases are synchronized so the timing attributes wall clock.
-fn score(
+pub(super) fn score(
     corpus: &Arc<Corpus>,
     model: &CausalPatchModel,
     origins: &[WindowRef],
@@ -1891,6 +2163,12 @@ fn score(
         timing.metrics_ms += phase(scoring);
     }
     timing.total_ms = synchronized(device, started);
+    // The resident upload buffer and the prefetcher's queue are dead once the last batch is
+    // accumulated, and the finishing path's temporaries are what has to fit beside the banks:
+    // the blocks these hold - 139.49 MB per batch shape - go back to the caching allocator
+    // here rather than after `finish`. Measured outside `total_ms`, which ends with the pass.
+    drop(resident);
+    drop(loader);
     scorer.finish(timing)
 }
 fn candle_windows(
@@ -1943,8 +2221,35 @@ fn candle_windows(
         .collect()
 }
 
+/// One memory-mapped bar header per end of each window: the origin's own timestamp, and the
+/// timestamp of the last bar its `pred_len` cumulative targets read, tagged with the ticker
+/// that owns both. The ticker tag is what makes the split's disjointness checkable - the
+/// reserved bands are cut on each ticker's own valid-bar ordinals - and the target timestamp
+/// is what the separation is MEASURED against, rather than inferred from the boundary
+/// arithmetic that produced it.
+fn dated(corpus: &Corpus, refs: &[WindowRef]) -> Vec<DatedOrigin> {
+    let pred_len = corpus.contract.pred_len;
+    refs.iter()
+        .map(|reference| {
+            let ticker = corpus.ticker(*reference);
+            (
+                reference.ticker,
+                ticker.timestamp(reference.origin),
+                ticker.timestamp(reference.origin + pred_len),
+            )
+        })
+        .collect()
+}
+
 pub fn train(args: TrainArgs) -> Result<()> {
     let base_learning_rate = args.validate()?;
+    if args.research_panel {
+        return super::jepa_runner::train(args, base_learning_rate);
+    }
+    ensure!(
+        !args.model.jepa_mode.enabled() && args.model.future_calendar,
+        "LeJEPA and disabled future-calendar modes require --research-panel"
+    );
     if let Some(name) = &args.run {
         RunDir::ensure_creatable(RUNS_PATH, name)?;
     }
@@ -1969,6 +2274,50 @@ pub fn train(args: TrainArgs) -> Result<()> {
     )?;
     corpus.prepare(device);
     corpus.timing.cuda_context_ms = cuda_context_ms;
+    // The held-out split's disjointness, PROVED the moment the corpus exists and nowhere else:
+    // before the contract write, before the corpus report, before the model, before every
+    // held-out draw, and therefore before the first optimizer step. It is a pure function of
+    // the corpus's own reserved partitions, so an unusable split must cost a corpus load and
+    // nothing else - job 5998 was refused beside the amplitude draws instead, after paying for
+    // the report, the model and four draws it could never use. The draws below are subsets of
+    // these two populations, so no draw can reintroduce an overlap this proof excludes and no
+    // per-evaluation re-check exists.
+    let phase = Instant::now();
+    let calibration_dated = dated(&corpus, &corpus.calibration_refs);
+    let validation_dated = dated(&corpus, &corpus.validation_refs);
+    let split = Blocks::per_ticker(
+        &calibration_dated,
+        &validation_dated,
+        corpus.contract.pred_len,
+        |ticker| corpus.contract.tickers[ticker].ticker.clone(),
+    )?;
+    // RESIDUAL, quantified rather than described: the bands are per-ticker, so the fit and the
+    // score occupy the SAME calendar span on DIFFERENT tickers. No ticker shares a bar, an
+    // origin or an instant with itself across the split, but a gain fitted on one block does
+    // see market-wide contemporaneous information. For `pred_len` amplitude scalars that is a
+    // weak leak; it is a real one, and closing it would mean a global wall-clock cut of the
+    // scored block - a different experiment, priced at 1% of the scored population in
+    // `probe::Partitions::split`.
+    let contemporaneous = calibration_dated
+        .iter()
+        .filter(|(_, _, target)| {
+            (split.evaluation_first_origin_ms..=split.evaluation_last_origin_ms).contains(target)
+        })
+        .count();
+    drop(calibration_dated);
+    println!(
+        "CausalPatch held-out split proof: {} calibration origins over [{}, {}] whose targets end at {}, {} validation origins over [{}, {}]; PER TICKER every calibration target completes before that ticker's own first validation origin, tightest separation {} ms over the shared names, proved on every origin of both partitions in {:.0} ms. Global extrema interleave by construction - each band is cut at the ticker's OWN valid-bar ordinal for a shared boundary timestamp - so they are not compared. RESIDUAL: {:.1}% of calibration targets fall inside the validation origins' calendar span, so fit and score share contemporaneous market information ACROSS tickers",
+        split.calibration_origins,
+        split.calibration_first_origin_ms,
+        split.calibration_last_origin_ms,
+        split.calibration_last_target_ms,
+        split.evaluation_origins,
+        split.evaluation_first_origin_ms,
+        split.evaluation_last_origin_ms,
+        split.purge_gap_ms,
+        phase.elapsed().as_secs_f64() * 1000.,
+        100. * contemporaneous as f64 / split.calibration_origins as f64,
+    );
     let phase = Instant::now();
     fs::write(
         run.root.join("timexer-segment-data-contract.json"),
@@ -2012,44 +2361,38 @@ pub fn train(args: TrainArgs) -> Result<()> {
     // The amplitude calibration's two draws.
     //
     // The FIT block is a strided pick over the corpus's reserved `[70%, 80%)` partition - the
-    // only population that took part in neither training nor checkpoint selection - drawn to
-    // the same size as the held-out sample, so fitting at every report interval costs one
-    // sample-sized pass rather than a full-split one.
-    let calibration_draw = fixed_origins(&corpus.calibration_refs, args.eval_origins)?;
+    // only population that took part in neither training nor checkpoint selection - sized by
+    // the fitted gain's own standard error at [`AMPLITUDE_FIT_ORIGINS`], never by the
+    // evaluation knob.
+    let calibration_draw = fixed_origins(&corpus.calibration_refs, AMPLITUDE_FIT_ORIGINS)?;
     // The in-sample comparand, and the only thing that answers WHY the amplitude is wrong: a
     // held-out gain that sweeps with the horizon is over-fitting if the in-sample gain is flat
     // and an objective defect if it sweeps too. Small on purpose - it is a diagnostic, not a
     // metric - and it never reaches the fit.
     let training_draw = fixed_origins(&corpus.train_refs, AMPLITUDE_TRAINING_ORIGINS)?;
-    // One memory-mapped bar header per end of each window: the origin's own timestamp, and the
-    // timestamp of the last bar its `pred_len` cumulative targets read. The second is what the
-    // separation between fit and evaluation is measured against - MEASURED, on the realized
-    // timestamps, rather than inferred from the boundary arithmetic that produced them.
-    let dated = |refs: &[WindowRef]| -> Vec<(i64, i64)> {
-        let pred_len = corpus.contract.pred_len;
-        refs.iter()
-            .map(|reference| {
-                let ticker = corpus.ticker(*reference);
-                (
-                    ticker.timestamp(reference.origin),
-                    ticker.timestamp(reference.origin + pred_len),
-                )
-            })
-            .collect()
-    };
-    let fit_dated = dated(&calibration_draw);
-    let amplitude_blocks = Blocks::spanning(&fit_dated, &dated(&corpus.validation_refs))?;
+    // The manifest's record of the block pair the gain is actually fitted and scored on. Same
+    // proof as the startup one over a strided subset of the same calibration population, so it
+    // cannot refuse what the startup proof admitted; what it adds is the DRAW's own dates and
+    // its own tightest per-ticker separation, which is what the checkpoint has to carry.
+    let fit_dated = dated(&corpus, &calibration_draw);
+    let amplitude_blocks = Blocks::per_ticker(
+        &fit_dated,
+        &validation_dated,
+        corpus.contract.pred_len,
+        |ticker| corpus.contract.tickers[ticker].ticker.clone(),
+    )?;
+    drop(validation_dated);
     // A gap in milliseconds is not legible on its own - the number that says whether the purge
     // is comfortable or marginal is how it compares to one origin's own `pred_len`-bar reach,
     // measured here from the same timestamps rather than assumed from a bar duration.
     let reach = fit_dated
         .iter()
-        .map(|(origin, target)| target - origin)
+        .map(|(_, origin, target)| target - origin)
         .max()
         .unwrap_or(1)
         .max(1);
     println!(
-        "CausalPatch amplitude calibration partition: {} fit origins over [{}, {}] whose targets end at {}, then {} held-out-full origins over [{}, {}]; the two are separated by {} ms and share no bar, which is {:.2}x the {} ms a single origin's {}-bar target reach spans; {} in-sample training origins are scored beside them as the mechanism comparand",
+        "CausalPatch amplitude calibration partition: {} fit origins over [{}, {}] whose targets end at {}, then {} held-out-full origins over [{}, {}]; on every shared ticker the fit targets complete at least {} ms before that ticker's own first scored origin, which is {:.2}x the {} ms a single origin's {}-bar target reach spans; {} in-sample training origins are scored beside them as the mechanism comparand",
         amplitude_blocks.calibration_origins,
         amplitude_blocks.calibration_first_origin_ms,
         amplitude_blocks.calibration_last_origin_ms,
@@ -2119,13 +2462,31 @@ pub fn train(args: TrainArgs) -> Result<()> {
         args.batch_size,
         origins.len()
     );
-    // The schedule's endpoint is stated, not inherited from how many steps an epoch happens
-    // to contain, and NOT from `--max-steps`: see [`schedule_budget`].
-    let schedule = LrSchedule::new(
-        schedule_budget(&args, steps_per_epoch),
-        NANOGPT_COOLDOWN_FRAC,
-        NANOGPT_COOLDOWN_FLOOR,
-    )?;
+    // The schedule's endpoint, resolved: `--schedule-budget` where stated, `--max-steps` where
+    // a cap is set without one, the whole planned run otherwise. See [`schedule_budget`].
+    let resolved_budget = schedule_budget(&args, steps_per_epoch);
+    let schedule = LrSchedule::new(resolved_budget, NANOGPT_COOLDOWN_FRAC, NANOGPT_COOLDOWN_FLOOR)?;
+    // Unconditional, and before the first step: the schedule SHAPE is the one run parameter
+    // that is invisible in every curve the run writes and is the difference between an annealed
+    // final weight state and one frozen at the peak rate. A log line that only appeared on
+    // capped arms is exactly how six of them were read as if they had annealed.
+    println!(
+        "CausalPatch learning-rate schedule: budget {resolved_budget} steps ({}), cooldown from \
+         step {} to a {NANOGPT_COOLDOWN_FLOOR} floor; --max-steps {}, --schedule-budget {}, \
+         {} steps per epoch x {} epochs planned",
+        match (args.schedule_budget, args.max_steps) {
+            (0, 0) => "the whole planned run",
+            (0, _) => "coupled to --max-steps",
+            _ => "stated by --schedule-budget",
+        },
+        schedule
+            .cooldown_start()
+            .map_or("never".to_owned(), |start| start.to_string()),
+        args.max_steps,
+        args.schedule_budget,
+        steps_per_epoch,
+        args.epochs
+    );
     let knobs = RecipeKnobs {
         scalar_lr_mult: args.scalar_lr_mult,
         x0_lambdas: args.model.x0_lambdas,
@@ -2140,6 +2501,22 @@ pub fn train(args: TrainArgs) -> Result<()> {
         args.fused,
         args.optimizer,
     )?;
+    if args.model.horizon_decimation.enabled() {
+        let plan = DecimationPlan::new(&geometry, args.model.seq_len as usize)?;
+        println!(
+            "CausalPatch horizon decimation {}: {}; surviving sub-origins at horizon h are at \
+             least h bars apart, each weighted by its own factor so the objective's numerator \
+             and denominator stay unbiased for the full lattice - the gradient's EXPECTATION is \
+             unchanged and only its long-horizon variance rises, by the ~sqrt(12) that equalizes \
+             gradient SNR per independent observation across the horizon axis. Phases are drawn \
+             on the host from --seed {} every step, because the captured step replays a frozen \
+             device RNG.",
+            args.model.horizon_decimation,
+            plan.summary(),
+            args.seed
+        );
+        engine.arm_horizon_decimation(plan, args.seed);
+    }
     corpus.timing.model_build_ms += phase.elapsed().as_secs_f64() * 1000.;
     corpus.timing.startup_total_ms =
         super::cache::process_elapsed_ms().unwrap_or(corpus.timing.total_ms);
@@ -2158,10 +2535,13 @@ pub fn train(args: TrainArgs) -> Result<()> {
     );
     let mut rng = ChaCha8Rng::seed_from_u64(args.seed);
     let mut step = 0;
-    // Both stopping criteria minimize the OBJECTIVE-weighted held-out NLL, never the
-    // equal-weighted aggregate: jobs 5190-5193 showed the aggregate is dominated by horizons
-    // with no out-of-period predictability, so it selects on the wrong quantity. Under
-    // `--horizon-loss uniform` the two are the same number and nothing about selection moves.
+    // Both stopping criteria minimize the SCALE-FREE objective - [`scale_free_objective`], the
+    // horizon-weighted close MSE ratio at each horizon's own best scale - and neither reads any
+    // NLL. The held-out NLL is a function of the learned `log_scale` as much as of the mean and
+    // the scale absorbs the mean's error: two states differing 2.3x in h = 1 IC were observed to
+    // differ in NLL in the fourth decimal, which is a selection rule that cannot see the
+    // quantity the arm exists to produce. The weighting is still the training objective's own,
+    // so no arm is selected on horizons its loss weights at zero.
     let mut best_full = f64::INFINITY;
     let mut stale_epochs = 0;
     let mut best_objective = f64::INFINITY;
@@ -2176,7 +2556,7 @@ pub fn train(args: TrainArgs) -> Result<()> {
     let loader = Prefetcher::new(Arc::clone(&corpus));
     println!("CausalPatch: {} tickers, {} training target bars, {} rows, {steps_per_epoch} optimizer steps per full epoch, {} rows left to the next epoch's reshuffle; context {}, horizon {}, {} dense origins per row, batch {}",corpus.contract.tickers.len(),corpus.contract.train_target_bars,origins.len(),origins.len() - steps_per_epoch * args.batch_size,args.model.seq_len,args.model.pred_len,args.model.origins(),args.batch_size);
     if let Some(cap) = rules.max_steps {
-        println!("CausalPatch step cap: stopping at exactly {cap} optimizer steps of the {planned_steps} planned, after a final held-out full validation pass; the learning-rate schedule is untouched and still shaped against {} steps, so these are the first {cap} steps of that trajectory", schedule.budget_steps());
+        println!("CausalPatch step cap: stopping at exactly {cap} optimizer steps of the {planned_steps} planned, after a final held-out full validation pass; the learning-rate schedule is shaped against {} steps, so this arm {}", schedule.budget_steps(), if schedule.budget_steps() == cap {"anneals into its own cap".to_owned()} else {format!("runs the first {cap} steps of a {}-step trajectory and is step-matched against arms that ran it out", schedule.budget_steps())});
     }
     // The interval's per-phase breakdown, refreshed by the sampled step of each interval.
     let mut step_phases = None;
@@ -2328,15 +2708,37 @@ pub fn train(args: TrainArgs) -> Result<()> {
                 score(&corpus, &model, &training_draw, args.eval_batch_size, device)?;
             let amplitude_ms = amplitude_started.elapsed().as_secs_f64() * 1000.;
             benchmark::cuda_memory(true)?;
+            // FATAL on a refusal, by design: the alternative is a gain of 1, which is
+            // bit-identical to a measured unit amplitude on every chart and in the manifest,
+            // so a run that cannot fit its calibration must not ship checkpoints stamped as
+            // calibrated. See [`super::calibration`]'s module docs.
             let calibration =
-                MeanCalibration::fit(amplitude_blocks.clone(), &calibration_pass.amplitude)?;
+                MeanCalibration::fit(amplitude_blocks.clone(), &calibration_pass.amplitude)
+                    .with_context(|| {
+                        format!(
+                            "amplitude calibration at step {step} on {} calibration-partition \
+                             fit origins",
+                            calibration_draw.len()
+                        )
+                    })?;
             let frozen = calibration.frozen();
             frozen.validate(corpus.contract.pred_len)?;
             log_calibration(step, &calibration, &training_pass.amplitude, amplitude_ms);
+            // The selection scalar can only be NaN where the draw measured no horizon at all,
+            // which is a broken evaluation and not a checkpoint to choose between: refused here
+            // rather than silently losing every comparison to `INFINITY` and leaving
+            // `weights/best` pinned to whatever step happened to be finite.
+            ensure!(
+                evaluation.scale_free_objective.is_finite(),
+                "the held-out selection objective at step {step} is {}, so no horizon of the \
+                 {} scored origins carried a best-scale MSE ratio",
+                evaluation.scale_free_objective,
+                selected.len()
+            );
             if !epoch_complete {
                 previews += 1;
-                if evaluation.objective_nll < best_objective {
-                    best_objective = evaluation.objective_nll;
+                if evaluation.scale_free_objective < best_objective {
+                    best_objective = evaluation.scale_free_objective;
                     best_step = Some(step);
                     stale_previews = 0;
                 } else if previews > 2 {
@@ -2348,8 +2750,8 @@ pub fn train(args: TrainArgs) -> Result<()> {
                     target_bars == corpus.contract.train_target_bars,
                     "epoch target coverage mismatch"
                 );
-                if evaluation.objective_nll < best_full {
-                    best_full = evaluation.objective_nll;
+                if evaluation.scale_free_objective < best_full {
+                    best_full = evaluation.scale_free_objective;
                     stale_epochs = 0;
                 } else {
                     stale_epochs += 1;
@@ -2391,7 +2793,7 @@ pub fn train(args: TrainArgs) -> Result<()> {
                 )?;
                 let (full_peak_bytes, _) = benchmark::cuda_memory(false)?;
                 benchmark::cuda_memory(true)?;
-                println!("CausalPatch final held-out full validation at step {step}: objective-weighted NLL {:.4}, aggregate NLL {:.4} (persistence {:.4}), market-neutral MSE ratio {:.4} over {} origins in {:.1} s",full.objective_nll,full.nll,full.persistence_nll,full.mse/full.persistence_mse,corpus.validation_refs.len(),started.elapsed().as_secs_f64());
+                println!("CausalPatch final held-out full validation at step {step}: selection objective {:.6}, objective-weighted NLL {:.4}, aggregate NLL {:.4} (persistence {:.4}), market-neutral MSE ratio {:.4} over {} origins in {:.1} s",full.scale_free_objective,full.objective_nll,full.nll,full.persistence_nll,full.mse/full.persistence_mse,corpus.validation_refs.len(),started.elapsed().as_secs_f64());
                 Some((full, full_peak_bytes))
             } else {
                 None
@@ -2402,16 +2804,29 @@ pub fn train(args: TrainArgs) -> Result<()> {
             // Sliced before the curves move into the split-keyed slots, because the step
             // axis needs this evaluation's decision horizons attached to THIS step's report
             // point; the curves themselves are overwritten at the next evaluation.
-            let horizons = reports::horizon_track(&evaluation.horizon, &evaluation.trading);
+            //
+            // Every held-out draw is reported against `frozen.anchor` - the gain THIS
+            // evaluation's calibration draw just fitted - as well as as emitted. The gain is
+            // installed at checkpoint LOAD, so a training-time pass emits the un-gained mean
+            // and its raw MSE ratio charts an amplitude the deployed model would never have:
+            // that is exactly the artifact that made the long-horizon ratio read as lost
+            // information. Both series ride along because their DELTA is the diagnostic, and
+            // the closed form costs no pass.
+            let applied = frozen.anchor.as_slice();
+            let horizons =
+                reports::horizon_track(&evaluation.horizon, &evaluation.trading, Some(applied));
             // The same slice through the cross-section pass. This is the one that carries the
             // decision metric at a report interval: the interval's own draw strides one origin
             // per timestamp, so its within-timestamp IC is undefined, and the full draw is
             // scored once per epoch. Its curves are also overwritten at the next evaluation.
-            let cross_horizons =
-                reports::horizon_track(&cross_evaluation.horizon, &cross_evaluation.trading);
+            let cross_horizons = reports::horizon_track(
+                &cross_evaluation.horizon,
+                &cross_evaluation.trading,
+                Some(applied),
+            );
             let in_period_horizons = in_period_evaluation
                 .as_ref()
-                .map(|e| reports::horizon_track(&e.horizon, &e.trading))
+                .map(|e| reports::horizon_track(&e.horizon, &e.trading, Some(applied)))
                 .unwrap_or_default();
             let curves = Curves {
                 horizon: evaluation.horizon,
@@ -2453,7 +2868,7 @@ pub fn train(args: TrainArgs) -> Result<()> {
                 validation_mse: evaluation.mse,
                 validation_is_full: epoch_complete,
                 best_step,
-                best_objective_nll: best_step.map(|_| best_objective),
+                best_scale_free_objective: best_step.map(|_| best_objective),
                 selection: selection_criterion(&args.model),
                 // Fitted at THIS evaluation on the reserved partition, so a checkpoint carries
                 // the calibration of the weights inside it and cannot be paired with another's.
@@ -2497,6 +2912,7 @@ pub fn train(args: TrainArgs) -> Result<()> {
                 train_mse: Some(train_loss[1]),
                 validation_nll: evaluation.nll,
                 validation_objective_nll: evaluation.objective_nll,
+                validation_scale_free_objective: evaluation.scale_free_objective,
                 persistence_nll: evaluation.persistence_nll,
                 validation_mse: evaluation.mse,
                 persistence_mse: evaluation.persistence_mse,
@@ -2543,6 +2959,7 @@ pub fn train(args: TrainArgs) -> Result<()> {
                 let point = Metrics {
                     validation_nll: full.nll,
                     validation_objective_nll: full.objective_nll,
+                    validation_scale_free_objective: full.scale_free_objective,
                     persistence_nll: full.persistence_nll,
                     validation_mse: full.mse,
                     persistence_mse: full.persistence_mse,
@@ -2559,7 +2976,7 @@ pub fn train(args: TrainArgs) -> Result<()> {
                     validation_is_full: true,
                     validation_origins: corpus.validation_refs.len(),
                     evaluation_peak_mib: Some(full_peak_bytes as f64 / 1048576.),
-                    horizons: reports::horizon_track(&full.horizon, &full.trading),
+                    horizons: reports::horizon_track(&full.horizon, &full.trading, Some(applied)),
                     ..points
                         .last()
                         .expect("the interval pushed its own held-out sample point")
@@ -2671,21 +3088,30 @@ pub fn train(args: TrainArgs) -> Result<()> {
                 &lr_trajectory,
             )?;
             reports::write_supervision_occupancy(&output, epoch, step, args.batch_size, &census)?;
+            if let Some(decimation) = engine.drain_horizon_decimation() {
+                reports::write_horizon_decimation(
+                    &output,
+                    epoch,
+                    step,
+                    args.batch_size,
+                    &decimation,
+                )?;
+            }
             reports::write_corpus(
                 &output,
                 &corpus.contract,
                 corpus.calibration_refs.len(),
                 &corpus.market,
             )?;
-            println!("CausalPatch epoch {epoch}/{} step {step}: {target_bars}/{} unique target bars; {} objective-weighted NLL {:.4}, aggregate NLL {:.4} (persistence {:.4}), market-neutral MSE ratio {:.4}, raw MSE ratio {:.4}; reports {}",args.epochs,corpus.contract.train_target_bars,if epoch_complete {"held-out full"} else {"held-out sample"},evaluation.objective_nll,evaluation.nll,evaluation.persistence_nll,evaluation.mse/evaluation.persistence_mse,evaluation.absolute_mse/evaluation.absolute_persistence_mse,output.display());
+            println!("CausalPatch epoch {epoch}/{} step {step}: {target_bars}/{} unique target bars; {} selection objective {:.6} (best {best_objective:.6} at step {}), objective-weighted NLL {:.4}, aggregate NLL {:.4} (persistence {:.4}), market-neutral MSE ratio {:.4}, raw MSE ratio {:.4}; reports {}",args.epochs,corpus.contract.train_target_bars,if epoch_complete {"held-out full"} else {"held-out sample"},evaluation.scale_free_objective,best_step.unwrap_or(0),evaluation.objective_nll,evaluation.nll,evaluation.persistence_nll,evaluation.mse/evaluation.persistence_mse,evaluation.absolute_mse/evaluation.absolute_persistence_mse,output.display());
             // One exit, named. Everything above has already been flushed at this step - the
             // evaluation, the checkpoints, every report base - so a run that stops here is as
             // readable as one that runs out of epochs.
             if let Some(reason) = ended {
                 match reason {
-                    Termination::StepCap => println!("CausalPatch stopped at step {step}: the --max-steps cap, with the learning-rate schedule still shaped against {} steps; nothing about the fit is implied and the held-out curve may well still have been descending; weights/best retained", engine.schedule().budget_steps()),
-                    Termination::PreviewPatience => println!("CausalPatch stopped at step {step}: held-out sample objective-weighted NLL {:.4} has not improved for {stale_previews} consecutive evaluations (best {best_objective:.4} at step {}, {}); weights/best retained", evaluation.objective_nll, best_step.unwrap_or(0), selection_criterion(&args.model)),
-                    Termination::EpochPatience => println!("CausalPatch stopped at step {step} after {stale_epochs} complete epochs without improved held-out full NLL; weights/best retained"),
+                    Termination::StepCap => println!("CausalPatch stopped at step {step}: the --max-steps cap, with the learning-rate schedule shaped against {} steps; weights/best retained", engine.schedule().budget_steps()),
+                    Termination::PreviewPatience => println!("CausalPatch stopped at step {step}: the held-out sample selection objective {:.6} has not improved for {stale_previews} consecutive evaluations (best {best_objective:.6} at step {}, {}); weights/best retained", evaluation.scale_free_objective, best_step.unwrap_or(0), selection_criterion(&args.model)),
+                    Termination::EpochPatience => println!("CausalPatch stopped at step {step} after {stale_epochs} complete epochs without an improved held-out full selection objective (best {best_full:.6}); weights/best retained"),
                     Termination::EpochLimit => println!("CausalPatch finished at step {step}: all {} planned epochs complete; weights/best retained", args.epochs),
                 }
                 break;
@@ -2714,8 +3140,8 @@ pub fn train(args: TrainArgs) -> Result<()> {
 /// The amplitude calibration is applied HERE and nowhere else. It is the checkpoint's own,
 /// fitted out of sample by the run that wrote it, so a loaded model emits the calibrated mean
 /// and the reports, the trading diagnostics and the portfolio sizing cannot disagree about
-/// what was applied. `mean_gain().is_identity()` is what a caller reads to say "this
-/// checkpoint's block identified no amplitude", and it is a measurement, not an absence.
+/// what was applied. Every curve in a manifest is a FITTED curve: the estimator aborts rather
+/// than emitting the identity, so a gain of 1 read here is a measurement.
 ///
 /// The [`nn::VarStore`] comes back with the model because it is what `store.load` wrote the
 /// checkpoint's bytes into; the caller has to hold it for as long as it scores.
@@ -2740,34 +3166,7 @@ pub(super) fn load_checkpoint(
     );
     let device = cuda_device()?;
     corpus.prepare(device);
-    let mut store = nn::VarStore::new(device);
-    let mut model = CausalPatchModel::new(&store.root(), &manifest.model);
-    store
-        .load(checkpoint.join("model.safetensors"))
-        .context("loading universe checkpoint")?;
-    check_head_layout(
-        store
-            .variables()
-            .get("head.output.weight")
-            .context("checkpoint has no head output weight")?,
-    )?;
-    model.set_mean_gain(&manifest.mean_gain)?;
-    println!(
-        "CausalPatch applying the checkpoint's own mean calibration, fitted on {} reserved calibration-partition origins ending {}: anchor gain {:.4} at h=1 and {:.4} at h={}, intrabar offset gain {:.4} and {:.4}{}",
-        manifest.mean_gain.blocks.calibration_origins,
-        manifest.mean_gain.blocks.calibration_last_origin_ms,
-        manifest.mean_gain.anchor[0],
-        manifest.mean_gain.anchor[manifest.data.pred_len - 1],
-        manifest.data.pred_len,
-        manifest.mean_gain.offset[0],
-        manifest.mean_gain.offset[manifest.data.pred_len - 1],
-        if manifest.mean_gain.is_identity() {
-            " (the identity: this checkpoint's calibration block identified no amplitude)"
-        } else {
-            ""
-        }
-    );
-    store.freeze();
+    let (store, model) = manifest.load_model(checkpoint, &corpus, device)?;
     Ok((manifest, Arc::new(corpus), store, model, device))
 }
 
@@ -2807,17 +3206,25 @@ fn log_calibration(
              calibration is then a patch over a live defect"
         }
     };
-    let refusals = [&calibration.anchor, &calibration.offset]
-        .into_iter()
-        .filter_map(|curve| {
-            curve
-                .unidentifiable
-                .as_deref()
-                .map(|reason| format!("; {} identity: {reason}", curve.coordinate.label()))
-        })
-        .collect::<String>();
+    // The intercept refusal is per horizon, so the summary is the worst RATIO of the two
+    // competing shares and where it sits - not the worst of each independently, which is the
+    // aggregation that let an h=1 intrabar intercept blank all 192 horizons.
+    let (share_at, worst_share) = calibration
+        .intercept_ceiling
+        .iter()
+        .zip(&calibration.amplitude_cost)
+        .enumerate()
+        .filter(|(_, (_, cost))| cost.is_finite())
+        .fold((0usize, 0f64), |best, (horizon, (ceiling, cost))| {
+            let share = ceiling / cost;
+            if share > best.1 {
+                (horizon + 1, share)
+            } else {
+                best
+            }
+        });
     println!(
-        "CausalPatch amplitude calibration at step {step} ({elapsed_ms:.0} ms of scoring): close-anchor gain {:.4} at h=1 to {:.4} at h={horizons} (implied log-log slope {:.3}, measured β̂ {:.4} to {:.4}, {:.1} effective dof over {} identified horizons, penalty {:.3e}), intrabar-offset gain {:.4} to {:.4} ({:.1} effective dof over {} identified); in-sample training close gain {:.4} to {:.4}, so the amplitude error is {mechanism}; worst constant-forecast ceiling {:.3e} against worst amplitude cost {:.3e}{refusals}",
+        "CausalPatch amplitude calibration at step {step} ({elapsed_ms:.0} ms of scoring): close-anchor gain {:.4} at h=1 to {:.4} at h={horizons} (implied log-log slope {:.3}, measured β̂ {:.4} to {:.4}, {:.1} effective dof over {} identified horizons, penalty {:.3e}), intrabar-offset gain {:.4} to {:.4} ({:.1} effective dof over {} identified); in-sample training close gain {:.4} to {:.4}, so the amplitude error is {mechanism}; worst per-horizon close-channel intercept share {worst_share:.3e} of that horizon's own amplitude cost at h={share_at} against the registered {INTERCEPT_CEILING_SHARE}, {} horizons refused",
         calibration.anchor.gain[0],
         calibration.anchor.gain[last],
         slope(&calibration.anchor.gain),
@@ -2832,8 +3239,7 @@ fn log_calibration(
         calibration.offset.identified,
         training_close[0],
         training_close[last],
-        calibration.intercept_ceiling.iter().cloned().fold(0., f64::max),
-        calibration.amplitude_cost.iter().cloned().fold(0., f64::max)
+        calibration.intercept_refused.len()
     );
 }
 
@@ -2907,6 +3313,7 @@ fn evaluate_placement(
         train_mse: None,
         validation_nll: result.nll,
         validation_objective_nll: result.objective_nll,
+        validation_scale_free_objective: result.scale_free_objective,
         persistence_nll: result.persistence_nll,
         validation_mse: result.mse,
         persistence_mse: result.persistence_mse,
@@ -2930,8 +3337,12 @@ fn evaluate_placement(
         evaluation_peak_mib: None,
         capture_budget: None,
         step_phases: None,
-        horizons: reports::horizon_track(&result.horizon, &result.trading),
-        cross_horizons: reports::horizon_track(&cross_result.horizon, &cross_result.trading),
+        // `None`, not the manifest's own curve: `load_checkpoint` has already installed it, so
+        // `result` IS the calibrated emission and gaining it again would report a double
+        // amplitude. The un-gained comparand for this entry point is `write_amplitude`'s
+        // inverted panel below.
+        horizons: reports::horizon_track(&result.horizon, &result.trading, None),
+        cross_horizons: reports::horizon_track(&cross_result.horizon, &cross_result.trading, None),
         cross_origins: cross_section.len(),
         in_period_horizons: Vec::new(),
         in_period_origins: 0,
@@ -3004,21 +3415,19 @@ fn evaluate_placement(
     )?;
     Ok(())
 }
-/// How far a within-timestamp statistic may move under a positive per-horizon gain before the
-/// run is declared broken rather than reported.
-///
-/// A positive scalar cannot reorder the rows of one timestamp at one horizon, so the TRUE
-/// drift is exactly zero and everything left is fp32 reduction rounding on a rescaled
-/// summand. `1e-4` is a thirtieth of the iid IC standard error on the full split (`2.8e-3`),
-/// so an implementation that really moved the ranks is caught long before its drift could be
-/// mistaken for noise. This is the strongest available self-check on the whole mechanism, so
-/// it aborts the run instead of printing a warning.
-const IC_INVARIANCE_TOLERANCE: f64 = 1e-4;
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::torch::timexer_segment::model::HorizonLoss;
+    /// How far a within-timestamp statistic may move under a positive per-horizon gain before
+    /// the mechanism is declared broken rather than reported.
+    ///
+    /// A positive scalar cannot reorder the rows of one timestamp at one horizon, so the TRUE
+    /// drift is exactly zero and everything left is fp32 reduction rounding on a rescaled
+    /// summand. `1e-4` is a thirtieth of the iid IC standard error on the full split (`2.8e-3`),
+    /// so an implementation that really moved the ranks is caught long before its drift could
+    /// be mistaken for noise. Asserted on the real [`Scorer`] reduction, not on the algebra.
+    const IC_INVARIANCE_TOLERANCE: f64 = 1e-4;
     #[test]
     fn preview_origins_are_fixed_unique_and_cover_partition() {
         let origins: Vec<_> = (800..1300).collect();
@@ -3079,6 +3488,321 @@ mod tests {
         assert_eq!(actual.len(), expected.len());
         for (a, e) in actual.iter().zip(expected) {
             assert!((a - e).abs() <= 1e-5 * (1. + e.abs()), "{a} != {e}");
+        }
+    }
+    /// The dense `[origins, pred_len]` reduction [`Scorer::moments`] replaced, kept verbatim as
+    /// the reference the collapsed per-horizon form is measured against. It is the whole reason
+    /// this test can say "bit-identical" instead of "close": the two forms are the same
+    /// arithmetic over the same origins, so any difference is a real reordering.
+    fn dense_moments(scorer: &Scorer) -> Vec<f64> {
+        let h = scorer.pred_len;
+        let device = scorer.bar_valid.device();
+        let m = &scorer.bar_valid;
+        let f = &scorer.bar_forecast;
+        let y = &scorer.bar_target;
+        let col = |t: &Tensor| t.sum_dim_intlist([0i64].as_slice(), false, Kind::Double);
+        let n = col(m);
+        let mu = (&n).clamp_min(1.).reciprocal() * col(f);
+        let mu_row = mu.to_kind(Kind::Float).reshape([1, h]);
+        let rate = |predicted: &Tensor, realized: &Tensor, valid: &Tensor| {
+            let (ps, rs) = (predicted.sign(), realized.sign());
+            let bet = ps.abs() * rs.abs() * valid;
+            let hit = (ps * rs).gt(0.).to_kind(Kind::Float) * valid;
+            (col(&hit), col(&bet))
+        };
+        let (close_hit, close_bet) = rate(f, y, m);
+        let mid = scorer.window_mid.reshape([-1, 1]);
+        let mid_target = (y - &mid) * m;
+        let mid_forecast = (f - &mid) * m;
+        let (mid_hit, mid_bet) = rate(&mid_forecast, &mid_target, m);
+        let delay_mask = m * m.narrow(1, 0, 1);
+        let delayed_target = (y - y.narrow(1, 0, 1)) * &delay_mask;
+        let delayed_forecast = (f - f.narrow(1, 0, 1)) * &delay_mask;
+        let (delayed_hit, delayed_bet) = rate(&delayed_forecast, &delayed_target, &delay_mask);
+        const SENTINEL: f64 = 1e30;
+        let ranks = |t: &Tensor| {
+            ((t + (1.0_f64 - m) * SENTINEL)
+                .argsort(0, false)
+                .argsort(0, false))
+            .to_kind(Kind::Float)
+                * m
+        };
+        let (rf, ry) = (ranks(f), ranks(y));
+        let g = (f - &mu_row) * m;
+        let magnitude = g.abs();
+        let k = (&n / 10.).floor().to_kind(Kind::Int64).clamp_min(1);
+        let widest = k.max().int64_value(&[]);
+        let index = (&k - 1).reshape([1, h]);
+        let high = &magnitude * m + (m - 1.);
+        let (top, _) = high.topk(widest, 0, true, true);
+        let top_mask = high.ge_tensor(&top.gather(0, &index, false)).to_kind(Kind::Float) * m;
+        let low = &magnitude * m + (1.0_f64 - m) * SENTINEL;
+        let (bottom, _) = low.topk(widest, 0, false, true);
+        let bottom_mask =
+            low.le_tensor(&bottom.gather(0, &index, false)).to_kind(Kind::Float) * m;
+        let side = g.sign() * y;
+        let decile = |selected: &Tensor| {
+            let (hit, bet) = rate(&g, y, selected);
+            [col(selected), col(&(&side * selected)), hit, bet]
+        };
+        let group = |source: &Tensor| {
+            Tensor::zeros([scorer.group_count, h], (Kind::Float, device))
+                .index_add(0, &scorer.groups, source)
+        };
+        let (gn, gf, gy) = (group(m), group(f), group(y));
+        let (gff, gyy, gfy) = (group(&f.square()), group(&y.square()), group(&(f * y)));
+        let inverse = gn.clamp_min(1.).reciprocal();
+        let (mean_f, mean_y) = (&gf * &inverse, &gy * &inverse);
+        let covariance = &gfy * &inverse - &mean_f * &mean_y;
+        let spread = ((&gff * &inverse - mean_f.square()).clamp_min(0.)
+            * (&gyy * &inverse - mean_y.square()).clamp_min(0.))
+        .sqrt();
+        let usable = gn
+            .ge(CROSS_SECTION_MIN as f64)
+            .logical_and(&spread.gt(1e-12))
+            .to_kind(Kind::Double);
+        let ic = (covariance / spread.clamp_min(1e-30)).to_kind(Kind::Double) * &usable;
+        let stacked = Tensor::stack(
+            &[
+                n,
+                col(f),
+                col(y),
+                col(&f.square()),
+                col(&y.square()),
+                col(&(f * y)),
+                col(&((y - f) * m).square()),
+                col(&scorer.bar_squared),
+                col(&scorer.bar_persistence),
+                col(&mid_target.square()),
+                mid_hit,
+                mid_bet,
+                close_hit,
+                close_bet,
+                col(&(&delayed_target - &delayed_forecast).square()),
+                col(&delayed_target.square()),
+                delayed_hit,
+                delayed_bet,
+                col(&rf),
+                col(&ry),
+                col(&rf.square()),
+                col(&ry.square()),
+                col(&(&rf * &ry)),
+                col(&usable),
+                col(&ic),
+                col(&ic.square()),
+            ]
+            .into_iter()
+            .chain(decile(&top_mask))
+            .chain(decile(&bottom_mask))
+            .collect::<Vec<_>>(),
+            0,
+        );
+        Vec::<f64>::try_from(stacked.to_device(Device::Cpu).flatten(0, -1)).unwrap()
+    }
+    /// The dense form of the tail-trimmed per-horizon sums, as the ratio `finish` reports them.
+    fn dense_trimmed_ratio(scorer: &Scorer) -> Vec<f64> {
+        let pred_len = scorer.pred_len;
+        let counts = scorer.horizon_sums.get(2);
+        let tail_counts = ((counts / CHANNELS as f64).round() + 99.)
+            .floor_divide_scalar(100)
+            .to_kind(Kind::Int64);
+        let widest = tail_counts.max().int64_value(&[]);
+        let bar_close = scorer.bar_target.abs() * &scorer.bar_valid + &scorer.bar_valid - 1.;
+        let (top, _) = bar_close.topk(widest, 0, true, true);
+        let thresholds = top.gather(0, &(tail_counts - 1).reshape([1, pred_len]), false);
+        let keep = bar_close.lt_tensor(&thresholds).to_kind(Kind::Float);
+        let squared = (&scorer.bar_squared * &keep).sum_dim_intlist(
+            [0i64].as_slice(),
+            false,
+            Kind::Double,
+        );
+        let persistence =
+            (&scorer.bar_persistence * keep).sum_dim_intlist([0i64].as_slice(), false, Kind::Double);
+        host(&squared)
+            .iter()
+            .zip(host(&persistence))
+            .map(|(numerator, denominator)| numerator / denominator)
+            .collect()
+    }
+    /// The finishing path reduces one horizon at a time. Dense, the rank `argsort` alone wrote
+    /// 634.720 MiB per output at 433,303 origins x 192 horizons x 8 B and the full-split pass
+    /// died on that growth request outside the captured step's private pool. The collapse is a
+    /// memory-layout change and nothing else, so every reported number has to come back
+    /// bit-identical - not close - to the dense reduction it replaced. CPU only: a synthetic
+    /// population, no model, no corpus, no device.
+    #[test]
+    fn per_horizon_finishing_path_is_bit_identical_to_the_dense_reduction() {
+        let _rng = crate::torch::test_rng::exclusive();
+        let (windows, pred_len, per_group) = (384i64, 6i64, 24i64);
+        let forecast = synthetic_forecast(windows, pred_len);
+        let ids: Vec<i64> = (0..windows).map(|row| row / per_group).collect();
+        let half_log_horizon =
+            ((Tensor::arange(pred_len, (Kind::Float, Device::Cpu)) + 1.).log() * 0.5)
+                .reshape([1, 1, pred_len, 1]);
+        let mut scorer = Scorer::new(
+            &half_log_horizon,
+            &vec![1.0; pred_len as usize],
+            &Tensor::from_slice(&ids),
+            (windows / per_group) as usize,
+            pred_len,
+            Device::Cpu,
+        );
+        for (start, rows) in [(0, 100), (100, 156), (256, 128)] {
+            let batch = slice(&forecast, start, rows);
+            let bars = batch.mask.sum(Kind::Int64).int64_value(&[]) as usize;
+            scorer.accumulate(&batch, bars);
+        }
+        let width = pred_len as usize;
+        let dense = dense_moments(&scorer);
+        let collapsed = scorer.moments().unwrap();
+        assert_eq!(dense.len(), TRADING_MOMENTS * width);
+        assert_eq!(collapsed.len(), dense.len());
+        for (cell, (actual, expected)) in collapsed.iter().zip(&dense).enumerate() {
+            assert_eq!(
+                actual.to_bits(),
+                expected.to_bits(),
+                "moment row {} at h={}: {actual} != {expected}",
+                cell / width,
+                cell % width + 1
+            );
+        }
+        let reference = scorer.curve(&dense).unwrap();
+        let (actual, _) = scorer.trading().unwrap();
+        let curves: [(&str, &Vec<f64>, &Vec<f64>); 28] = [
+            ("total gain", &actual.total_gain, &reference.total_gain),
+            (
+                "all-channel gain",
+                &actual.all_channel_gain,
+                &reference.all_channel_gain,
+            ),
+            ("offset gain", &actual.offset_gain, &reference.offset_gain),
+            (
+                "demeaned gain",
+                &actual.demeaned_gain,
+                &reference.demeaned_gain,
+            ),
+            ("scaling gain", &actual.scaling_gain, &reference.scaling_gain),
+            (
+                "mean forecast",
+                &actual.mean_forecast,
+                &reference.mean_forecast,
+            ),
+            ("mean target", &actual.mean_target, &reference.mean_target),
+            ("pearson", &actual.pearson, &reference.pearson),
+            ("spearman", &actual.spearman, &reference.spearman),
+            (
+                "cross-sectional IC",
+                &actual.cross_sectional_ic,
+                &reference.cross_sectional_ic,
+            ),
+            (
+                "cross-sectional IC standard error",
+                &actual.cross_sectional_ic_se,
+                &reference.cross_sectional_ic_se,
+            ),
+            (
+                "close MSE ratio",
+                &actual.close_mse_ratio,
+                &reference.close_mse_ratio,
+            ),
+            (
+                "mid-anchor MSE ratio",
+                &actual.mid_anchor_mse_ratio,
+                &reference.mid_anchor_mse_ratio,
+            ),
+            (
+                "delayed MSE ratio",
+                &actual.delayed_mse_ratio,
+                &reference.delayed_mse_ratio,
+            ),
+            (
+                "close hit rate",
+                &actual.close_hit_rate,
+                &reference.close_hit_rate,
+            ),
+            (
+                "mid-anchor hit rate",
+                &actual.mid_anchor_hit_rate,
+                &reference.mid_anchor_hit_rate,
+            ),
+            (
+                "delayed hit rate",
+                &actual.delayed_hit_rate,
+                &reference.delayed_hit_rate,
+            ),
+            (
+                "top-decile hit rate",
+                &actual.top_decile_hit_rate,
+                &reference.top_decile_hit_rate,
+            ),
+            (
+                "bottom-decile hit rate",
+                &actual.bottom_decile_hit_rate,
+                &reference.bottom_decile_hit_rate,
+            ),
+            (
+                "top-decile return",
+                &actual.top_decile_return,
+                &reference.top_decile_return,
+            ),
+            (
+                "bottom-decile return",
+                &actual.bottom_decile_return,
+                &reference.bottom_decile_return,
+            ),
+            (
+                "conviction spread return",
+                &actual.conviction_spread_return,
+                &reference.conviction_spread_return,
+            ),
+            ("optimal gain", &actual.optimal_gain, &reference.optimal_gain),
+            (
+                "forecast variance",
+                &actual.forecast_variance,
+                &reference.forecast_variance,
+            ),
+            ("covariance", &actual.covariance, &reference.covariance),
+            ("persistence", &actual.persistence, &reference.persistence),
+            (
+                "best-scale MSE ratio",
+                &actual.best_scale_mse_ratio,
+                &reference.best_scale_mse_ratio,
+            ),
+            (
+                "cross-sectional IC moments",
+                &actual.cross_sectional_ic_moments,
+                &reference.cross_sectional_ic_moments,
+            ),
+        ];
+        for (name, actual, expected) in curves {
+            assert_eq!(actual.len(), width, "{name} covers {width} horizons");
+            for (j, (a, e)) in actual.iter().zip(expected.iter()).enumerate() {
+                assert_eq!(
+                    a.to_bits(),
+                    e.to_bits(),
+                    "{name} at h={}: {a} != {e}",
+                    j + 1
+                );
+            }
+        }
+        assert_eq!(actual.cross_sections, reference.cross_sections);
+        // The tail-trimmed sums in `finish` were collapsed the same way.
+        let trimmed = dense_trimmed_ratio(&scorer);
+        let evaluation = scorer.finish(EvalTiming::default()).unwrap();
+        assert_eq!(evaluation.horizon.trimmed_mse_ratio.len(), width);
+        for (j, (a, e)) in evaluation
+            .horizon
+            .trimmed_mse_ratio
+            .iter()
+            .zip(&trimmed)
+            .enumerate()
+        {
+            assert_eq!(
+                a.to_bits(),
+                e.to_bits(),
+                "trimmed MSE ratio at h={}: {a} != {e}",
+                j + 1
+            );
         }
     }
     #[test]
@@ -3207,14 +3931,17 @@ mod tests {
         assert!(widest > 1, "the reference must exercise a multi-element tail");
         assert!((evaluation.tail_loss_share - tail / sq).abs() < 1e-5);
     }
-    /// Checkpoint selection and early stopping read the TRAINING objective, so the held-out
-    /// scalar they minimize has to be the training-weighted NLL and nothing else. Pinned
-    /// against `Σ w·mask·nll / Σ w·mask·CHANNELS` computed scalar by scalar on the host - the
-    /// same functional `CausalPatchModel::losses` minimizes, evaluated on the held-out split -
-    /// for every mode, and pinned to the plain aggregate EXACTLY under `uniform`, which is what
-    /// makes a `uniform` arm comparable to every curve recorded before the knob existed.
+    /// The reported objective-weighted held-out NLL is `Σ w·mask·nll / Σ w·mask·CHANNELS` and
+    /// nothing else, pinned scalar by scalar on the host against the same functional
+    /// `CausalPatchModel::losses` minimizes, for every mode, and pinned to the plain aggregate
+    /// EXACTLY under `uniform`.
+    ///
+    /// It no longer SELECTS anything - that is
+    /// `the_scale_free_selection_objective_is_the_weighted_best_scale_ratio_and_ignores_amplitude`
+    /// - but it is still the held-out likelihood every arm is compared on, so its definition
+    /// still has to be exact and still has to agree with the gradient's weighting.
     #[test]
-    fn the_selection_scalar_is_the_training_weighted_held_out_nll() {
+    fn the_reported_objective_nll_is_the_training_weighted_held_out_nll() {
         let _rng = crate::torch::test_rng::exclusive();
         let (w, h, c) = (13usize, 7usize, CHANNELS as usize);
         let forecast = synthetic_forecast(w as i64, h as i64);
@@ -3269,7 +3996,7 @@ mod tests {
             let expected = numerator / denominator;
             assert!(
                 (evaluation.objective_nll - expected).abs() <= 1e-6 * (1. + expected.abs()),
-                "{mode}: selection scalar {} is not the weighted NLL {expected}",
+                "{mode}: reported objective NLL {} is not the weighted NLL {expected}",
                 evaluation.objective_nll
             );
             if mode == HorizonLoss::Uniform {
@@ -3278,16 +4005,134 @@ mod tests {
                 // is an exact integer in fp64.
                 assert_eq!(
                     evaluation.objective_nll, evaluation.nll,
-                    "uniform must not redefine what the selection scalar means"
+                    "uniform must not redefine what the reported objective NLL means"
                 );
             } else {
                 assert!(
                     (evaluation.objective_nll - evaluation.nll).abs() > 1e-3,
-                    "{mode} left the selection scalar equal to the aggregate {}",
+                    "{mode} left the objective NLL equal to the aggregate {}",
                     evaluation.nll
                 );
             }
         }
+    }
+    /// THE selection contract, and the whole reason the scalar changed: what selects a
+    /// checkpoint must be a statement about the mean's INFORMATION and not about its amplitude.
+    ///
+    /// The fixture is `y_j = β_j·f + e` with `e` orthogonal to `f` and both means exactly zero,
+    /// so each horizon's best-scale close ratio is `4/(β_j² + 4)` in closed form and is
+    /// invariant to a rescale of the emitted mean. Scoring the SAME forecast at three
+    /// amplitudes spanning 30x pins four things at once: the aggregate is the horizon-weighted
+    /// mean of those closed forms, a zero-weighted horizon is outside it, it does not move with
+    /// amplitude at all, and the quantities selection used to read - the objective NLL and the
+    /// achieved close ratio - move enormously and across parity, which is exactly the failure
+    /// this change exists to remove.
+    #[test]
+    fn the_scale_free_selection_objective_is_the_weighted_best_scale_ratio_and_ignores_amplitude()
+    {
+        let (w, h) = (8usize, 4usize);
+        let channels = CHANNELS as usize;
+        let cpu = (Kind::Float, Device::Cpu);
+        let sign = |i: usize| if i % 2 == 0 { 1.0_f64 } else { -1.0 };
+        let noise = |i: usize| if (i / 2) % 2 == 0 { 2.0_f64 } else { -2.0 };
+        let beta = |j: usize| 0.25 * (j + 1) as f64;
+        // One weight is zero, so a `cutoff:K` arm's blanked horizons are proved OUT of the
+        // aggregate rather than assumed out.
+        let weights = vec![1.0_f64, 2.0, 0.0, 4.0];
+        let scored = |amplitude: f64| -> Evaluation {
+            let mut scaled = vec![0.0_f32; w * h * channels];
+            let mut targets = vec![0.0_f32; w * h * channels];
+            for i in 0..w {
+                for j in 0..h {
+                    for channel in 0..channels {
+                        let e = (i * h + j) * channels + channel;
+                        scaled[e] = (amplitude * sign(i)) as f32;
+                        targets[e] = (beta(j) * sign(i) + noise(i)) as f32;
+                    }
+                }
+            }
+            let shape = [w as i64, h as i64, CHANNELS];
+            let forecast = FinalOrigin {
+                scaled: Tensor::from_slice(&scaled).reshape(shape),
+                targets: Tensor::from_slice(&targets).reshape(shape),
+                log_scale: Tensor::zeros(shape, cpu),
+                mask: Tensor::ones([w as i64, h as i64], cpu),
+                drift: Tensor::zeros([w as i64, h as i64, 1], cpu),
+                prices: Tensor::full(shape, 100., cpu),
+                rebased_prices: Tensor::full(shape, 100., cpu),
+                target_prices: Tensor::full(shape, 100., cpu),
+                mid: Tensor::zeros([w as i64], cpu),
+                sigma: Tensor::full([w as i64], 0.01, cpu),
+            };
+            let mut scorer = Scorer::new(
+                &((Tensor::arange(h as i64, cpu) + 1.).log() * 0.5).reshape([1, 1, h as i64, 1]),
+                &weights,
+                &Tensor::zeros([w as i64], (Kind::Int64, Device::Cpu)),
+                1,
+                h as i64,
+                Device::Cpu,
+            );
+            // Two batches: the aggregate is a function of accumulated moments and has to hold
+            // across the accumulation, not only within one batch.
+            for (start, rows) in [(0usize, 3usize), (3, 5)] {
+                scorer.accumulate(&slice(&forecast, start as i64, rows as i64), rows * h);
+            }
+            scorer.finish(EvalTiming::default()).unwrap()
+        };
+        let (mut mass, mut expected) = (0., 0.);
+        for j in 0..h {
+            mass += weights[j];
+            expected += weights[j] * 4. / (beta(j) * beta(j) + 4.);
+        }
+        let expected = expected / mass;
+        let unit = scored(1.);
+        let mut previous: Option<f64> = None;
+        for amplitude in [1., 0.1, 3.] {
+            let evaluation = scored(amplitude);
+            // `1e-7`, not exact: the invariance is algebraically exact - `g` cancels between
+            // `Cov(f,y)²` and `Var(f)` - but the moments are fp32 elementwise products reduced
+            // in fp64, so a 30x rescale moves the last bits of both. Measured residual is
+            // 1.5e-9, six orders below the 0.3 the achieved ratio moves by over the same span,
+            // which is the comparison the assertion has to survive.
+            assert!(
+                (evaluation.scale_free_objective - expected).abs() <= 1e-7 * (1. + expected),
+                "at amplitude {amplitude} the selection objective is {} and not the \
+                 horizon-weighted best-scale ratio {expected}",
+                evaluation.scale_free_objective
+            );
+            if let Some(previous) = previous {
+                assert!(
+                    (evaluation.scale_free_objective - previous).abs() <= 1e-7,
+                    "the selection objective moved with amplitude alone: {} against {previous}",
+                    evaluation.scale_free_objective
+                );
+            }
+            previous = Some(evaluation.scale_free_objective);
+            // The comparand. Both of the quantities selection used to read move by more than
+            // the whole spread of the scalar above, and the achieved ratio crosses parity while
+            // the best-scale ratio at the same horizon stays under it - a forecast selected on
+            // the achieved ratio would be selected against amplitude and for nothing else.
+            if amplitude == 3. {
+                assert!(
+                    (evaluation.objective_nll - unit.objective_nll).abs() > 1.,
+                    "the fixture must move the objective NLL: {} against {}",
+                    evaluation.objective_nll,
+                    unit.objective_nll
+                );
+                assert!(evaluation.trading.close_mse_ratio[0] > 1.);
+                assert!(evaluation.trading.best_scale_mse_ratio[0] < 1.);
+            }
+        }
+        // The aggregate over a degenerate curve, as a pure function. An undefined horizon that
+        // CARRIES weight is dropped and the rest renormalized, so one unmeasurable horizon
+        // cannot NaN the scalar the whole run is selected on; an undefined horizon the
+        // objective weights at zero was never in the sum to begin with; and nothing measured at
+        // all is NaN, which the training loop refuses by name rather than selecting on.
+        let dropped = scale_free_objective(&[1., 1., 1.], &[0.9, f64::NAN, 0.7]);
+        assert!((dropped - 0.8).abs() < 1e-12, "{dropped}");
+        assert_eq!(scale_free_objective(&[1., 0.], &[0.5, f64::NAN]), 0.5);
+        assert!(scale_free_objective(&[1., 1.], &[f64::NAN, f64::NAN]).is_nan());
+        assert!(scale_free_objective(&[0., 0.], &[0.5, 0.5]).is_nan());
     }
     /// The trading diagnostics against a straightforward scalar reference. Ninety windows over
     /// three thirty-window evaluation timestamps and sixteen horizons, accumulated in three
@@ -3799,11 +4644,13 @@ mod tests {
             validation_mse: 0.004194157171231031,
             validation_is_full: false,
             best_step: Some(1000),
-            best_objective_nll: Some(1.3),
+            best_scale_free_objective: Some(0.9871),
             weights_sha256: file_sha256(directory.0.join("model.safetensors")).unwrap(),
-            // A seven-horizon frozen gain, non-identity so the digest covers a real curve, with
-            // one gated horizon carried signed: the manifest is the only place the applied
-            // amplitude is recorded, so it has to survive the round trip and the digest.
+            // A seven-horizon frozen gain, non-identity so the digest covers a real curve,
+            // carrying one horizon of each SIZING gate - a signed non-positive measurement, an
+            // absent one, and a refused parameterization: the manifest is the only place the
+            // applied amplitude is recorded, so all three have to survive the round trip and
+            // the digest, and stay distinguishable when they do.
             mean_gain: FrozenGain {
                 estimator: "test".into(),
                 blocks: Blocks {
@@ -3827,6 +4674,11 @@ mod tests {
                     Some(-0.04),
                     None,
                 ],
+                intercept_refused: vec![InterceptRefusal {
+                    horizon: 5,
+                    intercept: 4.2e-3,
+                    amplitude_cost: 1.1e-2,
+                }],
             },
             manifest_sha256: String::new(),
         };
@@ -3908,6 +4760,12 @@ mod tests {
         // one, and a `basis` arm's curves would be averaged in with arms whose long-horizon
         // means were unrestricted. That is the same failure the `v8` bump names, on the axis
         // that this time really does change the tensor shapes.
+        // `…-v10-…-mean-<spec>` is the LAST stamp before the amplitude calibration, and the
+        // most dangerous one on this list: its parameter set is identical to this build's, so
+        // every tensor loads, and its manifest simply has no `mean_gain`. Loading one would
+        // score an UN-CALIBRATED head under a calibrated build's labels, which is the exact
+        // confusion the whole mechanism exists to end. Refused by name here; the second half of
+        // that guarantee - a hand-restamped `v10` manifest - is asserted below.
         for stale in [
             "timexer-ohlc-universe-v4",
             "causal-patch-ohlc-universe-v5",
@@ -3917,6 +4775,8 @@ mod tests {
             "causal-patch-ohlc-universe-v8-head-channel-major-folded-mup-rmsnorm-relu2-lambdas-unet-vres-x0-none",
             "causal-patch-ohlc-universe-v9-head-channel-major-folded-mup-rmsnorm-relu2-lambdas-unet-vres-x0-learned",
             "causal-patch-ohlc-universe-v9-head-channel-major-folded-mup-rmsnorm-relu2-lambdas-unet-vres-x0-none",
+            "causal-patch-ohlc-universe-v10-head-channel-major-folded-mup-rmsnorm-relu2-lambdas-unet-vres-x0-learned-mean-basis:2:2",
+            "causal-patch-ohlc-universe-v10-head-channel-major-folded-mup-rmsnorm-relu2-lambdas-unet-vres-x0-none-mean-basis:2:2",
         ] {
             let mut previous_format = manifest.clone();
             previous_format.format = stale.into();
@@ -3928,6 +4788,58 @@ mod tests {
                 "{error}"
             );
         }
+        // The other half of the `v11` guarantee: a `v10` manifest hand-restamped to this
+        // build's format still cannot load, because `mean_gain` has no serde default. There is
+        // no such thing as a `v11` checkpoint whose amplitude is unstated, and this is the path
+        // that says so - the stamp check above can be edited around, a missing field cannot.
+        let mut restamped = serde_json::to_value(&manifest).unwrap();
+        restamped.as_object_mut().unwrap().remove("mean_gain");
+        fs::write(
+            directory.0.join("manifest.json"),
+            serde_json::to_vec_pretty(&restamped).unwrap(),
+        )
+        .unwrap();
+        let error = Manifest::read(&directory.0).unwrap_err().to_string();
+        assert!(error.contains("mean_gain"), "{error}");
+        // And the structural half, for a curve that is present but describes another horizon
+        // count: named against this checkpoint's own `pred_len` rather than at the first
+        // decode, where it would surface as a shape error with no provenance.
+        let mut short = manifest.clone();
+        short.mean_gain.anchor.truncate(3);
+        short.manifest_sha256 = short.digest().unwrap();
+        write(&short);
+        let error = format!("{:#}", Manifest::read(&directory.0).unwrap_err());
+        assert!(
+            error.contains("7-horizon forecast") && error.contains("not applicable"),
+            "{error}"
+        );
+        // The measurement round-trips with its unmeasured horizons INTACT: `None` survives as
+        // JSON `null`, which is the whole reason the field is not `Vec<f64>` - serde_json
+        // writes a NaN as `null` and then refuses to read it back into an `f64`, so a
+        // checkpoint with one unidentified horizon would have been unloadable.
+        write(&manifest);
+        let restored = Manifest::read(&directory.0).unwrap();
+        assert_eq!(restored.mean_gain.measured_anchor[6], None);
+        assert_eq!(restored.mean_gain.measured_anchor[5], Some(-0.04));
+        assert_eq!(
+            restored.mean_gain.gated(),
+            [
+                (
+                    5,
+                    SizingGate::InterceptDominates {
+                        intercept: 4.2e-3,
+                        amplitude_cost: 1.1e-2
+                    }
+                ),
+                (6, SizingGate::NonPositiveGain(-0.04)),
+                (7, SizingGate::Unmeasured)
+            ],
+            "each gated horizon must survive the manifest with its OWN reason: a refused \
+             parameterization, a measured non-positive amplitude and an absent measurement are \
+             three findings and one sentinel for all three is how a zero book stops being \
+             explicable"
+        );
+        assert!(serde_json::to_string(&manifest).unwrap().contains("null"));
         // A stamp that is accepted on its own but describes the OTHER parameter set: the
         // no-x0 stamp against a manifest declaring the learned injection. Both halves are
         // individually valid, so only the cross-check catches it - and it must, because the
@@ -4170,6 +5082,54 @@ mod tests {
         );
         scorer.accumulate(forecast, (windows * pred_len) as usize);
         scorer.finish(EvalTiming::default()).unwrap()
+    }
+
+    #[test]
+    fn per_horizon_gaussian_nll_preserves_masked_population_and_scale() {
+        let cpu = (Kind::Float, Device::Cpu);
+        let shape = [60, 2, CHANNELS];
+        let targets = Tensor::from_slice(&[1_f32, 2.])
+            .reshape([1, 2, 1])
+            .expand(shape, true);
+        let scaled = &targets - 0.5;
+        let log_scale = Tensor::from_slice(&[0_f32, 2_f32.ln()])
+            .reshape([1, 2, 1])
+            .expand(shape, true);
+        let mask = Tensor::ones([60, 2], cpu);
+        let _ = mask.narrow(0, 30, 30).select(1, 1).zero_();
+        let forecast = FinalOrigin {
+            prices: (&scaled * 1e-4).exp() * 100.,
+            rebased_prices: (&scaled * 1e-4).exp() * 100.,
+            target_prices: (&targets * 1e-4).exp() * 100.,
+            mid: Tensor::zeros([60], cpu),
+            sigma: Tensor::full([60], 1e-4, cpu),
+            drift: Tensor::zeros([60, 2, 1], cpu),
+            scaled,
+            targets,
+            log_scale,
+            mask,
+        };
+        let groups = Tensor::arange(60, (Kind::Int64, Device::Cpu)).floor_divide_scalar(20);
+        let mut scorer = Scorer::new(
+            &Tensor::from_slice(&[0_f32, 0.5 * 2_f32.ln()]),
+            &[1., 1.],
+            &groups,
+            3,
+            2,
+            Device::Cpu,
+        );
+        scorer.accumulate(&forecast, 90);
+        let measured = scorer.finish(EvalTiming::default()).unwrap();
+        // The shared scorer omits the model-independent half-log(2*pi) constant.
+        let expected = [0.125, 2_f64.ln() + 0.03125];
+        let persistence = [0.5, 0.5 * 2_f64.ln() + 1.];
+        for (actual, expected) in measured.horizon_nll.iter().zip(expected)
+            .chain(measured.horizon_persistence_nll.iter().zip(persistence))
+        {
+            assert!((actual - expected).abs() < 1e-6);
+        }
+        assert!((measured.nll - (2. * expected[0] + expected[1]) / 3.).abs() < 1e-6);
+        assert!((measured.persistence_nll - (2. * persistence[0] + persistence[1]) / 3.).abs() < 1e-6);
     }
     /// Payoffs restore raw market drift and enter at the next observed OPEN, while decisions
     /// consume the close predictive scale. Missing entry/endpoint data drops whole cohorts.
@@ -4423,26 +5383,19 @@ mod tests {
         assert_eq!(reported.last(), Some(&9590));
         assert_eq!(reason, Some(Termination::EpochLimit));
     }
-    /// The property that makes a capped arm comparable to the 9,590-step baselines at all: at
-    /// one `--schedule-budget`, the first N steps of a capped run are the first N steps of the
-    /// long run's OWN trajectory, bit for bit. If the cap ever leaked into the schedule, every
-    /// short arm would be a different experiment from the arms it is being read against and
-    /// the comparison would be silently wrong rather than loudly broken.
+    /// The coupling, and the override that undoes it. A capped arm with no stated budget MUST
+    /// anneal into its cap; an arm that states a budget MUST get exactly that schedule however
+    /// short the cap is, because that is the shape a step-matched comparison against the long
+    /// arms needs.
+    ///
+    /// This replaces the test that pinned the opposite - `--max-steps` deliberately absent from
+    /// the schedule inputs. That property bought step-matched comparability at the price of
+    /// never annealing: at the production geometry the cooldown starts at step 3,836, so six
+    /// capped arms at 2,500 steps each spent EVERY step at multiplier 1.0 and none of them
+    /// measured an annealed weight state. Comparability is now something an arm asks for.
     #[test]
-    fn a_step_cap_leaves_the_learning_rate_schedule_untouched() {
+    fn a_step_cap_shapes_the_learning_rate_schedule_unless_a_budget_is_stated() {
         let steps_per_epoch = 9590;
-        let long = TrainArgs {
-            schedule_budget: 9590,
-            ..TrainArgs::default()
-        };
-        let capped = TrainArgs {
-            max_steps: 4000,
-            ..long.clone()
-        };
-        assert_eq!(
-            schedule_budget(&capped, steps_per_epoch),
-            schedule_budget(&long, steps_per_epoch)
-        );
         let build = |args: &TrainArgs| {
             LrSchedule::new(
                 schedule_budget(args, steps_per_epoch),
@@ -4451,44 +5404,64 @@ mod tests {
             )
             .unwrap()
         };
-        let (long_schedule, capped_schedule) = (build(&long), build(&capped));
-        assert_eq!(long_schedule, capped_schedule);
-        for step in 0..4000 {
+        // Neither knob: the whole planned run, unchanged, which is every uncapped arm and
+        // every in-repo launcher.
+        let uncapped = TrainArgs::default();
+        assert_eq!(schedule_budget(&uncapped, steps_per_epoch), 9590);
+        // A cap alone now IS the budget, so the arm reaches the 0.15 floor at its last step
+        // instead of holding the peak rate through all 2,500 of them.
+        let capped = TrainArgs {
+            max_steps: 2500,
+            ..TrainArgs::default()
+        };
+        assert_eq!(schedule_budget(&capped, steps_per_epoch), 2500);
+        let annealed = build(&capped);
+        assert_eq!(annealed.cooldown_start(), Some(1000));
+        assert_eq!(annealed.scale(999).to_bits(), 1.0f64.to_bits());
+        assert!(
+            annealed.scale(2499) < 0.16,
+            "a capped arm must reach the cooldown floor at its last step, got {}",
+            annealed.scale(2499)
+        );
+        // What the old behaviour was, kept as the comparand it is: 2,500 steps of a 9,590-step
+        // schedule never leave multiplier 1.0 at all. This is the arm shape the sweep actually
+        // ran, and it is now only reachable by SAYING so.
+        let stated = TrainArgs {
+            schedule_budget: 9590,
+            ..capped.clone()
+        };
+        assert_eq!(schedule_budget(&stated, steps_per_epoch), 9590);
+        let long = build(&TrainArgs {
+            schedule_budget: 9590,
+            ..TrainArgs::default()
+        });
+        let unannealed = build(&stated);
+        assert_eq!(unannealed, long);
+        assert_eq!(unannealed.cooldown_start(), Some(3836));
+        for step in 0..2500 {
             assert_eq!(
-                capped_schedule.scale(step).to_bits(),
-                long_schedule.scale(step).to_bits(),
-                "the capped arm's rate multiplier at step {step} is not the long arm's"
+                unannealed.scale(step).to_bits(),
+                1.0f64.to_bits(),
+                "the stated-budget arm holds the peak rate at step {step}, which is the \
+                 property the override exists to preserve"
             );
             assert_eq!(
-                capped_schedule.muon_momentum(step).to_bits(),
-                long_schedule.muon_momentum(step).to_bits(),
-                "the capped arm's NorMuon momentum at step {step} is not the long arm's"
+                unannealed.muon_momentum(step).to_bits(),
+                long.muon_momentum(step).to_bits()
             );
         }
-        // The cooldown is still shaped against the 9,590-step budget: the base rate holds
-        // through step 3,835 and the capped arm spends only its last 164 steps in the very
-        // start of the warmdown, ending at 0.976 of the base rate. A cap that leaked into the
-        // schedule would have cooled from step 1,600 and ended at the 0.15 floor, i.e. a
-        // different optimizer trajectory from the baselines at every step past 1,600.
-        assert_eq!(capped_schedule.cooldown_start(), Some(3836));
-        assert_eq!(capped_schedule.scale(3835).to_bits(), 1.0f64.to_bits());
-        let last = capped_schedule.scale(3999);
-        assert!(last < 1. && last > 0.97, "{last}");
-        let leaked = LrSchedule::new(4000, NANOGPT_COOLDOWN_FRAC, NANOGPT_COOLDOWN_FLOOR).unwrap();
-        assert_eq!(leaked.cooldown_start(), Some(1600));
-        assert!(leaked.scale(3999) < 0.16);
-        // `--schedule-budget 0` still means "the whole planned run", and a cap does not shrink
-        // that either: this is the second arm shape, 4,000 steps of a schedule shaped against
-        // the full epoch without having to restate the epoch's length.
+        // A stated budget wins over the cap in BOTH directions, including a budget shorter than
+        // the cap: the knob is an override, not a maximum.
         assert_eq!(
             schedule_budget(
                 &TrainArgs {
+                    schedule_budget: 1500,
                     max_steps: 4000,
                     ..TrainArgs::default()
                 },
                 steps_per_epoch
             ),
-            9590
+            1500
         );
     }
     #[test]
@@ -4578,10 +5551,10 @@ mod tests {
     /// rather than on the algebra: applying a positive per-horizon gain to the anchored close
     /// leaves every rank and sign statistic where it was, and moves only the quadratic ones.
     ///
-    /// The calibrated forecast is built exactly as [`CausalPatchModel::fold_mean_gain`] builds
-    /// it - every channel shifted by `(gain - 1)·close`, so the close is scaled and the candle
-    /// offsets are untouched - which is what makes this a test of the deployed transform and
-    /// not of a convenient paraphrase of it.
+    /// The calibrated forecast is built exactly as `CausalPatchModel::gained` builds it, at the
+    /// offset gain of 1 this fixture uses - every channel shifted by `(gain - 1)·close`, so the
+    /// close is scaled and the candle offsets are untouched - which is what makes this a test
+    /// of the deployed transform and not of a convenient paraphrase of it.
     #[test]
     fn a_positive_per_horizon_gain_moves_mse_and_cannot_move_a_rank_statistic() {
         let _rng = crate::torch::test_rng::exclusive();
@@ -4680,9 +5653,9 @@ pub struct ProbeArgs {
     /// Where the three latent-probe report bases are written.
     #[arg(long)]
     pub output: PathBuf,
-    /// No split knob, for the same reason [`CalibrateArgs`] has none: the fit block is the
-    /// corpus's reserved `[70%, 80%)` partition and the scored block is the held-out full
-    /// split, and any knob here would be a knob that can produce leakage.
+    /// No split knob, for the same reason the retired `calibrate` subcommand had none: the fit
+    /// block is the corpus's reserved `[70%, 80%)` partition and the scored block is the
+    /// held-out full split, and any knob here would be a knob that can produce leakage.
     #[arg(long, default_value_t = 256)]
     pub batch_size: usize,
     /// Cap on the number of FIT origins, deterministically strided over the whole reserved

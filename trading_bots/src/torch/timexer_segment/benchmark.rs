@@ -101,7 +101,8 @@ pub struct LoaderAuditArgs {
     #[arg(long, default_value_t = 6000)]
     pub common_context: usize,
     /// Comma-separated exogenous variates: time-of-day, day-of-week, session-gap, volume,
-    /// market, spy, dispersion, cross-section-z; `all` or `none`.
+    /// market, spy, dispersion, cross-section-z, cross-section-rank, relative-volume, range-z;
+    /// `all` or `none`.
     #[arg(long, default_value_t = FeatureSet::ALL)]
     pub features: FeatureSet,
     #[arg(long, default_value_t = 2000)]
@@ -650,8 +651,8 @@ fn verify_optimizer(config: &ModelConfig, batch: &Batch) -> Result<f64> {
     let destination = fused_store.variables();
     for _ in 0..3 {
         reference.zero_grad()?;
-        Engine::forward_loss(&reference_model, batch, true)
-            .nll
+        Engine::forward_loss(&reference_model, batch, true, None)
+            .objective
             .backward();
         Python::attach(|py| -> Result<()> {
             py.import("torch")?;
@@ -806,7 +807,7 @@ fn paired_loss_arm(
             true => model.composed_losses(&head, &stats, &targets, &mask),
             false => model.losses(&head, &stats, &targets, &mask),
         };
-        losses.nll.backward();
+        losses.objective.backward();
         losses.nll.double_value(&[])
     };
     let clear = || {
@@ -970,6 +971,18 @@ pub fn run(args: BenchmarkArgs) -> Result<()> {
     // What the training loader hands the engine: the same numbers in PINNED host memory, so
     // the upload is a real asynchronous H2D of the packed row block rather than a D2D copy.
     let pinned_batch = device_batch.host_copy(Some(device));
+    // The eager comparison needs its own activation set; run before the training graph
+    // reserves a private pool that cannot be reused by eager allocations.
+    let paired = match args.paired_loss {
+        true => Some(paired_loss_arm(
+            &model,
+            &store,
+            &device_batch,
+            args.steps,
+            args.paired_repeats,
+        )?),
+        false => None,
+    };
     // Warmup and capture in exactly training's order: `CAPTURE_AFTER_STEPS` steps on the
     // capture stream's warmup body, then the forward+backward capture, then the rest of the
     // warmup on the replay. Before this, `run` never called `arm_step_graph` at all, so its
@@ -1007,18 +1020,6 @@ pub fn run(args: BenchmarkArgs) -> Result<()> {
     let loader_step_ms = match &args.corpus {
         Some(directory) => loader_arm(directory, &args, &model, &mut engine, device)?,
         None => f64::NAN,
-    };
-    // After every captured arm, so the paired arm's own allocations cannot displace the
-    // capture's private mempool, and before the summary that reports it.
-    let paired = match args.paired_loss {
-        true => Some(paired_loss_arm(
-            &model,
-            &store,
-            &device_batch,
-            args.steps,
-            args.paired_repeats,
-        )?),
-        false => None,
     };
     // The production step: what a training step costs when its batch arrives the way the
     // trainer's batches arrive. The device-fed arm above is the same kernels without the

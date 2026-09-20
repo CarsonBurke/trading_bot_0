@@ -8,6 +8,8 @@ use super::{
     calibration::FrozenGain,
     corpus::Batch,
     features::{Feature, FeatureSet},
+    jepa::{JepaConfig, JepaHeads, JepaMode, JepaRandom, RepresentationViews, CONDITIONAL_FEATURES},
+    supervision::HorizonDecimation,
     target_basis::{self, BasisTransform, BasisWeight, TargetBasis},
 };
 use crate::torch::model::rope::RotaryEmbedding;
@@ -85,6 +87,43 @@ pub enum X0Lambdas {
 impl X0Lambdas {
     pub fn enabled(self) -> bool {
         matches!(self, Self::Enabled)
+    }
+}
+
+/// Whether the squared-error term's gradient into the MEAN is weighted by the model's own
+/// predicted precision.
+///
+/// [`Self::Full`] is the textbook Gaussian NLL and the control: one quadratic term serves
+/// both parameter groups, so the mean's gradient weight is `exp(-2·ls)` and RISES wherever
+/// the head has learned to be confident. On the redundant overlapping windows at the long
+/// end of the horizon axis that is a super-linear reward for memorizing the training period,
+/// and it is the mechanism behind the measured pattern that long-horizon degradation is an
+/// output-AMPLITUDE failure rather than a loss of information.
+///
+/// [`Self::Decoupled`] splits the quadratic so the mean sees plain weighted MSE and the log
+/// scale keeps the exact objective it had. The stationary point in the scale does not move
+/// and no horizon reweighting is introduced; see
+/// [`fused_kernels::reference::decoupled_loss_geometry`] for the algebra and for why this is
+/// NOT Seitzer et al.'s multiplicative β-NLL. Both modes have fused geometry and backward;
+/// the composed ATen implementation remains an independent numerical reference.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
+#[serde(rename_all = "kebab-case")]
+pub enum ScaleCoupling {
+    #[default]
+    Full,
+    Decoupled,
+}
+
+impl ScaleCoupling {
+    /// Reduced terms the geometry stacks per channel: two under the full coupling, three
+    /// once the quadratic is split. Nothing normalizes by this - the objective's denominator
+    /// counts weighted OBSERVATIONS - but [`CausalPatchModel::reduce_geometry`] pins it, so a
+    /// geometry produced by one composition and reduced under the other cannot pass silently.
+    fn terms_per_channel(self) -> i64 {
+        match self {
+            Self::Full => 2,
+            Self::Decoupled => 3,
+        }
     }
 }
 
@@ -557,9 +596,15 @@ pub struct ModelConfig {
     #[arg(long, default_value_t = 256)]
     pub min_history: i64,
     /// Comma-separated exogenous variates: time-of-day, day-of-week, session-gap, volume,
-    /// market, spy, dispersion, cross-section-z; `all` or `none`.
+    /// market, spy, dispersion, cross-section-z, cross-section-rank, relative-volume, range-z;
+    /// `all` or `none`.
     #[arg(long, default_value_t = FeatureSet::ALL)]
     pub features: FeatureSet,
+    /// Condition on calendars of the actual future observed bars (legacy production path).
+    /// Disable for causal research panels: next-print times are not known at the origin.
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    #[serde(default = "calendar_enabled", skip_serializing_if = "is_calendar_enabled")]
+    pub future_calendar: bool,
     /// Whether the per-layer embedding re-injection exists; `disabled` removes the parameters
     /// and the kernel, and changes the checkpoint FORMAT stamp.
     #[arg(long, value_enum, default_value_t = X0Lambdas::Enabled)]
@@ -621,6 +666,33 @@ pub struct ModelConfig {
     #[arg(long)]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub basis_stats: Option<std::path::PathBuf>,
+    /// Whether the mean's gradient carries the head's own predicted precision: `full` (the
+    /// control, the textbook NLL and the fused kernel) or `decoupled`.
+    ///
+    /// The reported NLL does not move with this knob. `decoupled` changes only which
+    /// gradient the same scalar hands back, so held-out NLL, the selection scalar and every
+    /// chart that reads them stay comparable to the control's - see [`ScaleCoupling`].
+    #[arg(long, value_enum, default_value_t = ScaleCoupling::Full)]
+    #[serde(default, skip_serializing_if = "is_full_coupling")]
+    pub scale_coupling: ScaleCoupling,
+    /// Whether the TRAINING supervision mask is decimated along the sub-origin lattice per
+    /// horizon, with importance compensation: `none` (the control) or `lattice`.
+    ///
+    /// This is a VARIANCE knob, not a weighting one. The compensation makes both the
+    /// objective's numerator and its denominator unbiased for their full-lattice values, so
+    /// the expected gradient is unchanged and only its long-horizon noise rises - see
+    /// [`HorizonDecimation`] for why the uncompensated version would merely be
+    /// `--horizon-loss` under another name.
+    #[arg(long, value_enum, default_value_t = HorizonDecimation::None)]
+    #[serde(default, skip_serializing_if = "is_undecimated")]
+    pub horizon_decimation: HorizonDecimation,
+    /// Optional temporal objective; `off` preserves the forecast-only path.
+    #[arg(long, value_enum, default_value_t = JepaMode::Off)]
+    #[serde(default, skip_serializing_if = "JepaMode::is_off")]
+    pub jepa_mode: JepaMode,
+    #[command(flatten)]
+    #[serde(default, skip_serializing_if = "JepaConfig::is_default")]
+    pub jepa: JepaConfig,
 }
 
 /// `--amplitude-prior 0` is the control, and a control manifest must serialize exactly as it
@@ -630,6 +702,9 @@ fn no_amplitude_prior(lambda: &f64) -> bool {
     *lambda == 0.
 }
 
+fn calendar_enabled() -> bool { true }
+fn is_calendar_enabled(enabled: &bool) -> bool { *enabled }
+
 /// The control basis, skipped from the manifest for the same reason `--amplitude-prior 0` is:
 /// a control checkpoint must serialize, and therefore digest, exactly as it did before the knob.
 fn is_cumulative_basis(basis: &TargetBasis) -> bool {
@@ -638,6 +713,16 @@ fn is_cumulative_basis(basis: &TargetBasis) -> bool {
 
 fn is_uniform_basis_weight(weight: &BasisWeight) -> bool {
     *weight == BasisWeight::Uniform
+}
+
+/// The control coupling, skipped from the manifest for the reason `--amplitude-prior 0` is.
+fn is_full_coupling(coupling: &ScaleCoupling) -> bool {
+    *coupling == ScaleCoupling::Full
+}
+
+/// The control decimation, skipped from the manifest for the reason `--amplitude-prior 0` is.
+fn is_undecimated(decimation: &HorizonDecimation) -> bool {
+    *decimation == HorizonDecimation::None
 }
 
 impl Default for ModelConfig {
@@ -653,6 +738,7 @@ impl Default for ModelConfig {
             dropout: 0.0,
             min_history: 256,
             features: FeatureSet::ALL,
+            future_calendar: true,
             x0_lambdas: X0Lambdas::Enabled,
             horizon_loss: HorizonLoss::Uniform,
             horizon_mean: HorizonMean::Free,
@@ -660,6 +746,10 @@ impl Default for ModelConfig {
             target_basis: TargetBasis::Cumulative,
             basis_weight: BasisWeight::Uniform,
             basis_stats: None,
+            scale_coupling: ScaleCoupling::Full,
+            horizon_decimation: HorizonDecimation::None,
+            jepa_mode: JepaMode::Off,
+            jepa: JepaConfig::default(),
         }
     }
 }
@@ -788,11 +878,78 @@ impl ModelConfig {
                  measured ρ̂ per coefficient; it is fitted on the [70%,80%) partition"
             );
         }
+        if self.horizon_decimation.enabled() {
+            // Both refusals are about the MASK, which is the only channel the compensation
+            // factor can ride. `basis_losses` reduces `mask.amin(-1)`, the row COMPLETENESS
+            // indicator over the whole horizon window, so a per-horizon keep pattern would
+            // zero every row rather than decimate it; and `increment_pair` forms its mask as
+            // `mask * shift(mask)`, which would square the factor. Neither is a plumbing gap:
+            // a coefficient mixes all `pred_len` horizons, so "decimate horizon h" has no
+            // meaning in a rotated basis, and `increment` already attacks this exact overlap
+            // by moving the objective into non-overlapping per-bar targets - running both
+            // makes neither attributable.
+            ensure!(
+                self.target_basis.is_identity(),
+                "--horizon-decimation {} decimates a PER-HORIZON mask and --target-basis {} \
+                 measures error in coefficients that mix every horizon, so the objective has \
+                 no per-horizon element to keep or drop",
+                self.horizon_decimation,
+                self.target_basis
+            );
+            ensure!(
+                !matches!(self.horizon_mean, HorizonMean::Increment { .. }),
+                "--horizon-decimation {} and --horizon-mean {} are two treatments of the same \
+                 target-overlap defect; increments already supervise non-overlapping per-bar \
+                 targets, and the increment mask is a product of two horizon-adjacent masks \
+                 which would square the compensation factor",
+                self.horizon_decimation,
+                self.horizon_mean
+            );
+        }
+        self.jepa.validate(self)?;
         Ok(())
     }
 
     pub fn origins(&self) -> i64 {
         self.seq_len / self.patch_len
+    }
+
+    /// Complete optional objective/parameter contract for authenticated research manifests.
+    pub fn jepa_contract(&self) -> Option<String> {
+        self.jepa_mode.enabled().then(|| {
+            if self.jepa_mode.conditional() {
+                return format!(
+                    "temporal-conditional-cf-v1;mode={};config={};horizons-bars={:?};observation=unconstrained-shared-full-width-patch-embedding(causal-prefix-normalization);target=fixed-source-anchored-neutral-close-return/(source-sigma*sqrt(h));beta=source-causal-ridge;features=interleaved-cos-sin;frequencies=[0.25,0.5,1,2,4];mask=complete-source-patch-and-minimum-history-and-every-future-bar;predictor=direct-state-mlp-{}-gelu-{}-{};objective=prediction-weight*masked-feature-mse;population=batch-rows-per-source-and-horizon;sigreg=none;reconstruction=none;forecast-detached=false;future-calendar={}",
+                    self.jepa_mode,
+                    serde_json::to_string(&self.jepa).expect("validated JEPA config"),
+                    self.jepa_horizons(),
+                    self.d_model,
+                    self.jepa.predictor_width,
+                    self.jepa_mode.offsets().len() as i64 * CONDITIONAL_FEATURES,
+                    self.future_calendar,
+                );
+            }
+            let target = if self.jepa_mode == JepaMode::AnchoredProjectedSmall {
+                "attached-nonoverlapping-future-q(observation);projector=pointwise-d_model-gelu-16-no-normalization-no-dropout;forecast-input=original-observation"
+            } else if self.jepa_mode.projected() {
+                "attached-nonoverlapping-future-q(observation);projector=pointwise-d_model-gelu-d_model-no-normalization-no-dropout;forecast-input=original-observation"
+            } else {
+                "attached-nonoverlapping-future-observation"
+            };
+            format!(
+                "temporal-lejepa-v1;mode={};config={};horizons-bars={:?};observation=unconstrained-shared-full-width-patch-embedding(causal-prefix-normalization);target={};predictor=direct-state-mlp;population=batch-rows-per-view;reconstruction=normalized-local-price-tokens;forecast-detached={};future-calendar={}",
+                self.jepa_mode,
+                serde_json::to_string(&self.jepa).expect("validated JEPA config"),
+                self.jepa_horizons(),
+                target,
+                self.jepa_mode.detached_forecast(),
+                self.future_calendar,
+            )
+        })
+    }
+
+    pub fn jepa_horizons(&self) -> Vec<i64> {
+        self.jepa_mode.offsets().iter().map(|k| k * self.patch_len).collect()
     }
 
     /// `(encoder source, decoder destination)` for every U-net skip, deepest encoder layer
@@ -816,7 +973,7 @@ impl ModelConfig {
             .features
             .channel_mask(Feature::known_future)
             .iter()
-            .filter(|known| **known)
+            .filter(|known| self.future_calendar && **known)
             .count() as f64;
         let covariate_width = if known > 0. { COVARIATE_WIDTH as f64 } else { 0. };
         let head_input = width + covariate_width;
@@ -920,7 +1077,15 @@ impl ModelConfig {
         // objective weights at zero. Masking the loss rather than narrowing the head is the
         // deliberate trade - every per-horizon diagnostic keeps reading the untrained end,
         // which is the entire point of the arm.
-        let head_loss = fp32(tokens * horizon) * 74.;
+        //
+        // Fused decoupled geometry adds one precision-workspace write and four two-vector
+        // mean dots: nine fp32 traffic units, with the same backward traffic. The true NLL
+        // reuses reduced scale/log terms. This is an analytical bound, not a timing claim.
+        let head_loss = fp32(tokens * horizon)
+            * match self.scale_coupling {
+                ScaleCoupling::Full => 74.,
+                ScaleCoupling::Decoupled => 83.,
+            };
         // Value residual: `layers - 1` decoder layers each `lerp` their own value against layer
         // 0's. Ten passes over one `[tokens, d_model]` bf16 activation per such layer - three
         // forward (two reads and one write) and seven backward (`grad_self` and `grad_end` at a
@@ -978,18 +1143,52 @@ impl ModelConfig {
         } else {
             0.
         };
+        let (jepa_flops, jepa_bytes) = if self.jepa_mode.enabled() {
+            let offsets = self.jepa_mode.offsets();
+            let sources = rows * (self.origins() - offsets.last().unwrap()) as f64;
+            let hidden = self.jepa.predictor_width as f64;
+            let output_dim = if self.jepa_mode.conditional() { CONDITIONAL_FEATURES as f64 } else { self.jepa_mode.target_width(self.d_model) as f64 };
+            let predicted = output_dim * offsets.len() as f64;
+            let mut arithmetic = 3. * (gemm(sources, width, hidden) + gemm(sources, hidden, predicted));
+            let mut traffic = 6. * bf16(sources * (hidden + predicted))
+                + 8. * fp32(sources * predicted);
+            if self.jepa_mode.conditional() {
+                // Selected close/market endpoints, interval prefix counts and fixed CF phases;
+                // no second dense forecast target and no random sphere projection.
+                traffic += 4. * fp32(rows * self.seq_len as f64)
+                    + 8. * fp32(sources * offsets.len() as f64);
+            }
+            if self.jepa_mode.projected() {
+                arithmetic += 3. * (gemm(tokens, width, width) + gemm(tokens, width, output_dim));
+                traffic += 6. * bf16(tokens * (width + output_dim));
+            }
+            if self.jepa_mode.regularized() {
+                let views = self.jepa.views.min(self.origins()) as f64;
+                let directions = self.jepa.directions as f64;
+                arithmetic += 2. * gemm(rows * views, output_dim, directions);
+                // Lower bound for phases, sin/cos, masked moments and their backward.
+                traffic += 8. * fp32(rows * views * directions * 17.);
+            }
+            if self.jepa_mode == JepaMode::AnchoredReconstruct {
+                let features = (self.patch_len * CHANNELS) as f64;
+                arithmetic += 3. * gemm(tokens, width, features);
+                traffic += 6. * bf16(tokens * features) + 8. * fp32(tokens * features);
+            }
+            (arithmetic, traffic)
+        } else { (0., 0.) };
         StepCost {
-            matmul_flops: 3. * flops + expansion,
+            matmul_flops: 3. * flops + expansion + jepa_flops,
             traffic_bytes: 3. * 2. * bytes
                 + head_loss
                 + value_residual
                 + expansion_bytes
-                + amplitude_prior,
+                + amplitude_prior
+                + jepa_bytes,
         }
     }
 }
 
-fn projection(path: nn::Path, input: i64, output: i64, bias: bool) -> nn::Linear {
+pub(super) fn projection(path: nn::Path, input: i64, output: i64, bias: bool) -> nn::Linear {
     // Match torch.nn.Linear, including its fan-in initialization.
     let bound = 1.0 / (input as f64).sqrt();
     let init = nn::Init::Uniform {
@@ -1069,7 +1268,7 @@ fn hidden_projection(path: nn::Path, input: i64, output: i64) -> nn::Linear {
     )
 }
 
-fn linear(input: &Tensor, layer: &nn::Linear) -> Tensor {
+pub(super) fn linear(input: &Tensor, layer: &nn::Linear) -> Tensor {
     input.linear(
         &layer.ws.to_kind(input.kind()),
         layer.bs.as_ref().map(|bias| bias.to_kind(input.kind())),
@@ -1521,8 +1720,11 @@ pub struct CausalPatchModel {
     sigma_scale: Tensor,
     unit_scale: Tensor,
     /// `√h` per future bar, `[1, 1, 1, pred_len]` fp32: the unit the close coordinate is
-    /// measured in, and the ONE tensor a post-hoc mean calibration touches - see
-    /// [`Self::fold_mean_gain`].
+    /// measured in. NOT where a post-hoc mean calibration lands - folding a gain here would
+    /// rescale the anchor alone and leave the intrabar offsets, which are built from the range
+    /// and position coordinates, at their emitted size. The calibration is applied to the
+    /// DECODED candle instead, by [`Self::gained`], which is the single application point every
+    /// consumer shares.
     horizon_scale: Tensor,
     half_log_horizon: Tensor,
     /// `1/h` per future bar, `[1, 1, 1, pred_len]`: `exp(-2·½·ln h)` pulled out of the
@@ -1566,6 +1768,7 @@ pub struct CausalPatchModel {
     /// makes the control arm bit-for-bit the pre-knob objective rather than merely equal to it:
     /// the fused loss call below is reached by exactly the code it was reached by before.
     basis: Option<BasisTransform>,
+    jepa: Option<JepaHeads>,
 }
 
 /// A frozen amplitude calibration, resident: the two curves as the decode's operands, beside
@@ -1612,7 +1815,7 @@ impl CausalPatchModel {
             .channel_mask(Feature::known_future)
             .iter()
             .enumerate()
-            .filter_map(|(index, known)| known.then_some(index as i64))
+            .filter_map(|(index, known)| (config.future_calendar && *known).then_some(index as i64))
             .collect();
         let sigma_scale: Vec<f32> = config
             .features
@@ -1740,6 +1943,8 @@ impl CausalPatchModel {
             ),
             mean_gain: None,
             basis,
+            // Last random initialization: optional heads never perturb shared parameters.
+            jepa: config.jepa_mode.enabled().then(|| JepaHeads::new(path / "jepa", config)),
             config: config.clone(),
         }
     }
@@ -1842,10 +2047,14 @@ impl CausalPatchModel {
     }
 
     pub fn statistics(&self, batch: &Batch) -> Statistics {
+        self.statistics_range(batch, 0, self.config.seq_len)
+    }
+
+    fn statistics_range(&self, batch: &Batch, start: i64, context: i64) -> Statistics {
         let c = &self.config;
-        let (context, patch, origins) = (c.seq_len, c.patch_len, c.origins());
-        let log_prices = batch.log_prices.narrow(1, 0, context);
-        let valid = batch.valid.narrow(1, 0, context);
+        let (patch, origins) = (c.patch_len, context / c.patch_len);
+        let log_prices = batch.log_prices.narrow(1, start, context);
+        let valid = batch.valid.narrow(1, start, context);
         let rows = log_prices.size()[0];
         let close = log_prices.select(2, 3);
         let pair = valid.narrow(1, 1, context - 1) * valid.narrow(1, 0, context - 1);
@@ -1859,7 +2068,7 @@ impl CausalPatchModel {
         let mean = cumulative(&returns) / &pairs;
         let variance = cumulative(&returns.square()) / &pairs - mean.square();
         let sigma = (variance.clamp_min(0.0) + RETURN_VARIANCE_FLOOR).sqrt();
-        let market = batch.market_cum.narrow(1, 0, context);
+        let market = batch.market_cum.narrow(1, start, context);
         let steps = (market.narrow(1, 1, context - 1) - market.narrow(1, 0, context - 1)) * &pair;
         let market_squares = cumulative(&steps.square());
         let ridge = (&market_squares / &pairs).clamp_min(RETURN_VARIANCE_FLOOR) * BETA_PRIOR_BARS;
@@ -1914,24 +2123,30 @@ impl CausalPatchModel {
     /// Nothing here carries a gradient - prices, auxiliaries and statistics are all data - so
     /// none of these fp32 intermediates is retained past the cast.
     pub fn tokens(&self, batch: &Batch, stats: &Statistics) -> Tensor {
+        let rows = batch.log_prices.size()[0];
+        let length = self.config.seq_len + self.config.pred_len;
+        assert_eq!(batch.log_prices.size(), [rows, length, CHANNELS]);
+        assert_eq!(batch.aux.size(), [rows, length, self.config.features.channels() as i64]);
+        self.tokens_range(batch, stats, 0, self.config.seq_len)
+    }
+
+    fn tokens_range(&self, batch: &Batch, stats: &Statistics, start: i64, context: i64) -> Tensor {
         let c = &self.config;
-        let (context, patch, horizon, origins) = (c.seq_len, c.patch_len, c.pred_len, c.origins());
+        let (patch, origins) = (c.patch_len, context / c.patch_len);
         let aux_channels = c.features.channels() as i64;
         let rows = batch.log_prices.size()[0];
-        assert_eq!(batch.log_prices.size(), [rows, context + horizon, CHANNELS]);
-        assert_eq!(batch.aux.size(), [rows, context + horizon, aux_channels]);
         assert_eq!(stats.sigma.size(), [rows, origins]);
         let inv_sigma = per_bar(&stats.sigma.reciprocal());
         let prices = ((batch
             .log_prices
-            .narrow(1, 0, context)
+            .narrow(1, start, context)
             .reshape([rows, origins, patch, CHANNELS])
             - per_bar(&stats.log_close))
             * &inv_sigma)
             .to_kind(Kind::BFloat16);
         let aux = (batch
             .aux
-            .narrow(1, 0, context)
+            .narrow(1, start, context)
             .reshape([rows, origins, patch, aux_channels])
             * (&self.sigma_scale * inv_sigma + &self.unit_scale))
             .to_kind(Kind::BFloat16);
@@ -1963,6 +2178,15 @@ impl CausalPatchModel {
         let x0 = rms_norm(
             &linear(&self.tokens(batch, stats), &self.patch).dropout(self.config.dropout, train),
         );
+        self.trunk(&x0, train, last_only, origins)
+    }
+
+    fn trunk(&self, x0: &Tensor, train: bool, last_only: bool, origins: i64) -> Tensor {
+        let shortened = (origins != self.config.origins()).then(|| (
+            self.rotation.0.narrow(0, 0, origins),
+            self.rotation.1.narrow(0, 0, origins),
+        ));
+        let rotation = shortened.as_ref().unwrap_or(&self.rotation);
         // ONE cast and ONE `unbind` for the whole stack, as the reference does
         // (`train_gpt.py:1509-1512`, `self.resid_lambdas[:, 0].bfloat16().unbind(0)`). The cast
         // is mandatory, not cosmetic: this model runs without autocast, so a DIMENSIONED fp32
@@ -1993,13 +2217,13 @@ impl CausalPatchModel {
                     post: [&post[2 * index], &post[2 * index + 1]],
                     x0: x0_lambdas
                         .as_ref()
-                        .map(|lambdas| (&x0, &lambdas[index])),
+                        .map(|lambdas| (x0, &lambdas[index])),
                 };
                 let (next, published) = self.blocks[index].forward(
                     state,
                     first_value.as_ref(),
                     &lambdas,
-                    (&self.rotation.0, &self.rotation.1),
+                    (&rotation.0, &rotation.1),
                     train,
                 );
                 if let Some(value) = published {
@@ -2014,6 +2238,77 @@ impl CausalPatchModel {
         } else {
             state
         }
+    }
+
+    /// Frozen probes and the training objective share precisely the same representation path.
+    pub fn representation_views(&self, batch: &Batch, train: bool) -> RepresentationViews {
+        let stats = self.statistics(batch);
+        self.views_with_statistics(batch, &stats, train)
+    }
+
+    /// Recompute a genuinely short causal history ending at `source_index`, including its
+    /// normalization statistics. No full-prefix tensor or contextual state enters this path.
+    pub fn representation_state_at_recent(
+        &self, batch: &Batch, source_index: i64, recent_patches: i64,
+    ) -> Tensor {
+        assert!((0..self.config.origins()).contains(&source_index));
+        assert!((1..=source_index + 1).contains(&recent_patches));
+        let context = recent_patches * self.config.patch_len;
+        let start = (source_index + 1 - recent_patches) * self.config.patch_len;
+        let stats = self.statistics_range(batch, start, context);
+        let tokens = self.tokens_range(batch, &stats, start, context);
+        let embedding = rms_norm(&linear(&tokens, &self.patch));
+        self.trunk(&embedding, false, true, recent_patches).squeeze_dim(1)
+    }
+
+    fn views_with_statistics(&self, batch: &Batch, stats: &Statistics, train: bool) -> RepresentationViews {
+        let c = &self.config;
+        let tokens = self.tokens(batch, stats);
+        let embedding = linear(&tokens, &self.patch);
+        let x0 = rms_norm(&embedding.dropout(c.dropout, train));
+        let state = self.trunk(&x0, train, false, c.origins());
+        let observation = embedding;
+        let target = self.jepa.as_ref().map_or_else(
+            || observation.shallow_clone(),
+            |heads| heads.target(&observation),
+        );
+        let prediction = self.jepa.as_ref().map(|heads| heads.prediction(&state));
+        // Exactly the bf16-rounded price features used by the patch embedding, without aux.
+        let reconstruction_target = tokens.reshape([
+            tokens.size()[0], c.origins(), c.patch_len, CHANNELS + c.features.channels() as i64,
+        ]).narrow(-1, 0, CHANNELS).flatten(2, 3).to_kind(Kind::Float);
+        let conditional = self.jepa.as_ref().and_then(|heads| heads.conditional_targets(c, batch, stats));
+        RepresentationViews { observation, target, state, prediction, reconstruction_target, conditional, horizons: c.jepa_horizons() }
+    }
+
+    /// One backbone pass for forecast and temporal objectives; conditional targets are fixed data.
+    pub(super) fn jepa_losses(
+        &self, batch: &Batch, train: bool, keep: Option<&Tensor>, random: Option<&JepaRandom>,
+    ) -> Losses {
+        let stats = self.statistics(batch);
+        let views = self.views_with_statistics(batch, &stats, train);
+        let head_state = if self.config.jepa_mode.detached_forecast() {
+            views.state.detach()
+        } else {
+            views.state.shallow_clone()
+        };
+        let head = self.head(batch, &head_state, false);
+        let (targets, mask) = self.targets(batch, &stats, false);
+        let mask = match keep { Some(keep) => mask * keep, None => mask };
+        let mut losses = self.losses(&head, &stats, &targets, &mask);
+        let c = &self.config;
+        let heads = self.jepa.as_ref().expect("enabled JEPA heads");
+        let (auxiliary, diagnostics) = if let Some(targets) = &views.conditional {
+            heads.conditional_objective(c, &views, targets)
+        } else {
+            let valid = batch.valid.narrow(1, 0, c.seq_len)
+                .reshape([-1, c.origins(), c.patch_len]).amin([-1i64].as_slice(), false);
+            let source_valid = &valid * &stats.mask;
+            heads.objective(c, &views, &valid, &source_valid, random)
+        };
+        losses.objective = &losses.objective + auxiliary;
+        losses.jepa = Some(diagnostics);
+        losses
     }
 
     /// Every learned mixing scalar the backbone holds, as `(label, post-parameterization
@@ -2536,8 +2831,12 @@ impl CausalPatchModel {
             run: Box::new(move |_| self.targets(batch, stats, false).0),
         });
         let (targets, mask) = self.targets(batch, stats, false);
+        let decoupled = c.scale_coupling == ScaleCoupling::Decoupled;
         classes.push(KernelClass {
-            name: "fused loss geometry and NLL",
+            name: match decoupled {
+                false => "fused loss geometry and NLL",
+                true => "composed decoupled loss geometry and NLL",
+            },
             inputs: vec![(vec![rows, origins, OUTPUTS_PER_BAR, horizon], Kind::BFloat16)],
             // ENUMERATED, not a floor, because after the fusion there is nothing left to
             // guess: one mask fold (read the mask, write `mask·w`), the fused kernel's reads
@@ -2551,14 +2850,29 @@ impl CausalPatchModel {
             // that was actually streaming 1613 GB/s. A floor in the denominator of a roofline
             // fraction understates the kernel and hides the fact that the win available was
             // never bandwidth but pass count.
-            forward_bytes: 2. * fp32(slice)
-                + bf16(head_space)
-                + fp32(target_space)
-                + fp32(slice)
-                + 13. * fp32(slice)
-                + 24. * fp32(slice)
-                + 3. * fp32(slice),
-            forward_flops: 24. * slice + CHANNELS as f64 * 8. * slice,
+            //
+            // `decoupled` is that composition back again, at its own 121 forward units plus
+            // the split's 8 - four extra `dot`s reading two vectors each. The class must
+            // rename and recharge together with `ModelConfig::step_cost`, because a profile
+            // row that still said "fused" while `run` called the composed chain would report
+            // the right milliseconds against the wrong denominator and read as a 2.4x
+            // bandwidth regression in the kernel rather than as the arm's known price.
+            forward_bytes: match decoupled {
+                false => {
+                    2. * fp32(slice)
+                        + bf16(head_space)
+                        + fp32(target_space)
+                        + fp32(slice)
+                        + 13. * fp32(slice)
+                        + 24. * fp32(slice)
+                        + 3. * fp32(slice)
+                }
+                true => 129. * fp32(slice),
+            },
+            forward_flops: match decoupled {
+                false => 24. * slice + CHANNELS as f64 * 8. * slice,
+                true => 32. * slice + CHANNELS as f64 * 8. * slice,
+            },
             parameters: Vec::new(),
             run: Box::new(move |input| {
                 self.losses(&Head(input[0].shallow_clone()), stats, &targets, &mask)
@@ -2915,7 +3229,8 @@ impl CausalPatchModel {
         if let Some((scale, half_log, inverse)) = &self.increment_geometry {
             let (targets, mask) = Self::increment_pair(targets, mask);
             let (sigma, range, weighted_mask) = self.loss_operands(stats, &mask);
-            let geometry = loss_geometry(
+            let geometry = self.geometry(
+                true,
                 &head.0,
                 &targets,
                 &weighted_mask,
@@ -2924,13 +3239,12 @@ impl CausalPatchModel {
                 &range,
                 scale,
                 inverse,
-                &self.log_scale_gain,
-                LOG_SCALE_CAP,
             );
             return self.reduce_geometry(&geometry, &mask, &weighted_mask, half_log);
         }
         let (sigma, range, weighted_mask) = self.loss_operands(stats, mask);
-        let geometry = loss_geometry(
+        let geometry = self.geometry(
+            true,
             &head.0,
             targets,
             &weighted_mask,
@@ -2939,10 +3253,80 @@ impl CausalPatchModel {
             &range,
             &self.horizon_scale,
             &self.inverse_horizon,
-            &self.log_scale_gain,
-            LOG_SCALE_CAP,
         );
         self.reduce_geometry(&geometry, mask, &weighted_mask, &self.half_log_horizon)
+    }
+
+    /// The geometry provider, chosen by the kernel the caller wants and the coupling the
+    /// configuration declares.
+    ///
+    /// Both couplings have a fused CUDA path and an explicit composed reference. The full
+    /// branch is unchanged; the decoupled branch shares geometry but substitutes the
+    /// horizon-fixed mean gradient and emits separate true-NLL reductions.
+    #[allow(clippy::too_many_arguments)]
+    fn geometry(
+        &self,
+        fused: bool,
+        head: &Tensor,
+        targets: &Tensor,
+        weighted_mask: &Tensor,
+        mask: &Tensor,
+        sigma: &Tensor,
+        range: &Tensor,
+        horizon_scale: &Tensor,
+        inverse_horizon: &Tensor,
+    ) -> fused_kernels::LossGeometry {
+        let gain = &self.log_scale_gain;
+        match (self.config.scale_coupling, fused) {
+            (ScaleCoupling::Full, true) => loss_geometry(
+                head,
+                targets,
+                weighted_mask,
+                mask,
+                sigma,
+                range,
+                horizon_scale,
+                inverse_horizon,
+                gain,
+                LOG_SCALE_CAP,
+            ),
+            (ScaleCoupling::Full, false) => fused_kernels::reference::loss_geometry(
+                head,
+                targets,
+                weighted_mask,
+                mask,
+                sigma,
+                range,
+                horizon_scale,
+                inverse_horizon,
+                gain,
+                LOG_SCALE_CAP,
+            ),
+            (ScaleCoupling::Decoupled, true) => fused_kernels::decoupled_loss_geometry(
+                head,
+                targets,
+                weighted_mask,
+                mask,
+                sigma,
+                range,
+                horizon_scale,
+                inverse_horizon,
+                gain,
+                LOG_SCALE_CAP,
+            ),
+            (ScaleCoupling::Decoupled, false) => fused_kernels::reference::decoupled_loss_geometry(
+                head,
+                targets,
+                weighted_mask,
+                mask,
+                sigma,
+                range,
+                horizon_scale,
+                inverse_horizon,
+                gain,
+                LOG_SCALE_CAP,
+            ),
+        }
     }
 
     /// The SAME objective with the composed-ATen geometry instead of the fused kernel, for
@@ -2962,6 +3346,9 @@ impl CausalPatchModel {
     /// what makes the paired difference a measurement of the fusion rather than of two
     /// separately-written objectives, and `fused_kernels`' own bit-exactness suite is what
     /// makes the two arms' loss VALUES identical rather than merely close.
+    ///
+    /// Both couplings pair against their corresponding composed reference; the decoupled
+    /// reference also returns separate true-likelihood reductions.
     pub fn composed_losses(
         &self,
         head: &Head,
@@ -2975,7 +3362,8 @@ impl CausalPatchModel {
              own chain in `basis_losses`"
         );
         let (sigma, range, weighted_mask) = self.loss_operands(stats, mask);
-        let geometry = fused_kernels::reference::loss_geometry(
+        let geometry = self.geometry(
+            false,
             &head.0,
             targets,
             &weighted_mask,
@@ -2984,8 +3372,6 @@ impl CausalPatchModel {
             &range,
             &self.horizon_scale,
             &self.inverse_horizon,
-            &self.log_scale_gain,
-            LOG_SCALE_CAP,
         );
         self.reduce_geometry(&geometry, mask, &weighted_mask, &self.half_log_horizon)
     }
@@ -3004,6 +3390,13 @@ impl CausalPatchModel {
     /// The twelve `dot`s and the gradient-free prior: everything the fusion deliberately did
     /// NOT absorb, because a reduction's summation tree is cuBLAS's and reassociating it
     /// moves the loss value.
+    ///
+    /// Twelve under `--scale-coupling full`; sixteen under `decoupled`, which stacks a third
+    /// term per channel. Nothing here normalizes by the term COUNT - `objective_count` counts
+    /// weighted observations and would be wrong if it did - so the stack length is pinned
+    /// against the configured coupling rather than trusted: the failure it catches is a
+    /// geometry built by one composition and reduced as if it were the other, which would
+    /// otherwise be a silently wrong loss and not a crash.
     fn reduce_geometry(
         &self,
         geometry: &fused_kernels::LossGeometry,
@@ -3011,6 +3404,18 @@ impl CausalPatchModel {
         weighted_mask: &Tensor,
         half_log: &Tensor,
     ) -> Losses {
+        let coupling = self.config.scale_coupling;
+        assert_eq!(
+            geometry.terms.size(),
+            [coupling.terms_per_channel() * CHANNELS],
+            "a {coupling:?} geometry stacks {} terms per channel",
+            coupling.terms_per_channel()
+        );
+        assert_eq!(
+            geometry.nll_terms.is_some(),
+            coupling == ScaleCoupling::Decoupled,
+            "only the decoupled composition separates the reported NLL from the objective"
+        );
         // `Some` only at nonzero λ, and the arithmetic is two `[pred_len]` reductions over the
         // mean coordinate the fused op already had to produce - see [`Self::amplitude_prior`].
         let amplitude = self.amplitude_prior(&geometry.close, mask);
@@ -3022,17 +3427,30 @@ impl CausalPatchModel {
             * CHANNELS;
         let objective_count = (weighted_mask.sum(Kind::Float) * CHANNELS).clamp_min(1.0);
         let count = (mask.sum(Kind::Float) * CHANNELS).clamp_min(1.0);
-        // The prior is already normalized per (origin, horizon), so it is added to the
-        // NORMALIZED objective rather than folded into the numerator: λ then means the same
-        // thing whatever share of the batch's bars happened to be valid, and the reported NLL
-        // stays comparable to the control's only insofar as it genuinely includes the penalty.
-        let nll = (geometry.terms.sum(Kind::Float) + prior) / objective_count;
+        // Normalize the forecast term independently of any auxiliary penalty. The amplitude
+        // prior belongs only in `objective`, never in the reported likelihood.
+        let objective = (geometry.terms.sum(Kind::Float) + &prior) / &objective_count;
+        // Under `decoupled` the objective's VALUE counts the squared error twice under two
+        // different weightings, so it is not a likelihood and nothing may report it as one.
+        // Retain the historical forecast surrogate gradient for callers inspecting this term;
+        // its value is exactly the true NLL. Training backpropagates the separate objective.
+        let nll = match &geometry.nll_terms {
+            None => objective.shallow_clone(),
+            Some(terms) => {
+                let value =
+                    tch::no_grad(|| (terms.sum(Kind::Float) + &prior) / &objective_count);
+                (&objective - objective.detach()) + value
+            }
+        };
+        let objective = match amplitude {
+            Some(penalty) => &objective + penalty,
+            None => objective.shallow_clone(),
+        };
         Losses {
-            nll: match amplitude {
-                Some(penalty) => nll + penalty,
-                None => nll,
-            },
+            nll,
+            objective,
             mse: geometry.squares.sum(Kind::Float) / count,
+            jepa: None,
         }
     }
 
@@ -3134,17 +3552,48 @@ fn increment_pair(targets: &Tensor, mask: &Tensor) -> (Tensor, Tensor) {
         let weighted = mask.amin([-1i64].as_slice(), true) * basis.weight();
         let objective_count = (weighted.sum(Kind::Float) * CHANNELS).clamp_min(1.0);
         let count = (mask.sum(Kind::Float) * CHANNELS).clamp_min(1.0);
-        let terms = (residual * (-&log_scale).exp()).square() * 0.5 + &log_scale;
-        let nll = (terms * weighted).sum(Kind::Float) / objective_count;
+        // The same split the dense path makes, in the space this arm measures error in. The
+        // horizon-fixed factor here is `exp(-half_log_prior)`, the COEFFICIENT's prior scale,
+        // which is what `1/h` is in horizon space and is what the identity basis reduces to:
+        // the mean's weight is the part of the precision the head does not choose, and the
+        // head's own `CAP·tanh(u)` reaches only the frozen-residual term and the log term.
+        let (terms, reported) = match self.config.scale_coupling {
+            ScaleCoupling::Full => (
+                (&residual * (-&log_scale).exp()).square() * 0.5 + &log_scale,
+                None,
+            ),
+            ScaleCoupling::Decoupled => {
+                let fixed = (&residual * (-basis.half_log_prior()).exp()).square() * 0.5;
+                let coupled = (residual.detach() * (-&log_scale).exp()).square() * 0.5;
+                // Bit-equal to the `full` numerator: `detach(e)·exp(-ls)` and `e·exp(-ls)`
+                // are the same numbers through the same two kernels.
+                let value = tch::no_grad(|| &coupled + &log_scale);
+                (fixed + &coupled + &log_scale, Some(value))
+            }
+        };
+        let objective = (terms * &weighted).sum(Kind::Float) / &objective_count;
+        // See [`Self::reduce_geometry`]: the value is the likelihood, the gradient is not.
+        let nll = match reported {
+            None => objective.shallow_clone(),
+            Some(elements) => {
+                let value = tch::no_grad(|| {
+                    (elements * &weighted).sum(Kind::Float) / &objective_count
+                });
+                (&objective - objective.detach()) + value
+            }
+        };
         // The close coordinate the penalty reduces is decode_joint's fourth channel, which is
         // the same tensor the fused path hands back as `geometry.close`.
         let amplitude = self.amplitude_prior(&prediction.narrow(-2, CHANNELS - 1, 1), mask);
+        let objective = match amplitude {
+            Some(penalty) => &objective + penalty,
+            None => objective.shallow_clone(),
+        };
         Losses {
-            nll: match amplitude {
-                Some(penalty) => nll + penalty,
-                None => nll,
-            },
+            nll,
+            objective,
             mse: tch::no_grad(|| (error.square() * mask).sum(Kind::Float) / count),
+            jepa: None,
         }
     }
 }
@@ -3191,8 +3640,30 @@ pub fn nll_elements(prediction: &Tensor, log_scale: &Tensor, target: &Tensor) ->
 }
 
 pub struct Losses {
+    /// True forecasting metric value, never an auxiliary penalty.
     pub nll: Tensor,
     pub mse: Tensor,
+    /// The scalar to backpropagate, including configured auxiliary terms.
+    pub objective: Tensor,
+    /// Detached diagnostics in `jepa::diagnostic_labels` order; absent on the off path.
+    pub jepa: Option<Tensor>,
+}
+
+impl Losses {
+    pub fn forecast(nll: Tensor, mse: Tensor) -> Self {
+        Self { objective: nll.shallow_clone(), nll, mse, jepa: None }
+    }
+
+    pub fn detached(&self) -> Self {
+        Self { nll: self.nll.detach(), mse: self.mse.detach(), objective: self.objective.detach(),
+            jepa: self.jepa.as_ref().map(Tensor::detach) }
+    }
+
+    /// All outputs leave the shared graph pool before the optimizer can overwrite its storage.
+    pub fn copied(&self) -> Self {
+        Self { nll: self.nll.detach().copy(), mse: self.mse.detach().copy(),
+            objective: self.objective.detach().copy(), jepa: self.jepa.as_ref().map(|x| x.detach().copy()) }
+    }
 }
 
 /// Masked means over valid (origin, channel, bar) triples; `mse` carries no gradient. The
@@ -3215,7 +3686,7 @@ pub fn gaussian_nll(
     let nll = (nll_elements(prediction, log_scale, target) * weighted_mask).sum(Kind::Float)
         / objective_count;
     let mse = tch::no_grad(|| ((target - prediction).square() * mask).sum(Kind::Float) / count);
-    Losses { nll, mse }
+    Losses::forecast(nll, mse)
 }
 
 #[cfg(test)]
@@ -3239,6 +3710,7 @@ mod tests {
             dropout: 0.0,
             min_history: 16,
             features: FeatureSet::ALL,
+            future_calendar: true,
             x0_lambdas: X0Lambdas::Enabled,
             horizon_loss: HorizonLoss::Uniform,
             horizon_mean: HorizonMean::Free,
@@ -3246,6 +3718,10 @@ mod tests {
             target_basis: TargetBasis::Cumulative,
             basis_weight: BasisWeight::Uniform,
             basis_stats: None,
+            scale_coupling: ScaleCoupling::Full,
+            horizon_decimation: HorizonDecimation::None,
+            jepa_mode: JepaMode::Off,
+            jepa: JepaConfig::default(),
         }
     }
 
@@ -3633,11 +4109,19 @@ mod tests {
             .enumerate()
             .filter_map(|(index, known)| (!known).then_some(index as i64))
             .collect();
-        assert_eq!(history_channels, [6, 7, 8, 9, 10, 11]);
+        let (&first, &last) = (
+            history_channels.first().expect("history channels exist"),
+            history_channels.last().expect("history channels exist"),
+        );
+        assert_eq!(
+            history_channels,
+            (first..=last).collect::<Vec<i64>>(),
+            "the leak probe narrows one contiguous span"
+        );
         let _ = batch
             .aux
             .narrow(1, config.seq_len, config.pred_len)
-            .narrow(2, 6, 6)
+            .narrow(2, first, last - first + 1)
             .fill_(7.0);
         let unchanged = model.output(&model.forward(&batch, &stats, false, false));
         assert!(unchanged.coordinates.equal(&reference.coordinates));
@@ -3697,6 +4181,9 @@ mod tests {
                 Some(-0.3),
                 None,
             ],
+            // Likewise the refusal list: a sizing gate the decode must ignore, because a
+            // refused horizon is still SCORED under the gain the prior gave it.
+            intercept_refused: Vec::new(),
         };
         assert_eq!(frozen.anchor.len(), config.pred_len as usize);
         let weights = |store: &nn::VarStore| {
@@ -4000,8 +4487,13 @@ mod tests {
     /// and normalizes by `Σ w·mask·CHANNELS`, so this is also the definitional pin on what the
     /// weighted objective - and therefore the selection scalar computed the same way on the
     /// held-out split - means.
+    ///
+    /// The RNG guard belongs to the `#[test]` that drives this, not here: `torch::test_rng`'s
+    /// lock is a non-reentrant `parking_lot::RwLock` and taking the write side a second time
+    /// on the thread that already holds it wedges the thread outright, which is what this
+    /// helper did. Each call reseeds to 17 and compares only within itself, so per-call
+    /// locking bought nothing even before it deadlocked.
     fn fused_matches_reference(horizon_loss: HorizonLoss) {
-        let _rng = crate::torch::test_rng::exclusive();
         tch::manual_seed(17);
         let config = ModelConfig {
             horizon_loss,
@@ -4115,6 +4607,109 @@ mod tests {
         }
     }
 
+    /// The whole contract of `--scale-coupling decoupled`, on one explicit case: the MEAN's
+    /// gradient stops depending on what the head predicted its own scale to be, and the
+    /// number the run REPORTS does not move at all.
+    ///
+    /// Both halves are load-bearing and neither implies the other. The invariance is the fix:
+    /// under the full coupling the squared error reaches the mean weighted by
+    /// `exp(-2·CAP·tanh(u))`, so raising the log-scale rows by a constant rescales every mean
+    /// gradient - which is how a memorized origin buys itself a larger step than an
+    /// unmemorized one. The equality of the reported NLL is what keeps the arm readable: the
+    /// decoupled objective's value counts the squared error twice, so if `Losses::nll` carried
+    /// that value instead of the likelihood, held-out NLL, the selection scalar and every
+    /// chart built on them would be measuring a different quantity in the two arms and the
+    /// A/B would be uninterpretable.
+    ///
+    /// Two log-scale settings and not one: invariance to a SINGLE substitution is what a
+    /// missing dependency and a coincidentally-equal one look like alike, so the full arm is
+    /// run on exactly the same pair and required to disagree.
+    ///
+    /// Two bases and not one because there are two hand-written compositions, not one:
+    /// `cumulative` reaches `fused_kernels::reference::decoupled_loss_geometry` and a rotated
+    /// basis reaches the split inside [`CausalPatchModel::basis_losses`], where the
+    /// horizon-fixed factor is the coefficient's `exp(-half_log_prior)` rather than `1/h`. A
+    /// rotated arm that silently kept the old coupling would look exactly like a working one
+    /// from the dense path.
+    #[test]
+    fn decoupling_frees_the_mean_gradient_and_leaves_the_reported_nll_alone() {
+        let _rng = crate::torch::test_rng::exclusive();
+        tch::manual_seed(23);
+        let config = small_config();
+        let store = nn::VarStore::new(Device::Cpu);
+        let model = CausalPatchModel::new(&store.root(), &config);
+        let batch = synthetic(&config, &[8, 5]);
+        let stats = model.statistics(&batch);
+        let (targets, mask) = model.targets(&batch, &stats, false);
+        let shape = {
+            let mut shape = targets.size();
+            shape[2] = 2 * CHANNELS;
+            shape
+        };
+        // The mean rows are FIXED across all four evaluations; only the log-scale rows and the
+        // coupling move, so nothing but those can explain a difference in the mean's gradient.
+        let means = Tensor::randn(&shape, (Kind::Float, Device::Cpu)).narrow(2, 0, CHANNELS);
+        // Far apart on the `tanh` - `-1.5` and `+1.5` land at |tanh| ≈ 0.905, so the two
+        // precisions differ by `exp(4·CAP·0.905)` ≈ 3e6. An invariance that survives that is
+        // not a numerically invisible dependency.
+        let scales = |value: f64| Tensor::full(&shape, value, (Kind::Float, Device::Cpu)).narrow(2, CHANNELS, CHANNELS);
+        let run = |coupling: ScaleCoupling, basis: TargetBasis, log_scale: &Tensor| {
+            let config = ModelConfig {
+                scale_coupling: coupling,
+                target_basis: basis,
+                ..small_config()
+            };
+            let store = nn::VarStore::new(Device::Cpu);
+            let model = CausalPatchModel::new(&store.root(), &config);
+            let head = Tensor::cat(&[&means, log_scale], 2)
+                .to_kind(Kind::BFloat16)
+                .set_requires_grad(true);
+            let losses = model.losses(&Head(head.shallow_clone()), &stats, &targets, &mask);
+            let value = losses.nll.double_value(&[]);
+            let gradient = Tensor::run_backward(&[&losses.nll], &[&head], false, false)
+                .remove(0)
+                .narrow(2, 0, CHANNELS)
+                .to_kind(Kind::Float);
+            (gradient, value)
+        };
+        let (low, high) = (scales(-1.5), scales(1.5));
+        for basis in [TargetBasis::Cumulative, TargetBasis::Dct] {
+            let (decoupled_low, decoupled_value) = run(ScaleCoupling::Decoupled, basis, &low);
+            let (decoupled_high, _) = run(ScaleCoupling::Decoupled, basis, &high);
+            let (full_low, full_value) = run(ScaleCoupling::Full, basis, &low);
+            let (full_high, _) = run(ScaleCoupling::Full, basis, &high);
+            assert!(
+                decoupled_low.equal(&decoupled_high),
+                "the decoupled mean gradient moved with the log scale under {basis} by up to \
+                 {}",
+                (&decoupled_low - &decoupled_high).abs().max().double_value(&[])
+            );
+            assert!(
+                decoupled_low.abs().max().double_value(&[]) > 0.,
+                "the decoupled mean gradient under {basis} is identically zero, which is \
+                 invariant for the wrong reason"
+            );
+            // The control, on the same two settings: the coupling is real and this is the
+            // size of it. `tanh(∓1.5)·CAP` differ by 7.24 nats of log scale, so the weights
+            // differ by `exp(2·7.24)`; the gradients cannot be within a factor of two.
+            let separation = full_high.abs().max().double_value(&[])
+                / full_low.abs().max().double_value(&[]).max(f64::MIN_POSITIVE);
+            assert!(
+                !full_low.equal(&full_high) && (separation < 0.5 || separation > 2.0),
+                "the full coupling's mean gradient barely moved with the log scale under \
+                 {basis}: ratio {separation}"
+            );
+            // And the number the run reports is the likelihood either way, to the bit: the
+            // decoupled composition reduces the full coupling's own terms for it.
+            assert_eq!(
+                decoupled_value.to_bits(),
+                full_value.to_bits(),
+                "under {basis} decoupled reports {decoupled_value} against the full \
+                 coupling's {full_value}"
+            );
+        }
+    }
+
     #[test]
     fn fused_loss_matches_the_reference_decode_and_nll_including_gradients() {
         let _rng = crate::torch::test_rng::exclusive();
@@ -4190,6 +4785,188 @@ mod tests {
                 let _ = block.second.ws.shallow_clone().uniform_(-0.1, 0.1);
             }
         });
+    }
+
+    /// The ONE claim `--horizon-decimation lattice` makes: with the compensation factor and a
+    /// uniform phase, the objective's numerator and its denominator are each UNBIASED for
+    /// their full-lattice values, so the expected gradient is unchanged and only its variance
+    /// moves. Without the factor the same thinning would cancel out of the self-normalizing
+    /// reduction and be indistinguishable in expectation from `--horizon-loss` reweighting,
+    /// which is the failure mode this test exists to catch.
+    ///
+    /// The phases are enumerated rather than sampled: `decim` runs over `1, 2, 3, 4` at this
+    /// geometry, so a common counter over `0..lcm = 12` gives every horizon a MARGINALLY
+    /// uniform phase, and both sums are linear in the per-horizon terms, which is all
+    /// unbiasedness of the sums needs. The objective is their RATIO, so it carries a genuine
+    /// (small) Jensen gap and is asserted separately at a looser tolerance. Measured here:
+    /// numerator 8.1e-8 and denominator 5.1e-9 relative, i.e. fp32 summation roundoff and
+    /// nothing else, against the ratio's 2.5e-4.
+    ///
+    /// Also pinned: with the knob OFF the training call site produces the pre-knob objective
+    /// on the BITS, because it emits no multiply at all.
+    #[test]
+    fn compensated_horizon_decimation_leaves_the_objective_unbiased() {
+        use super::super::supervision::{DecimationPlan, SupervisionGeometry};
+        let _rng = crate::torch::test_rng::shared();
+        tch::manual_seed(31);
+        let config = ModelConfig {
+            seq_len: 64,
+            pred_len: 32,
+            patch_len: 8,
+            min_history: 8,
+            // A non-uniform weight, so the test also covers the fold of `w` into the mask the
+            // compensation now shares with it.
+            horizon_loss: HorizonLoss::InverseSqrt,
+            ..small_config()
+        };
+        config.validate().unwrap();
+        let store = nn::VarStore::new(Device::Cpu);
+        let model = CausalPatchModel::new(&store.root(), &config);
+        live_head(&model);
+        let batch = synthetic(&config, &[32, 20]);
+        let stats = model.statistics(&batch);
+        let head = model.forward(&batch, &stats, false, false);
+        let (targets, mask) = model.targets(&batch, &stats, false);
+
+        // OFF is the identity, on the bits: the same tensors through the same call.
+        let today = model.losses(&head, &stats, &targets, &mask);
+        let off = crate::torch::timexer_segment::compute::Engine::forward_loss(
+            &model, &batch, false, None,
+        );
+        assert!(
+            off.nll.equal(&today.nll) && off.mse.equal(&today.mse),
+            "an unarmed engine must reproduce the pre-knob objective bit-for-bit, got NLL {} \
+             against {}",
+            off.nll.double_value(&[]),
+            today.nll.double_value(&[])
+        );
+
+        let geometry = SupervisionGeometry::new(64, 8, 8, 32).unwrap();
+        let plan = DecimationPlan::new(&geometry, 64).unwrap();
+        assert_eq!(plan.origins, 8);
+        assert_eq!(plan.first_active, 0);
+        assert_eq!(
+            plan.factors,
+            (0..32).map(|j| (j + 1usize).div_ceil(8)).collect::<Vec<_>>()
+        );
+
+        let weight = model.horizon_weight_buffer();
+        let output = model.output(&head);
+        let prediction = model.decode(&output, &stats);
+        let elements = nll_elements(&prediction, &output.log_scale, &targets);
+        // The reduction `losses` performs, written out so numerator and denominator can be
+        // averaged separately: `Σ w·m·nll` over `Σ w·m·CHANNELS`.
+        let parts = |mask: &Tensor| {
+            let weighted = mask * weight;
+            (
+                (&elements * &weighted).sum(Kind::Float).double_value(&[]),
+                weighted.sum(Kind::Float).double_value(&[]) * CHANNELS as f64,
+            )
+        };
+        let (full_numerator, full_denominator) = parts(&mask);
+        let full_objective = full_numerator / full_denominator;
+        let shipped = gaussian_nll(&prediction, &output.log_scale, &targets, &mask, weight)
+            .nll
+            .double_value(&[]);
+        assert!(
+            (shipped - full_objective).abs() <= 1e-5 * shipped.abs(),
+            "the hand-written reduction must be the shipped one: {full_objective} vs {shipped}"
+        );
+
+        let phase_count = 12usize;
+        let (mut numerator, mut denominator, mut objective) = (0., 0., 0.);
+        // The same sums with the compensation factor STRIPPED: this is the counterfactual the
+        // knob is not, and the two shortfalls below are exactly why the factor is not
+        // optional.
+        let (mut raw_numerator, mut raw_denominator) = (0., 0.);
+        let mut values = vec![0f32; plan.origins * plan.pred_len()];
+        let mut kept = vec![0f64; plan.pred_len()];
+        for draw in 0..phase_count {
+            let phases: Vec<usize> = plan.factors.iter().map(|factor| draw % factor).collect();
+            plan.fill(&phases, &mut values, &mut kept);
+            let keep = Tensor::from_slice(&values).reshape([
+                1,
+                plan.origins as i64,
+                1,
+                plan.pred_len() as i64,
+            ]);
+            let decimated = &mask * &keep;
+            let (drawn_numerator, drawn_denominator) = parts(&decimated);
+            numerator += drawn_numerator;
+            denominator += drawn_denominator;
+            let (drawn_raw_numerator, drawn_raw_denominator) =
+                parts(&(&mask * keep.gt(0.).to_kind(Kind::Float)));
+            raw_numerator += drawn_raw_numerator;
+            raw_denominator += drawn_raw_denominator;
+            objective +=
+                gaussian_nll(&prediction, &output.log_scale, &targets, &decimated, weight)
+                    .nll
+                    .double_value(&[]);
+            // A thinning that kept everything would make the whole test vacuous.
+            assert!(
+                decimated.count_nonzero(None).int64_value(&[])
+                    < mask.count_nonzero(None).int64_value(&[]),
+                "draw {draw} decimated nothing"
+            );
+        }
+        let numerator_error =
+            ((numerator / phase_count as f64) - full_numerator).abs() / full_numerator.abs();
+        let denominator_error =
+            ((denominator / phase_count as f64) - full_denominator).abs() / full_denominator;
+        let objective_error =
+            ((objective / phase_count as f64) - full_objective).abs() / full_objective.abs();
+        assert!(
+            numerator_error <= 1e-6,
+            "the compensated numerator is biased by {numerator_error:e} relative"
+        );
+        assert!(
+            denominator_error <= 1e-6,
+            "the compensated denominator is biased by {denominator_error:e} relative"
+        );
+        assert!(
+            objective_error <= 1e-3,
+            "the phase-averaged objective is off by {objective_error:e} relative, which is far \
+             beyond the ratio's Jensen gap"
+        );
+        // The uncompensated thinning is NOT a subsample of the objective: both of its sums
+        // shrink by the keep rate, so the ratio survives as a keep-rate-weighted horizon
+        // average - arithmetically a `--horizon-loss` reweighting, which is the axis this knob
+        // deliberately is not on. Both sums land EXACTLY on the full lattice reweighted by
+        // `1/decim`, which is the sharpest possible way to say the factor is not optional.
+        let inverse = Tensor::from_slice(
+            &plan
+                .factors
+                .iter()
+                .map(|factor| (*factor as f64).recip() as f32)
+                .collect::<Vec<_>>(),
+        )
+        .reshape([1, 1, 1, plan.pred_len() as i64]);
+        let (reweighted_numerator, reweighted_denominator) = parts(&(&mask * &inverse));
+        for (label, realized, expected, full) in [
+            (
+                "numerator",
+                raw_numerator / phase_count as f64,
+                reweighted_numerator,
+                full_numerator,
+            ),
+            (
+                "denominator",
+                raw_denominator / phase_count as f64,
+                reweighted_denominator,
+                full_denominator,
+            ),
+        ] {
+            let error = (realized - expected).abs() / expected.abs();
+            assert!(
+                error <= 1e-5,
+                "the uncompensated {label} must BE the `1/decim`-reweighted lattice, off by \
+                 {error:e}"
+            );
+            assert!(
+                expected.abs() < 0.9 * full.abs(),
+                "the counterfactual must actually shrink the {label}: {expected} against {full}"
+            );
+        }
     }
 
     /// Every mode's normalization: mean 1 over ALL `pred_len` horizons, so `Σ w = pred_len`.
@@ -5317,7 +6094,7 @@ mod tests {
             let losses = model.losses(&head, &stats, &targets, &mask);
             assert!(losses.nll.double_value(&[]).is_finite());
             optimizer.zero_grad();
-            losses.nll.backward();
+            losses.objective.backward();
             optimizer.step();
         }
         for (name, parameter) in store.variables() {
@@ -6483,5 +7260,301 @@ mod tests {
             moved(&reference, &output()),
             "the stack ignored the source layer's value"
         );
+    }
+
+    fn jepa_gpu_config(mode: JepaMode) -> ModelConfig {
+        ModelConfig { seq_len: 256, pred_len: 16, min_history: 32, jepa_mode: mode, future_calendar: false, ..small_config() }
+    }
+
+    #[test]
+    fn cuda_jepa_future_observations_cannot_change_earlier_states_or_predictions() {
+        let _rng = crate::torch::test_rng::exclusive();
+        if std::env::var("TIMEXER_SEGMENT_GPU_TEST").as_deref() != Ok("1") { return; }
+        assert!(tch::Cuda::is_available());
+        crate::torch::cuda::cfg::configure_cuda();
+        let _backward = crate::torch::cuda::cfg::disable_autograd_multithreading();
+        for mode in [JepaMode::Anchored, JepaMode::AnchoredProjected, JepaMode::AnchoredProjectedSmall, JepaMode::AnchoredConditional] {
+            let config = jepa_gpu_config(mode);
+            let store = nn::VarStore::new(Device::Cuda(0));
+            let model = CausalPatchModel::new(&store.root(), &config);
+            live_head(&model);
+            let batch = synthetic(&config, &[16, 16, 16, 16]).to_device(Device::Cuda(0));
+            let before = tch::no_grad(|| model.representation_views(&batch, false));
+            let forecast_before = tch::no_grad(|| model.forward(&batch, &model.statistics(&batch), false, false).0);
+            let _ = batch.log_prices.narrow(1, 48, 32).fill_(2.);
+            let _ = batch.aux.narrow(1, 48, 32).fill_(-7.);
+            let after = tch::no_grad(|| model.representation_views(&batch, false));
+            let forecast_after = tch::no_grad(|| model.forward(&batch, &model.statistics(&batch), false, false).0);
+            assert!(forecast_before.narrow(1, 0, 3).equal(&forecast_after.narrow(1, 0, 3)),
+                "forecast read future observed-calendar features despite future_calendar=false");
+            assert!(before.observation.narrow(1, 0, 3).equal(&after.observation.narrow(1, 0, 3)));
+            assert!(before.target.narrow(1, 0, 3).equal(&after.target.narrow(1, 0, 3)));
+            assert!(before.state.narrow(1, 0, 3).equal(&after.state.narrow(1, 0, 3)));
+            if let (Some(a), Some(b)) = (&before.conditional, &after.conditional) {
+                assert!(a.values.narrow(1, 1, 1).narrow(2, 0, 1)
+                    .equal(&b.values.narrow(1, 1, 1).narrow(2, 0, 1)),
+                    "h=16 target read beyond its endpoint at bar47");
+                assert!(!a.values.narrow(1, 1, 1).narrow(2, 1, 1)
+                    .equal(&b.values.narrow(1, 1, 1).narrow(2, 1, 1)),
+                    "h=32 fixed target ignored its intervened endpoint at bar63");
+            }
+            assert!(before.prediction.unwrap().narrow(1, 0, 3).equal(&after.prediction.unwrap().narrow(1, 0, 3)));
+            assert!(!before.observation.narrow(1, 3, 2).equal(&after.observation.narrow(1, 3, 2)));
+            assert!(!before.target.narrow(1, 3, 2).equal(&after.target.narrow(1, 3, 2)));
+            // Recomputing a suffix must also forget old normalization information.
+            let recent = tch::no_grad(|| model.representation_state_at_recent(&batch, 10, 3));
+            let _ = batch.log_prices.narrow(1, 0, 64).fill_(9.);
+            let _ = batch.aux.narrow(1, 0, 64).fill_(4.);
+            let changed = tch::no_grad(|| model.representation_state_at_recent(&batch, 10, 3));
+            assert!(recent.equal(&changed), "recent path inherited old prices or normalization");
+        }
+    }
+
+    #[test]
+    fn cuda_jepa_conditional_targets_use_source_statistics_complete_intervals_and_no_target_gradient() {
+        let _rng = crate::torch::test_rng::exclusive();
+        if std::env::var("TIMEXER_SEGMENT_GPU_TEST").as_deref() != Ok("1") { return; }
+        assert!(tch::Cuda::is_available());
+        crate::torch::cuda::cfg::configure_cuda();
+        let _backward = crate::torch::cuda::cfg::disable_autograd_multithreading();
+        let config = jepa_gpu_config(JepaMode::AnchoredConditional);
+        let store = nn::VarStore::new(Device::Cuda(0));
+        let model = CausalPatchModel::new(&store.root(), &config);
+        let batch = synthetic(&config, &[16, 16, 16, 16]).to_device(Device::Cuda(0));
+        // Row0 has an INTERIOR hole outside the source and h=64 endpoint patches.
+        // Row1 has a broken source patch despite enough history. Row2 lacks history.
+        let _ = batch.valid.select(0, 0).narrow(0, 65, 1).fill_(0.);
+        let _ = batch.valid.select(0, 1).narrow(0, 50, 1).fill_(0.);
+        let _ = batch.valid.select(0, 2).narrow(0, 0, 16).fill_(0.);
+        let stats = model.statistics(&batch);
+        let views = model.representation_views(&batch, false);
+        let targets = views.conditional.as_ref().unwrap();
+        assert!(!targets.values.requires_grad(), "fixed labels acquired a learned target path");
+        assert_eq!(views.prediction.as_ref().unwrap().kind(), Kind::BFloat16);
+        let frequencies = [0.25, 0.5, 1., 2., 4.];
+        let is_valid = |row: i64, bar: i64| match row {
+            0 => bar != 65,
+            1 => bar != 50,
+            2 => bar >= 16,
+            _ => true,
+        };
+        let mut pairs = 0.;
+        let mut persistence = 0.;
+        for row in 0..4 {
+            for source in 0..4 {
+                let t = (source + 1) * config.patch_len - 1;
+                let source_valid = (source * config.patch_len..=t).all(|bar| is_valid(row, bar))
+                    && (0..=t).filter(|&bar| is_valid(row, bar)).count() as i64 >= config.min_history;
+                for (k, h) in config.jepa_horizons().into_iter().enumerate() {
+                    let expected_mask = source_valid && (t + 1..=t + h).all(|bar| is_valid(row, bar));
+                    assert_eq!(targets.mask.double_value(&[row, source, k as i64]),
+                        if expected_mask { 1. } else { 0. });
+                    let y = (batch.log_prices.double_value(&[row, t + h, 3])
+                        - stats.log_close.double_value(&[row, source])
+                        - stats.beta.double_value(&[row, source])
+                            * (batch.market_cum.double_value(&[row, t + h])
+                                - stats.market.double_value(&[row, source])))
+                        / (stats.sigma.double_value(&[row, source]) * (h as f64).sqrt());
+                    let mut baseline = 0.;
+                    for (f, w) in frequencies.into_iter().enumerate() {
+                        let (sin, cos) = (w * y).sin_cos();
+                        for (coordinate, expected) in [(2 * f, cos), (2 * f + 1, sin)] {
+                            assert!((targets.values.double_value(&[row, source, k as i64, coordinate as i64])
+                                - expected).abs() < 2e-5, "conditional target used future normalization or wrong endpoint");
+                        }
+                        baseline += (cos - 1.).powi(2) + sin.powi(2);
+                    }
+                    if expected_mask {
+                        pairs += 1.;
+                        persistence += baseline / 10.;
+                    }
+                }
+            }
+        }
+        let (objective, diagnostics) = model.jepa.as_ref().unwrap()
+            .conditional_objective(&config, &views, targets);
+        assert_eq!(diagnostics.double_value(&[4]), pairs);
+        assert!((diagnostics.double_value(&[3]) - persistence / pairs).abs() < 2e-6,
+            "persistence must be psi(0), not a learned/previous observation");
+        let prediction = views.prediction.as_ref().unwrap();
+        let gradients = Tensor::run_backward(
+            &[&objective], &[&views.observation, prediction, &model.patch.ws], false, false,
+        );
+        assert_eq!(gradients[0].narrow(1, 4, 12).abs().max().double_value(&[]), 0.,
+            "conditional loss sent gradients to future observation targets");
+        assert!(gradients[2].abs().sum(Kind::Float).double_value(&[]) > 0.,
+            "source encoder did not receive conditional prediction gradients");
+        assert_eq!((&gradients[1] * targets.mask.eq(0.).unsqueeze(-1))
+            .abs().max().double_value(&[]), 0., "invalid intervals trained the predictor");
+        tch::no_grad(|| {
+            for (_, mut parameter) in store.variables() {
+                let _ = parameter.fill_(0.);
+            }
+        });
+        let after = model.representation_views(&batch, false);
+        assert!(targets.values.equal(&after.conditional.unwrap().values),
+            "parameter intervention moved fixed conditional labels");
+    }
+
+    #[test]
+    fn cuda_jepa_optional_heads_preserve_off_initialization_and_forecasting() {
+        let _rng = crate::torch::test_rng::exclusive();
+        if std::env::var("TIMEXER_SEGMENT_GPU_TEST").as_deref() != Ok("1") { return; }
+        assert!(tch::Cuda::is_available());
+        crate::torch::cuda::cfg::configure_cuda();
+        for mode in [JepaMode::Anchored, JepaMode::AnchoredConditional] {
+            let off = jepa_gpu_config(JepaMode::Off);
+            let enabled = ModelConfig { jepa_mode: mode, ..off.clone() };
+            tch::manual_seed(941);
+            let off_store = nn::VarStore::new(Device::Cuda(0));
+            let off_model = CausalPatchModel::new(&off_store.root(), &off);
+            tch::manual_seed(941);
+            let enabled_store = nn::VarStore::new(Device::Cuda(0));
+            let enabled_model = CausalPatchModel::new(&enabled_store.root(), &enabled);
+            let batch = synthetic(&off, &[16, 16]).to_device(Device::Cuda(0));
+            tch::no_grad(|| {
+                let a = off_model.representation_views(&batch, false);
+                let b = enabled_model.representation_views(&batch, false);
+                assert!(a.observation.equal(&b.observation));
+                assert!(a.state.equal(&b.state), "optional initialization perturbed shared weights");
+                let stats = off_model.statistics(&batch);
+                let direct = off_model.forward(&batch, &stats, false, false);
+                assert!(direct.0.equal(&off_model.head(&batch, &a.state, false).0));
+                let (targets, mask) = off_model.targets(&batch, &stats, false);
+                let old = off_model.losses(&direct, &stats, &targets, &mask);
+                let new = super::super::compute::Engine::forward_loss(&off_model, &batch, false, None);
+                assert!(old.nll.equal(&new.nll));
+                assert!(old.mse.equal(&new.mse));
+                assert!(old.objective.equal(&new.objective));
+                assert!(new.jepa.is_none());
+            });
+        }
+    }
+
+    #[test]
+    fn cuda_jepa_target_projector_never_enters_forecasting_or_changes_shared_initialization() {
+        let _rng = crate::torch::test_rng::exclusive();
+        if std::env::var("TIMEXER_SEGMENT_GPU_TEST").as_deref() != Ok("1") { return; }
+        assert!(tch::Cuda::is_available());
+        crate::torch::cuda::cfg::configure_cuda();
+        let config = jepa_gpu_config(JepaMode::Anchored);
+        tch::manual_seed(941);
+        let baseline_store = nn::VarStore::new(Device::Cuda(0));
+        let baseline = CausalPatchModel::new(&baseline_store.root(), &config);
+        tch::manual_seed(941);
+        let projected_store = nn::VarStore::new(Device::Cuda(0));
+        let projected = CausalPatchModel::new(&projected_store.root(), &ModelConfig {
+            jepa_mode: JepaMode::AnchoredProjected,
+            ..config.clone()
+        });
+        let batch = synthetic(&config, &[16, 16]).to_device(Device::Cuda(0));
+        tch::no_grad(|| {
+            let original = baseline.representation_views(&batch, false);
+            let before = projected.representation_views(&batch, false);
+            assert!(original.observation.equal(&before.observation));
+            assert!(original.state.equal(&before.state));
+            assert!(original.prediction.unwrap().equal(before.prediction.as_ref().unwrap()),
+                "projector initialization perturbed the existing predictor");
+            live_head(&projected);
+            let before = projected.representation_views(&batch, false);
+            let stats = projected.statistics(&batch);
+            let forecast = projected.forward(&batch, &stats, false, false);
+            assert!(forecast.0.equal(&projected.head(&batch, &before.state, false).0));
+            let recent = projected.representation_state_at_recent(&batch, 10, 3);
+            for (name, mut parameter) in projected_store.variables() {
+                if name.starts_with("jepa.target_") {
+                    let _ = parameter.fill_(0.);
+                }
+            }
+            let after = projected.representation_views(&batch, false);
+            assert!(!before.target.equal(&after.target), "projector intervention was ineffective");
+            assert!(before.observation.equal(&after.observation));
+            assert!(before.state.equal(&after.state), "auxiliary q entered the training trunk");
+            assert!(before.prediction.unwrap().equal(&after.prediction.unwrap()));
+            assert!(forecast.0.equal(&projected.forward(&batch, &stats, false, false).0),
+                "auxiliary q entered the inference trunk");
+            assert!(recent.equal(&projected.representation_state_at_recent(&batch, 10, 3)));
+        });
+    }
+
+    #[test]
+    fn cuda_jepa_latent_only_forecast_trains_readout_without_anchor_gradient() {
+        let _rng = crate::torch::test_rng::exclusive();
+        if std::env::var("TIMEXER_SEGMENT_GPU_TEST").as_deref() != Ok("1") { return; }
+        assert!(tch::Cuda::is_available());
+        crate::torch::cuda::cfg::configure_cuda();
+        let _backward = crate::torch::cuda::cfg::disable_autograd_multithreading();
+        for mode in [JepaMode::LatentOne, JepaMode::AnchoredNoSigreg, JepaMode::AnchoredConditional] {
+            let config = jepa_gpu_config(mode);
+            let store = nn::VarStore::new(Device::Cuda(0));
+            let model = CausalPatchModel::new(&store.root(), &config);
+            live_head(&model);
+            let batch = synthetic(&config, &[16, 16]).to_device(Device::Cuda(0));
+            let losses = super::super::compute::Engine::forward_loss(&model, &batch, true, None);
+            losses.nll.backward();
+            assert!(model.head_output.ws.grad().abs().sum(Kind::Float).double_value(&[]) > 0.);
+            let gradient = model.patch.ws.grad();
+            if mode.detached_forecast() {
+                assert!(!gradient.defined(), "forecast anchor reached the latent-only encoder");
+            } else {
+                assert!(gradient.abs().sum(Kind::Float).double_value(&[]) > 0.);
+            }
+        }
+    }
+
+    #[test]
+    fn cuda_jepa_capture_keeps_metrics_uncontaminated_and_outside_optimizer_pool() {
+        use super::super::compute::{Engine, OptimizerKind, RecipeKnobs, CAPTURE_AFTER_STEPS};
+        let _rng = crate::torch::test_rng::exclusive();
+        if std::env::var("TIMEXER_SEGMENT_GPU_TEST").as_deref() != Ok("1") { return; }
+        assert!(tch::Cuda::is_available());
+        crate::torch::cuda::cfg::configure_cuda();
+        let _backward = crate::torch::cuda::cfg::disable_autograd_multithreading();
+        for mode in [JepaMode::AnchoredReconstruct, JepaMode::AnchoredProjectedSmall, JepaMode::AnchoredConditional] {
+            let config = jepa_gpu_config(mode);
+            let store = nn::VarStore::new(Device::Cuda(0));
+            let model = CausalPatchModel::new(&store.root(), &config);
+            let batch = synthetic(&config, &[16, 16, 16, 16]).to_device(Device::Cuda(0));
+            let mut engine = Engine::new(&store, 0.001, RecipeKnobs::reference(config.x0_lambdas), false, OptimizerKind::PolarExpress).unwrap();
+            for _ in 0..CAPTURE_AFTER_STEPS {
+                let reference = tch::no_grad(|| {
+                    let stats = model.statistics(&batch);
+                    let head = model.forward(&batch, &stats, false, false);
+                    let (targets, mask) = model.targets(&batch, &stats, false);
+                    model.losses(&head, &stats, &targets, &mask)
+                });
+                let trained = engine.step(&model, &batch).unwrap();
+                assert!(trained.nll.equal(&reference.nll), "an auxiliary term contaminated forecast NLL");
+                assert!(trained.mse.equal(&reference.mse));
+                assert!(trained.objective.double_value(&[]) > trained.nll.double_value(&[]));
+            }
+            let captured = engine.arm_step_graph(&model, &batch).unwrap();
+            assert!(engine.step_graph_captured());
+            let saved = captured.copied();
+            let diagnostic = captured.jepa.as_ref().unwrap();
+            if mode.conditional() {
+                assert!(diagnostic.double_value(&[0]) > 0.);
+                assert_eq!(diagnostic.double_value(&[1]), 0.);
+                assert_eq!(diagnostic.double_value(&[2]), 0.);
+                let mut close = batch.log_prices.select(2, 3).narrow(1, 47, 1);
+                close.copy_(&(&close + 0.007));
+                let reference = tch::no_grad(|| Engine::forward_loss(&model, &batch, false, None));
+                let replay = engine.step(&model, &batch).unwrap();
+                let persistence = replay.jepa.as_ref().unwrap().double_value(&[3]);
+                assert!((persistence - reference.jepa.unwrap().double_value(&[3])).abs() < 1e-6);
+                assert!((persistence - diagnostic.double_value(&[3])).abs() > 1e-5,
+                    "captured CF targets did not follow the resident batch intervention");
+            } else if mode == JepaMode::AnchoredReconstruct {
+                assert!(diagnostic.double_value(&[2]) > 0.);
+            } else {
+                assert!(diagnostic.double_value(&[1]) > 0.);
+            }
+            for _ in 0..3 { engine.step(&model, &batch).unwrap(); }
+            assert!(captured.nll.equal(&saved.nll));
+            assert!(captured.mse.equal(&saved.mse));
+            assert!(captured.objective.equal(&saved.objective));
+            assert!(captured.jepa.unwrap().equal(&saved.jepa.unwrap()),
+                "optimizer/next replay overwrote a retained diagnostic tensor");
+        }
     }
 }
