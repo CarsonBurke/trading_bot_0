@@ -110,6 +110,10 @@ enum Commands {
     BasisStatsTimexerSegment(torch::timexer_segment::runner::BasisStatsArgs),
     /// Evaluate a continuous synchronized account on validation; terminal test remains locked.
     EvaluateTimexerPortfolio(torch::timexer_segment::runner::PortfolioEvaluateArgs),
+    /// Run the un-gained forecast path as an overlapping-tranche market-neutral book through a
+    /// realistic IBKR Pro account, swept over AUM, commission tier and the aggregation and
+    /// weighting choices; terminal test remains locked.
+    EvaluateTimexerBook(torch::timexer_segment::book_data::BookEvaluateArgs),
     /// Render direct-horizon forecasts against observed validation candles.
     TimexerCandles(torch::single_ticker_timexer::candles::CandleArgs),
     /// Measure TimeXer batch and training throughput with numerical equivalence checks.
@@ -1963,6 +1967,15 @@ async fn run() {
             .await
             .expect("TimeXer portfolio evaluation panicked")
             .expect("TimeXer portfolio evaluation failed");
+        }
+        Some(Commands::EvaluateTimexerBook(args)) => {
+            let args = args.clone();
+            tokio::task::spawn_blocking(move || {
+                torch::timexer_segment::book_data::evaluate_book(args)
+            })
+            .await
+            .expect("TimeXer book evaluation panicked")
+            .expect("TimeXer book evaluation failed");
         }
         Some(Commands::TrainTimexer(args)) => {
             let args = args.clone();

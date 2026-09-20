@@ -65,25 +65,25 @@ pub struct ScheduleConfig {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-struct Metadata {
-    as_of_ms: i64,
-    assets: Vec<MetadataAsset>,
+pub(super) struct Metadata {
+    pub as_of_ms: i64,
+    pub assets: Vec<MetadataAsset>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
-struct MetadataAsset {
-    symbol: String,
+pub(super) struct MetadataAsset {
+    pub symbol: String,
     #[serde(default)]
-    sector: Option<String>,
+    pub sector: Option<String>,
     #[serde(default)]
-    shortable: bool,
+    pub shortable: bool,
 }
 
-struct Plan {
-    tape: Tape,
-    origins: Vec<WindowRef>,
-    destinations: Vec<(usize, usize)>,
-    summary: BTreeMap<String, f64>,
-    assumptions: Vec<String>,
+pub(super) struct Plan {
+    pub tape: Tape,
+    pub origins: Vec<WindowRef>,
+    pub destinations: Vec<(usize, usize)>,
+    pub summary: BTreeMap<String, f64>,
+    pub assumptions: Vec<String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -107,7 +107,7 @@ struct ScalarCalibration {
     sha256: String,
 }
 
-fn digest(bytes: &[u8]) -> String {
+pub(super) fn digest(bytes: &[u8]) -> String {
     ring::digest::digest(&ring::digest::SHA256, bytes)
         .as_ref()
         .iter()
@@ -115,7 +115,7 @@ fn digest(bytes: &[u8]) -> String {
         .collect()
 }
 
-fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
+pub(super) fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
     if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
         fs::create_dir_all(parent)?;
     }
@@ -125,7 +125,7 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
-fn clock(timestamp: i64) -> (NaiveDate, u32) {
+pub(super) fn clock(timestamp: i64) -> (NaiveDate, u32) {
     let time = New_York
         .timestamp_millis_opt(timestamp)
         .single()
@@ -141,7 +141,7 @@ fn at(date: NaiveDate, hour: u32, minute: u32) -> i64 {
         .timestamp_millis()
 }
 
-fn lower_bound(ticker: &CorpusTicker, timestamp: i64) -> usize {
+pub(super) fn lower_bound(ticker: &CorpusTicker, timestamp: i64) -> usize {
     let (mut low, mut high) = (0, ticker.contract.valid_bars);
     while low < high {
         let middle = low + (high - low) / 2;
@@ -154,7 +154,7 @@ fn lower_bound(ticker: &CorpusTicker, timestamp: i64) -> usize {
     low
 }
 
-fn ticker(corpus: &Corpus, index: usize) -> &CorpusTicker {
+pub(super) fn ticker(corpus: &Corpus, index: usize) -> &CorpusTicker {
     corpus.ticker(WindowRef {
         ticker: index,
         origin: 0,
@@ -281,7 +281,7 @@ fn correlation(a: &[(i64, f64)], b: &[(i64, f64)]) -> Option<(f64, f64)> {
     (vx > 0. && vy > 0.).then(|| (cov / (vx * vy).sqrt(), cov / vy))
 }
 
-fn plan(
+pub(super) fn plan(
     corpus: &Corpus,
     config: &ScheduleConfig,
     horizon: usize,
@@ -432,9 +432,10 @@ fn plan(
     for (index, candidate) in candidates.iter_mut().enumerate() {
         candidate.risk_group = root(&parent, index);
     }
-    let assets = candidates
+    let assets: Vec<Asset> = candidates
         .iter()
-        .map(|candidate| {
+        .enumerate()
+        .map(|(index, candidate)| {
             let symbol = ticker(corpus, candidate.ticker).contract.ticker.clone();
             let metadata = metadata.and_then(|m| m.assets.iter().find(|row| row.symbol == symbol));
             Asset {
@@ -443,6 +444,9 @@ fn plan(
                 shortable: metadata.is_some_and(|m| m.shortable),
                 beta: candidate.beta,
                 risk_group: candidate.risk_group,
+                // The measured cost panel is built in this same asset order, so an asset's
+                // position in the universe IS its `CostCalibration::symbols` row.
+                symbol_index: index as u32,
             }
         })
         .collect();
@@ -475,6 +479,7 @@ fn plan(
                         0.
                     },
                     forecast: None,
+                    target: None,
                 },
                 WindowRef {
                     ticker: candidate.ticker,
@@ -1285,7 +1290,8 @@ pub(super) fn evaluate(
         caching.elapsed().as_secs_f64() * 1000.,
     );
     let simulation = Instant::now();
-    let mut result = portfolio::simulate(&prepared.tape, &args.account)?;
+    let mut result =
+        portfolio::simulate(&prepared.tape, &args.account, &portfolio::CostSource::Flat)?;
     result.summary.insert(
         "simulation_ms".into(),
         simulation.elapsed().as_secs_f64() * 1000.,

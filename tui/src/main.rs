@@ -1240,6 +1240,45 @@ mod planner_inference_discovery_tests {
                 "{step_indexed} is written but the TUI never scans for it"
             );
         }
+        // The book backtest family. `meta_chart_bases` extends from the same registry, so the
+        // scan side holds by construction; these are pinned by name anyway because the nine
+        // headline panels are the deliverable a reader judges the strategy on, and a rename
+        // that dropped one would stay green under the registry membership check above.
+        for book in [
+            "timexer_book_equity",
+            "timexer_book_interval_return",
+            "timexer_book_annualized",
+            "timexer_book_cost_decomposition",
+            "timexer_book_exposure",
+            "timexer_book_drawdown",
+            "timexer_book_signal_ic",
+            "timexer_book_uncertainty_ic",
+            "timexer_book_calibration",
+        ] {
+            assert!(
+                registered.contains(&book),
+                "{book} must stay registered: it is one of the nine panels the book backtest \
+                 is read off"
+            );
+            assert!(
+                bases.contains(&book),
+                "{book} is written but the TUI never scans for it"
+            );
+        }
+        let scanned_book: Vec<_> = bases
+            .iter()
+            .copied()
+            .filter(|base| base.starts_with("timexer_book_"))
+            .collect();
+        let registered_book: Vec<_> = registered
+            .iter()
+            .copied()
+            .filter(|base| base.starts_with("timexer_book_"))
+            .collect();
+        assert_eq!(
+            scanned_book, registered_book,
+            "every timexer_book_* base the TUI scans must be registered and vice versa"
+        );
         // Retired: the mis-scaling cross term moved into `_horizon_steps_decomposition`
         // beside the two components of the same identity, in the same unit. A name that is
         // scanned with no writer renders as a permanently blank panel.

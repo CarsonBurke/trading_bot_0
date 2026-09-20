@@ -262,6 +262,41 @@ pub const TIMEXER_SEGMENT_REPORT_BASES: &[&str] = &[
     // produced was one wall clock covering three populations, a corpus load and a `finish`,
     // which is why a 75 ms batch was read as a 189 ms one.
     "timexer_segment_eval_phases",
+    // The end-to-end book backtest: the pretrained forecast path turned into an
+    // overlapping-tranche market-neutral long/short book, priced through the IBKR Pro cost
+    // model and swept over AUM. Written by `reports::write_book`.
+    //
+    // `_equity` and `_drawdown` are bar-indexed paths; the eight `_interval_*`/`_annualized*`/
+    // `_cost_*`/`_exposure`/`_turnover`/`_names` bases are AUM-indexed, because the capacity
+    // decay is the SHAPE of the sweep and an equity curve cannot carry it. Sixteen bases and
+    // not the nine questions they answer, for the reason at the top of this list: a mean
+    // return in basis points, the same cost as a share of gross P&L, a Sharpe near 1, a name
+    // count near 50 and a turnover multiple near 300 on one axis render four of the five as
+    // flat lines.
+    //
+    // The last four exist only when the optional diagnostics pass ran, and they are the ones
+    // that say WHY the book earned what it earned: `_signal_ic` is the per-horizon
+    // cross-sectional information with its standard errors and the cross-horizon aggregate
+    // drawn flat beside them, `_uncertainty_ic` and `_uncertainty_hit_rate` are the σ- and
+    // agreement-decile families whose FLATNESS is the measured verdict that the predictive σ
+    // is not an alpha source at fixed horizon, and `_calibration` is the σ coverage that is
+    // the only explanation available for a realized vol that missed its ex-ante target.
+    "timexer_book_equity",
+    "timexer_book_interval_return",
+    "timexer_book_interval_sharpe",
+    "timexer_book_annualized",
+    "timexer_book_annualized_ratio",
+    "timexer_book_cost_decomposition",
+    "timexer_book_cost_share",
+    "timexer_book_cost_coverage",
+    "timexer_book_exposure",
+    "timexer_book_turnover",
+    "timexer_book_names",
+    "timexer_book_drawdown",
+    "timexer_book_signal_ic",
+    "timexer_book_uncertainty_ic",
+    "timexer_book_uncertainty_hit_rate",
+    "timexer_book_calibration",
     // Fixed-budget forecasting/temporal-objective research, frozen CUDA probes, and
     // separately learned synthetic delayed-cue evidence. Synthetic panels are not markets.
     // Paired actual forecasts on one authenticated panel; no latent/probe loss substitutes.

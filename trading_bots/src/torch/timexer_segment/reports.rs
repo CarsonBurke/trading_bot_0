@@ -2283,7 +2283,7 @@ pub(super) fn write_account(
             .filter(|key| {
                 let cost = matches!(
                     *key,
-                    "commission_usd" | "regulatory_usd" | "spread_usd"
+                    "commission_usd" | "regulatory_usd" | "spread_usd" | "impact_usd"
                         | "slippage_usd" | "borrow_usd" | "costs_usd"
                 );
                 match base {
@@ -5115,6 +5115,1628 @@ mod supervision_occupancy_tests {
         let empty = SupervisionCensus { rows: 0, ..census.clone() };
         assert!(write_supervision_occupancy(&root, 1, 1, 256, &empty).is_err());
         assert!(write_supervision_occupancy(&root, 1, 1, 0, &census).is_err());
+        fs::remove_dir_all(&root).unwrap();
+    }
+}
+
+/// Fallback account clock, used ONLY when an evaluation carries no measurable window.
+///
+/// A regular US equity session is 78 five-minute bars and a year is 252 of them, so 19 656.
+/// That is NOT the cadence this account simulates: its tape retains every observed mark
+/// including extended hours, which is roughly 191 bars a session and 48 000 a year. Every
+/// annualization below therefore measures its own interval count off the evaluation via
+/// [`BookCadence`] and reaches these constants only for a degenerate window, where no
+/// annualization is meaningful anyway.
+const BOOK_BARS_PER_YEAR: f64 = 19_656.0;
+const BOOK_SESSIONS_PER_YEAR: f64 = 252.0;
+const BOOK_MONTHS_PER_YEAR: f64 = 12.0;
+
+/// Book panel axes. Each states its denominator, because the book charts a return per
+/// interval, a cost per traded dollar and a cost per dollar of gross P&L, and those three
+/// share no axis: a 0.4 bps bar return beside a 600 bps month, or an 8 bps cost beside the
+/// 0.9 share of P&L it consumed, renders one of each pair as a flat line.
+const BOOK_EQUITY_UNIT: &str = "equity as a multiple of the run's own initial capital \
+                                (1.0 = flat; normalized because a $25k curve and a $100M \
+                                curve in USD cannot share an axis)";
+/// The calendar-month series is the one interval whose trailing partial period is dropped
+/// outright, so its mean times its count under-reports the window's total by that stub. Said
+/// on the axis because a reader reconciling the panel against total P&L will otherwise read
+/// the stub as a measurement error.
+const BOOK_INTERVAL_UNIT: &str = "mean realized net return per interval (basis points of \
+                                  equity; net of every modeled cost, NaN = fewer than two \
+                                  complete intervals were observed; every series times its \
+                                  own interval count reconciles with total net P&L except \
+                                  the calendar month, whose trailing partial month is \
+                                  dropped)";
+const BOOK_SHARPE_UNIT: &str = "annualized Sharpe (dimensionless; interval mean / interval \
+                                sample std × sqrt(intervals per year); NaN on a zero-variance \
+                                or single-observation interval)";
+const BOOK_RATIO_UNIT: &str = "annualized risk-adjusted ratio (dimensionless; NaN where the \
+                               denominator is zero, which is not a good ratio)";
+const BOOK_COST_UNIT: &str = "basis points of one-way traded notional (what each dollar \
+                              transacted cost; the breakeven edge the signal must clear)";
+const BOOK_COST_SHARE_UNIT: &str = "fraction of gross pre-cost P&L (1.0 = the component ate \
+                                    the whole edge; negative = gross P&L was itself negative, \
+                                    which no cost reduction rescues)";
+const BOOK_SYMBOL_UNIT: &str = "symbols";
+const BOOK_NAME_UNIT: &str = "names (mean over decision frames)";
+const BOOK_EXPOSURE_UNIT: &str = "fraction (each series names its denominator: equity, the \
+                                  tradable universe, or decision frames)";
+const BOOK_TURNOVER_UNIT: &str = "annualized one-way turnover (multiples of equity per year)";
+const BOOK_DRAWDOWN_UNIT: &str = "drawdown (fraction of peak equity; 0 = at the high-water \
+                                  mark, negative = underwater)";
+const BOOK_IC_UNIT: &str = "within-timestamp cross-ticker rank information coefficient \
+                            (dimensionless; 0 = no information)";
+const BOOK_HIT_UNIT: &str = "fraction of names whose realized sign matched the forecast's \
+                             (> 0.5 = skill)";
+const BOOK_COVERAGE_UNIT: &str = "fraction of realizations inside the predictive interval \
+                                  (below nominal = the predictive σ is too tight, so the \
+                                  ex-ante vol target undershoots realized vol)";
+
+const BOOK_AUM_AXIS: &str = "account AUM (USD, ascending)";
+const BOOK_BAR_AXIS: &str = "five-minute bar ordinal from the first scheduled frame";
+const BOOK_HORIZON_AXIS: &str = "forecast horizon (five-minute bars)";
+
+/// Every chart base [`write_book`] can produce, named here so the writer, the registry in
+/// [`shared::report::TIMEXER_SEGMENT_REPORT_BASES`] and the registration test cannot disagree
+/// about a string. Sixteen bases and not the nine questions they answer, for the reason the
+/// registry's own header gives: the split is by UNIT, and an annualized return near 0.1 on
+/// the same axis as a Sharpe near 1.5, or a cost in basis points beside the same cost as a
+/// share of P&L, renders one of each pair unreadable.
+pub(super) const BOOK_REPORT_BASES: &[&str] = &[
+    "timexer_book_equity",
+    "timexer_book_interval_return",
+    "timexer_book_interval_sharpe",
+    "timexer_book_annualized",
+    "timexer_book_annualized_ratio",
+    "timexer_book_cost_decomposition",
+    "timexer_book_cost_share",
+    "timexer_book_cost_coverage",
+    "timexer_book_exposure",
+    "timexer_book_turnover",
+    "timexer_book_names",
+    "timexer_book_drawdown",
+    "timexer_book_signal_ic",
+    "timexer_book_uncertainty_ic",
+    "timexer_book_uncertainty_hit_rate",
+    "timexer_book_calibration",
+];
+
+/// The bases that exist only when the diagnostics pass ran. `diagnostics: None` is a
+/// legitimate configuration - the AUM sweep is the deliverable and the signal audit is a
+/// separate optional pass - so these are ABSENT rather than written with reference lines and
+/// no measurement, which is a panel a reader cannot distinguish from a measured zero.
+pub(super) const BOOK_DIAGNOSTIC_BASES: &[&str] = &[
+    "timexer_book_signal_ic",
+    "timexer_book_uncertainty_ic",
+    "timexer_book_uncertainty_hit_rate",
+    "timexer_book_calibration",
+];
+
+/// The cost ledger, in the order a reader should read it: what the broker bills per share,
+/// what the regulators take, what the market charges for immediacy, and what accrues on
+/// calendar time. The measured impact term and the flat slippage proxy are SEPARATE rows and
+/// are never summed: a run priced from the Roll/ADV calibration pays the former and zeroes
+/// the latter, a flat-cost run does the reverse, and a panel that added them would double
+/// count whichever one the run actually paid.
+const BOOK_COST_COMPONENTS: [(&str, &str); 6] = [
+    ("commission", "commission_usd"),
+    ("regulatory (SEC + TAF + CAT)", "regulatory_usd"),
+    ("spread", "spread_usd"),
+    ("measured impact", "impact_usd"),
+    ("flat slippage proxy", "slippage_usd"),
+    ("borrow", "borrow_usd"),
+];
+
+/// The account's ACTUAL clock, measured off one evaluation instead of assumed.
+///
+/// Every annualization on these panels is a count of intervals per year, and the count is a
+/// property of the tape rather than of the exchange calendar: the account marks and accrues on
+/// every observed bar, extended hours included, so it simulates roughly 191 bars a session
+/// where a 09:30-16:00 regular session holds 78. Annualizing that series with 19 656 bars a
+/// year understates the geometric return in log space by 2.4x and every vol, Sharpe and
+/// Sortino by sqrt(2.4), which is precisely how a 9.6% year came to be charted as 3.8%.
+///
+/// Derived from [`AccountEvaluation::span_years`] and the series' own lengths, so the count
+/// and the window it is a count over cannot disagree. Calendar months are the one exception:
+/// twelve a year is an identity, not an estimate.
+#[derive(Clone, Copy)]
+struct BookCadence {
+    /// Wall-clock length of the window, the denominator of every count below.
+    years: f64,
+    bars_per_year: f64,
+    sessions_per_year: f64,
+}
+
+impl BookCadence {
+    fn measure(evaluation: &super::portfolio::AccountEvaluation) -> Self {
+        let years = evaluation.span_years();
+        let per_year = |count: usize, fallback: f64| {
+            if years > 0.0 && count > 1 {
+                count as f64 / years
+            } else {
+                fallback
+            }
+        };
+        Self {
+            years,
+            bars_per_year: per_year(evaluation.points.len(), BOOK_BARS_PER_YEAR),
+            sessions_per_year: per_year(evaluation.daily.len(), BOOK_SESSIONS_PER_YEAR),
+        }
+    }
+
+    fn bars_per_session(&self) -> f64 {
+        self.bars_per_year / self.sessions_per_year
+    }
+
+    /// The annualized panel's axis, stating the window and the bar count it annualized with
+    /// rather than a constant a reader would have to trust.
+    fn annual_unit(&self) -> String {
+        format!(
+            "annualized fraction of equity (geometric net return over the window's own \
+             {:.3} years, return std and downside std x sqrt({:.0} simulated bars/yr measured \
+             from the run itself rather than a 19 656-bar regular-session year), max drawdown \
+             as a fraction of peak equity and therefore negative)",
+            self.years, self.bars_per_year
+        )
+    }
+}
+
+/// How one charted interval's returns are assembled from the account's own series.
+enum BookIntervalSource {
+    /// Compound this many consecutive simulated bar returns.
+    Bars(usize),
+    /// Compound this many consecutive New-York-calendar session returns.
+    Sessions(usize),
+    /// The account's own calendar-month aggregation.
+    Months,
+}
+
+struct BookInterval {
+    /// Names the interval in every series label that reports it.
+    name: &'static str,
+    source: BookIntervalSource,
+}
+
+/// The five intervals the headline return panel reports, shortest first. Hours and weeks are
+/// FIXED-LENGTH blocks of the interval below them rather than wall-clock calendar units: a
+/// holiday-shortened calendar week and a full one are not the same bet, and a mean over both
+/// denominators answers neither "what does a week earn" nor "what does a session earn". The
+/// month is the account's own New-York calendar month, the one interval where the account
+/// already did the grouping and where a fixed block would drift against the reporting period
+/// a reader compares against.
+const BOOK_INTERVALS: [BookInterval; 5] = [
+    BookInterval {
+        name: "five-minute bar",
+        source: BookIntervalSource::Bars(1),
+    },
+    BookInterval {
+        name: "12-bar hour",
+        source: BookIntervalSource::Bars(12),
+    },
+    BookInterval {
+        name: "session",
+        source: BookIntervalSource::Sessions(1),
+    },
+    BookInterval {
+        name: "5-session week",
+        source: BookIntervalSource::Sessions(5),
+    },
+    BookInterval {
+        name: "calendar month",
+        source: BookIntervalSource::Months,
+    },
+];
+
+impl BookInterval {
+    /// One realized return per COMPLETE interval. A trailing partial block is dropped rather
+    /// than annualized as if it were whole, which is the only treatment under which the mean
+    /// of this series is a return per interval of the stated length.
+    fn returns(&self, evaluation: &super::portfolio::AccountEvaluation) -> Vec<f64> {
+        match self.source {
+            BookIntervalSource::Bars(block) => {
+                book_compound(&book_returns(&evaluation.points, "return"), block)
+            }
+            BookIntervalSource::Sessions(block) => {
+                book_compound(&book_returns(&evaluation.daily, "return_fraction"), block)
+            }
+            BookIntervalSource::Months => book_returns(&evaluation.monthly, "return_fraction"),
+        }
+    }
+
+    /// Intervals of this length per year, on the cadence the run actually simulated.
+    fn per_year(&self, cadence: &BookCadence) -> f64 {
+        match self.source {
+            BookIntervalSource::Bars(block) => cadence.bars_per_year / block.max(1) as f64,
+            BookIntervalSource::Sessions(block) => {
+                cadence.sessions_per_year / block.max(1) as f64
+            }
+            BookIntervalSource::Months => BOOK_MONTHS_PER_YEAR,
+        }
+    }
+
+    /// Interval length in simulated bars, for the labels that state it. Measured, so a session
+    /// reads as the ~191 extended-hours bars the account really marked rather than the 78 a
+    /// regular session would hold.
+    fn bars(&self, cadence: &BookCadence) -> f64 {
+        match self.source {
+            BookIntervalSource::Bars(block) => block.max(1) as f64,
+            BookIntervalSource::Sessions(block) => {
+                block.max(1) as f64 * cadence.bars_per_session()
+            }
+            BookIntervalSource::Months => cadence.bars_per_year / BOOK_MONTHS_PER_YEAR,
+        }
+    }
+}
+
+/// Mean, sample dispersion and downside dispersion of one interval's realized returns, or an
+/// all-NaN record when fewer than two complete intervals were observed. One observation is
+/// reported as UNMEASURED on purpose: a single realization carries no dispersion and no
+/// Sharpe, and a lone monthly return drawn as "the mean monthly return" beside a mean over
+/// 20 000 bars is exactly the misreading these panels exist to prevent.
+#[derive(Clone, Copy)]
+struct BookMoments {
+    mean: f64,
+    std: f64,
+    downside: f64,
+}
+
+impl BookMoments {
+    /// Annualized Sharpe on the interval actually charted. NaN on a degenerate series: a
+    /// constant return has no dispersion to divide by, and the infinity `mean / 0` produces
+    /// would render as the best book in the sweep.
+    fn sharpe(&self, per_year: f64) -> f64 {
+        if self.std > 0.0 {
+            self.mean / self.std * per_year.sqrt()
+        } else {
+            f64::NAN
+        }
+    }
+
+    fn sortino(&self, per_year: f64) -> f64 {
+        if self.downside > 0.0 {
+            self.mean / self.downside * per_year.sqrt()
+        } else {
+            f64::NAN
+        }
+    }
+}
+
+fn book_moments(values: &[f64]) -> BookMoments {
+    let usable: Vec<f64> = values.iter().copied().filter(|v| v.is_finite()).collect();
+    if usable.len() < 2 {
+        return BookMoments {
+            mean: f64::NAN,
+            std: f64::NAN,
+            downside: f64::NAN,
+        };
+    }
+    let count = usable.len() as f64;
+    let mean = usable.iter().sum::<f64>() / count;
+    let variance = usable.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / (count - 1.0);
+    // Downside deviation on the same denominator as the std beside it, so Sortino and Sharpe
+    // differ only in which realizations they charge for.
+    let downside = usable.iter().map(|v| v.min(0.0).powi(2)).sum::<f64>() / (count - 1.0);
+    BookMoments {
+        mean,
+        std: variance.sqrt(),
+        downside: downside.sqrt(),
+    }
+}
+
+fn book_returns(points: &[super::portfolio::AccountPoint], key: &str) -> Vec<f64> {
+    points
+        .iter()
+        .filter_map(|point| point.values.get(key).copied())
+        .collect()
+}
+
+fn book_compound(returns: &[f64], block: usize) -> Vec<f64> {
+    returns
+        .chunks_exact(block.max(1))
+        .map(|chunk| chunk.iter().map(|r| 1.0 + r).product::<f64>() - 1.0)
+        .collect()
+}
+
+/// A summary scalar, or NaN when the run never measured it. Never 0: an account that
+/// transacted nothing has no cost per traded basis point, and a 0 there would read as
+/// execution that was free.
+fn book_stat(summary: &BTreeMap<String, f64>, key: &str) -> f64 {
+    summary
+        .get(key)
+        .copied()
+        .filter(|value| value.is_finite())
+        .unwrap_or(f64::NAN)
+}
+
+fn book_mean(
+    points: &[super::portfolio::AccountPoint],
+    key: &str,
+    map: impl Fn(f64) -> f64,
+) -> f64 {
+    let mut sum = 0.0;
+    let mut count = 0usize;
+    for point in points {
+        if let Some(value) = point.values.get(key).copied().filter(|v| v.is_finite()) {
+            sum += map(value);
+            count += 1;
+        }
+    }
+    if count == 0 {
+        f64::NAN
+    } else {
+        sum / count as f64
+    }
+}
+
+fn book_row(values: impl IntoIterator<Item = f64>) -> Vec<f32> {
+    values.into_iter().map(|value| value as f32).collect()
+}
+
+/// `$25k`, `$1M`, `$100M`: the AUM as a reader says it. The numeric axis carries the exact
+/// value, so this is legend shorthand only.
+fn book_aum_label(aum: f64) -> String {
+    let (value, suffix) = if aum >= 1e9 {
+        (aum / 1e9, "B")
+    } else if aum >= 1e6 {
+        (aum / 1e6, "M")
+    } else if aum >= 1e3 {
+        (aum / 1e3, "k")
+    } else {
+        (aum, "")
+    };
+    let mut text = format!("{value:.3}");
+    while text.ends_with('0') {
+        text.pop();
+    }
+    if text.ends_with('.') {
+        text.pop();
+    }
+    format!("${text}{suffix}")
+}
+
+/// Every scalar the variant × AUM panels draw, measured once per run. Assembled from the
+/// account's own summary and points rather than recomputed from the tape: the simulator is
+/// the only thing that knows what actually filled, and a second implementation of the same
+/// arithmetic here would eventually disagree with it and there would be no way to tell which
+/// number the charts were showing.
+struct BookMetrics {
+    cadence: BookCadence,
+    annualized_return: f64,
+    annualized_vol: f64,
+    annualized_downside_vol: f64,
+    max_drawdown: f64,
+    annualized_turnover: f64,
+    intervals: [BookMoments; BOOK_INTERVALS.len()],
+    cost_usd: [f64; BOOK_COST_COMPONENTS.len()],
+    total_cost_usd: f64,
+    traded_notional_usd: f64,
+    gross_pnl_usd: f64,
+    spread_fallback_symbols: f64,
+    spread_measured_symbols: f64,
+    universe_symbols: f64,
+    held_names: f64,
+    active_names: f64,
+    gross_exposure: f64,
+    net_exposure: f64,
+    absolute_net_exposure: f64,
+    active_fraction: f64,
+    turnover_capped_fraction: f64,
+}
+
+impl BookMetrics {
+    fn measure(evaluation: &super::portfolio::AccountEvaluation) -> Self {
+        let summary = &evaluation.summary;
+        let cadence = BookCadence::measure(evaluation);
+        let intervals: [BookMoments; BOOK_INTERVALS.len()] =
+            std::array::from_fn(|index| book_moments(&BOOK_INTERVALS[index].returns(evaluation)));
+        // Geometric, from the account's own terminal equity over the window's own wall-clock
+        // length: the book compounds, and an arithmetic (bars per year) x of a mean bar return
+        // overstates a volatile path, so it is not the number an investor receives. Using the
+        // measured span rather than a bar count times an assumed bars-per-year is what makes
+        // this figure identical to the headline table's `ann_ret`.
+        let growth = 1.0 + book_stat(summary, "total_return_fraction");
+        let annualized_return = if growth > 0.0 && cadence.years > 0.0 {
+            growth.powf(1.0 / cadence.years) - 1.0
+        } else {
+            f64::NAN
+        };
+        let universe_symbols = book_stat(summary, "universe_count");
+        let held_names = book_mean(&evaluation.points, "held_count", |value| value);
+        let decisions = book_stat(summary, "decision_count");
+        let bar_annualization = cadence.bars_per_year.sqrt();
+        Self {
+            cadence,
+            annualized_return,
+            annualized_vol: intervals[0].std * bar_annualization,
+            annualized_downside_vol: intervals[0].downside * bar_annualization,
+            max_drawdown: book_stat(summary, "max_drawdown_fraction"),
+            annualized_turnover: book_stat(summary, "turnover_annualized"),
+            intervals,
+            cost_usd: std::array::from_fn(|index| {
+                book_stat(summary, BOOK_COST_COMPONENTS[index].1)
+            }),
+            total_cost_usd: book_stat(summary, "costs_usd"),
+            traded_notional_usd: book_stat(summary, "traded_notional_usd"),
+            gross_pnl_usd: book_stat(summary, "gross_pnl_usd"),
+            spread_fallback_symbols: book_stat(summary, "spread_fallback_count"),
+            spread_measured_symbols: book_stat(summary, "spread_measured_count"),
+            universe_symbols,
+            held_names,
+            active_names: book_stat(summary, "mean_active_names"),
+            gross_exposure: book_stat(summary, "mean_gross_exposure"),
+            net_exposure: book_stat(summary, "mean_net_exposure"),
+            absolute_net_exposure: book_mean(&evaluation.points, "net_fraction", f64::abs),
+            active_fraction: if universe_symbols > 0.0 {
+                held_names / universe_symbols
+            } else {
+                f64::NAN
+            },
+            turnover_capped_fraction: if decisions > 0.0 {
+                book_stat(summary, "turnover_capped_count") / decisions
+            } else {
+                f64::NAN
+            },
+        }
+    }
+
+    fn cost_bps(&self, index: usize) -> f64 {
+        if self.traded_notional_usd > 0.0 {
+            self.cost_usd[index] / self.traded_notional_usd * 1e4
+        } else {
+            f64::NAN
+        }
+    }
+
+    fn total_cost_bps(&self) -> f64 {
+        if self.traded_notional_usd > 0.0 {
+            self.total_cost_usd / self.traded_notional_usd * 1e4
+        } else {
+            f64::NAN
+        }
+    }
+
+    fn cost_share(&self, index: usize) -> f64 {
+        if self.gross_pnl_usd != 0.0 && self.gross_pnl_usd.is_finite() {
+            self.cost_usd[index] / self.gross_pnl_usd
+        } else {
+            f64::NAN
+        }
+    }
+
+    fn total_cost_share(&self) -> f64 {
+        if self.gross_pnl_usd != 0.0 && self.gross_pnl_usd.is_finite() {
+            self.total_cost_usd / self.gross_pnl_usd
+        } else {
+            f64::NAN
+        }
+    }
+
+    /// Return per unit of the deepest hole it was earned through. NaN at zero drawdown, which
+    /// is either a book that never lost or a book that never traded, and neither has a Calmar.
+    fn calmar(&self) -> f64 {
+        if self.max_drawdown < 0.0 {
+            self.annualized_return / self.max_drawdown.abs()
+        } else {
+            f64::NAN
+        }
+    }
+}
+
+/// The realized book, charted. Nine questions have to be answerable off these panels without
+/// a reader recomputing anything: how did capital move, what does the book earn per bar, hour,
+/// session, week and month, does that survive annualization, WHERE DOES IT STOP SCALING, what
+/// did execution cost and against what, how much risk was on and was the book throttled by its
+/// own turnover cap rather than by a weak signal, how deep was the worst hole, and - when the
+/// diagnostics pass ran - whether the forecast's cross-sectional information, its predictive σ
+/// and its calibration justify the selection the book made.
+///
+/// `runs` is the whole `(variant, AUM)` grid. The AUM axis is sorted ASCENDING here rather
+/// than taken in the order the sweep was simulated, because the capacity decay is the SHAPE of
+/// every AUM-indexed panel and a curve drawn on an unsorted axis is a zigzag that cannot be
+/// told apart from an edge that is not monotone in size.
+///
+/// Every unmeasured quantity reaches the chart as NaN. A measured zero and an unmeasured
+/// statistic are opposite claims: a book that transacted nothing has no cost per traded basis
+/// point, and a 0 there would read as execution that was free.
+pub(super) fn write_book(
+    output: &Path,
+    epoch: usize,
+    step: usize,
+    runs: &[(String, f64, super::portfolio::AccountEvaluation)],
+    diagnostics: Option<&super::book_diagnostics::BookDiagnostics>,
+) -> Result<()> {
+    use std::collections::BTreeSet;
+
+    ensure!(
+        !runs.is_empty(),
+        "a book report needs at least one simulated run"
+    );
+    let mut identities = BTreeSet::new();
+    for (label, aum, evaluation) in runs {
+        ensure!(!label.is_empty(), "every book run carries a variant label");
+        ensure!(
+            aum.is_finite() && *aum > 0.0,
+            "book run {label} carries a nonpositive AUM"
+        );
+        ensure!(
+            identities.insert((label.as_str(), aum.to_bits())),
+            "book run {label} at AUM {aum} is duplicated; two identical legend entries cannot be told apart"
+        );
+        ensure!(
+            !evaluation.points.is_empty(),
+            "book run {label} at AUM {aum} produced no account points"
+        );
+        // The density of `points` IS the denominator of every annualization below, so a
+        // series that contradicts the account's own bar census is refused rather than charted:
+        // a second entry per fill, per AUM variant or per mark-and-decide pass would otherwise
+        // arrive as a quietly diluted return per bar.
+        let census = book_stat(&evaluation.summary, "bars_simulated");
+        ensure!(
+            !census.is_finite() || census == evaluation.points.len() as f64,
+            "book run {label} at AUM {aum} simulated {census} bars but emitted {} account \
+             points; the per-bar series would annualize on the wrong density",
+            evaluation.points.len()
+        );
+    }
+    let mut aums: Vec<f64> = runs.iter().map(|(_, aum, _)| *aum).collect();
+    aums.sort_by(|left, right| left.partial_cmp(right).expect("validated finite AUM"));
+    aums.dedup();
+    let aum_steps: Vec<u64> = aums.iter().map(|aum| aum.round() as u64).collect();
+    let mut variants: Vec<&str> = Vec::new();
+    for (label, _, _) in runs {
+        if !variants.contains(&label.as_str()) {
+            variants.push(label.as_str());
+        }
+    }
+    // The AUM the time-indexed panels are drawn at: the lower median of the sweep, not an end
+    // of it. The smallest book in the sweep is dominated by the $0.35 per-order minimum and
+    // the largest by impact, so either end would present an extreme as the representative
+    // path. The value is in the title, so no reader has to guess which one it is.
+    let reference_aum = aums[(aums.len() - 1) / 2];
+    let metrics: Vec<BookMetrics> = runs
+        .iter()
+        .map(|(_, _, evaluation)| BookMetrics::measure(evaluation))
+        .collect();
+    // Label text quotes the FIRST run's measured cadence; every charted value annualizes on
+    // its own run's. A sweep is one tape simulated at several sizes, so the two coincide.
+    let cadence = metrics[0].cadence;
+    let scope = format!(
+        "timexer book backtest | validation partition (terminal test untouched) | {} variant(s) x {} AUM level(s), time-indexed panels at {} | epoch {epoch} step {step}",
+        variants.len(),
+        aums.len(),
+        book_aum_label(reference_aum)
+    );
+    let chart = |base: &str,
+                 question: &str,
+                 unit: &str,
+                 axis: &str,
+                 scale: ScaleKind,
+                 steps: &[u64],
+                 series: Vec<ReportSeries>|
+     -> Result<()> {
+        ensure!(
+            BOOK_REPORT_BASES.contains(&base),
+            "book panel {base} is written but is not a registered book base"
+        );
+        ensure!(
+            diagnostics.is_some() || !BOOK_DIAGNOSTIC_BASES.contains(&base),
+            "book panel {base} was written without the diagnostics pass that measures it"
+        );
+        for line in &series {
+            ensure!(
+                line.values.len() == steps.len(),
+                "book panel {base} series {} carries {} values for {} steps",
+                line.label,
+                line.values.len(),
+                steps.len()
+            );
+            ensure!(
+                line.values.iter().all(|v| v.is_nan() || v.is_finite()),
+                "book panel {base} series {} carries an unrepresentable value",
+                line.label
+            );
+        }
+        write_report(
+            output.join(format!("{base}.report.bin")),
+            &Report {
+                title: format!("{scope} | {question}"),
+                x_label: Some(axis.to_owned()),
+                y_label: Some(unit.to_owned()),
+                scale,
+                kind: ReportKind::IndexedLines {
+                    steps: steps.to_vec(),
+                    series,
+                },
+            },
+        )?;
+        Ok(())
+    };
+    // Every series on an AUM-indexed panel is one variant's quantity read across the sorted
+    // axis, with NaN wherever that variant was not simulated at that AUM - a hole in the grid
+    // is a run that did not happen, not a run that earned nothing.
+    let aum_row = |variant: &str, pick: &dyn Fn(&BookMetrics) -> f64| -> Vec<f32> {
+        book_row(aums.iter().map(|aum| {
+            runs.iter()
+                .zip(&metrics)
+                .find(|(run, _)| run.0 == variant && run.1 == *aum)
+                .map_or(f64::NAN, |(_, measured)| pick(measured))
+        }))
+    };
+    let aum_series = |quantity: &str, pick: &dyn Fn(&BookMetrics) -> f64| -> Vec<ReportSeries> {
+        variants
+            .iter()
+            .map(|variant| ReportSeries {
+                label: format!("{variant} | {quantity}"),
+                values: aum_row(variant, pick),
+            })
+            .collect()
+    };
+    let flat = |label: &str, value: f64, width: usize| ReportSeries {
+        label: label.to_owned(),
+        values: vec![value as f32; width],
+    };
+
+    // 1. The equity path, normalized. Every run on one axis in USD would draw the $100M book
+    // and flatten the four below it; as a multiple of each run's own capital the five paths
+    // are directly comparable and the capacity decay shows up as separation between them.
+    let bars = runs
+        .iter()
+        .map(|(_, _, evaluation)| evaluation.points.len())
+        .max()
+        .expect("nonempty runs");
+    let bar_steps: Vec<u64> = (0..bars as u64).collect();
+    let equity = runs
+        .iter()
+        .map(|(label, aum, evaluation)| {
+            let initial = book_stat(&evaluation.summary, "initial_cash_usd");
+            let mut values = book_row(evaluation.points.iter().map(|point| {
+                let equity = point.values.get("equity_usd").copied().unwrap_or(f64::NAN);
+                if initial > 0.0 {
+                    equity / initial
+                } else {
+                    f64::NAN
+                }
+            }));
+            values.resize(bars, f32::NAN);
+            ReportSeries {
+                label: format!("{label} @ {}", book_aum_label(*aum)),
+                values,
+            }
+        })
+        .collect();
+    chart(
+        "timexer_book_equity",
+        "how did the book's capital actually move?",
+        BOOK_EQUITY_UNIT,
+        BOOK_BAR_AXIS,
+        ScaleKind::Symlog,
+        &bar_steps,
+        equity,
+    )?;
+
+    // 2 and 3. The headline: what one interval earns, and whether that survives risk. Both are
+    // AUM-indexed with the interval in the SERIES label rather than on the axis, because the
+    // question is how each interval's payoff decays with size and because a Sharpe whose
+    // interval a reader has to infer from an axis position is a Sharpe that will be misread.
+    let mut interval_return = Vec::new();
+    let mut interval_sharpe = Vec::new();
+    for (index, interval) in BOOK_INTERVALS.iter().enumerate() {
+        interval_return.extend(aum_series(
+            &format!("mean net return per {}", interval.name),
+            &|measured| measured.intervals[index].mean * 1e4,
+        ));
+        interval_sharpe.extend(aum_series(
+            &format!(
+                "annualized Sharpe on {} returns ({:.0}-bar interval, x sqrt({:.1}/yr))",
+                interval.name,
+                interval.bars(&cadence),
+                interval.per_year(&cadence)
+            ),
+            &|measured| measured.intervals[index].sharpe(interval.per_year(&measured.cadence)),
+        ));
+    }
+    interval_return.push(flat("zero return 0.0", 0.0, aums.len()));
+    interval_sharpe.push(flat("zero Sharpe 0.0", 0.0, aums.len()));
+    interval_sharpe.push(flat("Sharpe 1.0", 1.0, aums.len()));
+    chart(
+        "timexer_book_interval_return",
+        "how much does the book make per bar, hour, session, week and month?",
+        BOOK_INTERVAL_UNIT,
+        BOOK_AUM_AXIS,
+        ScaleKind::Symlog,
+        &aum_steps,
+        interval_return,
+    )?;
+    chart(
+        "timexer_book_interval_sharpe",
+        "does the per-interval payoff survive its own dispersion, and at which interval?",
+        BOOK_SHARPE_UNIT,
+        BOOK_AUM_AXIS,
+        ScaleKind::Linear,
+        &aum_steps,
+        interval_sharpe,
+    )?;
+
+    // 4 and 5. Capacity. The shape of these two panels IS the answer to "how large can this
+    // run": the AUM where the return curve turns down and the ratio curve crosses its own
+    // reference is where the strategy stops scaling.
+    let mut annualized = aum_series("annualized net return", &|m| m.annualized_return);
+    annualized.extend(aum_series("annualized vol", &|m| m.annualized_vol));
+    annualized.extend(aum_series("annualized downside vol", &|m| {
+        m.annualized_downside_vol
+    }));
+    annualized.extend(aum_series("max drawdown (negative)", &|m| m.max_drawdown));
+    annualized.push(flat("flat 0.0", 0.0, aums.len()));
+    chart(
+        "timexer_book_annualized",
+        "at which AUM does the book stop scaling?",
+        &cadence.annual_unit(),
+        BOOK_AUM_AXIS,
+        ScaleKind::Linear,
+        &aum_steps,
+        annualized,
+    )?;
+    let mut ratios = aum_series(
+        &format!(
+            "annualized Sharpe (simulated bar returns, x sqrt({:.0}/yr))",
+            cadence.bars_per_year
+        ),
+        &|m| m.intervals[0].sharpe(m.cadence.bars_per_year),
+    );
+    ratios.extend(aum_series(
+        &format!(
+            "annualized Sortino (simulated bar returns, x sqrt({:.0}/yr))",
+            cadence.bars_per_year
+        ),
+        &|m| m.intervals[0].sortino(m.cadence.bars_per_year),
+    ));
+    ratios.extend(aum_series("Calmar (annualized return / |max drawdown|)", &|m| {
+        m.calmar()
+    }));
+    ratios.push(flat("zero 0.0", 0.0, aums.len()));
+    ratios.push(flat("unity 1.0", 1.0, aums.len()));
+    chart(
+        "timexer_book_annualized_ratio",
+        "how much of the book's return is paid for in risk, and does that hold as it scales?",
+        BOOK_RATIO_UNIT,
+        BOOK_AUM_AXIS,
+        ScaleKind::Linear,
+        &aum_steps,
+        ratios,
+    )?;
+
+    // 6, 7 and 8. What execution cost, in the two denominators that mean different things: per
+    // traded dollar it is the edge the signal must clear, and per dollar of gross P&L it is how
+    // much of the edge was left. Reading the first as the second is how a 9 bps cost on a 40
+    // bps gross cohort payoff gets mistaken for a rounding error.
+    let mut decomposition = Vec::new();
+    let mut shares = Vec::new();
+    for (index, &(name, _)) in BOOK_COST_COMPONENTS.iter().enumerate() {
+        decomposition.extend(aum_series(name, &|m| m.cost_bps(index)));
+        shares.extend(aum_series(name, &|m| m.cost_share(index)));
+    }
+    decomposition.extend(aum_series("all modeled costs", &|m| m.total_cost_bps()));
+    shares.extend(aum_series("all modeled costs", &|m| m.total_cost_share()));
+    shares.push(flat("the whole edge 1.0", 1.0, aums.len()));
+    chart(
+        "timexer_book_cost_decomposition",
+        &format!(
+            "what did one transacted dollar cost, and in which component? | {}",
+            runs[0].2.assumptions.join("; ")
+        ),
+        BOOK_COST_UNIT,
+        BOOK_AUM_AXIS,
+        ScaleKind::Linear,
+        &aum_steps,
+        decomposition,
+    )?;
+    chart(
+        "timexer_book_cost_share",
+        "how much of the gross edge did each cost component consume?",
+        BOOK_COST_SHARE_UNIT,
+        BOOK_AUM_AXIS,
+        ScaleKind::Linear,
+        &aum_steps,
+        shares,
+    )?;
+    // How much of the spread above was MEASURED. No bid/ask series exists anywhere in the
+    // corpus, so every spread is either a Roll estimate from the symbol's own 5-minute
+    // autocovariance or a flat assumption where Roll was unusable; a cost panel read without
+    // this one cannot distinguish a measured 4 bps spread from an assumed one.
+    let mut coverage = aum_series("spread assumed (Roll unusable)", &|m| {
+        m.spread_fallback_symbols
+    });
+    coverage.extend(aum_series("spread Roll-measured", &|m| {
+        m.spread_measured_symbols
+    }));
+    chart(
+        "timexer_book_cost_coverage",
+        "how much of the charged spread was measured rather than assumed?",
+        BOOK_SYMBOL_UNIT,
+        BOOK_AUM_AXIS,
+        ScaleKind::Linear,
+        &aum_steps,
+        coverage,
+    )?;
+
+    // 9, plus the two census panels the exposure fractions cannot carry. The turnover-cap
+    // binding fraction is the reason this family exists: a book throttled by its own cap and a
+    // book with a weak signal both draw thin exposure and small returns, and only this series
+    // separates them.
+    let mut exposure = aum_series("mean gross exposure (x equity)", &|m| m.gross_exposure);
+    exposure.extend(aum_series("mean net exposure (x equity)", &|m| m.net_exposure));
+    exposure.extend(aum_series("mean |net| exposure (x equity)", &|m| {
+        m.absolute_net_exposure
+    }));
+    exposure.extend(aum_series("mean held names / tradable universe", &|m| {
+        m.active_fraction
+    }));
+    exposure.extend(aum_series(
+        "decision frames where the turnover cap bound",
+        &|m| m.turnover_capped_fraction,
+    ));
+    exposure.push(flat("market neutral 0.0", 0.0, aums.len()));
+    chart(
+        "timexer_book_exposure",
+        "how much risk was on, and was the book throttled by its own turnover cap?",
+        BOOK_EXPOSURE_UNIT,
+        BOOK_AUM_AXIS,
+        ScaleKind::Linear,
+        &aum_steps,
+        exposure,
+    )?;
+    chart(
+        "timexer_book_turnover",
+        "how many times over does the book trade its own equity in a year?",
+        BOOK_TURNOVER_UNIT,
+        BOOK_AUM_AXIS,
+        ScaleKind::Linear,
+        &aum_steps,
+        aum_series("annualized one-way turnover", &|m| m.annualized_turnover),
+    )?;
+    let mut names = aum_series("mean held names", &|m| m.held_names);
+    names.extend(aum_series("mean active (nonzero target) names", &|m| {
+        m.active_names
+    }));
+    names.extend(aum_series("tradable universe", &|m| m.universe_symbols));
+    chart(
+        "timexer_book_names",
+        "how many names does the book actually carry, and how many could it have?",
+        BOOK_NAME_UNIT,
+        BOOK_AUM_AXIS,
+        ScaleKind::Linear,
+        &aum_steps,
+        names,
+    )?;
+
+    // 10. The underwater curve at the reference AUM. Its own panel and not a series on the
+    // equity chart: a drawdown lives in [-1, 0] and an equity multiple near 1, so on one axis
+    // the deepest hole in the run is a wobble at the bottom of the frame.
+    let drawdown = runs
+        .iter()
+        .filter(|(_, aum, _)| *aum == reference_aum)
+        .map(|(label, _, evaluation)| {
+            let mut values = book_row(
+                evaluation
+                    .points
+                    .iter()
+                    .map(|point| point.values.get("drawdown_fraction").copied().unwrap_or(f64::NAN)),
+            );
+            values.resize(bars, f32::NAN);
+            ReportSeries {
+                label: label.clone(),
+                values,
+            }
+        })
+        .collect();
+    chart(
+        "timexer_book_drawdown",
+        "how deep and how long was the worst hole the book had to sit in?",
+        BOOK_DRAWDOWN_UNIT,
+        BOOK_BAR_AXIS,
+        ScaleKind::Linear,
+        &bar_steps,
+        drawdown,
+    )?;
+
+    let Some(measured) = diagnostics else {
+        return Ok(());
+    };
+    ensure!(
+        !measured.horizons.is_empty(),
+        "the book diagnostics pass reported no horizons"
+    );
+    let horizon_steps: Vec<u64> = measured.horizons.iter().map(|h| u64::from(*h)).collect();
+    let width = horizon_steps.len();
+    ensure!(
+        measured.ic_by_horizon.len() == width,
+        "the book IC curve carries {} points for {width} horizons",
+        measured.ic_by_horizon.len()
+    );
+    let ic_se = |index: usize| {
+        measured
+            .ic_se_by_horizon
+            .get(index)
+            .copied()
+            .unwrap_or(f64::NAN)
+    };
+    // 11. The decision panel. The SE bands are there because the per-horizon ICs on this
+    // corpus are single-digit thousandths against a standard error near 0.003, so a curve
+    // read without them invites a horizon ranking that is entirely noise. The aggregated IC
+    // is drawn FLAT across the same axis so "did cross-horizon precision weighting beat the
+    // best single horizon" is answered by looking at whether the flat line clears the curve's
+    // peak, rather than by a reader recomputing it.
+    let signal = vec![
+        ReportSeries {
+            label: "cross-sectional IC".to_owned(),
+            values: book_row(measured.ic_by_horizon.iter().copied()),
+        },
+        ReportSeries {
+            label: "cross-sectional IC +1 SE".to_owned(),
+            values: book_row(
+                measured
+                    .ic_by_horizon
+                    .iter()
+                    .enumerate()
+                    .map(|(index, ic)| ic + ic_se(index)),
+            ),
+        },
+        ReportSeries {
+            label: "cross-sectional IC -1 SE".to_owned(),
+            values: book_row(
+                measured
+                    .ic_by_horizon
+                    .iter()
+                    .enumerate()
+                    .map(|(index, ic)| ic - ic_se(index)),
+            ),
+        },
+        flat(
+            &format!(
+                "cross-horizon aggregated IC {:.4} (flat reference)",
+                measured.aggregated_ic
+            ),
+            measured.aggregated_ic,
+            width,
+        ),
+        flat(
+            "aggregated IC +1 SE (flat reference)",
+            measured.aggregated_ic + measured.aggregated_ic_se,
+            width,
+        ),
+        flat(
+            "aggregated IC -1 SE (flat reference)",
+            measured.aggregated_ic - measured.aggregated_ic_se,
+            width,
+        ),
+        flat("zero information 0.0", 0.0, width),
+    ];
+    chart(
+        "timexer_book_signal_ic",
+        &format!(
+            "which horizons carry cross-sectional information, and did aggregating them beat the best single one? | {} cross-sections | trade horizon h={}",
+            measured.cross_sections, measured.trade_horizon
+        ),
+        BOOK_IC_UNIT,
+        BOOK_HORIZON_AXIS,
+        ScaleKind::Linear,
+        &horizon_steps,
+        signal,
+    )?;
+    // 12 and 13. Whether the predictive σ carries SELECTION information. A flat family means
+    // it does not - σ ranking is Sharpe-neutral at a fixed horizon, which is the measured
+    // result this book is built around - and a fanned family means it does, in which case the
+    // decile ordering says which end to trade. The reading is in the title because a reader
+    // who inferred alpha from a fanned σ family would be re-deriving a conclusion the run
+    // already rejected.
+    let deciles = |rows: &[Vec<f64>], family: &str, into: &mut Vec<ReportSeries>| -> Result<()> {
+        for (index, row) in rows.iter().enumerate() {
+            ensure!(
+                row.len() == width,
+                "book diagnostics {family} decile {index} carries {} points for {width} horizons",
+                row.len()
+            );
+            into.push(ReportSeries {
+                label: format!("{family} decile {index}"),
+                values: book_row(row.iter().copied()),
+            });
+        }
+        Ok(())
+    };
+    let sigma_family = "ascending predicted-σ";
+    let agreement_family = "ascending cross-horizon agreement";
+    if !measured.ic_by_std_decile.is_empty() || !measured.ic_by_agreement_decile.is_empty() {
+        let mut uncertainty = Vec::new();
+        deciles(&measured.ic_by_std_decile, sigma_family, &mut uncertainty)?;
+        deciles(
+            &measured.ic_by_agreement_decile,
+            agreement_family,
+            &mut uncertainty,
+        )?;
+        uncertainty.push(flat("zero information 0.0", 0.0, width));
+        chart(
+            "timexer_book_uncertainty_ic",
+            "does the predictive σ select? a FLAT family of deciles means the σ carries no selection information; a FANNED family means it does",
+            BOOK_IC_UNIT,
+            BOOK_HORIZON_AXIS,
+            ScaleKind::Linear,
+            &horizon_steps,
+            uncertainty,
+        )?;
+    }
+    if !measured.hit_rate_by_std_decile.is_empty()
+        || !measured.hit_rate_by_agreement_decile.is_empty()
+    {
+        let mut hits = Vec::new();
+        deciles(&measured.hit_rate_by_std_decile, sigma_family, &mut hits)?;
+        deciles(
+            &measured.hit_rate_by_agreement_decile,
+            agreement_family,
+            &mut hits,
+        )?;
+        hits.push(flat("coin flip 0.5", 0.5, width));
+        hits.push(flat(
+            &format!(
+                "aggregated hit rate {:.4} (flat reference)",
+                measured.aggregated_hit_rate
+            ),
+            measured.aggregated_hit_rate,
+            width,
+        ));
+        chart(
+            "timexer_book_uncertainty_hit_rate",
+            "same question in sign space: does a σ or agreement decile get the direction right more often?",
+            BOOK_HIT_UNIT,
+            BOOK_HORIZON_AXIS,
+            ScaleKind::Linear,
+            &horizon_steps,
+            hits,
+        )?;
+    }
+    // 14. Whether the σ the vol target divides by is the σ the market delivered. Coverage
+    // below nominal is over-dispersion in the realizations relative to the predictive law,
+    // and it is the ONLY panel that explains a book whose realized vol overshot its ex-ante
+    // target: the target was computed from a σ that was too small.
+    if !measured.coverage_1_sigma.is_empty() || !measured.coverage_2_sigma.is_empty() {
+        let mut calibration = Vec::new();
+        for (label, coverage) in [
+            ("within 1σ", &measured.coverage_1_sigma),
+            ("within 2σ", &measured.coverage_2_sigma),
+        ] {
+            if coverage.is_empty() {
+                continue;
+            }
+            ensure!(
+                coverage.len() == width,
+                "book diagnostics coverage {label} carries {} points for {width} horizons",
+                coverage.len()
+            );
+            calibration.push(ReportSeries {
+                label: format!("realized {label}"),
+                values: book_row(coverage.iter().copied()),
+            });
+        }
+        calibration.push(flat("nominal 1σ = 0.6827", 0.6827, width));
+        calibration.push(flat("nominal 2σ = 0.9500", 0.95, width));
+        chart(
+            "timexer_book_calibration",
+            "is the predictive σ the vol target divides by the σ the market delivered?",
+            BOOK_COVERAGE_UNIT,
+            BOOK_HORIZON_AXIS,
+            ScaleKind::Linear,
+            &horizon_steps,
+            calibration,
+        )?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod book_report_tests {
+    use super::*;
+    use crate::torch::timexer_segment::book_diagnostics::BookDiagnostics;
+    use crate::torch::timexer_segment::portfolio::{AccountEvaluation, AccountPoint};
+    use shared::report::{read_report, TIMEXER_SEGMENT_REPORT_BASES};
+    use std::fs;
+
+    fn temp(name: &str) -> std::path::PathBuf {
+        let root = std::env::temp_dir().join(format!("timexer_{name}_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    fn period(timestamp_ms: i64, ret: f64, equity: f64) -> AccountPoint {
+        AccountPoint {
+            timestamp_ms,
+            values: BTreeMap::from([
+                ("return_fraction".to_owned(), ret),
+                ("equity_usd".to_owned(), equity),
+            ]),
+        }
+    }
+
+    /// A run whose per-bar returns are exactly `returns`, carrying the summary keys the panels
+    /// read - and deliberately NOT carrying `slippage_usd`, because an absent key has to reach
+    /// the chart as a gap and the tests below depend on that being the behavior rather than a
+    /// zero default.
+    fn run(
+        label: &str,
+        aum: f64,
+        returns: &[f64],
+        sessions: usize,
+        months: usize,
+    ) -> (String, f64, AccountEvaluation) {
+        let mut equity = aum;
+        let mut points = Vec::new();
+        for (index, ret) in returns.iter().enumerate() {
+            equity *= 1.0 + ret;
+            points.push(AccountPoint {
+                timestamp_ms: 1_700_000_000_000 + index as i64 * 300_000,
+                values: BTreeMap::from([
+                    ("return".to_owned(), *ret),
+                    ("return_fraction".to_owned(), *ret),
+                    ("equity_usd".to_owned(), equity),
+                    ("held_count".to_owned(), 40.0),
+                    ("gross_fraction".to_owned(), 1.8),
+                    ("net_fraction".to_owned(), -0.02),
+                    ("drawdown_fraction".to_owned(), -0.01),
+                ]),
+            });
+        }
+        let daily = (0..sessions)
+            .map(|index| period(1_700_000_000_000 + index as i64 * 86_400_000, 0.001, aum))
+            .collect();
+        let monthly = (0..months)
+            .map(|index| period(1_700_000_000_000 + index as i64 * 2_592_000_000, 0.02, aum))
+            .collect();
+        let summary = BTreeMap::from([
+            ("initial_cash_usd".to_owned(), aum),
+            ("equity_usd".to_owned(), equity),
+            ("total_return_fraction".to_owned(), equity / aum - 1.0),
+            ("max_drawdown_fraction".to_owned(), -0.05),
+            ("bars_simulated".to_owned(), returns.len() as f64),
+            ("universe_count".to_owned(), 500.0),
+            ("decision_count".to_owned(), 100.0),
+            ("turnover_capped_count".to_owned(), 25.0),
+            ("turnover_annualized".to_owned(), 180.0),
+            ("traded_notional_usd".to_owned(), aum * 12.0),
+            ("gross_pnl_usd".to_owned(), aum * 0.02),
+            ("pnl_usd".to_owned(), aum * 0.01),
+            ("costs_usd".to_owned(), aum * 0.01),
+            ("commission_usd".to_owned(), aum * 0.004),
+            ("regulatory_usd".to_owned(), aum * 0.001),
+            ("spread_usd".to_owned(), aum * 0.004),
+            ("impact_usd".to_owned(), aum * 0.001),
+            ("borrow_usd".to_owned(), 0.0),
+            ("mean_gross_exposure".to_owned(), 1.8),
+            ("mean_net_exposure".to_owned(), -0.02),
+            ("mean_active_names".to_owned(), 40.0),
+            ("spread_fallback_count".to_owned(), 12.0),
+            ("spread_measured_count".to_owned(), 488.0),
+        ]);
+        (
+            label.to_owned(),
+            aum,
+            AccountEvaluation {
+                points,
+                daily,
+                monthly,
+                summary,
+                assumptions: vec!["synthetic scenario".to_owned()],
+            },
+        )
+    }
+
+    fn diagnostics() -> BookDiagnostics {
+        BookDiagnostics {
+            horizons: vec![1, 8, 16, 32, 64, 128],
+            ic_by_horizon: vec![0.018, 0.0248, 0.037, 0.0473, 0.0547, 0.0561],
+            ic_se_by_horizon: vec![0.0027; 6],
+            ic_by_std_decile: (0..10).map(|_| vec![0.02; 6]).collect(),
+            hit_rate_by_std_decile: (0..10).map(|_| vec![0.51; 6]).collect(),
+            ic_by_agreement_decile: (0..10)
+                .map(|decile| vec![0.01 * decile as f64; 6])
+                .collect(),
+            hit_rate_by_agreement_decile: (0..10).map(|_| vec![0.52; 6]).collect(),
+            aggregated_ic: 0.0601,
+            aggregated_ic_se: 0.0027,
+            aggregated_hit_rate: 0.523,
+            cross_sections: 4096,
+            coverage_1_sigma: vec![0.66; 6],
+            coverage_2_sigma: vec![0.93; 6],
+            ..Default::default()
+        }
+    }
+
+    fn lines(report: &Report) -> (&Vec<u64>, &Vec<ReportSeries>) {
+        let ReportKind::IndexedLines { steps, series } = &report.kind else {
+            panic!("every book panel is an indexed line chart");
+        };
+        (steps, series)
+    }
+
+    fn line<'a>(series: &'a [ReportSeries], needle: &str) -> &'a ReportSeries {
+        series
+            .iter()
+            .find(|line| line.label.contains(needle))
+            .unwrap_or_else(|| panic!("no book series mentions {needle:?}"))
+    }
+
+    /// The registration contract, the AUM ordering and the gap-versus-zero rule in one pass
+    /// over a full sweep: two AUM levels of one variant, handed over in DESCENDING order,
+    /// with one cost bucket left unmeasured.
+    #[test]
+    fn the_book_panels_are_registered_and_ordered_by_ascending_aum() {
+        let root = temp("book_report_sweep");
+        let returns: Vec<f64> = (0..200)
+            .map(|index| if index % 2 == 0 { 0.0004 } else { -0.0002 })
+            .collect();
+        let runs = vec![
+            run("precision decile", 1_000_000.0, &returns, 12, 3),
+            run("precision decile", 25_000.0, &returns, 12, 3),
+        ];
+        write_book(&root, 3, 4000, &runs, Some(&diagnostics())).unwrap();
+        for base in BOOK_REPORT_BASES {
+            assert!(
+                TIMEXER_SEGMENT_REPORT_BASES.contains(base),
+                "{base} is written but unregistered, so the TUI never scans for it"
+            );
+            assert!(
+                root.join(format!("{base}.report.bin")).exists(),
+                "{base} is registered but was not written"
+            );
+        }
+        let annualized = read_report(root.join("timexer_book_annualized.report.bin")).unwrap();
+        let (steps, series) = lines(&annualized);
+        assert_eq!(
+            steps,
+            &vec![25_000u64, 1_000_000],
+            "the capacity axis must be ascending whatever order the sweep was simulated in"
+        );
+        // One variant seen twice is one legend entry, not two.
+        assert_eq!(
+            series
+                .iter()
+                .filter(|line| line.label.contains("annualized net return"))
+                .count(),
+            1
+        );
+        // An unmeasured cost bucket is a gap; the measured ones are exact basis points of the
+        // traded notional the account reported.
+        let costs =
+            read_report(root.join("timexer_book_cost_decomposition.report.bin")).unwrap();
+        let (_, costs) = lines(&costs);
+        assert!(
+            line(costs, "flat slippage proxy")
+                .values
+                .iter()
+                .all(|value| value.is_nan()),
+            "an unmeasured cost bucket must chart as a gap, never as free execution"
+        );
+        assert!(
+            (line(costs, "commission").values[0] - 0.004 / 12.0 * 1e4).abs() < 1e-3,
+            "{:?}",
+            line(costs, "commission").values
+        );
+        // Equity is normalized, so the $25k and $1M paths are comparable rather than one
+        // curve and four flat lines.
+        let equity = read_report(root.join("timexer_book_equity.report.bin")).unwrap();
+        let (bars, equity) = lines(&equity);
+        assert_eq!(bars.len(), returns.len());
+        assert!(equity
+            .iter()
+            .all(|line| (line.values[0] - 1.0).abs() < 0.01));
+        // The time-indexed panels are drawn at the lower median of the sweep, so exactly one
+        // of the two runs appears on the underwater curve.
+        let drawdown = read_report(root.join("timexer_book_drawdown.report.bin")).unwrap();
+        assert_eq!(lines(&drawdown).1.len(), 1);
+        assert!(drawdown.title.contains("$25k"), "{}", drawdown.title);
+        // The aggregation verdict is readable off the IC panel: a flat aggregated line above
+        // the per-horizon curve's peak is what "aggregating beat the best single horizon"
+        // looks like, and it is drawn rather than left to the reader.
+        let signal = read_report(root.join("timexer_book_signal_ic.report.bin")).unwrap();
+        let (horizons, signal) = lines(&signal);
+        assert_eq!(horizons, &vec![1u64, 8, 16, 32, 64, 128]);
+        let aggregated = line(signal, "aggregated IC 0.0601");
+        let curve = line(signal, "cross-sectional IC");
+        let peak = curve.values.iter().copied().fold(f32::MIN, f32::max);
+        assert!(aggregated.values.iter().all(|value| *value > peak));
+        assert!(line(signal, "zero information 0.0")
+            .values
+            .iter()
+            .all(|value| *value == 0.0));
+        // Coverage below nominal is the only available explanation for a vol target that
+        // undershoots, so both nominal levels are on the calibration panel by name.
+        let calibration = read_report(root.join("timexer_book_calibration.report.bin")).unwrap();
+        let (_, calibration) = lines(&calibration);
+        assert!((line(calibration, "nominal 1σ").values[0] - 0.6827).abs() < 1e-6);
+        assert!((line(calibration, "nominal 2σ").values[0] - 0.95).abs() < 1e-6);
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// The diagnostics pass is optional. Without it the account panels still land and the four
+    /// signal panels are ABSENT rather than written as reference lines with no measurement.
+    #[test]
+    fn a_book_without_diagnostics_writes_the_account_panels_and_no_signal_panels() {
+        let root = temp("book_report_no_diagnostics");
+        let returns: Vec<f64> = (0..120)
+            .map(|index| if index % 3 == 0 { -0.0003 } else { 0.0002 })
+            .collect();
+        let runs = vec![run("precision decile", 1_000_000.0, &returns, 12, 3)];
+        write_book(&root, 1, 1, &runs, None).unwrap();
+        for base in BOOK_REPORT_BASES {
+            assert_eq!(
+                root.join(format!("{base}.report.bin")).exists(),
+                !BOOK_DIAGNOSTIC_BASES.contains(base),
+                "{base} was written without the pass that measures it, or dropped with it"
+            );
+        }
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// An interval with fewer than two complete observations is unmeasured, and unmeasured is
+    /// NaN. A 20-bar run completes one 12-bar hour, one session and no week or month; charting
+    /// any of those as 0.0 would claim the book earns nothing per month on evidence that never
+    /// contained a month.
+    #[test]
+    fn an_interval_with_too_few_observations_is_a_gap_not_a_zero() {
+        let root = temp("book_report_short");
+        let returns: Vec<f64> = (0..20)
+            .map(|index| if index % 2 == 0 { 0.0005 } else { -0.0001 })
+            .collect();
+        let runs = vec![run("precision decile", 1_000_000.0, &returns, 1, 0)];
+        write_book(&root, 1, 1, &runs, None).unwrap();
+        let report = read_report(root.join("timexer_book_interval_return.report.bin")).unwrap();
+        let (_, series) = lines(&report);
+        assert!(line(series, "per five-minute bar").values[0].is_finite());
+        for unmeasured in ["per 12-bar hour", "per session", "per 5-session week", "per calendar month"] {
+            let values = &line(series, unmeasured).values;
+            assert!(
+                values.iter().all(|value| value.is_nan()),
+                "{unmeasured} charted {values:?} on fewer than two complete intervals"
+            );
+        }
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// A zero-variance return series has no Sharpe. The failure this pins is an infinity: a
+    /// constant book would otherwise chart as the best risk-adjusted run in the sweep, and the
+    /// report writer would reject the value instead of drawing a gap.
+    #[test]
+    fn a_constant_return_series_has_no_sharpe_rather_than_an_infinite_one() {
+        let root = temp("book_report_constant");
+        let runs = vec![run("precision decile", 1_000_000.0, &[0.0003; 64], 12, 3)];
+        write_book(&root, 1, 1, &runs, None).unwrap();
+        let report = read_report(root.join("timexer_book_annualized_ratio.report.bin")).unwrap();
+        let (_, series) = lines(&report);
+        let sharpe = line(series, "annualized Sharpe");
+        assert!(
+            sharpe.values.iter().all(|value| value.is_nan()),
+            "{:?}",
+            sharpe.values
+        );
+        assert!(sharpe.values.iter().all(|value| !value.is_infinite()));
+        // The vol itself IS measured, and measured zero: the book really did not move.
+        let annualized = read_report(root.join("timexer_book_annualized.report.bin")).unwrap();
+        let (_, annualized) = lines(&annualized);
+        assert_eq!(line(annualized, "annualized vol").values[0], 0.0);
+        assert!(line(annualized, "annualized net return").values[0] > 0.0);
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    const DENSE_START_MS: i64 = 1_700_000_000_000;
+    const DENSE_SESSION_MS: i64 = 86_400_000;
+
+    /// A self-consistent synthetic account on the cadence the real one simulates: `sessions`
+    /// sessions of `bars` marks each, `step_ms` apart, with the daily and monthly series
+    /// compounded from those same bars. Extended hours included, so a session carries ~191
+    /// marks rather than a regular session's 78 - which is the whole point: this is the
+    /// density the account really emits, and the reports have to annualize on it.
+    ///
+    /// Complete 21-session months only; a trailing stub is dropped exactly as the account's
+    /// own calendar aggregation drops it.
+    fn dense(
+        aum: f64,
+        sessions: usize,
+        bars: usize,
+        step_ms: i64,
+        ret: impl Fn(usize) -> f64,
+    ) -> (String, f64, AccountEvaluation) {
+        let mut points = Vec::with_capacity(sessions * bars);
+        let mut session_returns = Vec::with_capacity(sessions);
+        let mut equity = aum;
+        for session in 0..sessions {
+            let open = equity;
+            for bar in 0..bars {
+                let realized = ret(session * bars + bar);
+                equity *= 1.0 + realized;
+                points.push(AccountPoint {
+                    timestamp_ms: DENSE_START_MS
+                        + session as i64 * DENSE_SESSION_MS
+                        + bar as i64 * step_ms,
+                    values: BTreeMap::from([
+                        ("return".to_owned(), realized),
+                        ("return_fraction".to_owned(), realized),
+                        ("equity_usd".to_owned(), equity),
+                        ("held_count".to_owned(), 40.0),
+                    ]),
+                });
+            }
+            session_returns.push(equity / open - 1.0);
+        }
+        let daily = session_returns
+            .iter()
+            .enumerate()
+            .map(|(index, realized)| {
+                period(
+                    DENSE_START_MS + index as i64 * DENSE_SESSION_MS,
+                    *realized,
+                    aum,
+                )
+            })
+            .collect();
+        let monthly = session_returns
+            .chunks_exact(21)
+            .enumerate()
+            .map(|(index, month)| {
+                period(
+                    DENSE_START_MS + index as i64 * 21 * DENSE_SESSION_MS,
+                    month.iter().map(|realized| 1.0 + realized).product::<f64>() - 1.0,
+                    aum,
+                )
+            })
+            .collect();
+        let summary = BTreeMap::from([
+            ("initial_cash_usd".to_owned(), aum),
+            ("equity_usd".to_owned(), equity),
+            ("total_return_fraction".to_owned(), equity / aum - 1.0),
+            ("net_pnl_usd".to_owned(), equity - aum),
+            ("max_drawdown_fraction".to_owned(), -0.05),
+            ("bars_simulated".to_owned(), points.len() as f64),
+            ("sessions_simulated".to_owned(), sessions as f64),
+            ("universe_count".to_owned(), 256.0),
+            ("decision_count".to_owned(), sessions as f64),
+            ("turnover_capped_count".to_owned(), 0.0),
+            ("turnover_annualized".to_owned(), 180.0),
+            ("traded_notional_usd".to_owned(), aum * 12.0),
+            ("gross_pnl_usd".to_owned(), aum * 0.08),
+            ("costs_usd".to_owned(), aum * 0.03),
+            ("mean_active_names".to_owned(), 40.0),
+        ]);
+        (
+            "dense".to_owned(),
+            aum,
+            AccountEvaluation {
+                points,
+                daily,
+                monthly,
+                summary,
+                assumptions: vec!["synthetic dense cadence".to_owned()],
+            },
+        )
+    }
+
+    /// Total net return the charted mean for one interval implies: the mean, in basis points,
+    /// times the number of complete intervals the window held.
+    fn implied(series: &[ReportSeries], interval: &str, count: usize) -> f64 {
+        f64::from(line(series, interval).values[0]) / 1e4 * count as f64
+    }
+
+    /// THE invariant these panels exist for, and the defect it pins. Every interval series on
+    /// the return panel, times the number of intervals the window held, must recover the run's
+    /// own total net return, and the annualized figure must be that total annualized over the
+    /// window's TRUE wall-clock length. The account marks every observed bar, extended hours
+    /// included, so a year is roughly 48 000 of them; annualizing the same series with a
+    /// 19 656-bar regular-session year understated this book's year by a factor of 3.6.
+    #[test]
+    fn every_book_interval_reconciles_with_the_total_and_the_true_window_length() {
+        let root = temp("book_report_reconciliation");
+        let (sessions, bars) = (255usize, 191usize);
+        // A small positive drift under a much larger zero-mean wobble, so the dispersion the
+        // Sharpe divides by is real and the reconciliation is not a test of a constant.
+        let runs = vec![dense(1_000_000.0, sessions, bars, 300_000, |index| {
+            9.7e-7 + if index % 2 == 0 { 8e-5 } else { -8e-5 }
+        })];
+        let total = runs[0].2.summary["total_return_fraction"];
+        // The window's length, from the construction rather than from the code under test.
+        let years = ((sessions - 1) as f64 * DENSE_SESSION_MS as f64
+            + (bars - 1) as f64 * 300_000.0)
+            / (365.25 * 86_400_000.0);
+        write_book(&root, 1, 1, &runs, None).unwrap();
+        let report = read_report(root.join("timexer_book_interval_return.report.bin")).unwrap();
+        let (_, series) = lines(&report);
+        let session_return = f64::from(line(series, "per session").values[0]) / 1e4;
+        for (interval, count) in [
+            ("per five-minute bar", sessions * bars),
+            ("per 12-bar hour", sessions * bars / 12),
+            ("per session", sessions),
+            ("per 5-session week", sessions / 5),
+        ] {
+            let recovered = implied(series, interval, count);
+            assert!(
+                (recovered - total).abs() < 0.005,
+                "{interval} implies {recovered:.6} over {count} intervals against a total of \
+                 {total:.6}"
+            );
+        }
+        // The calendar month is the documented exception: its trailing partial period is
+        // dropped, so it recovers the total MINUS the dropped sessions - and the residual has
+        // to stay well inside one month's return, which is what distinguishes "the stub was
+        // dropped" from "a whole month went missing".
+        let dropped = sessions % 21;
+        let months = implied(series, "per calendar month", sessions / 21);
+        let stub = total - dropped as f64 * session_return;
+        assert!(
+            months < total && (months - stub).abs() < 21.0 * session_return / 2.0,
+            "the month series implies {months:.6}; dropping {dropped} trailing sessions off a \
+             total of {total:.6} accounts for {stub:.6}"
+        );
+        // And the headline: the total annualized over the window's own length, which is also
+        // the figure the stdout table prints.
+        let annualized = read_report(root.join("timexer_book_annualized.report.bin")).unwrap();
+        let (_, annualized) = lines(&annualized);
+        let charted = f64::from(line(annualized, "annualized net return").values[0]);
+        let expected = (1.0 + total).powf(1.0 / years) - 1.0;
+        assert!(
+            (charted - expected).abs() < 5e-4,
+            "the panel annualizes {total:.6} over {years:.4} years as {charted:.6}, not \
+             {expected:.6}"
+        );
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// The density of `points` is the denominator of every annualization on these panels, so
+    /// the same year at twice the mark cadence must annualize to the SAME year rather than to
+    /// half of it - and a bar census that contradicts the series it describes is refused rather
+    /// than charted at a density nothing measured.
+    #[test]
+    fn a_denser_points_series_annualizes_to_the_same_year_and_a_false_census_is_refused() {
+        let root = temp("book_report_density");
+        let coarse = dense(1_000_000.0, 60, 78, 300_000, |_| 4e-6);
+        // The identical path resampled: two half-size bars wherever the coarse run had one, on
+        // the same wall clock and to the same terminal equity.
+        let fine = dense(1_000_000.0, 60, 156, 150_000, |_| 2e-6 - 1e-12);
+        let annualized_of = |run: &(String, f64, AccountEvaluation), name: &str| -> f64 {
+            let root = temp(name);
+            write_book(&root, 1, 1, std::slice::from_ref(run), None).unwrap();
+            let report = read_report(root.join("timexer_book_annualized.report.bin")).unwrap();
+            let value = f64::from(line(lines(&report).1, "annualized net return").values[0]);
+            fs::remove_dir_all(&root).unwrap();
+            value
+        };
+        let (slow, quick) = (
+            annualized_of(&coarse, "book_report_density_coarse"),
+            annualized_of(&fine, "book_report_density_fine"),
+        );
+        assert!(
+            (slow - quick).abs() < 5e-4 && slow > 0.01,
+            "the same year annualizes to {slow:.6} at 78 marks a session and {quick:.6} at 156"
+        );
+        // A census that disagrees with the series is a fault, not a chart.
+        let mut lying = coarse;
+        lying
+            .2
+            .summary
+            .insert("bars_simulated".to_owned(), 19_500.0);
+        assert!(write_book(&root, 1, 1, &[lying], None).is_err());
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// A diagnostics record whose curves disagree with its own horizon axis is a pairing
+    /// fault, not a chart to draw with one axis silently truncated.
+    #[test]
+    fn book_diagnostics_that_disagree_with_their_horizon_axis_are_refused() {
+        let root = temp("book_report_mismatch");
+        let runs = vec![run("precision decile", 1_000_000.0, &[0.0002, -0.0001, 0.0003], 2, 0)];
+        let mut broken = diagnostics();
+        broken.ic_by_horizon.pop();
+        assert!(write_book(&root, 1, 1, &runs, Some(&broken)).is_err());
+        let mut ragged = diagnostics();
+        ragged.ic_by_std_decile[3].pop();
+        assert!(write_book(&root, 1, 1, &runs, Some(&ragged)).is_err());
+        assert!(write_book(&root, 1, 1, &[], None).is_err());
         fs::remove_dir_all(&root).unwrap();
     }
 }
