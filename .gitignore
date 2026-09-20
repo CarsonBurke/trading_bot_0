@@ -13,3 +13,10 @@ bench_*.json
 *.pyc
 worktrees/
 /.venv-fa4/
+benchmark_results/**/pinned/trading_bot_0
+benchmark_results/**/pinned/report_cli
+benchmark_results/**/*-assets/trading_bot_0*
+benchmark_results/**/*-assets/report_cli*
+benchmark_results/**/*-assets/library-tests*
+benchmark_results/**/*-assets/jepa-tests*
+benchmark_results/**/*.submit.lock
