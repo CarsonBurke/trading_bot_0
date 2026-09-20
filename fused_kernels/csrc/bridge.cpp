@@ -466,14 +466,16 @@ struct LossGeometryOp : public torch::autograd::Function<LossGeometryOp> {
             torch::Tensor targets, torch::Tensor weighted_mask, torch::Tensor mask,
             torch::Tensor sigma, torch::Tensor range, torch::Tensor horizon_scale,
             torch::Tensor inverse_horizon, torch::Tensor log_scale_gain, double cap,
-            double ln2, int64_t rounding) {
+            double ln2, int64_t rounding, bool decoupled) {
         const LossLayout layout =
             loss_layout(head, targets, weighted_mask, mask, sigma, range, horizon_scale,
                         inverse_horizon, log_scale_gain);
         torch::Tensor close = at::empty(
             {head.size(0), head.size(1), 1, layout.horizon}, weighted_mask.options());
-        torch::Tensor workspace =
-            at::empty({3 * kLossChannels, layout.elements}, weighted_mask.options());
+        const int64_t term_count = (decoupled ? 3 : 2) * kLossChannels;
+        torch::Tensor workspace = at::empty(
+            {3 * kLossChannels + (decoupled ? 1 : 0), layout.elements},
+            weighted_mask.options());
         const float narrow_ln2 = static_cast<float>(ln2);
         check_launch(fk_loss_geometry_forward(
                          head.const_data_ptr(), targets.const_data_ptr(),
@@ -485,19 +487,31 @@ struct LossGeometryOp : public torch::autograd::Function<LossGeometryOp> {
                          layout.target_token_stride, layout.target_channel_stride,
                          layout.target_bar_stride,
                          static_cast<float>(cap), narrow_ln2, 1.0f / narrow_ln2,
-                         static_cast<int>(rounding), current_stream(head)),
+                         static_cast<int>(rounding), decoupled, current_stream(head)),
                      "loss_geometry forward");
         std::vector<torch::Tensor> terms;
         std::vector<torch::Tensor> squares;
-        terms.reserve(2 * kLossChannels);
+        std::vector<torch::Tensor> nll_terms;
+        terms.reserve(term_count);
+        if (decoupled) {
+            nll_terms.reserve(2 * kLossChannels);
+        }
         squares.reserve(kLossChannels);
         const torch::Tensor weighted_flat = weighted_mask.reshape({-1});
         const torch::Tensor mask_flat = mask.reshape({-1});
         for (int64_t channel = 0; channel < kLossChannels; ++channel) {
             const torch::Tensor square = workspace.select(0, channel);
-            terms.push_back(square.dot(workspace.select(0, kLossChannels + channel)) * 0.5);
-            terms.push_back(
-                workspace.select(0, 2 * kLossChannels + channel).dot(weighted_flat) * cap);
+            const torch::Tensor quadratic =
+                square.dot(workspace.select(0, kLossChannels + channel)) * 0.5;
+            const torch::Tensor logarithmic =
+                workspace.select(0, 2 * kLossChannels + channel).dot(weighted_flat) * cap;
+            if (decoupled) {
+                terms.push_back(square.dot(workspace.select(0, 3 * kLossChannels)) * 0.5);
+                nll_terms.push_back(quadratic);
+                nll_terms.push_back(logarithmic);
+            }
+            terms.push_back(quadratic);
+            terms.push_back(logarithmic);
             squares.push_back(square.dot(mask_flat));
         }
         // `head` and the targets are already resident and the rest is per-origin or
@@ -507,6 +521,7 @@ struct LossGeometryOp : public torch::autograd::Function<LossGeometryOp> {
         ctx->saved_data["cap"] = cap;
         ctx->saved_data["ln2"] = ln2;
         ctx->saved_data["rounding"] = rounding;
+        ctx->saved_data["decoupled"] = decoupled;
         // NOT materialized. Autograd's default hands an unused output a freshly ZEROED
         // tensor, and for the mean coordinate that is not a no-op: the kernel would add
         // `+0` to a gradient that is `-0` wherever the origin is invalid, and `-0 + +0` is
@@ -520,6 +535,11 @@ struct LossGeometryOp : public torch::autograd::Function<LossGeometryOp> {
         // The diagnostic MSE carries no gradient in the composition either - it is inside
         // a `no_grad` there - and saying so here is what stops autograd from demanding a
         // gradient path for it.
+        if (decoupled) {
+            torch::Tensor stacked_nll = at::stack(nll_terms);
+            ctx->mark_non_differentiable({stacked_squares, stacked_nll});
+            return {close, at::stack(terms), stacked_squares, stacked_nll};
+        }
         ctx->mark_non_differentiable({stacked_squares});
         return {close, at::stack(terms), stacked_squares};
     }
@@ -533,6 +553,8 @@ struct LossGeometryOp : public torch::autograd::Function<LossGeometryOp> {
         const double cap = ctx->saved_data["cap"].toDouble();
         const double ln2 = ctx->saved_data["ln2"].toDouble();
         const int64_t rounding = ctx->saved_data["rounding"].toInt();
+        const bool decoupled = ctx->saved_data["decoupled"].toBool();
+        const int64_t term_count = (decoupled ? 3 : 2) * kLossChannels;
         const int64_t horizon = head.size(3);
         const int64_t tokens = head.size(0) * head.size(1);
         const torch::Tensor grad_close =
@@ -547,9 +569,9 @@ struct LossGeometryOp : public torch::autograd::Function<LossGeometryOp> {
         }
         if (grad_terms.defined()) {
             check_f32_cuda(grad_terms, "loss_geometry term gradient");
-            TORCH_CHECK(grad_terms.numel() == 2 * kLossChannels,
+            TORCH_CHECK(grad_terms.numel() == term_count,
                         "loss_geometry term gradient has ", grad_terms.numel(),
-                        " elements, not ", 2 * kLossChannels);
+                        " elements, not ", term_count);
         }
         // The SAVED targets, strides and all: the forward retained the caller's tensor
         // rather than a dense copy of it, so the backward reads the same layout.
@@ -567,11 +589,12 @@ struct LossGeometryOp : public torch::autograd::Function<LossGeometryOp> {
                 grad_head.mutable_data_ptr(), tokens, horizon, targets.stride(1),
                 targets.stride(2), targets.stride(3), static_cast<float>(cap),
                 narrow_ln2, 1.0f / narrow_ln2, static_cast<int>(rounding),
-                current_stream(head)),
+                decoupled, current_stream(head)),
             "loss_geometry backward");
         return {grad_head,      torch::Tensor(), torch::Tensor(), torch::Tensor(),
                 torch::Tensor(), torch::Tensor(), torch::Tensor(), torch::Tensor(),
-                torch::Tensor(), torch::Tensor(), torch::Tensor(), torch::Tensor()};
+                torch::Tensor(), torch::Tensor(), torch::Tensor(), torch::Tensor(),
+                torch::Tensor()};
     }
 };
 
@@ -628,23 +651,23 @@ void *fk_qk_norm_rope(const void *input, const void *cosine, const void *sine,
     });
 }
 
-// Three outputs, so this cannot go through `protect`: `outputs` receives the mean
-// coordinate, the `[2·CHANNELS]` objective terms and the `[CHANNELS]` diagnostic squares,
-// each a freshly owned `torch::Tensor`. Returns 0 on success and leaves `fk_last_error`
-// set otherwise, with nothing allocated.
+// Three coupled outputs, or four decoupled outputs (the fourth is detached true-NLL
+// terms). Every output owns a freshly allocated `torch::Tensor` handle. Returns 0 on
+// success and leaves `fk_last_error` set otherwise.
 int fk_loss_geometry(const void *head, const void *targets, const void *weighted_mask,
                      const void *mask, const void *sigma, const void *range,
                      const void *horizon_scale, const void *inverse_horizon,
                      const void *log_scale_gain, double cap, double ln2, int64_t rounding,
-                     void **outputs) {
+                     int64_t decoupled, void **outputs) {
     last_error.clear();
     try {
         const torch::autograd::variable_list produced = LossGeometryOp::apply(
             borrow(head), borrow(targets), borrow(weighted_mask), borrow(mask),
             borrow(sigma), borrow(range), borrow(horizon_scale), borrow(inverse_horizon),
-            borrow(log_scale_gain), cap, ln2, rounding);
-        TORCH_CHECK(produced.size() == 3, "the fused loss returned ", produced.size(),
-                    " tensors, not three");
+            borrow(log_scale_gain), cap, ln2, rounding, decoupled != 0);
+        const size_t expected = decoupled ? 4 : 3;
+        TORCH_CHECK(produced.size() == expected, "the fused loss returned ", produced.size(),
+                    " tensors, not ", expected);
         for (size_t index = 0; index < produced.size(); ++index) {
             outputs[index] = static_cast<void *>(new torch::Tensor(produced[index]));
         }

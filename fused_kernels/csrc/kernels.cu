@@ -849,6 +849,7 @@ loss_geometry_of(const __nv_bfloat16 *__restrict__ channel, int64_t horizon, flo
 // composition tolerated that silently because every pointwise op it called accepts strided
 // inputs; a fused kernel has to say so. Three extra int64 arguments and one multiply per
 // channel read cost nothing, where a `.contiguous()` would copy 295 MB and read it back.
+template <bool Decoupled>
 __global__ void loss_geometry_forward_kernel(
     const __nv_bfloat16 *__restrict__ head, const float *__restrict__ targets,
     const float *__restrict__ weighted_mask, const float *__restrict__ sigma,
@@ -873,6 +874,9 @@ __global__ void loss_geometry_forward_kernel(
         const float *target =
             targets + token * target_token_stride + bar * target_bar_stride;
         close_out[index] = geometry.close;
+        if constexpr (Decoupled) {
+            workspace[12 * elements + index] = geometry.precision;
+        }
 #pragma unroll
         for (int channel_index = 0; channel_index < 4; ++channel_index) {
             const float scale = tanhf(
@@ -896,6 +900,7 @@ __global__ void loss_geometry_forward_kernel(
 // `relative_range` accumulates the open position, then the full-range `log1p`, then the low
 // position. Any other grouping differs in the last bit, which
 // `composed_loss_geometry_accumulates_in_descending_creation_order` pins.
+template <bool Decoupled>
 __global__ void loss_geometry_backward_kernel(
     const __nv_bfloat16 *__restrict__ head, const float *__restrict__ targets,
     const float *__restrict__ weighted_mask, const float *__restrict__ sigma,
@@ -907,9 +912,10 @@ __global__ void loss_geometry_backward_kernel(
     float cap, float ln2, float inverse_ln2, int rounding) {
     const float gain = log_scale_gain[0];
     const float slope = -2.0f * cap;
-    float term[8];
+    constexpr int terms_per_channel = Decoupled ? 3 : 2;
+    float term[4 * terms_per_channel];
 #pragma unroll
-    for (int i = 0; i < 8; ++i) {
+    for (int i = 0; i < 4 * terms_per_channel; ++i) {
         term[i] = grad_terms == nullptr ? 0.0f : grad_terms[i];
     }
     const int64_t stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
@@ -917,6 +923,22 @@ __global__ void loss_geometry_backward_kernel(
          index < elements; index += stride) {
         const int64_t token = index / horizon;
         const int64_t bar = index - token * horizon;
+        if constexpr (Decoupled) {
+            // With no consumer of `terms`, even a nonfinite residual or scale is outside
+            // the gradient graph. Multiplying its derivative by zero would manufacture
+            // NaNs instead of differentiating the returned close coordinate alone.
+            if (grad_terms == nullptr) {
+                __nv_bfloat16 *out = grad_head + token * 8 * horizon + bar;
+                out[0] = __float2bfloat16(
+                    grad_close == nullptr ? 0.0f
+                                          : fk_mul(grad_close[index], horizon_scale[bar]));
+#pragma unroll
+                for (int channel_index = 1; channel_index < 8; ++channel_index) {
+                    out[channel_index * horizon] = __float2bfloat16(0.0f);
+                }
+                continue;
+            }
+        }
         const __nv_bfloat16 *channel = head + token * 8 * horizon + bar;
         const float mask = weighted_mask[index];
         const LossGeometry geometry =
@@ -941,14 +963,21 @@ __global__ void loss_geometry_backward_kernel(
             const float square = fk_mul(difference, difference);
             // `dot`'s backward is `grad · other`, and the reference's `·½` and `·cap`
             // scalar multiplies ride on the term gradient first.
-            const float grad_dot = fk_mul(term[2 * channel_index], 0.5f);
-            const float grad_square = fk_mul(grad_dot, weight);
-            const float grad_weight = fk_mul(grad_dot, square);
+            const int base = terms_per_channel * channel_index;
+            const float grad_dot = fk_mul(term[base], 0.5f);
+            // Decoupling removes the learned precision from ONLY the residual branch.
+            // The scale branch consumes the same residual VALUE with no derivative back
+            // to the coordinates, exactly as `square.detach()` in the composition.
+            const float grad_square =
+                fk_mul(grad_dot, Decoupled ? geometry.precision : weight);
+            const float grad_scale_dot =
+                Decoupled ? fk_mul(term[base + 1], 0.5f) : grad_dot;
+            const float grad_weight = fk_mul(grad_scale_dot, square);
             // `scale` has two consumers - the precision weight and its own `dot` against
             // the weighted mask - and two addends commute exactly, so this pair needs no
             // measured order.
             const float grad_scale = fk_add(
-                fk_mul(fk_mul(term[2 * channel_index + 1], cap), mask),
+                fk_mul(fk_mul(term[base + terms_per_channel - 1], cap), mask),
                 fk_mul(fk_mul(fk_mul(grad_weight, geometry.precision), exponential),
                        slope));
             out[(4 + channel_index) * horizon] = __float2bfloat16(
@@ -1104,8 +1133,8 @@ extern "C" int fk_stream_copy(const void *input, void *output, int64_t count, vo
     return static_cast<int>(cudaGetLastError());
 }
 
-extern "C" int
-fk_loss_geometry_forward(const void *head, const void *targets,
+template <bool Decoupled>
+static int launch_loss_geometry_forward(const void *head, const void *targets,
                          const void *weighted_mask, const void *sigma, const void *range,
                          const void *horizon_scale, const void *inverse_horizon,
                          const void *log_scale_gain, void *close, void *workspace,
@@ -1117,8 +1146,8 @@ fk_loss_geometry_forward(const void *head, const void *targets,
     if (elements <= 0) {
         return static_cast<int>(cudaSuccess);
     }
-    loss_geometry_forward_kernel<<<grid_for(elements), kThreads, 0,
-                                   static_cast<cudaStream_t>(stream)>>>(
+    loss_geometry_forward_kernel<Decoupled><<<grid_for(elements), kThreads, 0,
+                                              static_cast<cudaStream_t>(stream)>>>(
         static_cast<const __nv_bfloat16 *>(head), static_cast<const float *>(targets),
         static_cast<const float *>(weighted_mask), static_cast<const float *>(sigma),
         static_cast<const float *>(range), static_cast<const float *>(horizon_scale),
@@ -1129,8 +1158,8 @@ fk_loss_geometry_forward(const void *head, const void *targets,
     return static_cast<int>(cudaGetLastError());
 }
 
-extern "C" int
-fk_loss_geometry_backward(const void *head, const void *targets,
+template <bool Decoupled>
+static int launch_loss_geometry_backward(const void *head, const void *targets,
                           const void *weighted_mask, const void *sigma, const void *range,
                           const void *horizon_scale, const void *inverse_horizon,
                           const void *log_scale_gain, const void *grad_terms,
@@ -1143,8 +1172,8 @@ fk_loss_geometry_backward(const void *head, const void *targets,
     if (elements <= 0) {
         return static_cast<int>(cudaSuccess);
     }
-    loss_geometry_backward_kernel<<<grid_for(elements), kThreads, 0,
-                                    static_cast<cudaStream_t>(stream)>>>(
+    loss_geometry_backward_kernel<Decoupled><<<grid_for(elements), kThreads, 0,
+                                               static_cast<cudaStream_t>(stream)>>>(
         static_cast<const __nv_bfloat16 *>(head), static_cast<const float *>(targets),
         static_cast<const float *>(weighted_mask), static_cast<const float *>(sigma),
         static_cast<const float *>(range), static_cast<const float *>(horizon_scale),
@@ -1154,4 +1183,50 @@ fk_loss_geometry_backward(const void *head, const void *targets,
         static_cast<__nv_bfloat16 *>(grad_head), elements, horizon, target_token_stride,
         target_channel_stride, target_bar_stride, cap, ln2, inverse_ln2, rounding);
     return static_cast<int>(cudaGetLastError());
+}
+
+extern "C" int
+fk_loss_geometry_forward(const void *head, const void *targets,
+                         const void *weighted_mask, const void *sigma, const void *range,
+                         const void *horizon_scale, const void *inverse_horizon,
+                         const void *log_scale_gain, void *close, void *workspace,
+                         int64_t tokens, int64_t horizon, int64_t target_token_stride,
+                         int64_t target_channel_stride, int64_t target_bar_stride,
+                         float cap, float ln2, float inverse_ln2, int rounding,
+                         int decoupled, void *stream) {
+    if (decoupled) {
+        return launch_loss_geometry_forward<true>(
+            head, targets, weighted_mask, sigma, range, horizon_scale, inverse_horizon,
+            log_scale_gain, close, workspace, tokens, horizon, target_token_stride,
+            target_channel_stride, target_bar_stride, cap, ln2, inverse_ln2, rounding,
+            stream);
+    }
+    return launch_loss_geometry_forward<false>(
+        head, targets, weighted_mask, sigma, range, horizon_scale, inverse_horizon,
+        log_scale_gain, close, workspace, tokens, horizon, target_token_stride,
+        target_channel_stride, target_bar_stride, cap, ln2, inverse_ln2, rounding, stream);
+}
+
+extern "C" int
+fk_loss_geometry_backward(const void *head, const void *targets,
+                          const void *weighted_mask, const void *sigma, const void *range,
+                          const void *horizon_scale, const void *inverse_horizon,
+                          const void *log_scale_gain, const void *grad_terms,
+                          const void *grad_close, void *grad_head, int64_t tokens,
+                          int64_t horizon, int64_t target_token_stride,
+                          int64_t target_channel_stride, int64_t target_bar_stride,
+                          float cap, float ln2, float inverse_ln2, int rounding,
+                          int decoupled, void *stream) {
+    if (decoupled) {
+        return launch_loss_geometry_backward<true>(
+            head, targets, weighted_mask, sigma, range, horizon_scale, inverse_horizon,
+            log_scale_gain, grad_terms, grad_close, grad_head, tokens, horizon,
+            target_token_stride, target_channel_stride, target_bar_stride, cap, ln2,
+            inverse_ln2, rounding, stream);
+    }
+    return launch_loss_geometry_backward<false>(
+        head, targets, weighted_mask, sigma, range, horizon_scale, inverse_horizon,
+        log_scale_gain, grad_terms, grad_close, grad_head, tokens, horizon,
+        target_token_stride, target_channel_stride, target_bar_stride, cap, ln2,
+        inverse_ln2, rounding, stream);
 }

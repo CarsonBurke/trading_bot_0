@@ -101,6 +101,8 @@ int fk_stream_copy(const void *input, void *output, int64_t count, void *stream)
 // `[12, tokens*horizon]` fp32 - rows 0-3 the squared errors, 4-7 the precision weights,
 // 8-11 the capped log scales. Each row is contiguous, so the twelve `dot`s that follow are
 // ATen's own and their summation trees are untouched.
+// Decoupled mode appends row 12, `weighted_mask * inverse_horizon`, shared by the four
+// mean-only quadratic dots; rows 0-11 and all geometry arithmetic are unchanged.
 //
 // `rounding` selects the fp32 forms ATen's own build emitted; see the definition of
 // `FK_LOSS_GEOMETRY_ROUNDING` for the fields and for why they are measured, not chosen.
@@ -114,10 +116,13 @@ int fk_loss_geometry_forward(const void *head, const void *targets,
                              void *close, void *workspace, int64_t tokens, int64_t horizon,
                              int64_t target_token_stride, int64_t target_channel_stride,
                              int64_t target_bar_stride, float cap, float ln2,
-                             float inverse_ln2, int rounding, void *stream);
+                             float inverse_ln2, int rounding, int decoupled, void *stream);
 
 // The same chain's transpose in one pass. `grad_terms` is `[8]` fp32 - per channel the
-// gradient of `dot(square, weight)·½` then of `dot(log_scale, weighted_mask)·cap` - and
+// gradient of `dot(square, weight)·½` then of `dot(log_scale, weighted_mask)·cap`.
+// In decoupled mode `grad_terms` is `[12]`: per channel the fixed-precision mean
+// quadratic, detached-residual scale quadratic, then the log-scale term. Mean gradients
+// never use learned precision; scale gradients retain the original NLL derivative.
 // `grad_close` is either `[tokens, horizon]` fp32 or null when nothing consumes the mean
 // coordinate. Nothing the forward computed is retained: every intermediate is recomputed
 // from `head` and the targets, which is one read of data already resident against twelve
@@ -133,7 +138,7 @@ int fk_loss_geometry_backward(const void *head, const void *targets,
                               void *grad_head, int64_t tokens, int64_t horizon,
                               int64_t target_token_stride, int64_t target_channel_stride,
                               int64_t target_bar_stride, float cap, float ln2,
-                              float inverse_ln2, int rounding, void *stream);
+                              float inverse_ln2, int rounding, int decoupled, void *stream);
 
 #ifdef __cplusplus
 }

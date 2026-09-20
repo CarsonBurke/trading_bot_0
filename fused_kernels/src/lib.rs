@@ -78,6 +78,7 @@ extern "C" {
         cap: f64,
         ln2: f64,
         rounding: i64,
+        decoupled: i64,
         outputs: *mut *mut C_tensor,
     ) -> i32;
     fn fk_stream_copy_tensor(input: *const C_tensor) -> *mut C_tensor;
@@ -263,13 +264,20 @@ pub const LOSS_GEOMETRY_ROUNDING: i64 = 2;
 pub struct LossGeometry {
     /// `[rows, origins, 1, pred_len]` fp32: `coordinate_0 · horizon_scale`, differentiable.
     pub close: Tensor,
-    /// `[2·LOSS_CHANNELS]` fp32: per channel `½·dot(square, weight)` then
-    /// `cap·dot(log_scale, weighted_mask)`, in that order. Their sum is the objective's
-    /// unnormalized numerator.
+    /// `[2·LOSS_CHANNELS]` fp32 under the full coupling: per channel `½·dot(square, weight)`
+    /// then `cap·dot(log_scale, weighted_mask)`, in that order. Their sum is the objective's
+    /// unnormalized numerator. `[3·LOSS_CHANNELS]` under
+    /// [`decoupled_loss_geometry`], which splits the quadratic in two - see its reference.
     pub terms: Tensor,
     /// `[LOSS_CHANNELS]` fp32, gradient-free: `dot(square, mask)`, the diagnostic MSE's
     /// numerator per channel.
     pub squares: Tensor,
+    /// `[2·LOSS_CHANNELS]` fp32, gradient-free, `Some` ONLY when `terms` is not itself the
+    /// NLL's numerator: the decoupled `terms` double-count the squared error under two
+    /// different weightings, so their VALUE is not a likelihood. These are the full
+    /// coupling's eight terms, detached, so the reported NLL stays the same number every
+    /// other arm reports.
+    pub nll_terms: Option<Tensor>,
 }
 
 /// The candle geometry and the masked Gaussian NLL element chain in ONE pass, with a
@@ -326,6 +334,49 @@ pub fn loss_geometry(
         LOSS_GEOMETRY_ROUNDING,
     )
 }
+/// The decoupled mean/scale objective, fused with the same candle geometry as
+/// [`loss_geometry`]. Operands and output layout match
+/// [`reference::decoupled_loss_geometry`]: per channel, `terms` contains the fixed-precision
+/// mean quadratic, the detached-residual scale quadratic, then the log-scale term.
+///
+/// `nll_terms` contains the detached true Gaussian NLL terms, NOT the sum of the two
+/// quadratics. A caller reporting the NLL while training the split objective must preserve
+/// its surrogate-gradient construction. The mean gradient never uses the learned scale;
+/// the scale gradient is unchanged from the coupled NLL. `close` remains differentiable.
+///
+/// CUDA shares the existing geometry and backward implementation. One extra workspace row
+/// holds the horizon-fixed precision for the mean's four ATen `dot`s; the true NLL reuses
+/// the already-reduced scale/log terms. No activation copy or host read is needed. The
+/// composed reference remains the off-CUDA implementation, as for [`loss_geometry`].
+#[allow(clippy::too_many_arguments)]
+pub fn decoupled_loss_geometry(
+    head: &Tensor,
+    targets: &Tensor,
+    weighted_mask: &Tensor,
+    mask: &Tensor,
+    sigma: &Tensor,
+    range: &Tensor,
+    horizon_scale: &Tensor,
+    inverse_horizon: &Tensor,
+    log_scale_gain: &Tensor,
+    cap: f64,
+) -> LossGeometry {
+    loss_geometry_impl(
+        head,
+        targets,
+        weighted_mask,
+        mask,
+        sigma,
+        range,
+        horizon_scale,
+        inverse_horizon,
+        log_scale_gain,
+        cap,
+        LOSS_GEOMETRY_ROUNDING,
+        true,
+    )
+}
+
 
 /// [`loss_geometry`] with the rounding selector open, so the discovery test can prove which
 /// of the thirty-two forms ATen's build emitted and that the others disagree. The model path
@@ -344,8 +395,44 @@ pub fn loss_geometry_with_rounding(
     cap: f64,
     rounding: i64,
 ) -> LossGeometry {
+    loss_geometry_impl(
+        head,
+        targets,
+        weighted_mask,
+        mask,
+        sigma,
+        range,
+        horizon_scale,
+        inverse_horizon,
+        log_scale_gain,
+        cap,
+        rounding,
+        false,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn loss_geometry_impl(
+    head: &Tensor,
+    targets: &Tensor,
+    weighted_mask: &Tensor,
+    mask: &Tensor,
+    sigma: &Tensor,
+    range: &Tensor,
+    horizon_scale: &Tensor,
+    inverse_horizon: &Tensor,
+    log_scale_gain: &Tensor,
+    cap: f64,
+    rounding: i64,
+    decoupled: bool,
+) -> LossGeometry {
     if !head.device().is_cuda() {
-        return reference::loss_geometry(
+        let composed = if decoupled {
+            reference::decoupled_loss_geometry
+        } else {
+            reference::loss_geometry
+        };
+        return composed(
             head,
             targets,
             weighted_mask,
@@ -358,7 +445,7 @@ pub fn loss_geometry_with_rounding(
             cap,
         );
     }
-    let mut outputs = [std::ptr::null_mut::<C_tensor>(); 3];
+    let mut outputs = [std::ptr::null_mut::<C_tensor>(); 4];
     let status = unsafe {
         fk_loss_geometry(
             head.as_ptr(),
@@ -373,17 +460,19 @@ pub fn loss_geometry_with_rounding(
             cap,
             std::f64::consts::LN_2,
             rounding,
+            i64::from(decoupled),
             outputs.as_mut_ptr(),
         )
     };
     if status != 0 {
         panic!("fused loss_geometry failed: {}", last_error());
     }
-    let [close, terms, squares] = outputs;
+    let [close, terms, squares, nll_terms] = outputs;
     LossGeometry {
         close: unsafe { Tensor::from_ptr(close) },
         terms: unsafe { Tensor::from_ptr(terms) },
         squares: unsafe { Tensor::from_ptr(squares) },
+        nll_terms: decoupled.then(|| unsafe { Tensor::from_ptr(nll_terms) }),
     }
 }
 
@@ -661,24 +750,15 @@ pub mod reference {
         log_scale_gain: &Tensor,
         cap: f64,
     ) -> super::LossGeometry {
-        let channels = head.split(1, 2);
+        let (channels, close, predictions) = candles(head, sigma, range, horizon_scale);
         let last = super::LOSS_CHANNELS as usize;
-        let coordinate = |index: usize| channels[index].to_kind(tch::Kind::Float);
-        let close = &channels[0] * horizon_scale;
-        let relative_range = coordinate(1).softplus() * range / std::f64::consts::LN_2;
-        let low = &close - (coordinate(2).sigmoid() * &relative_range).log1p() / sigma;
-        let high = &low + relative_range.log1p() / sigma;
-        let open = &low + (coordinate(3).sigmoid() * &relative_range).log1p() / sigma;
         let flat = |tensor: &Tensor| tensor.reshape([-1]);
         let mask_flat = flat(mask);
         let weighted_flat = flat(weighted_mask);
         let precision = weighted_mask * inverse_horizon;
         let mut terms = Vec::with_capacity(2 * last);
         let mut squares = Vec::with_capacity(last);
-        for (channel, prediction) in [open, high, low, close.shallow_clone()]
-            .into_iter()
-            .enumerate()
-        {
+        for (channel, prediction) in predictions.into_iter().enumerate() {
             let scale = (&channels[last + channel] * log_scale_gain).tanh();
             let weight = (&scale * (-2.0 * cap)).exp() * &precision;
             let square = (targets.narrow(2, channel as i64, 1) - prediction).square();
@@ -690,6 +770,121 @@ pub mod reference {
             close,
             terms: Tensor::stack(&terms, 0),
             squares: Tensor::stack(&squares, 0),
+            nll_terms: None,
+        }
+    }
+
+    /// The four decoded candle coordinates in channel order and the σ-scaled close they are
+    /// all offsets from, lifted out of [`loss_geometry`] verbatim.
+    ///
+    /// It is lifted rather than copied because [`decoupled_loss_geometry`] has to reproduce
+    /// the full coupling's NLL VALUE on the bits, and it can only do that if the residuals
+    /// entering both compositions are the same bits. A second transcription of five
+    /// elementwise ops would be a second place for that to stop being true.
+    fn candles(
+        head: &Tensor,
+        sigma: &Tensor,
+        range: &Tensor,
+        horizon_scale: &Tensor,
+    ) -> (Vec<Tensor>, Tensor, [Tensor; 4]) {
+        let channels = head.split(1, 2);
+        let coordinate = |index: usize| channels[index].to_kind(tch::Kind::Float);
+        let close = &channels[0] * horizon_scale;
+        let relative_range = coordinate(1).softplus() * range / std::f64::consts::LN_2;
+        let low = &close - (coordinate(2).sigmoid() * &relative_range).log1p() / sigma;
+        let high = &low + relative_range.log1p() / sigma;
+        let open = &low + (coordinate(3).sigmoid() * &relative_range).log1p() / sigma;
+        let shared = close.shallow_clone();
+        (channels, close, [open, high, low, shared])
+    }
+
+    /// The same geometry with the squared-error term SPLIT, so the mean and the log scale
+    /// each receive the gradient they should instead of one term serving both.
+    ///
+    /// The defect this removes is in the Gaussian NLL itself, not in the implementation of
+    /// it. With `u = cap·scale + ½·ln h` the quadratic is `½·r²·exp(-2·u)`, so the gradient
+    /// reaching the MEAN is weighted by the model's own predicted precision, with no detach
+    /// anywhere. On an origin the trunk has memorized the residual shrinks, the head answers
+    /// with a smaller scale, and the mean's gradient weight RISES - a super-linear reward for
+    /// memorization, largest exactly where memorization is cheapest (long horizons, whose
+    /// overlapping windows are almost the same window). It is also why two checkpoints whose
+    /// `h = 1` IC differed by 2.3x scored the same held-out NLL to four decimals: the head
+    /// can trade mean accuracy against scale accuracy at constant likelihood.
+    ///
+    /// The split, per channel:
+    ///
+    /// ```text
+    /// mean  : ½·dot(r²,         w·m·(1/h))                 gradient -> mean only
+    /// scale : ½·dot(detach(r²), w·m·(1/h)·exp(-2·cap·s))   gradient -> scale only
+    /// log   : cap·dot(s, w·m)                              gradient -> scale, unchanged
+    /// ```
+    ///
+    /// Three properties make this the right split rather than a convenient one. The
+    /// stationary point in `s` is IDENTICAL to the original NLL's - detaching `r²` removes no
+    /// `s`-dependence, so `∂/∂s` of the last two terms is the original's exactly, and the
+    /// fitted scale still means what it meant. The mean's per-horizon weight is `1/h`, which
+    /// is precisely the horizon-fixed factor the original already carried once `exp(-2·ls)`
+    /// was factored as `exp(-2·cap·tanh)·(1/h)`, so no horizon reweighting is smuggled in and
+    /// `--horizon-loss` remains the only knob on that axis. And the mean now sees plain
+    /// weighted MSE, which is what a conditional-mean estimator is supposed to minimize.
+    ///
+    /// This is deliberately NOT Seitzer et al. 2022's β-NLL (arXiv:2203.09168). Their
+    /// multiplicative `detach(σ^{2β})·NLL` also rescales the LOG term: at β = 1 with the
+    /// `½·ln h` prior hoisted out, that factor is `detach(exp(2·cap·s))`, spanning `e^-8` to
+    /// `e^+8` element by element, and using the unfactored `σ²` instead makes it `h`, up to
+    /// 192x at the far end. Either one reweights the scale objective far harder than it
+    /// repairs the mean's. The additive split reweights nothing.
+    ///
+    /// What it costs: `terms` is no longer a likelihood. Its two quadratic rows count the
+    /// same squared error under two different weightings, so the training loss VALUE is not
+    /// the NLL and would not be comparable to any other arm's. `nll_terms` is therefore
+    /// returned as well - the full coupling's own eight terms, detached - and it is bit-equal
+    /// to what [`loss_geometry`] would have produced on the same inputs, because
+    /// `detach(r²)·weight` and `r²·weight` are the same numbers reduced by the same `dot`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn decoupled_loss_geometry(
+        head: &Tensor,
+        targets: &Tensor,
+        weighted_mask: &Tensor,
+        mask: &Tensor,
+        sigma: &Tensor,
+        range: &Tensor,
+        horizon_scale: &Tensor,
+        inverse_horizon: &Tensor,
+        log_scale_gain: &Tensor,
+        cap: f64,
+    ) -> super::LossGeometry {
+        let (channels, close, predictions) = candles(head, sigma, range, horizon_scale);
+        let last = super::LOSS_CHANNELS as usize;
+        let flat = |tensor: &Tensor| tensor.reshape([-1]);
+        let mask_flat = flat(mask);
+        let weighted_flat = flat(weighted_mask);
+        let precision = weighted_mask * inverse_horizon;
+        let precision_flat = flat(&precision);
+        let mut terms = Vec::with_capacity(3 * last);
+        let mut nll_terms = Vec::with_capacity(2 * last);
+        let mut squares = Vec::with_capacity(last);
+        for (channel, prediction) in predictions.into_iter().enumerate() {
+            let scale = (&channels[last + channel] * log_scale_gain).tanh();
+            let weight = (&scale * (-2.0 * cap)).exp() * &precision;
+            let square = flat(&(targets.narrow(2, channel as i64, 1) - prediction).square());
+            // The one line the whole change is. `detach` on the residual, not on the weight:
+            // detaching the weight would leave the mean's gradient scaled by the predicted
+            // precision's VALUE, which is the coupling, merely frozen for one step.
+            let coupled = square.detach().dot(&flat(&weight)) * 0.5;
+            let logarithmic = flat(&scale).dot(&weighted_flat) * cap;
+            nll_terms.push(coupled.detach());
+            nll_terms.push(logarithmic.detach());
+            terms.push(square.dot(&precision_flat) * 0.5);
+            terms.push(coupled);
+            terms.push(logarithmic);
+            squares.push(tch::no_grad(|| square.dot(&mask_flat)));
+        }
+        super::LossGeometry {
+            close,
+            terms: Tensor::stack(&terms, 0),
+            squares: Tensor::stack(&squares, 0),
+            nll_terms: Some(Tensor::stack(&nll_terms, 0)),
         }
     }
 }
@@ -1123,13 +1318,17 @@ mod tests {
     /// capture's private pool, or a launch geometry that depended on anything but the
     /// arguments would fail the capture or produce a stale replay.
     ///
-    /// ONE capture test for all three kernels, not one each: `cargo test` runs tests in
-    /// parallel threads and two concurrent captures on one device fail each other, so the
-    /// suite gets exactly one capture window.
+    /// ONE serialized test for all kernels and both loss modes: independent concurrent
+    /// captures on one device would invalidate each other.
     #[test]
     fn every_kernel_captures_and_replays_inside_a_cuda_graph() {
         let Some(claim) = cuda() else { return };
-        let device = *claim;
+        for decoupled in [false, true] {
+            captured_kernel_case(*claim, decoupled);
+        }
+    }
+
+    fn captured_kernel_case(device: Device, decoupled: bool) {
         if !unsafe { torch_sys::at_cuda_graph_is_available() } {
             return;
         }
@@ -1149,7 +1348,7 @@ mod tests {
             let activation = relu_square(&hidden);
             let rotated = rope(&packed, &cosine, &sine, heads);
             let normed = qk_norm_rope(&raw_packed, &cosine, &sine, heads);
-            let geometry = loss_geometry(
+            let geometry = loss_geometry_impl(
                 &loss.head,
                 &loss.targets,
                 &loss.weighted_mask,
@@ -1160,6 +1359,8 @@ mod tests {
                 &loss.inverse_horizon,
                 &loss.log_scale_gain,
                 LOSS_CAP,
+                LOSS_GEOMETRY_ROUNDING,
+                decoupled,
             );
             let objective = activation.sum(Kind::Float)
                 + rotated.sum(Kind::Float)
@@ -1179,6 +1380,7 @@ mod tests {
                 gradients[2].shallow_clone(),
                 gradients[3].shallow_clone(),
                 objective,
+                geometry.nll_terms,
             )
         };
 
@@ -1212,6 +1414,9 @@ mod tests {
             packed.detach().copy_(&fresh_packed);
             raw_packed.detach().copy_(&fresh_raw);
             loss.head.detach().copy_(&fresh_head);
+            if decoupled {
+                let _ = loss.log_scale_gain.shallow_clone().fill_(0.5);
+            }
         });
         unsafe {
             torch_sys::at_cuda_graph_stream_begin(graph, 0);
@@ -1234,7 +1439,12 @@ mod tests {
             let activation = reference::relu_square(&hidden_leaf);
             let rotated = reference::rope(&packed_leaf, &cosine, &sine, heads);
             let normed = reference::qk_norm_rope(&raw_leaf, &cosine, &sine, heads);
-            let geometry = reference::loss_geometry(
+            let reference_loss = if decoupled {
+                reference::decoupled_loss_geometry
+            } else {
+                reference::loss_geometry
+            };
+            let geometry = reference_loss(
                 &head_leaf,
                 &loss.targets,
                 &loss.weighted_mask,
@@ -1264,6 +1474,7 @@ mod tests {
                 gradients[2].shallow_clone(),
                 gradients[3].shallow_clone(),
                 objective,
+                geometry.nll_terms,
             )
         };
         assert!(
@@ -1295,6 +1506,13 @@ mod tests {
             eager.4.double_value(&[]),
             "the replayed objective does not match an eager evaluation on the same bytes"
         );
+        if decoupled {
+            assert!(identical(
+                captured.5.as_ref().unwrap(),
+                eager.5.as_ref().unwrap()
+            ), "captured true NLL did not update with the head and scale-gain buffers");
+        }
+        unsafe { torch_sys::at_cuda_graph_free(graph) };
     }
 
     /// A packed input with the interesting values forced in rather than hoped for. The
@@ -1586,6 +1804,17 @@ mod tests {
         close_upstream: Option<&Tensor>,
         rounding: i64,
     ) -> (LossGeometry, Tensor, LossGeometry, Tensor) {
+        loss_pair_mode(inputs, upstream, close_upstream, rounding, LOSS_CAP, false)
+    }
+
+    fn loss_pair_mode(
+        inputs: &LossInputs,
+        upstream: &Tensor,
+        close_upstream: Option<&Tensor>,
+        rounding: i64,
+        cap: f64,
+        decoupled: bool,
+    ) -> (LossGeometry, Tensor, LossGeometry, Tensor) {
         let run = |geometry: LossGeometry| {
             let mut objective = geometry.terms.dot(upstream);
             if let Some(weight) = close_upstream {
@@ -1595,7 +1824,12 @@ mod tests {
                 Tensor::run_backward(&[&objective], &[&inputs.head], false, false).remove(0);
             (geometry, gradient)
         };
-        let (composed, composed_gradient) = run(reference::loss_geometry(
+        let reference = if decoupled {
+            reference::decoupled_loss_geometry
+        } else {
+            reference::loss_geometry
+        };
+        let (composed, composed_gradient) = run(reference(
             &inputs.head,
             &inputs.targets,
             &inputs.weighted_mask,
@@ -1605,9 +1839,9 @@ mod tests {
             &inputs.horizon_scale,
             &inputs.inverse_horizon,
             &inputs.log_scale_gain,
-            LOSS_CAP,
+            cap,
         ));
-        let (fused, fused_gradient) = run(loss_geometry_with_rounding(
+        let (fused, fused_gradient) = run(loss_geometry_impl(
             &inputs.head,
             &inputs.targets,
             &inputs.weighted_mask,
@@ -1617,8 +1851,9 @@ mod tests {
             &inputs.horizon_scale,
             &inputs.inverse_horizon,
             &inputs.log_scale_gain,
-            LOSS_CAP,
+            cap,
             rounding,
+            decoupled,
         ));
         (composed, composed_gradient, fused, fused_gradient)
     }
@@ -2287,5 +2522,239 @@ mod tests {
             composed_activation.numel(),
             max_absolute(&composed_activation, &fused_activation)
         );
+    }
+
+    fn split_geometry(inputs: &LossInputs, cap: f64) -> LossGeometry {
+        decoupled_loss_geometry(
+            &inputs.head,
+            &inputs.targets,
+            &inputs.weighted_mask,
+            &inputs.mask,
+            &inputs.sigma,
+            &inputs.range,
+            &inputs.horizon_scale,
+            &inputs.inverse_horizon,
+            &inputs.log_scale_gain,
+            cap,
+        )
+    }
+
+    fn assert_split_pair(
+        inputs: &LossInputs,
+        upstream: &Tensor,
+        cap: f64,
+    ) -> (LossGeometry, Tensor) {
+        let (composed, composed_gradient, fused, fused_gradient) =
+            loss_pair_mode(inputs, upstream, None, LOSS_GEOMETRY_ROUNDING, cap, true);
+        assert_eq!(
+            loss_differences(&composed, &composed_gradient, &fused, &fused_gradient),
+            [0, 0, 0, 0],
+            "decoupled geometry/terms/squares/gradient differ from the composition"
+        );
+        assert!(identical(
+            composed.nll_terms.as_ref().unwrap(),
+            fused.nll_terms.as_ref().unwrap()
+        ));
+        assert!(!fused.nll_terms.as_ref().unwrap().requires_grad());
+        assert!(!fused.squares.requires_grad());
+        (fused, fused_gradient)
+    }
+
+    #[test]
+    fn fused_decoupled_loss_geometry_matches_values_and_gradients() {
+        let Some(claim) = cuda() else { return };
+        let device = *claim;
+        tch::manual_seed(59);
+        // Real horizon with channel-innermost targets; odd sizes and saturated nonlinear
+        // branches; then the h=1 / cap=0 boundary where the two precisions coincide.
+        for (rows, origins, horizon, scale, cap) in [
+            (8, 375, 192, 2.0, LOSS_CAP),
+            (3, 257, 37, 24.0, 1.75),
+            (2, 5, 1, 2.0, 0.0),
+        ] {
+            let mut inputs = loss_inputs(rows, origins, horizon, device, scale);
+            inputs.targets = inputs.targets.transpose(2, 3).contiguous().transpose(2, 3);
+            let upstream = Tensor::randn([3 * LOSS_CHANNELS], (Kind::Float, device));
+            let (fused, _) = assert_split_pair(&inputs, &upstream, cap);
+            let coupled = tch::no_grad(|| {
+                reference::loss_geometry(
+                    &inputs.head,
+                    &inputs.targets,
+                    &inputs.weighted_mask,
+                    &inputs.mask,
+                    &inputs.sigma,
+                    &inputs.range,
+                    &inputs.horizon_scale,
+                    &inputs.inverse_horizon,
+                    &inputs.log_scale_gain,
+                    cap,
+                )
+            });
+            assert!(
+                identical(fused.nll_terms.as_ref().unwrap(), &coupled.terms),
+                "decoupling changed the reported Gaussian NLL at cap={cap}"
+            );
+        }
+    }
+
+    #[test]
+    fn fused_decoupled_loss_geometry_isolates_mean_and_scale_gradients() {
+        let Some(claim) = cuda() else { return };
+        let device = *claim;
+        tch::manual_seed(61);
+        let inputs = loss_inputs(3, 17, 37, device, 2.0);
+        let ones = Tensor::ones([3 * LOSS_CHANNELS], (Kind::Float, device));
+        let (geometry, gradient) = assert_split_pair(&inputs, &ones, LOSS_CAP);
+        let mut changed = targets_dense(&inputs);
+        changed.head = inputs.head.detach().copy().set_requires_grad(true);
+        tch::no_grad(|| {
+            changed.head.narrow(2, LOSS_CHANNELS, LOSS_CHANNELS).copy_(
+                &(inputs.head.narrow(2, LOSS_CHANNELS, LOSS_CHANNELS) + 3.5),
+            );
+        });
+        let (_, changed_gradient) = assert_split_pair(&changed, &ones, LOSS_CAP);
+        assert!(
+            identical(
+                &gradient.narrow(2, 0, LOSS_CHANNELS),
+                &changed_gradient.narrow(2, 0, LOSS_CHANNELS)
+            ),
+            "the mean gradient still depends on learned precision"
+        );
+        assert!(
+            differing(
+                &gradient.narrow(2, LOSS_CHANNELS, LOSS_CHANNELS),
+                &changed_gradient.narrow(2, LOSS_CHANNELS, LOSS_CHANNELS)
+            ) > 0,
+            "the scale perturbation did not exercise its gradient"
+        );
+        let coupled_upstream = Tensor::ones([2 * LOSS_CHANNELS], (Kind::Float, device));
+        let (_, _, _, coupled_gradient) =
+            loss_pair(&inputs, &coupled_upstream, None, LOSS_GEOMETRY_ROUNDING);
+        assert!(
+            identical(
+                &gradient.narrow(2, LOSS_CHANNELS, LOSS_CHANNELS),
+                &coupled_gradient.narrow(2, LOSS_CHANNELS, LOSS_CHANNELS)
+            ),
+            "decoupling changed the original likelihood's scale gradient"
+        );
+
+        for (weights, disconnected) in [([1.0f32, 0.0, 0.0], LOSS_CHANNELS), ([0.0, 1.0, 1.0], 0)] {
+            let upstream = Tensor::from_slice(&weights).to_device(device).repeat([LOSS_CHANNELS]);
+            let (_, isolated) = assert_split_pair(&inputs, &upstream, LOSS_CAP);
+            assert_eq!(
+                isolated.narrow(2, disconnected, LOSS_CHANNELS)
+                    .to_kind(Kind::Float).abs().max().double_value(&[]),
+                0.0,
+                "the split quadratic leaked a gradient into its detached branch"
+            );
+        }
+
+        // Exercise the consumer's actual contract, not just the three individual terms:
+        // true NLL as the value, with the split objective's gradient.
+        let fresh = split_geometry(&inputs, LOSS_CAP);
+        let train = fresh.terms.sum(Kind::Float);
+        let nll = fresh.nll_terms.as_ref().unwrap().sum(Kind::Float);
+        let surrogate = &nll + (&train - train.detach());
+        assert!(identical(&surrogate, &geometry.nll_terms.unwrap().sum(Kind::Float)));
+        let surrogate_gradient =
+            Tensor::run_backward(&[&surrogate], &[&inputs.head], false, false).remove(0);
+        assert!(identical(&surrogate_gradient, &gradient));
+    }
+
+    #[test]
+    fn fused_decoupled_loss_geometry_preserves_invalid_mask_and_scale_semantics() {
+        let Some(claim) = cuda() else { return };
+        let device = *claim;
+        tch::manual_seed(67);
+        let inputs = loss_inputs(2, 17, 37, device, 6.0);
+        let upstream = Tensor::randn([3 * LOSS_CHANNELS], (Kind::Float, device));
+        tch::no_grad(|| {
+            for (origin, value) in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY].into_iter().enumerate() {
+                let _ = inputs.head.select(0, 0).select(0, origin as i64)
+                    .narrow(0, LOSS_CHANNELS, LOSS_CHANNELS).fill_(value);
+            }
+            // A zero mask must not sanitize a NaN scale; a nonfinite mask must not be
+            // silently clamped. Invalid normalization scales follow IEEE, as in ATen.
+            let _ = inputs.mask.select(0, 0).select(0, 0).fill_(0.0);
+            let _ = inputs.weighted_mask.select(0, 0).select(0, 0).fill_(0.0);
+            let _ = inputs.mask.select(0, 1).select(0, 0).fill_(f64::NAN);
+            let _ = inputs.weighted_mask.select(0, 1).select(0, 0).fill_(f64::NAN);
+            let _ = inputs.sigma.select(0, 1).select(0, 1).fill_(0.0);
+            let _ = inputs.range.select(0, 1).select(0, 2).fill_(-1.0);
+        });
+        let (geometry, gradient) = assert_split_pair(&inputs, &upstream, LOSS_CAP);
+        assert!(geometry.nll_terms.unwrap().isnan().any().int64_value(&[]) != 0);
+        assert!(
+            gradient.select(0, 0).narrow(1, 0, LOSS_CHANNELS).isfinite().all().int64_value(&[]) != 0,
+            "a nonfinite learned scale poisoned the scale-independent mean gradient"
+        );
+
+        let mut blind = loss_inputs(2, 17, 37, device, 6.0);
+        let _ = blind.mask.fill_(0.0);
+        let _ = blind.weighted_mask.fill_(0.0);
+        let (geometry, gradient) = assert_split_pair(&blind, &upstream, LOSS_CAP);
+        for value in [&geometry.terms, &geometry.squares, geometry.nll_terms.as_ref().unwrap(), &gradient] {
+            assert_eq!(value.to_kind(Kind::Float).abs().max().double_value(&[]), 0.0);
+        }
+    }
+
+    #[test]
+    fn fused_decoupled_loss_geometry_carries_extra_and_close_only_gradients() {
+        let Some(claim) = cuda() else { return };
+        let device = *claim;
+        tch::manual_seed(71);
+        let mut inputs = loss_inputs(4, 129, 37, device, 2.0);
+        let upstream = Tensor::randn([3 * LOSS_CHANNELS], (Kind::Float, device));
+        let close_upstream = Tensor::randn(inputs.mask.size(), (Kind::Float, device));
+        let (composed, composed_gradient, fused, fused_gradient) = loss_pair_mode(
+            &inputs, &upstream, Some(&close_upstream), LOSS_GEOMETRY_ROUNDING, LOSS_CAP, true,
+        );
+        assert!(identical(&composed.close, &fused.close));
+        assert!(identical(&composed.terms, &fused.terms));
+        assert!(identical(
+            &composed_gradient.narrow(2, 1, 2 * LOSS_CHANNELS - 1),
+            &fused_gradient.narrow(2, 1, 2 * LOSS_CHANNELS - 1)
+        ));
+        // The extra consumer changes three-addend accumulation order only on coordinate 0.
+        // Match the existing coupled-loss rounding bound; all other channels remain exact.
+        let scale = composed_gradient.to_kind(Kind::Float).abs().max().double_value(&[]);
+        assert!(scale > 0.0);
+        assert!(max_absolute(&composed_gradient, &fused_gradient) / scale <= 1e-2);
+
+        tch::no_grad(|| {
+            let _ = inputs.targets.fill_(f64::NAN);
+            let _ = inputs.head.narrow(2, LOSS_CHANNELS, LOSS_CHANNELS).fill_(f64::NAN);
+        });
+        let geometry = split_geometry(&inputs, LOSS_CAP);
+        let objective = (&geometry.close * &close_upstream).sum(Kind::Float);
+        let gradient =
+            Tensor::run_backward(&[&objective], &[&inputs.head], false, false).remove(0);
+        let reference_close = inputs.head.narrow(2, 0, 1).to_kind(Kind::Float) * &inputs.horizon_scale;
+        let reference_objective = (reference_close * &close_upstream).sum(Kind::Float);
+        let reference_gradient =
+            Tensor::run_backward(&[&reference_objective], &[&inputs.head], false, false).remove(0);
+        assert!(
+            identical(&gradient, &reference_gradient),
+            "unused likelihood outputs contaminated the close-only gradient"
+        );
+    }
+
+    #[test]
+    fn fused_decoupled_loss_geometry_rejects_malformed_mask_and_scale_buffers() {
+        let Some(claim) = cuda() else { return };
+        let device = *claim;
+        for malformed in 0..3 {
+            let mut inputs = loss_inputs(2, 17, 37, device, 2.0);
+            match malformed {
+                // Broadcastable is not sufficient: the kernel addresses one mask per bar.
+                0 => inputs.weighted_mask = Tensor::ones([2, 17, 1, 1], (Kind::Float, device)),
+                1 => inputs.inverse_horizon = Tensor::ones([36], (Kind::Float, device)),
+                _ => inputs.log_scale_gain = Tensor::ones([2], (Kind::Float, device)),
+            }
+            let rejected = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                split_geometry(&inputs, LOSS_CAP)
+            }));
+            assert!(rejected.is_err(), "malformed buffer {malformed} reached a kernel launch");
+        }
     }
 }
