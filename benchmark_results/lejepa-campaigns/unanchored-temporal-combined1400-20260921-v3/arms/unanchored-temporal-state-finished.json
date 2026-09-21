@@ -1,0 +1,135 @@
+{
+  "evidence": {
+    "checkpoint": "/home/marvin/Documents/repositories/trading_bot_0/training/runs/unanchored-temporal-combined1400-20260921-v3-unanchored-temporal-state/weights/jepa-manifest.json",
+    "checkpoint_sha256": "60d6586431d6bbf3b212e670fe3e4ee07c05c72105bfa8602208f77088ebdc9f",
+    "cross_section_sha256": "91eb1ee756b9835317316883b68ba5b0e0e97e2e8056b04f6c1b4bfea64615c3",
+    "probe_fit_origins_sha256": "5d565a270e7ce6d4f3a94258423baaf7534cc4d917006bc421052b30c384224c",
+    "reports": [
+      {
+        "path": "/home/marvin/Documents/repositories/trading_bot_0/training/runs/unanchored-temporal-combined1400-20260921-v3-unanchored-temporal-state/gens/0/timexer_segment_jepa_delayed_future_correlation.report.bin",
+        "sha256": "c2375529ccbcbd3fbb369971aaedd17ded5c91f9d62303b3d9a74e099abaeb01"
+      },
+      {
+        "path": "/home/marvin/Documents/repositories/trading_bot_0/training/runs/unanchored-temporal-combined1400-20260921-v3-unanchored-temporal-state/gens/0/timexer_segment_jepa_delayed_future_count.report.bin",
+        "sha256": "20877820d09f8ca8238f04286b7929556b3c940540bd44923896be1b25849e7e"
+      },
+      {
+        "path": "/home/marvin/Documents/repositories/trading_bot_0/training/runs/unanchored-temporal-combined1400-20260921-v3-unanchored-temporal-state/gens/0/timexer_segment_jepa_delayed_future_error.report.bin",
+        "sha256": "21476fb9128ea4c3f6402c52c79763102f5590192f16897f1b88040382374cad"
+      },
+      {
+        "path": "/home/marvin/Documents/repositories/trading_bot_0/training/runs/unanchored-temporal-combined1400-20260921-v3-unanchored-temporal-state/gens/0/timexer_segment_jepa_delayed_future_penalty.report.bin",
+        "sha256": "3526560a3c4e9652c0197005301e177678dc10939a940cd27cd1927c3e0672bb"
+      },
+      {
+        "path": "/home/marvin/Documents/repositories/trading_bot_0/training/runs/unanchored-temporal-combined1400-20260921-v3-unanchored-temporal-state/gens/0/timexer_segment_jepa_delayed_future_ratio.report.bin",
+        "sha256": "048e681d797186d62053ccaacee09b1b552b9f3a2f4af92d0052aa988f7d2a4a"
+      },
+      {
+        "path": "/home/marvin/Documents/repositories/trading_bot_0/training/runs/unanchored-temporal-combined1400-20260921-v3-unanchored-temporal-state/gens/0/timexer_segment_jepa_delayed_recall_correlation.report.bin",
+        "sha256": "be7003ebf1f2f0c2c867441efc3bc0d5fe96c0e52d9441cf7b342c0caaae56b0"
+      },
+      {
+        "path": "/home/marvin/Documents/repositories/trading_bot_0/training/runs/unanchored-temporal-combined1400-20260921-v3-unanchored-temporal-state/gens/0/timexer_segment_jepa_delayed_recall_count.report.bin",
+        "sha256": "ff584bea3d2365790188e23345d79eb758d9292d331041ffc88c1617661ea0eb"
+      },
+      {
+        "path": "/home/marvin/Documents/repositories/trading_bot_0/training/runs/unanchored-temporal-combined1400-20260921-v3-unanchored-temporal-state/gens/0/timexer_segment_jepa_delayed_recall_error.report.bin",
+        "sha256": "37bf07c05c10a1510b33c238e43dd26b6d816edf7770a7594d50156ee4583c5e"
+      },
+      {
+        "path": "/home/marvin/Documents/repositories/trading_bot_0/training/runs/unanchored-temporal-combined1400-20260921-v3-unanchored-temporal-state/gens/0/timexer_segment_jepa_delayed_recall_penalty.report.bin",
+        "sha256": "2d0e038316e105e7d3e607c208320c50faa2e912e055c0938b4daf70f60c135e"
+      },
+      {
+        "path": "/home/marvin/Documents/repositories/trading_bot_0/training/runs/unanchored-temporal-combined1400-20260921-v3-unanchored-temporal-state/gens/0/timexer_segment_jepa_delayed_recall_ratio.report.bin",
+        "sha256": "5045d5105500c66f3b44c860b4354e2bdd60101d2436a70e3f85b0915cc2bdeb"
+      },
+      {
+        "path": "/home/marvin/Documents/repositories/trading_bot_0/training/runs/unanchored-temporal-combined1400-20260921-v3-unanchored-temporal-state/gens/0/timexer_segment_jepa_geometry.report.bin",
+        "sha256": "05b42591d7dbbb45f8c89f20e401442594ed5b5d4d6eeb6d32a69ce8c90790aa"
+      },
+      {
+        "path": "/home/marvin/Documents/repositories/trading_bot_0/training/runs/unanchored-temporal-combined1400-20260921-v3-unanchored-temporal-state/gens/0/timexer_segment_jepa_objective.report.bin",
+        "sha256": "9b61a363db615a9662fe06c2015e93cc72f9680afccda3ea0ac13a8852e06fde"
+      },
+      {
+        "path": "/home/marvin/Documents/repositories/trading_bot_0/training/runs/unanchored-temporal-combined1400-20260921-v3-unanchored-temporal-state/gens/0/timexer_segment_jepa_panel.report.bin",
+        "sha256": "276f3df53b8feb935190225dfec4f340a2a5970eea328a9cbb579178920d0be2"
+      },
+      {
+        "path": "/home/marvin/Documents/repositories/trading_bot_0/training/runs/unanchored-temporal-combined1400-20260921-v3-unanchored-temporal-state/gens/0/timexer_segment_jepa_probe_correlation.report.bin",
+        "sha256": "9842f1edb9193be5c693f07cbf7a674e41e639f10297ff7e86e5c35a47461065"
+      },
+      {
+        "path": "/home/marvin/Documents/repositories/trading_bot_0/training/runs/unanchored-temporal-combined1400-20260921-v3-unanchored-temporal-state/gens/0/timexer_segment_jepa_probe_count.report.bin",
+        "sha256": "9c844e6845d9c459262bf7a75031f4ee73ddf81a3246802b25740cfdf2c4d3a7"
+      },
+      {
+        "path": "/home/marvin/Documents/repositories/trading_bot_0/training/runs/unanchored-temporal-combined1400-20260921-v3-unanchored-temporal-state/gens/0/timexer_segment_jepa_probe_direction.report.bin",
+        "sha256": "3bba29d8911428bb93aec6d9c090b1825d388a0ac346b821a82a2482611106d3"
+      },
+      {
+        "path": "/home/marvin/Documents/repositories/trading_bot_0/training/runs/unanchored-temporal-combined1400-20260921-v3-unanchored-temporal-state/gens/0/timexer_segment_jepa_probe_direction_count.report.bin",
+        "sha256": "9d3331c804e3d685c0aa5da753fe11060891d73cc1178d1fb103ecd151b573fa"
+      },
+      {
+        "path": "/home/marvin/Documents/repositories/trading_bot_0/training/runs/unanchored-temporal-combined1400-20260921-v3-unanchored-temporal-state/gens/0/timexer_segment_jepa_probe_error.report.bin",
+        "sha256": "e0bb6dd5f212e70a53889ec1e997cf7828d89b1663613a21f7ef4dec8ee460a3"
+      },
+      {
+        "path": "/home/marvin/Documents/repositories/trading_bot_0/training/runs/unanchored-temporal-combined1400-20260921-v3-unanchored-temporal-state/gens/0/timexer_segment_jepa_probe_gap.report.bin",
+        "sha256": "a77ee60baeb29f98e3921772519d20f600e51a9368bb340233b4ac8e3d2de8a5"
+      },
+      {
+        "path": "/home/marvin/Documents/repositories/trading_bot_0/training/runs/unanchored-temporal-combined1400-20260921-v3-unanchored-temporal-state/gens/0/timexer_segment_jepa_probe_penalty.report.bin",
+        "sha256": "822c8bec9e81539705e48d529d1ce5b66cb75cfef560fb32426603d6aba4f4bb"
+      },
+      {
+        "path": "/home/marvin/Documents/repositories/trading_bot_0/training/runs/unanchored-temporal-combined1400-20260921-v3-unanchored-temporal-state/gens/0/timexer_segment_jepa_probe_population.report.bin",
+        "sha256": "9755004b7942fb109c1a986041c2477873355e0f8d5ed66c53b2880354054590"
+      },
+      {
+        "path": "/home/marvin/Documents/repositories/trading_bot_0/training/runs/unanchored-temporal-combined1400-20260921-v3-unanchored-temporal-state/gens/0/timexer_segment_jepa_probe_ratio.report.bin",
+        "sha256": "030f1ddee6f310466bf790201857366bd5c8a78c3a7c776a9d386f26732c5e4f"
+      },
+      {
+        "path": "/home/marvin/Documents/repositories/trading_bot_0/training/runs/unanchored-temporal-combined1400-20260921-v3-unanchored-temporal-state/gens/0/timexer_segment_jepa_reconstruction.report.bin",
+        "sha256": "1932e67c2bb53b6872e0f726f7c495f3e90f0b9fa9ec9807193d07c7bae29c14"
+      },
+      {
+        "path": "/home/marvin/Documents/repositories/trading_bot_0/training/runs/unanchored-temporal-combined1400-20260921-v3-unanchored-temporal-state/gens/0/timexer_segment_jepa_reconstruction_correlation.report.bin",
+        "sha256": "287a9e1bc49bb96219e4efc6fdc8b8be5dd52666bcfbdc8080f8bd018b4c335b"
+      },
+      {
+        "path": "/home/marvin/Documents/repositories/trading_bot_0/training/runs/unanchored-temporal-combined1400-20260921-v3-unanchored-temporal-state/gens/0/timexer_segment_jepa_reconstruction_count.report.bin",
+        "sha256": "1c0676614b26844cbf9434c1f181db449e51c5152ef054e87d2fcdbf4eeb0109"
+      },
+      {
+        "path": "/home/marvin/Documents/repositories/trading_bot_0/training/runs/unanchored-temporal-combined1400-20260921-v3-unanchored-temporal-state/gens/0/timexer_segment_jepa_runtime.report.bin",
+        "sha256": "92783b6a9445e67eff591a6753dbb943571ea8971daeed00367277704491ddcb"
+      },
+      {
+        "path": "/home/marvin/Documents/repositories/trading_bot_0/training/runs/unanchored-temporal-combined1400-20260921-v3-unanchored-temporal-state/gens/0/timexer_segment_jepa_token_variance.report.bin",
+        "sha256": "f9ece8fc16e73b99026432d141484a1f0679e506bc84e05a8f73cdcfc472a177"
+      },
+      {
+        "path": "/home/marvin/Documents/repositories/trading_bot_0/training/runs/unanchored-temporal-combined1400-20260921-v3-unanchored-temporal-state/gens/0/timexer_segment_progress.report.bin",
+        "sha256": "05056b4fa9a70d5ccd2dcd00e082567368e7f673bc50f5684fe516b07829b0cf"
+      }
+    ],
+    "sample_plan_sha256": "83803ce708201e591203206522abf27d0bf7674514ccf64cb6902f27de8d037c",
+    "training_origins_sha256": "0f2375c8af73ffdf4915ced389900fd1616ea27b4f419a8735ca5c394c475594",
+    "validation_origins_sha256": "fbe7ebacd6fe79dd424786ce050e9bf17a59e1bbb5fb7d720f8c1bfc76c08046",
+    "weights_sha256": "a13a60485fd4fe28e13a61f9fe4f662c1100e71043007ab3845bcde8dd21ae17"
+  },
+  "failure": null,
+  "finished_at": "2026-09-21T21:09:56.442778+00:00",
+  "idempotency_key": "lejepa-713766097a4bd984bd88fe001b833f60b92513b8b7f6a7a6c8430290e2dcdd14-unanchored-temporal-state",
+  "plan_sha256": "713766097a4bd984bd88fe001b833f60b92513b8b7f6a7a6c8430290e2dcdd14",
+  "shared_identity_sha256": "57aea8554843edc93739bd3d25233060ea3c9fa0f650a5cc7d6775cdf9f366bc",
+  "started_at": "2026-09-21T21:05:33.459341+00:00",
+  "status": "complete",
+  "task": "unanchored-temporal-state",
+  "wall_seconds": 262.9834072499998
+}
