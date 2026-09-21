@@ -42,8 +42,9 @@ direction are worse than the no-SIGReg temporal control; this is not promotion e
 Temporal delta targets are not competitive with the 0.975143 matched leader; adding SIGReg worsens
 this cohort's aggregate and h64 direction. The follow-up sign-aligned treatment is documented in
 [temporal-projected-sign005](../benchmark_results/lejepa-campaigns/temporal-projected-sign005-20260921/plan.json).
-The temporal collection is authenticated in
-[complete.json](../benchmark_results/lejepa-campaigns/temporal-projected1400-20260921-v2/complete.json).
+The temporal and sign campaigns are authenticated in their respective
+[complete.json](../benchmark_results/lejepa-campaigns/temporal-projected1400-20260921-v2/complete.json)
+and [sign completion](../benchmark_results/lejepa-campaigns/temporal-projected-sign005-20260921/complete.json).
 
 ### Supervised reader-SIGReg ablation — not an unanchored representation test
 

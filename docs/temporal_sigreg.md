@@ -255,16 +255,17 @@ restricted to anchored non-conditional temporal projected JEPA with cumulative t
 parallel metric channel is introduced. This is a predeclared single weight, not a validation sweep.
 The immutable plan is
 [temporal-projected-sign005](../benchmark_results/lejepa-campaigns/temporal-projected-sign005-20260921/plan.json).
-The 1400-step model job **8836 succeeded**; its existing JEPA objective report emits the new
-`decision sign logistic loss` diagnostic (endpoint **0.69292927**), proving the auxiliary follows
-the captured training path without an ad-hoc metric channel. On the unchanged validation panel,
-the sign treatment scored aggregate close MSE/persistence **0.998657**, h64 direction **51.07%**
-and h64 signed IC **0.08190**. It improves neither aggregate error nor direction over the
-no-SIGReg temporal control (**0.986919**, **52.44%**), despite the highest h64 IC in this small
-cohort. It is therefore not promoted; collection job **8837** remains queued behind unrelated
-protected GPU work, with the endpoint and failed/cancelled provenance preserved.
+The 1400-step model job **8836** and collector **8837** both succeeded; the authenticated
+[collection](../benchmark_results/lejepa-campaigns/temporal-projected-sign005-20260921/complete.json)
+contains the existing JEPA objective report with the new `decision sign logistic loss` diagnostic
+(endpoint **0.69292927**), proving the auxiliary follows the captured training path without an
+ad-hoc metric channel. On the unchanged validation panel, the sign treatment scored aggregate
+close MSE/persistence **0.998657**, h64 direction **51.07%** and h64 signed IC **0.08190**. It
+improves neither aggregate error nor direction over the no-SIGReg temporal control (**0.986919**,
+**52.44%**), despite the highest h64 IC in this small cohort. It is therefore not promoted.
 
 The active unresolved question is no longer whether a sign-aligned gradient is implementable:
 whether any temporal representation objective can improve the aggregate close panel without
 sacrificing calibration remains unanswered. A direction-only or IC-only win is not promotion
-evidence.
+evidence; the cancelled pre-mask campaign and unrelated protected-job failure remain preserved.
+
