@@ -1,6 +1,6 @@
-# Top-run ledger
+,o# Top-run ledger
 
-Updated: 2026-09-20. Replace current standings after every completed matched comparison; keep only decision-changing history. Accuracy means observable future-price/return accuracy, never latent JEPA loss. No production promotion or terminal-test claim from these development panels.
+Updated: 2026-09-21. Replace current standings after every completed matched comparison; keep only decision-changing history. Accuracy means observable future-price/return accuracy, never latent JEPA loss. No production promotion or terminal-test claim from these development panels.
 
 ## Current standings
 
@@ -25,6 +25,38 @@ Protocol: `lejepa-fixed1400-20260919`; 1400 updates, batch 256, seed 20260919, f
 
 At h192, no-SIGReg JEPA = **0.997561**, full/none = 1.000512, decoupled/lattice = 1.001884. A horizon-specific win is not a global win. Latent-only one/multi-horizon close scores ≈0.99935/0.99998: not competitive.
 
+### Supervised reader-SIGReg ablation — not an unanchored representation test
+
+Same 1400-step protocol and panels, but **all four fresh arms remove the final reader RMSNorm and receive forecasting gradients in their encoder/trunk**. Total SIGReg weight 0.09, split equally for both sites. The normalized-reader leader above is a separate normalization reference. These results evaluate adding SIGReg to supervised forecasting; they are ineligible as evidence about the user's required unanchored temporal representation learner.
+
+| Reader placement | Close score ↓ | h64 direction | h64 signed IC | Run under `training/runs/` |
+| --- | ---: | ---: | ---: | --- |
+| **None: cohort leader** | **0.977267** | **52.15%** | **0.04719** | `reader-sigreg1400-20260920-reader-none` |
+| Local | 0.984570 | 52.00% | 0.02250 | `reader-sigreg1400-20260920-reader-local` |
+| State | 0.991508 | 52.39% | 0.00690 | `reader-sigreg1400-20260920-reader-state` |
+| Both | 0.990054 | 51.66% | 0.02231 | `reader-sigreg1400-20260920-reader-both` |
+
+No addition is promoted for this supervised forecaster. Supervised delayed-cue mean paired-effect error also worsens: none **0.004825**, local **0.009954**, state **0.087689**, both **0.073240**; all eight relevant/null tasks completed 1024 updates with exact paired input equality. Those encoders also received forecast gradients, so this is not a clean temporal SIGReg memory test.
+
+### Clean unanchored memory comparison
+
+Fresh attached temporal JEPA + SIGReg only; no forecasting/reconstruction gradients or gradient surgery. Eight relevant/null tasks each complete1024 updates, B64, D128×2, seed20260919, BF16/CUDA graphs. Freeze every parameter, then independently fit train-only ridge readers2048/512, refit2560, score256 held-out paired episodes.
+
+Full-state mean paired-effect error at16/32/64/128/192: **local0.001168**, off0.033061, both0.041104, state0.792244. Local improves96.5% over the JEPA-only control; h64 close MSE/persistence **0.182696**, versus off0.202598 and analytic Bayes0.182086. Recent/local readers have zero paired response; every full store stays bit-identical throughout reader fitting/evaluation. This is controlled-memory evidence, not market accuracy. [Reports/protocol](../benchmark_results/unanchored-sigreg-memory-20260920/), job8752 succeeded; [interpretation](temporal_sigreg.md#completed-clean-delayed-cue-comparison).
+
+### Clean unanchored market comparison — separate frozen-reader protocol
+
+Four fresh 1400-step JEPA-only ±SIGReg arms, B256, D512×8, seed20260919; no downstream pretraining loss. Freeze, fit/select ridge on 4096 training origins (3260 inner + 820 selection after 16-row purge), refit, score 2048 validation origins. Score = mean **raw close-return MSE/persistence at 16/32/64/128/192**, not the supervised seven-horizon market-neutral score above.
+
+| Placement | Frozen full-state score ↓ | h64 direction | h64 pooled correlation | Run under `training/runs/` |
+| --- | ---: | ---: | ---: | --- |
+| Off: JEPA-only | 0.999643 | 49.36% | 0.03365 | `unanchored-sigreg1400-20260920-v3-unanchored-none` |
+| Local | 0.999893 | 49.36% | -0.01264 | `unanchored-sigreg1400-20260920-v3-unanchored-local` |
+| **State: full-state cohort leader** | **0.999213** | 49.36% | 0.01555 | `unanchored-sigreg1400-20260920-v3-unanchored-state` |
+| Both | 1.001351 | 49.11% | 0.01975 | `unanchored-sigreg1400-20260920-v3-unanchored-both` |
+
+State's advantage over off is only 0.000430; all full-state results remain near persistence. The off arm's recomputed-recent reader scores 0.999063, better than every full-state reader. The large synthetic local-SIGReg gain does not transfer here; no production promotion. Direction has 2032 nonzero targets at h64; zero predictions are misses. [Completed collection](../benchmark_results/lejepa-campaigns/unanchored-sigreg1400-20260920-v3/complete.json), jobs8757–8761 succeeded; [per-horizon reports and interpretation](temporal_sigreg.md#clean-market-protocol-and-operational-evidence).
+
 ## Historical references — not matched treatments
 
 Same scoring observations, but **2500 updates, different seed, frozen calibrated means, future-calendar inputs**. Do not attribute differences solely to model design.
@@ -36,15 +68,17 @@ Same scoring observations, but **2500 updates, different seed, frozen calibrated
 
 ## Evidence and operational state
 
-- [Latest paired accuracy reports](../benchmark_results/accuracy-temporal-moments-20260920/): **18 checkpoints** (16 matched, 2 historical) plus persistence, 25 `timexer_accuracy_*` `.report.bin` bases and authenticated protocol; job **8599 succeeded**. [Objective and completed experiment](temporal_sigreg.md#completed-matched-experiment).
+- [Latest paired accuracy reports](../benchmark_results/accuracy-reader-sigreg-20260920/): **six checkpoints plus persistence**, 25 registered binary-report bases; job **8646 succeeded**. [Completed reader comparison and interpretation limits](temporal_sigreg.md#completed-causal-reader-comparison). [Earlier 18-checkpoint comparison](../benchmark_results/accuracy-temporal-moments-20260920/) retains the prior matched and historical evidence.
 - Evaluation job **8480 succeeded**, nine models in **26.845s**. Original six models: job **8444 succeeded**, each 233–268s. Missing full/none trained in **237.02s**.
 - Five new fixed-1400 runs completed: projected ±SIGReg **276.06/280.62s**, conditional CF decoupled/full **243.97/242.36s**, 16D projected **247.11s**. Training jobs **8494/8495/8512/8513/8521**; all old endpoints reused.
 - Full/none job **8476** failed only in post-training validation of omitted Serde defaults. Validator corrected; saved endpoint independently authenticated and scored without retraining. Original failed receipt preserved; [reverification provenance](../benchmark_results/accuracy-decoupled-comparison-20260920-assets/control-endpoint-reverification.json).
-- New campaigns use one bounded queue job per model, fixed update budget, 420s watchdog; extending a matched campaign reuses authenticated endpoints.
+- Campaigns use one exclusive normal-priority queue job per model and a fixed update budget; reader arms use a 900s watchdog (+30s queue grace). Extending campaigns reuses authenticated historical endpoints, never the differently normalized model as the reader-none control.
 - [Frozen residual diagnosis](../benchmark_results/temporal-moment-witness-20260920-full-none/): train-only tuned/refitted fixed instruments and frozen-state corrections worsen the leader's close score to **0.977356 / 0.977343**, from 0.975143. Neither is promoted. Job **8570 succeeded**; all 46 emitted binary report bases are registered for the TUI.
 - Four moment/direct-MSE arms completed in **263.60 / 252.23 / 252.04 / 247.32s**, jobs **8574–8577**. Collector **8578** then failed on relocated-validator certificate path resolution; dependent accuracy **8583** was skipped. [Explicit revalidation](../benchmark_results/lejepa-campaigns/temporal-moments1400-20260920/arms/collect-revalidated.json) authenticated all 14 collection endpoints and the corrected validator without retraining or overwriting the original failure; [execution provenance](../benchmark_results/temporal-moments-20260920-assets/execution.json).
 - All four treatment witness jobs **8584–8587** succeeded. Both fixed and state corrections worsen every treatment's aggregate validation score; five witness runs each emit the same 46 registered report bases. Exact correction scores and report links are in the completed experiment.
+- Reader jobs **8640–8643** completed in **256.07 / 251.17 / 259.49 / 259.14s**; collector **8644** authenticated 18 endpoints. Reference probes **8647**, corrected-provenance diagnostic **8648**, and controlled memory **8649** all succeeded. All five frozen panels emitted ten registered delayed bases, 2048 validation rows at every delay. [Execution provenance](../benchmark_results/reader-sigreg-20260920-assets/execution.json).
+- Clean unanchored GPU contracts8743 passed 38/38; market8757–8760, collector8761 and memory8752 succeeded. Prior market8747–8749 warmup OOMs (external26.04GiB process), completed8750, test failures and skipped dependencies are preserved, not silently replaced. [Execution and exact plans](../benchmark_results/unanchored-sigreg-20260920-assets/execution.json).
 
 ## Active question
 
-**Decision: retain full/none forecasting-only, with both new auxiliary weights zero.** Neither training-time conditional mean moments nor direct decision-MSE reweighting beats its **0.975143** aggregate score. Moment weight 0.5 improves h8/h128/h192, but sacrifices other horizons; higher IC alone does not satisfy the price-error criterion. Train-only residual corrections fail to transfer for the leader and all four treatments. The active question is whether residual structure can be shown to transfer across additional predeclared chronological development regimes before imposing stronger conditional constraints—not whether the latent distribution can be made more Gaussian. No global-optimum, significance or no-signal claim.
+**Retain the measured supervised forecasting leader: 0.975143, `reader_norm=rms`, `sigreg_placement=off`.** The clean tests now establish that local SIGReg improves old-cue accessibility in the controlled task without downstream anchoring, but not market prediction under the matched frozen-reader protocol. State's small market advantage does not establish a robust edge. The unresolved question is how an unanchored temporal objective preserves weak market-relevant information, rather than merely Gaussian geometry or synthetic memory. [Clean results and limitations](temporal_sigreg.md#clean-market-protocol-and-operational-evidence).
