@@ -1,0 +1,997 @@
+{
+  "schema": "unanchored-sigreg-execution-v1",
+  "campaign": "unanchored-sigreg1400-20260920",
+  "objective": "fresh attached-target temporal JEPA + selected reader SIGReg; no downstream gradients, no gradient surgery",
+  "placements": [
+    "off",
+    "local",
+    "state",
+    "both"
+  ],
+  "pretrain_steps": 1400,
+  "memory_steps_per_task": 1024,
+  "seed": 20260919,
+  "frozen_reader_protocol": {
+    "fit_rows": 4096,
+    "validation_rows": 2048,
+    "horizons": [
+      16,
+      32,
+      64,
+      128,
+      192
+    ],
+    "target": "raw close log returns",
+    "primary": "mean frozen full-state ridge MSE / zero-return persistence MSE",
+    "selection": "train-only chronological penalty selection, then refit and held-out scoring",
+    "direction": "nonzero targets, zero prediction counts as miss"
+  },
+  "queue_policy": {
+    "priority": 0,
+    "max_parallel_runs": 1,
+    "max_attempts": 1,
+    "train_watchdog_seconds": 900
+  },
+  "campaign_refusals": [
+    {
+      "case": "missing arm",
+      "reason": "temporal-unanchored-sigreg requires exactly four fresh unanchored-none/local/state/both arms"
+    },
+    {
+      "case": "reused supervised reference",
+      "reason": "unanchored suite requires fresh initialization of all arms; supervised or inherited endpoints cannot qualify"
+    },
+    {
+      "case": "recovered supervised endpoint",
+      "reason": "unanchored suite requires fresh initialization of all arms; supervised or inherited endpoints cannot qualify"
+    },
+    {
+      "case": "shortened schedule",
+      "reason": "unanchored suite requires the fixed 1400-step B256 seed20260919 fit4096/score2048 protocol"
+    },
+    {
+      "case": "wrong probe cohort",
+      "reason": "unanchored suite requires the fixed 1400-step B256 seed20260919 fit4096/score2048 protocol"
+    },
+    {
+      "case": "anchored objective",
+      "reason": "unanchored-none: unsupported objective/recipe treatment"
+    },
+    {
+      "case": "normalized reader",
+      "reason": "unanchored-none: reader normalization or SIGReg placement differs from its named treatment"
+    },
+    {
+      "case": "extra warmstart",
+      "reason": "unanchored-none: command differs from the exact fresh unanchored protocol (no warmstarts or extra objectives)"
+    },
+    {
+      "case": "downstream loss mutation",
+      "reason": "unanchored immutable pretraining/frozen-reader contract differs"
+    },
+    {
+      "case": "target detach mutation",
+      "reason": "unanchored immutable pretraining/frozen-reader contract differs"
+    },
+    {
+      "case": "extra reconstruction",
+      "reason": "unanchored-none: command differs from the exact fresh unanchored protocol (no warmstarts or extra objectives)"
+    },
+    {
+      "case": "changed normalization geometry",
+      "reason": "unanchored suite requires the exact shared D512x8 context6000 patch16 pred192 configuration"
+    }
+  ],
+  "legacy_authentication": {
+    "plan_sha256": "948821c4b5f65648dd0d56395d8a0b8aae5ea2b057f03ad16151aa0f62fe0fa1",
+    "endpoints": [
+      "reader-none",
+      "reader-local",
+      "reader-state",
+      "reader-both"
+    ]
+  },
+  "assets": {
+    "trainer": {
+      "path": "/home/marvin/Documents/repositories/trading_bot_0/benchmark_results/unanchored-sigreg-20260920-assets/trading_bot_0",
+      "source": "/home/marvin/Documents/repositories/trading_bot_0/target/release/trading_bot_0",
+      "sha256": "7c09177b4a7dadfa61dc4d392306b47ed37724125cb968f0f55b8af2e9321d33"
+    },
+    "report_cli": {
+      "path": "/home/marvin/Documents/repositories/trading_bot_0/benchmark_results/unanchored-sigreg-20260920-assets/report_cli",
+      "source": "/home/marvin/Documents/repositories/trading_bot_0/target/release/report_cli",
+      "sha256": "d01af23fc1eef2d87c7c712803102d0afb6e36f0bd41805558a1da671c5bc086"
+    },
+    "tests": {
+      "path": "/home/marvin/Documents/repositories/trading_bot_0/benchmark_results/unanchored-sigreg-20260920-assets/library-tests",
+      "source": "/var/tmp/cargo-build/a0/1fb30e0f0e2b3c/release/build/trading_bot_0/735888772b722b5a/out/trading_bot_0-735888772b722b5a",
+      "sha256": "941e157ef1b42169497cfebb43f599b880878180374d855bdb1c384e8c7cb51e"
+    },
+    "tests_v2": {
+      "path": "/home/marvin/Documents/repositories/trading_bot_0/benchmark_results/unanchored-sigreg-20260920-assets/library-tests-v2",
+      "source": "/var/tmp/cargo-build/a0/1fb30e0f0e2b3c/release/build/trading_bot_0/735888772b722b5a/out/trading_bot_0-735888772b722b5a",
+      "sha256": "fe0b0e3becb7322888da9952781b49a03e07956bee59ffc6914397f9f8ceb5fe"
+    },
+    "trainer_v2": {
+      "path": "/home/marvin/Documents/repositories/trading_bot_0/benchmark_results/unanchored-sigreg-20260920-assets/trading_bot_0-v2",
+      "source": "/home/marvin/Documents/repositories/trading_bot_0/target/release/trading_bot_0",
+      "sha256": "a2e49f0639443c00eebc977a881b5c241593ff134d2e0c8826c8119a6dca76f2"
+    },
+    "tests_v3": {
+      "path": "/home/marvin/Documents/repositories/trading_bot_0/benchmark_results/unanchored-sigreg-20260920-assets/library-tests-v3",
+      "source": "/var/tmp/cargo-build/a0/1fb30e0f0e2b3c/release/build/trading_bot_0/735888772b722b5a/out/trading_bot_0-735888772b722b5a",
+      "sha256": "c2ab4923041d758878ffabd67fd2a53f015706131691e4ee7f3a817eb058ee47"
+    }
+  },
+  "contract_job": {
+    "id": 8711,
+    "name": "unanchored-sigreg-contracts-20260920",
+    "state": "queued",
+    "eligibility": "waiting_for_slot",
+    "maxParallelRuns": 1,
+    "priority": 0,
+    "cwd": "/home/marvin/Documents/repositories/trading_bot_0",
+    "args": [
+      "/home/marvin/Documents/repositories/trading_bot_0/benchmark_results/unanchored-sigreg-20260920-assets/library-tests",
+      "torch::timexer_segment::jepa::tests",
+      "torch::timexer_segment::jepa_eval::tests",
+      "torch::timexer_segment::model::tests::unanchored_",
+      "torch::timexer_segment::model::tests::cuda_unanchored_",
+      "torch::timexer_segment::model::tests::reader_",
+      "torch::timexer_segment::model::tests::cuda_reader_",
+      "torch::timexer_segment::model::tests::cuda_jepa_",
+      "torch::timexer_segment::accuracy::tests",
+      "torch::timexer_segment::jepa_memory::tests",
+      "--test-threads=1"
+    ],
+    "maxAttempts": 1,
+    "retryDelayMs": 0,
+    "timeLimitMs": 300000,
+    "readySequence": 8061,
+    "attemptCount": 0,
+    "createdAt": 1789952868894,
+    "updatedAt": 1789952868894,
+    "attempts": []
+  },
+  "compile": {
+    "cargo_check": "trading_bot_0,shared,report_cli,trading-bot-tui passed",
+    "release_build": "trading_bot_0,report_cli and lib tests compiled",
+    "log": "artifact://591"
+  },
+  "cli_checks": {
+    "train-timexer-segment": [
+      "unanchored",
+      "--reader-norm",
+      "--sigreg-placement"
+    ],
+    "benchmark-jepa-memory": [
+      "--unanchored-sigreg"
+    ],
+    "conflicting-memory-modes": "error: the argument '--unanchored-sigreg' cannot be used with '--reader-sigreg'\n\nUsage: trading_bot_0 benchmark-jepa-memory --output <OUTPUT> --unanchored-sigreg\n\nFor more information, try '--help'."
+  },
+  "initial_contract_failure": {
+    "job": 8711,
+    "passed": 35,
+    "failed": 3,
+    "log": "benchmark_results/unanchored-sigreg-20260920-assets/contracts-8711.log",
+    "root_cause_hypothesis": "test-only differentiable parameter snapshots created default-stream AccumulateGrad nodes before side-stream capture; detached observation copies remove that graph ownership",
+    "correction": "test snapshots only; no JEPA stop-gradient added",
+    "root_cause_confirmed": "test-only differentiable snapshots bound leaf AccumulateGrad nodes to the default stream; detach().copy() snapshots allow capture (observed in job8720)"
+  },
+  "corrected_contract_job": {
+    "id": 8720,
+    "name": "unanchored-sigreg-contracts-v2-20260920",
+    "state": "queued",
+    "eligibility": "backfill_window_open: job 8715",
+    "maxParallelRuns": 1,
+    "priority": 0,
+    "cwd": "/home/marvin/Documents/repositories/trading_bot_0",
+    "args": [
+      "/home/marvin/Documents/repositories/trading_bot_0/benchmark_results/unanchored-sigreg-20260920-assets/library-tests-v2",
+      "torch::timexer_segment::jepa::tests",
+      "torch::timexer_segment::jepa_eval::tests",
+      "torch::timexer_segment::model::tests::unanchored_",
+      "torch::timexer_segment::model::tests::cuda_unanchored_",
+      "torch::timexer_segment::model::tests::reader_",
+      "torch::timexer_segment::model::tests::cuda_reader_",
+      "torch::timexer_segment::model::tests::cuda_jepa_",
+      "torch::timexer_segment::accuracy::tests",
+      "torch::timexer_segment::jepa_memory::tests",
+      "--test-threads=1"
+    ],
+    "maxAttempts": 1,
+    "retryDelayMs": 0,
+    "timeLimitMs": 300000,
+    "readySequence": 8066,
+    "attemptCount": 0,
+    "createdAt": 1789953425580,
+    "updatedAt": 1789953425580,
+    "attempts": []
+  },
+  "reviews": {
+    "gradient": "No blockers; gradient routes, frozen forecast parameters, masks, placement RNG, graph integration, checkpoint freeze verified by reviewer",
+    "protocol": "No blockers after reviewer withdrew cross-lag leakage claim: independent per-output ridge coefficients/penalties; same-lag intervals disjoint under source purge",
+    "accepted_fixes": [
+      "Detach test-only observation snapshots before side-stream capture (no JEPA gradient detachment)",
+      "Use Display CLI spellings in frozen-probe titles"
+    ],
+    "interpretation_limits": [
+      "Retrospective recall can share historical input windows; it is not future prediction or evidence of stored memory alone",
+      "One seed and fixed finite reader capacity; no statistical significance or absence-of-information claim"
+    ]
+  },
+  "plan_command": [
+    "python3",
+    "benchmarks/lejepa_campaign.py",
+    "plan",
+    "--executable",
+    "/home/marvin/Documents/repositories/trading_bot_0/benchmark_results/unanchored-sigreg-20260920-assets/trading_bot_0-v2",
+    "--report-cli",
+    "/home/marvin/Documents/repositories/trading_bot_0/benchmark_results/unanchored-sigreg-20260920-assets/report_cli",
+    "--data-dir",
+    "long_data/bars",
+    "--data-contract",
+    "/home/marvin/Documents/repositories/trading_bot_0/benchmark_results/lejepa-campaigns/temporal-moments1400-20260920/pinned/expected-data-contract.json",
+    "--output-root",
+    "benchmark_results/lejepa-campaigns",
+    "--campaign",
+    "unanchored-sigreg1400-20260920",
+    "--suite",
+    "temporal-unanchored-sigreg",
+    "--max-steps",
+    "1400",
+    "--seed",
+    "20260919",
+    "--batch-size",
+    "256",
+    "--eval-every",
+    "350",
+    "--eval-origins",
+    "2048",
+    "--probe-fit-origins",
+    "4096",
+    "--eval-batch-size",
+    "64",
+    "--arm-timeout-seconds",
+    "900",
+    "--env",
+    "LD_LIBRARY_PATH=/home/marvin/Documents/repositories/trading_bot_0/.venv-fa4/lib/python3.14/site-packages/torch/lib",
+    "--env",
+    "PATH=/home/marvin/Documents/repositories/trading_bot_0/.venv-fa4/bin:/home/marvin/.local/share/mise/installs/bun/latest/bin:/home/marvin/.local/share/mise/installs/claude/2.1.263:/home/marvin/.local/share/mise/installs/fnox/latest:/home/marvin/.local/share/mise/installs/gemini-cli/latest/bin:/home/marvin/.local/share/mise/installs/node/20.19.6/bin:/home/marvin/.local/share/mise/installs/oxfmt/0.46.0/bin:/home/marvin/.local/share/mise/installs/oxlint/latest/bin:/home/marvin/.local/share/mise/installs/ubi-sst-opencode/1.0.129:/home/marvin/.local/share/mise/shims:/home/linuxbrew/.linuxbrew/bin:/home/marvin/.grok/bin:/home/marvin/.fly/bin:/home/marvin/go/bin:/home/marvin/.opencode/bin:/home/marvin/.cargo/bin:/home/marvin/.bun/bin:/usr/local/NVIDIA-Nsight-Compute:/opt/cuda/bin:/home/marvin/.local/bin:/home/marvin/.config/orca/linux-orca-cli-shim:/usr/local/bin:/usr/bin:/usr/bin/site_perl:/usr/bin/vendor_perl:/usr/bin/core_perl:/usr/lib/rustup/bin:/home/marvin/.nvm/versions/node/v20.19.4/bin:/home/marvin/.volta/bin:/home/marvin/.asdf/shims:/home/marvin/.fnm/aliases/default/bin:/home/marvin/.local/share/pnpm:/home/marvin/.yarn/bin:/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/sbin:/snap/bin:/nix/var/nix/profiles/default/bin:/home/marvin/bin:/home/marvin/.nix-profile/bin:/home/marvin/.vite-plus/bin",
+    "--env",
+    "PYO3_PYTHON=/home/marvin/Documents/repositories/trading_bot_0/.venv-fa4/bin/python",
+    "--env",
+    "PYTHONPATH=/home/marvin/Documents/repositories/trading_bot_0/.venv-fa4/lib/python3.14/site-packages",
+    "--env",
+    "PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True",
+    "--env",
+    "VIRTUAL_ENV=/home/marvin/Documents/repositories/trading_bot_0/.venv-fa4"
+  ],
+  "plan_sha256": "1e9594212b071ac9fadc9ed0724d39421372394bc33079206708ccfa3d65931c",
+  "reviewed_build": "artifact://615",
+  "model_jobs": [
+    {
+      "id": 8734,
+      "task": "unanchored-none",
+      "submitted_at": "2026-09-21T01:34:04.360145+00:00",
+      "plan_sha256": "1e9594212b071ac9fadc9ed0724d39421372394bc33079206708ccfa3d65931c",
+      "idempotency_key": "lejepa-1e9594212b071ac9fadc9ed0724d39421372394bc33079206708ccfa3d65931c-unanchored-none",
+      "request_sha256": "b372734a7f0bc010f4e24833cd622d5850320378cdcd18c1e59b63c721b7ddf9",
+      "after_success": [
+        8720
+      ]
+    },
+    {
+      "id": 8735,
+      "task": "unanchored-local",
+      "submitted_at": "2026-09-21T01:34:04.381546+00:00",
+      "plan_sha256": "1e9594212b071ac9fadc9ed0724d39421372394bc33079206708ccfa3d65931c",
+      "idempotency_key": "lejepa-1e9594212b071ac9fadc9ed0724d39421372394bc33079206708ccfa3d65931c-unanchored-local",
+      "request_sha256": "0fa334afb24608120468fad5267b8cb2605c84a2482456c5066e3eeaac2270a6",
+      "after_success": [
+        8720
+      ]
+    },
+    {
+      "id": 8736,
+      "task": "unanchored-state",
+      "submitted_at": "2026-09-21T01:34:04.403625+00:00",
+      "plan_sha256": "1e9594212b071ac9fadc9ed0724d39421372394bc33079206708ccfa3d65931c",
+      "idempotency_key": "lejepa-1e9594212b071ac9fadc9ed0724d39421372394bc33079206708ccfa3d65931c-unanchored-state",
+      "request_sha256": "e3ee703b9aaf04bf4f3a30fa7ced281836448e4aed94d0465708a8964fade899",
+      "after_success": [
+        8720
+      ]
+    },
+    {
+      "id": 8737,
+      "task": "unanchored-both",
+      "submitted_at": "2026-09-21T01:34:04.425631+00:00",
+      "plan_sha256": "1e9594212b071ac9fadc9ed0724d39421372394bc33079206708ccfa3d65931c",
+      "idempotency_key": "lejepa-1e9594212b071ac9fadc9ed0724d39421372394bc33079206708ccfa3d65931c-unanchored-both",
+      "request_sha256": "df222d81a1461da5c6601104bb4214d0c2ca832e137bd8fbfd7a366bafea8d0e",
+      "after_success": [
+        8720
+      ]
+    }
+  ],
+  "collector_job": {
+    "id": 8738,
+    "task": "collect",
+    "submitted_at": "2026-09-21T01:34:04.451520+00:00",
+    "plan_sha256": "1e9594212b071ac9fadc9ed0724d39421372394bc33079206708ccfa3d65931c",
+    "idempotency_key": "lejepa-1e9594212b071ac9fadc9ed0724d39421372394bc33079206708ccfa3d65931c-collect",
+    "request_sha256": "823fa7580068edc38443debd50358ed7ca36af8839937dca7d6674dcd8f49d87",
+    "after_success": [
+      8734,
+      8735,
+      8736,
+      8737
+    ]
+  },
+  "memory_job": {
+    "id": 8739,
+    "name": "unanchored-sigreg-memory-20260920",
+    "state": "queued",
+    "eligibility": "waiting_for_dependencies: jobs [8720]",
+    "maxParallelRuns": 1,
+    "priority": 0,
+    "cwd": "/home/marvin/Documents/repositories/trading_bot_0",
+    "args": [
+      "/home/marvin/Documents/repositories/trading_bot_0/benchmark_results/unanchored-sigreg-20260920-assets/trading_bot_0-v2",
+      "benchmark-jepa-memory",
+      "--unanchored-sigreg",
+      "--output",
+      "benchmark_results/unanchored-sigreg-memory-20260920",
+      "--steps",
+      "1024",
+      "--batch-size",
+      "64",
+      "--validation-pairs",
+      "256",
+      "--eval-every",
+      "128",
+      "--seed",
+      "20260919",
+      "--learning-rate",
+      "0.001"
+    ],
+    "maxAttempts": 1,
+    "retryDelayMs": 0,
+    "timeLimitMs": 600000,
+    "attemptCount": 0,
+    "createdAt": 1789954444464,
+    "updatedAt": 1789954444464,
+    "dependencies": [
+      {
+        "parent": 8720,
+        "condition": "succeeded",
+        "parentState": "queued"
+      }
+    ],
+    "attempts": []
+  },
+  "memory_command": [
+    "/home/marvin/Documents/repositories/trading_bot_0/benchmark_results/unanchored-sigreg-20260920-assets/trading_bot_0-v2",
+    "benchmark-jepa-memory",
+    "--unanchored-sigreg",
+    "--output",
+    "benchmark_results/unanchored-sigreg-memory-20260920",
+    "--steps",
+    "1024",
+    "--batch-size",
+    "64",
+    "--validation-pairs",
+    "256",
+    "--eval-every",
+    "128",
+    "--seed",
+    "20260919",
+    "--learning-rate",
+    "0.001"
+  ],
+  "submission": "existing submit_job helper with authenticated --after-success GPU contract8720 on each independent workload",
+  "second_contract_failure": {
+    "job": 8720,
+    "passed": 36,
+    "failed": 2,
+    "log": "benchmark_results/unanchored-sigreg-20260920-assets/contracts-8720.log",
+    "outcome": "graph capture now succeeds; remaining decomposition assertions compared FP32 tensor sums via FP64 host subtraction with absolute1e-5 tolerance",
+    "correction": "compare exact FP32 tensor arithmetic instead; stronger bitwise decomposition assertion",
+    "skipped_dependent_jobs": [
+      8734,
+      8735,
+      8736,
+      8737,
+      8738,
+      8739
+    ],
+    "no_training_started": true
+  },
+  "final_contract_job": {
+    "id": 8743,
+    "name": "unanchored-sigreg-contracts-v3-20260920",
+    "state": "queued",
+    "eligibility": "waiting_for_higher_priority: job 8742 (pri 1)",
+    "maxParallelRuns": 1,
+    "priority": 0,
+    "cwd": "/home/marvin/Documents/repositories/trading_bot_0",
+    "args": [
+      "/home/marvin/Documents/repositories/trading_bot_0/benchmark_results/unanchored-sigreg-20260920-assets/library-tests-v3",
+      "torch::timexer_segment::jepa::tests",
+      "torch::timexer_segment::jepa_eval::tests",
+      "torch::timexer_segment::model::tests::unanchored_",
+      "torch::timexer_segment::model::tests::cuda_unanchored_",
+      "torch::timexer_segment::model::tests::reader_",
+      "torch::timexer_segment::model::tests::cuda_reader_",
+      "torch::timexer_segment::model::tests::cuda_jepa_",
+      "torch::timexer_segment::accuracy::tests",
+      "torch::timexer_segment::jepa_memory::tests",
+      "--test-threads=1"
+    ],
+    "maxAttempts": 1,
+    "retryDelayMs": 0,
+    "timeLimitMs": 60000,
+    "readySequence": 8079,
+    "attemptCount": 0,
+    "createdAt": 1789954894986,
+    "updatedAt": 1789954894986,
+    "attempts": []
+  },
+  "contract_result": {
+    "job": 8743,
+    "passed": 38,
+    "failed": 0,
+    "ignored": 0,
+    "test_runtime_seconds": 3.21
+  },
+  "final_campaign": "unanchored-sigreg1400-20260920-v3",
+  "final_plan_command": [
+    "python3",
+    "benchmarks/lejepa_campaign.py",
+    "plan",
+    "--executable",
+    "/home/marvin/Documents/repositories/trading_bot_0/benchmark_results/unanchored-sigreg-20260920-assets/trading_bot_0-v2",
+    "--report-cli",
+    "/home/marvin/Documents/repositories/trading_bot_0/benchmark_results/unanchored-sigreg-20260920-assets/report_cli",
+    "--data-dir",
+    "long_data/bars",
+    "--data-contract",
+    "/home/marvin/Documents/repositories/trading_bot_0/benchmark_results/lejepa-campaigns/temporal-moments1400-20260920/pinned/expected-data-contract.json",
+    "--output-root",
+    "benchmark_results/lejepa-campaigns",
+    "--campaign",
+    "unanchored-sigreg1400-20260920-v3",
+    "--suite",
+    "temporal-unanchored-sigreg",
+    "--max-steps",
+    "1400",
+    "--seed",
+    "20260919",
+    "--batch-size",
+    "256",
+    "--eval-every",
+    "350",
+    "--eval-origins",
+    "2048",
+    "--probe-fit-origins",
+    "4096",
+    "--eval-batch-size",
+    "64",
+    "--arm-timeout-seconds",
+    "900",
+    "--env",
+    "LD_LIBRARY_PATH=/home/marvin/Documents/repositories/trading_bot_0/.venv-fa4/lib/python3.14/site-packages/torch/lib",
+    "--env",
+    "PATH=/home/marvin/Documents/repositories/trading_bot_0/.venv-fa4/bin:/home/marvin/.local/share/mise/installs/bun/latest/bin:/home/marvin/.local/share/mise/installs/claude/2.1.263:/home/marvin/.local/share/mise/installs/fnox/latest:/home/marvin/.local/share/mise/installs/gemini-cli/latest/bin:/home/marvin/.local/share/mise/installs/node/20.19.6/bin:/home/marvin/.local/share/mise/installs/oxfmt/0.46.0/bin:/home/marvin/.local/share/mise/installs/oxlint/latest/bin:/home/marvin/.local/share/mise/installs/ubi-sst-opencode/1.0.129:/home/marvin/.local/share/mise/shims:/home/linuxbrew/.linuxbrew/bin:/home/marvin/.grok/bin:/home/marvin/.fly/bin:/home/marvin/go/bin:/home/marvin/.opencode/bin:/home/marvin/.cargo/bin:/home/marvin/.bun/bin:/usr/local/NVIDIA-Nsight-Compute:/opt/cuda/bin:/home/marvin/.local/bin:/home/marvin/.config/orca/linux-orca-cli-shim:/usr/local/bin:/usr/bin:/usr/bin/site_perl:/usr/bin/vendor_perl:/usr/bin/core_perl:/usr/lib/rustup/bin:/home/marvin/.nvm/versions/node/v20.19.4/bin:/home/marvin/.volta/bin:/home/marvin/.asdf/shims:/home/marvin/.fnm/aliases/default/bin:/home/marvin/.local/share/pnpm:/home/marvin/.yarn/bin:/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/sbin:/snap/bin:/nix/var/nix/profiles/default/bin:/home/marvin/bin:/home/marvin/.nix-profile/bin:/home/marvin/.vite-plus/bin",
+    "--env",
+    "PYO3_PYTHON=/home/marvin/Documents/repositories/trading_bot_0/.venv-fa4/bin/python",
+    "--env",
+    "PYTHONPATH=/home/marvin/Documents/repositories/trading_bot_0/.venv-fa4/lib/python3.14/site-packages",
+    "--env",
+    "PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True",
+    "--env",
+    "VIRTUAL_ENV=/home/marvin/Documents/repositories/trading_bot_0/.venv-fa4"
+  ],
+  "final_plan_sha256": "444214e066e7e433403b07c5f4eb0f5a900be39ac26028144df73591bc8ef34e",
+  "final_model_jobs": {
+    "unanchored-none": {
+      "after_success": [],
+      "id": 8757,
+      "idempotency_key": "lejepa-444214e066e7e433403b07c5f4eb0f5a900be39ac26028144df73591bc8ef34e-unanchored-none",
+      "plan_sha256": "444214e066e7e433403b07c5f4eb0f5a900be39ac26028144df73591bc8ef34e",
+      "request_sha256": "1d953a3e82678b2e14b539f591579af9bfe7297a1f1f572ad8b665f108bde1d5",
+      "submitted_at": "2026-09-21T02:11:02.418673+00:00",
+      "task": "unanchored-none"
+    },
+    "unanchored-local": {
+      "after_success": [],
+      "id": 8758,
+      "idempotency_key": "lejepa-444214e066e7e433403b07c5f4eb0f5a900be39ac26028144df73591bc8ef34e-unanchored-local",
+      "plan_sha256": "444214e066e7e433403b07c5f4eb0f5a900be39ac26028144df73591bc8ef34e",
+      "request_sha256": "258973338d8002dab6827f21295fae638a44b61dad0e7975844c05d811e2fa78",
+      "submitted_at": "2026-09-21T02:11:02.441784+00:00",
+      "task": "unanchored-local"
+    },
+    "unanchored-state": {
+      "after_success": [],
+      "id": 8759,
+      "idempotency_key": "lejepa-444214e066e7e433403b07c5f4eb0f5a900be39ac26028144df73591bc8ef34e-unanchored-state",
+      "plan_sha256": "444214e066e7e433403b07c5f4eb0f5a900be39ac26028144df73591bc8ef34e",
+      "request_sha256": "b934904392bedb1bf7f36a1525c0877c62d274ed17867b55a690df7f4a394372",
+      "submitted_at": "2026-09-21T02:11:02.463868+00:00",
+      "task": "unanchored-state"
+    },
+    "unanchored-both": {
+      "after_success": [],
+      "id": 8760,
+      "idempotency_key": "lejepa-444214e066e7e433403b07c5f4eb0f5a900be39ac26028144df73591bc8ef34e-unanchored-both",
+      "plan_sha256": "444214e066e7e433403b07c5f4eb0f5a900be39ac26028144df73591bc8ef34e",
+      "request_sha256": "2e4124b710b274f7445b68bad5ccb9beff04fe6b31c7553cb0b411a0a670f126",
+      "submitted_at": "2026-09-21T02:11:02.485447+00:00",
+      "task": "unanchored-both"
+    }
+  },
+  "final_collector_job": {
+    "after_success": [
+      8757,
+      8758,
+      8759,
+      8760
+    ],
+    "id": 8761,
+    "idempotency_key": "lejepa-444214e066e7e433403b07c5f4eb0f5a900be39ac26028144df73591bc8ef34e-collect",
+    "plan_sha256": "444214e066e7e433403b07c5f4eb0f5a900be39ac26028144df73591bc8ef34e",
+    "request_sha256": "94ae3f2c2af47720b90a490d91a62da51b3a57ccb533ef95a18d4da447b2c84e",
+    "submitted_at": "2026-09-21T02:11:02.507406+00:00",
+    "task": "collect"
+  },
+  "final_memory_job": {
+    "id": 8752,
+    "name": "unanchored-sigreg-memory-v2-20260920",
+    "state": "queued",
+    "eligibility": "backfill_window_open: job 8747",
+    "maxParallelRuns": 1,
+    "priority": 0,
+    "cwd": "/home/marvin/Documents/repositories/trading_bot_0",
+    "args": [
+      "/home/marvin/Documents/repositories/trading_bot_0/benchmark_results/unanchored-sigreg-20260920-assets/trading_bot_0-v2",
+      "benchmark-jepa-memory",
+      "--unanchored-sigreg",
+      "--output",
+      "benchmark_results/unanchored-sigreg-memory-20260920",
+      "--steps",
+      "1024",
+      "--batch-size",
+      "64",
+      "--validation-pairs",
+      "256",
+      "--eval-every",
+      "128",
+      "--seed",
+      "20260919",
+      "--learning-rate",
+      "0.001"
+    ],
+    "maxAttempts": 1,
+    "retryDelayMs": 0,
+    "timeLimitMs": 600000,
+    "readySequence": 8087,
+    "attemptCount": 0,
+    "createdAt": 1789956137346,
+    "updatedAt": 1789956137346,
+    "dependencies": [
+      {
+        "parent": 8743,
+        "condition": "succeeded",
+        "parentState": "succeeded",
+        "resolution": "satisfied",
+        "parentOutcome": "succeeded",
+        "resolvedAt": 1789956137346
+      }
+    ],
+    "attempts": []
+  },
+  "market_resource_failure": {
+    "campaign": "unanchored-sigreg1400-20260920-v2",
+    "failed_jobs": [
+      8747,
+      8748,
+      8749
+    ],
+    "failure": "CUDA OOM during first warmup: competing PID4132374 held26.04GiB; own process2.02GiB; <=114MiB free",
+    "successful_job": 8750,
+    "competing_process_exit_observed": true,
+    "recovery_decision": "rerun complete identical four-arm cohort under fresh names; preserve all failures and successful endpoint; no batch/precision/budget/objective changes"
+  },
+  "completed_memory": {
+    "job": 8752,
+    "completion": "benchmark_results/unanchored-sigreg-memory-20260920/memory-completion.json",
+    "all8_tasks_completed_1024": true,
+    "all_parameter_snapshots_unchanged": true,
+    "all_paired_recent_inputs_equal": true,
+    "registered_report_bases": [
+      "timexer_segment_jepa_memory_bayes_regret",
+      "timexer_segment_jepa_memory_correlation",
+      "timexer_segment_jepa_memory_error",
+      "timexer_segment_jepa_memory_frozen",
+      "timexer_segment_jepa_memory_input_equality",
+      "timexer_segment_jepa_memory_objective",
+      "timexer_segment_jepa_memory_pair_effect",
+      "timexer_segment_jepa_memory_pair_error",
+      "timexer_segment_jepa_memory_pair_sign",
+      "timexer_segment_jepa_memory_population",
+      "timexer_segment_jepa_memory_ratio",
+      "timexer_segment_jepa_memory_reader_fit",
+      "timexer_segment_jepa_memory_reader_penalty",
+      "timexer_segment_jepa_memory_reader_spectrum",
+      "timexer_segment_jepa_memory_runtime",
+      "timexer_segment_jepa_memory_state"
+    ],
+    "decision": "local SIGReg improves frozen-reader old-cue accessibility; state and split do not beat JEPA-only control on paired-effect error; no market claim"
+  },
+  "completed_outcomes": {
+    "8743": {
+      "id": 8743,
+      "name": "unanchored-sigreg-contracts-v3-20260920",
+      "state": "succeeded",
+      "maxParallelRuns": 1,
+      "priority": 0,
+      "cwd": "/home/marvin/Documents/repositories/trading_bot_0",
+      "args": [
+        "/home/marvin/Documents/repositories/trading_bot_0/benchmark_results/unanchored-sigreg-20260920-assets/library-tests-v3",
+        "torch::timexer_segment::jepa::tests",
+        "torch::timexer_segment::jepa_eval::tests",
+        "torch::timexer_segment::model::tests::unanchored_",
+        "torch::timexer_segment::model::tests::cuda_unanchored_",
+        "torch::timexer_segment::model::tests::reader_",
+        "torch::timexer_segment::model::tests::cuda_reader_",
+        "torch::timexer_segment::model::tests::cuda_jepa_",
+        "torch::timexer_segment::accuracy::tests",
+        "torch::timexer_segment::jepa_memory::tests",
+        "--test-threads=1"
+      ],
+      "maxAttempts": 1,
+      "retryDelayMs": 0,
+      "timeLimitMs": 60000,
+      "readySequence": 8079,
+      "attemptCount": 1,
+      "createdAt": 1789954894986,
+      "updatedAt": 1789956098222,
+      "finishedAt": 1789956098222,
+      "attempts": [
+        {
+          "id": 6879,
+          "jobId": 8743,
+          "number": 1,
+          "state": "succeeded",
+          "maxParallelRuns": 1,
+          "exitCode": 0,
+          "createdAt": 1789956093129,
+          "finishedAt": 1789956098222,
+          "logDir": "/home/marvin/.local/state/mlqueue/attempts/6879"
+        }
+      ]
+    },
+    "8752": {
+      "id": 8752,
+      "name": "unanchored-sigreg-memory-v2-20260920",
+      "state": "succeeded",
+      "maxParallelRuns": 1,
+      "priority": 0,
+      "cwd": "/home/marvin/Documents/repositories/trading_bot_0",
+      "args": [
+        "/home/marvin/Documents/repositories/trading_bot_0/benchmark_results/unanchored-sigreg-20260920-assets/trading_bot_0-v2",
+        "benchmark-jepa-memory",
+        "--unanchored-sigreg",
+        "--output",
+        "benchmark_results/unanchored-sigreg-memory-20260920",
+        "--steps",
+        "1024",
+        "--batch-size",
+        "64",
+        "--validation-pairs",
+        "256",
+        "--eval-every",
+        "128",
+        "--seed",
+        "20260919",
+        "--learning-rate",
+        "0.001"
+      ],
+      "maxAttempts": 1,
+      "retryDelayMs": 0,
+      "timeLimitMs": 600000,
+      "readySequence": 8087,
+      "attemptCount": 1,
+      "createdAt": 1789956137346,
+      "updatedAt": 1789956548822,
+      "finishedAt": 1789956548822,
+      "dependencies": [
+        {
+          "parent": 8743,
+          "condition": "succeeded",
+          "parentState": "succeeded",
+          "resolution": "satisfied",
+          "parentOutcome": "succeeded",
+          "resolvedAt": 1789956137346
+        }
+      ],
+      "attempts": [
+        {
+          "id": 6886,
+          "jobId": 8752,
+          "number": 1,
+          "state": "succeeded",
+          "maxParallelRuns": 1,
+          "exitCode": 0,
+          "createdAt": 1789956525728,
+          "finishedAt": 1789956548822,
+          "logDir": "/home/marvin/.local/state/mlqueue/attempts/6886"
+        }
+      ]
+    },
+    "8757": {
+      "id": 8757,
+      "name": "unanchored-sigreg1400-20260920-v3-unanchored-none",
+      "state": "succeeded",
+      "maxParallelRuns": 1,
+      "priority": 0,
+      "cwd": "/home/marvin/Documents/repositories/trading_bot_0",
+      "args": [
+        "/usr/bin/python3.14",
+        "/home/marvin/Documents/repositories/trading_bot_0/benchmark_results/lejepa-campaigns/unanchored-sigreg1400-20260920-v3/pinned/lejepa_campaign.py",
+        "_run-arm",
+        "--plan",
+        "/home/marvin/Documents/repositories/trading_bot_0/benchmark_results/lejepa-campaigns/unanchored-sigreg1400-20260920-v3/plan.json",
+        "--plan-sha256",
+        "444214e066e7e433403b07c5f4eb0f5a900be39ac26028144df73591bc8ef34e",
+        "--arm",
+        "unanchored-none"
+      ],
+      "maxAttempts": 1,
+      "retryDelayMs": 0,
+      "timeLimitMs": 930000,
+      "readySequence": 8089,
+      "attemptCount": 1,
+      "createdAt": 1789956662410,
+      "updatedAt": 1789957261622,
+      "finishedAt": 1789957261622,
+      "attempts": [
+        {
+          "id": 6888,
+          "jobId": 8757,
+          "number": 1,
+          "state": "succeeded",
+          "maxParallelRuns": 1,
+          "exitCode": 0,
+          "createdAt": 1789957006328,
+          "finishedAt": 1789957261622,
+          "logDir": "/home/marvin/.local/state/mlqueue/attempts/6888"
+        }
+      ]
+    },
+    "8758": {
+      "id": 8758,
+      "name": "unanchored-sigreg1400-20260920-v3-unanchored-local",
+      "state": "succeeded",
+      "maxParallelRuns": 1,
+      "priority": 0,
+      "cwd": "/home/marvin/Documents/repositories/trading_bot_0",
+      "args": [
+        "/usr/bin/python3.14",
+        "/home/marvin/Documents/repositories/trading_bot_0/benchmark_results/lejepa-campaigns/unanchored-sigreg1400-20260920-v3/pinned/lejepa_campaign.py",
+        "_run-arm",
+        "--plan",
+        "/home/marvin/Documents/repositories/trading_bot_0/benchmark_results/lejepa-campaigns/unanchored-sigreg1400-20260920-v3/plan.json",
+        "--plan-sha256",
+        "444214e066e7e433403b07c5f4eb0f5a900be39ac26028144df73591bc8ef34e",
+        "--arm",
+        "unanchored-local"
+      ],
+      "maxAttempts": 1,
+      "retryDelayMs": 0,
+      "timeLimitMs": 930000,
+      "readySequence": 8090,
+      "attemptCount": 1,
+      "createdAt": 1789956662436,
+      "updatedAt": 1789957522922,
+      "finishedAt": 1789957522922,
+      "attempts": [
+        {
+          "id": 6889,
+          "jobId": 8758,
+          "number": 1,
+          "state": "succeeded",
+          "maxParallelRuns": 1,
+          "exitCode": 0,
+          "createdAt": 1789957261631,
+          "finishedAt": 1789957522922,
+          "logDir": "/home/marvin/.local/state/mlqueue/attempts/6889"
+        }
+      ]
+    },
+    "8759": {
+      "id": 8759,
+      "name": "unanchored-sigreg1400-20260920-v3-unanchored-state",
+      "state": "succeeded",
+      "maxParallelRuns": 1,
+      "priority": 0,
+      "cwd": "/home/marvin/Documents/repositories/trading_bot_0",
+      "args": [
+        "/usr/bin/python3.14",
+        "/home/marvin/Documents/repositories/trading_bot_0/benchmark_results/lejepa-campaigns/unanchored-sigreg1400-20260920-v3/pinned/lejepa_campaign.py",
+        "_run-arm",
+        "--plan",
+        "/home/marvin/Documents/repositories/trading_bot_0/benchmark_results/lejepa-campaigns/unanchored-sigreg1400-20260920-v3/plan.json",
+        "--plan-sha256",
+        "444214e066e7e433403b07c5f4eb0f5a900be39ac26028144df73591bc8ef34e",
+        "--arm",
+        "unanchored-state"
+      ],
+      "maxAttempts": 1,
+      "retryDelayMs": 0,
+      "timeLimitMs": 930000,
+      "readySequence": 8091,
+      "attemptCount": 1,
+      "createdAt": 1789956662459,
+      "updatedAt": 1789957781523,
+      "finishedAt": 1789957781523,
+      "attempts": [
+        {
+          "id": 6890,
+          "jobId": 8759,
+          "number": 1,
+          "state": "succeeded",
+          "maxParallelRuns": 1,
+          "exitCode": 0,
+          "createdAt": 1789957522929,
+          "finishedAt": 1789957781523,
+          "logDir": "/home/marvin/.local/state/mlqueue/attempts/6890"
+        }
+      ]
+    },
+    "8760": {
+      "id": 8760,
+      "name": "unanchored-sigreg1400-20260920-v3-unanchored-both",
+      "state": "succeeded",
+      "maxParallelRuns": 1,
+      "priority": 0,
+      "cwd": "/home/marvin/Documents/repositories/trading_bot_0",
+      "args": [
+        "/usr/bin/python3.14",
+        "/home/marvin/Documents/repositories/trading_bot_0/benchmark_results/lejepa-campaigns/unanchored-sigreg1400-20260920-v3/pinned/lejepa_campaign.py",
+        "_run-arm",
+        "--plan",
+        "/home/marvin/Documents/repositories/trading_bot_0/benchmark_results/lejepa-campaigns/unanchored-sigreg1400-20260920-v3/plan.json",
+        "--plan-sha256",
+        "444214e066e7e433403b07c5f4eb0f5a900be39ac26028144df73591bc8ef34e",
+        "--arm",
+        "unanchored-both"
+      ],
+      "maxAttempts": 1,
+      "retryDelayMs": 0,
+      "timeLimitMs": 930000,
+      "readySequence": 8092,
+      "attemptCount": 1,
+      "createdAt": 1789956662481,
+      "updatedAt": 1789958039522,
+      "finishedAt": 1789958039522,
+      "attempts": [
+        {
+          "id": 6891,
+          "jobId": 8760,
+          "number": 1,
+          "state": "succeeded",
+          "maxParallelRuns": 1,
+          "exitCode": 0,
+          "createdAt": 1789957781531,
+          "finishedAt": 1789958039522,
+          "logDir": "/home/marvin/.local/state/mlqueue/attempts/6891"
+        }
+      ]
+    },
+    "8761": {
+      "id": 8761,
+      "name": "unanchored-sigreg1400-20260920-v3-collect",
+      "state": "succeeded",
+      "maxParallelRuns": 1,
+      "priority": 0,
+      "cwd": "/home/marvin/Documents/repositories/trading_bot_0",
+      "args": [
+        "/usr/bin/python3.14",
+        "/home/marvin/Documents/repositories/trading_bot_0/benchmark_results/lejepa-campaigns/unanchored-sigreg1400-20260920-v3/pinned/lejepa_campaign.py",
+        "_collect",
+        "--plan",
+        "/home/marvin/Documents/repositories/trading_bot_0/benchmark_results/lejepa-campaigns/unanchored-sigreg1400-20260920-v3/plan.json",
+        "--plan-sha256",
+        "444214e066e7e433403b07c5f4eb0f5a900be39ac26028144df73591bc8ef34e"
+      ],
+      "maxAttempts": 1,
+      "retryDelayMs": 0,
+      "timeLimitMs": 120000,
+      "readySequence": 8100,
+      "attemptCount": 1,
+      "createdAt": 1789956662502,
+      "updatedAt": 1789958295422,
+      "finishedAt": 1789958295422,
+      "dependencies": [
+        {
+          "parent": 8757,
+          "condition": "succeeded",
+          "parentState": "succeeded",
+          "resolution": "satisfied",
+          "parentOutcome": "succeeded",
+          "resolvedAt": 1789957261622
+        },
+        {
+          "parent": 8758,
+          "condition": "succeeded",
+          "parentState": "succeeded",
+          "resolution": "satisfied",
+          "parentOutcome": "succeeded",
+          "resolvedAt": 1789957522922
+        },
+        {
+          "parent": 8759,
+          "condition": "succeeded",
+          "parentState": "succeeded",
+          "resolution": "satisfied",
+          "parentOutcome": "succeeded",
+          "resolvedAt": 1789957781523
+        },
+        {
+          "parent": 8760,
+          "condition": "succeeded",
+          "parentState": "succeeded",
+          "resolution": "satisfied",
+          "parentOutcome": "succeeded",
+          "resolvedAt": 1789958039522
+        }
+      ],
+      "attempts": [
+        {
+          "id": 6899,
+          "jobId": 8761,
+          "number": 1,
+          "state": "succeeded",
+          "maxParallelRuns": 1,
+          "exitCode": 0,
+          "createdAt": 1789958293932,
+          "finishedAt": 1789958295422,
+          "logDir": "/home/marvin/.local/state/mlqueue/attempts/6899"
+        }
+      ]
+    }
+  },
+  "complete_sha256": "ded3852730600e790d3229311c30e8602d47126618754cc862489059769b23b0",
+  "final_verification": {
+    "all4_market_arms_1400": true,
+    "all8_memory_tasks_1024": true,
+    "gradient_contracts": 38,
+    "cuda_graphs_all_arms": true,
+    "no_online_forecast_reports": true,
+    "market_validation_rows": 2048,
+    "market_probe_inner_selection_purge": [
+      3260,
+      820,
+      16
+    ],
+    "new_report_bases_registered_and_emitted": 6,
+    "evidence_links_verified": 8
+  },
+  "decision": {
+    "memory": "Local SIGReg materially improves frozen-reader old-cue accessibility vs JEPA-only; state/split do not improve paired-effect precision",
+    "market": "State has best full-state raw-return score but advantage is small, all are near persistence; local synthetic advantage does not transfer; JEPA-only recent-state reader beats every full-state reader",
+    "promotion": "No supervised forecaster or production replacement; preserve current measured supervised leader",
+    "unresolved": "Learn market-relevant temporal information without downstream anchoring rather than selecting only geometry or synthetic cue accessibility"
+  },
+  "cleanup": {
+    "temporary_source_scripts_created": false,
+    "pinned_binaries_and_failed_receipts_retained": true,
+    "documentation": [
+      "docs/temporal_sigreg.md",
+      "docs/top_runs.md"
+    ]
+  }
+}

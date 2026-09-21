@@ -1,0 +1,75 @@
+
+running 38 tests
+test torch::timexer_segment::accuracy::tests::calibration_target_reach_must_precede_both_final_origin_panels_strictly ... ok
+test torch::timexer_segment::accuracy::tests::comparison_deltas_preserve_signed_information_and_undefined_horizons ... ok
+test torch::timexer_segment::accuracy::tests::geometry_allows_recipe_controls_but_rejects_changed_source_or_target ... ok
+test torch::timexer_segment::accuracy::tests::named_paths_keep_equals_in_the_path_and_reject_missing_identity ... ok
+test torch::timexer_segment::jepa::tests::cuda_jepa_resident_randomness_refreshes_reproducibly_without_advancing_torch_rng ... ok
+test torch::timexer_segment::jepa::tests::cuda_jepa_sigreg_uses_batch_population_and_never_pools_time_views ... ok
+test torch::timexer_segment::jepa::tests::cuda_jepa_targets_are_attached_and_invalid_or_short_history_pairs_have_zero_gradient ... ok
+test torch::timexer_segment::jepa::tests::cuda_reader_both_is_the_same_draw_convex_combination_and_masks_have_zero_gradient ... ok
+test torch::timexer_segment::jepa::tests::cuda_sigreg_allows_persistent_population_diversity_without_pooling_time_or_singletons ... ok
+test torch::timexer_segment::jepa_eval::tests::chronological_selection_purges_actual_target_reach_and_timestamp_ties ... ok
+test torch::timexer_segment::jepa_eval::tests::chronology_reaches_the_last_supported_delayed_future_endpoint ... ok
+test torch::timexer_segment::jepa_eval::tests::common_probe_origin_cannot_move_with_objective_horizon_count ... ok
+test torch::timexer_segment::jepa_eval::tests::conditional_baseline_uses_only_valid_training_pairs_per_horizon ... ok
+test torch::timexer_segment::jepa_eval::tests::cuda_probe_direction_excludes_zero_targets_but_not_zero_predictions ... ok
+test torch::timexer_segment::jepa_eval::tests::cuda_ridge_refit_uses_extra_training_rows_without_retuning_penalty ... ok
+test torch::timexer_segment::jepa_eval::tests::delayed_masks_exclude_unavailable_and_invalid_intervals_not_unneeded_gaps ... ok
+test torch::timexer_segment::jepa_eval::tests::delayed_return_endpoints_use_the_last_observed_source_bar ... ok
+test torch::timexer_segment::jepa_eval::tests::feature_second_moment_spectrum_retains_constant_energy ... ok
+test torch::timexer_segment::jepa_eval::tests::masked_moment_error_matches_paired_residuals_after_merging_mask_patterns ... ok
+test torch::timexer_segment::jepa_eval::tests::missing_intermediate_bar_masks_return_without_turning_it_into_zero_label ... ok
+test torch::timexer_segment::jepa_eval::tests::partition_authentication_rejects_validation_as_training_and_duplicates ... ok
+test torch::timexer_segment::jepa_memory::tests::intervention_endpoint_cannot_leak_through_global_centering ... ok
+test torch::timexer_segment::jepa_memory::tests::irrelevant_cue_changes_no_price_or_future_label ... ok
+test torch::timexer_segment::jepa_memory::tests::paired_intervention_has_identical_recent_prices_auxiliary_and_anchor ... ok
+test torch::timexer_segment::model::tests::cuda_jepa_capture_keeps_metrics_uncontaminated_and_outside_optimizer_pool ... ok
+test torch::timexer_segment::model::tests::cuda_jepa_conditional_targets_use_source_statistics_complete_intervals_and_no_target_gradient ... ok
+test torch::timexer_segment::model::tests::cuda_jepa_future_observations_cannot_change_earlier_states_or_predictions ... ok
+test torch::timexer_segment::model::tests::cuda_jepa_latent_only_forecast_trains_readout_without_anchor_gradient ... ok
+test torch::timexer_segment::model::tests::cuda_jepa_optional_heads_preserve_off_initialization_and_forecasting ... ok
+test torch::timexer_segment::model::tests::cuda_jepa_target_projector_never_enters_forecasting_or_changes_shared_initialization ... ok
+test torch::timexer_segment::model::tests::cuda_reader_capture_refreshes_populations_and_retained_diagnostics_survive_replay ... ok
+test torch::timexer_segment::model::tests::cuda_reader_placements_share_causal_forecasts_and_the_actual_unnormalized_probe_interface ... ok
+test torch::timexer_segment::model::tests::cuda_reader_sigreg_uses_complete_source_patches_and_actual_valid_history_without_future_masks ... ok
+test torch::timexer_segment::model::tests::cuda_unanchored_capture_all_placements_preserves_frozen_forecast_and_diagnostic_packets ... FAILED
+test torch::timexer_segment::model::tests::cuda_unanchored_future_forecast_labels_cannot_change_objective_or_representation_gradients ... ok
+test torch::timexer_segment::model::tests::cuda_unanchored_placements_share_initialization_and_select_actual_reader_interfaces ... FAILED
+test torch::timexer_segment::model::tests::reader_contract_rejects_mixed_objectives_and_authenticates_even_the_unregularized_reader ... ok
+test torch::timexer_segment::model::tests::unanchored_refuses_semantic_anchors_and_nonclean_recipes ... ok
+
+failures:
+
+---- torch::timexer_segment::model::tests::cuda_unanchored_capture_all_placements_preserves_frozen_forecast_and_diagnostic_packets stdout ----
+PyTorch autograd multithreading disabled for single-GPU pretraining
+NorMuon optimizer: 8 2D params (NS5 + per-row second moment), 11 other params (AdamW)
+  batched NorMuon groups: 8 params in 4 group(s) of identical shape
+pretrain CUDA graphs armed: 8 NorMuon params in 4 batched group(s), 11 AdamW params, two captured bodies sharing one private mempool, 3 warmup steps each
+pretrain CUDA graph captured: NorMuon+AdamW optimizer step
+CausalPatch training step captured: forward and backward in one graph after 5 warmup steps; private mempool 0 MiB, reserved 88 of 32116 MiB on device
+NorMuon optimizer: 8 2D params (NS5 + per-row second moment), 11 other params (AdamW)
+  batched NorMuon groups: 8 params in 4 group(s) of identical shape
+pretrain CUDA graphs armed: 8 NorMuon params in 4 batched group(s), 11 AdamW params, two captured bodies sharing one private mempool, 3 warmup steps each
+pretrain CUDA graph captured: NorMuon+AdamW optimizer step
+CausalPatch training step captured: forward and backward in one graph after 5 warmup steps; private mempool 0 MiB, reserved 88 of 32116 MiB on device
+
+thread 'torch::timexer_segment::model::tests::cuda_unanchored_capture_all_placements_preserves_frozen_forecast_and_diagnostic_packets' (4053822) panicked at trading_bots/src/torch/timexer_segment/model.rs:8098:13:
+assertion failed: (replay.objective.double_value(&[]) - packet.double_value(&[0]) -
+                packet.double_value(&[9])).abs() < 1e-5
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+---- torch::timexer_segment::model::tests::cuda_unanchored_placements_share_initialization_and_select_actual_reader_interfaces stdout ----
+PyTorch autograd multithreading disabled for single-GPU pretraining
+
+thread 'torch::timexer_segment::model::tests::cuda_unanchored_placements_share_initialization_and_select_actual_reader_interfaces' (4053824) panicked at trading_bots/src/torch/timexer_segment/model.rs:7942:13:
+assertion failed: (losses.objective.double_value(&[]) - diagnostic.double_value(&[0]) -
+                diagnostic.double_value(&[9])).abs() < 1e-5
+
+
+failures:
+    torch::timexer_segment::model::tests::cuda_unanchored_capture_all_placements_preserves_frozen_forecast_and_diagnostic_packets
+    torch::timexer_segment::model::tests::cuda_unanchored_placements_share_initialization_and_select_actual_reader_interfaces
+
+test result: FAILED. 36 passed; 2 failed; 0 ignored; 0 measured; 1220 filtered out; finished in 1.63s
+

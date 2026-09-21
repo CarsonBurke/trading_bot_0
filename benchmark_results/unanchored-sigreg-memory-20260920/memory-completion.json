@@ -1,0 +1,154 @@
+{
+  "completed_independent_tasks": 8,
+  "completed_pretraining_episodes": 524288,
+  "completed_pretraining_updates": 8192,
+  "frozen_reader_count": 24,
+  "protocol": "memory-protocol.json",
+  "schema": "causal-delayed-cue-unanchored-memory-completion-v1",
+  "tasks": [
+    [
+      "unanchored-off/relevant-cue",
+      {
+        "captured_training": true,
+        "completed_updates": 1024,
+        "frozen_at_update": 1024,
+        "holdout_rows": 512,
+        "inner_rows": 2048,
+        "max_parameter_difference": 0.0,
+        "parameter_scalars_checked": 2178572,
+        "parameter_tensors_checked": 23,
+        "reader_fit_started_after_update": 1024,
+        "refit_rows": 2560,
+        "remaining_trainable_tensors": 0,
+        "training_episodes": 65536,
+        "validation_pairs": 256
+      }
+    ],
+    [
+      "unanchored-off/irrelevant-cue-null",
+      {
+        "captured_training": true,
+        "completed_updates": 1024,
+        "frozen_at_update": 1024,
+        "holdout_rows": 512,
+        "inner_rows": 2048,
+        "max_parameter_difference": 0.0,
+        "parameter_scalars_checked": 2178572,
+        "parameter_tensors_checked": 23,
+        "reader_fit_started_after_update": 1024,
+        "refit_rows": 2560,
+        "remaining_trainable_tensors": 0,
+        "training_episodes": 65536,
+        "validation_pairs": 256
+      }
+    ],
+    [
+      "unanchored-local/relevant-cue",
+      {
+        "captured_training": true,
+        "completed_updates": 1024,
+        "frozen_at_update": 1024,
+        "holdout_rows": 512,
+        "inner_rows": 2048,
+        "max_parameter_difference": 0.0,
+        "parameter_scalars_checked": 2178572,
+        "parameter_tensors_checked": 23,
+        "reader_fit_started_after_update": 1024,
+        "refit_rows": 2560,
+        "remaining_trainable_tensors": 0,
+        "training_episodes": 65536,
+        "validation_pairs": 256
+      }
+    ],
+    [
+      "unanchored-local/irrelevant-cue-null",
+      {
+        "captured_training": true,
+        "completed_updates": 1024,
+        "frozen_at_update": 1024,
+        "holdout_rows": 512,
+        "inner_rows": 2048,
+        "max_parameter_difference": 0.0,
+        "parameter_scalars_checked": 2178572,
+        "parameter_tensors_checked": 23,
+        "reader_fit_started_after_update": 1024,
+        "refit_rows": 2560,
+        "remaining_trainable_tensors": 0,
+        "training_episodes": 65536,
+        "validation_pairs": 256
+      }
+    ],
+    [
+      "unanchored-state/relevant-cue",
+      {
+        "captured_training": true,
+        "completed_updates": 1024,
+        "frozen_at_update": 1024,
+        "holdout_rows": 512,
+        "inner_rows": 2048,
+        "max_parameter_difference": 0.0,
+        "parameter_scalars_checked": 2178572,
+        "parameter_tensors_checked": 23,
+        "reader_fit_started_after_update": 1024,
+        "refit_rows": 2560,
+        "remaining_trainable_tensors": 0,
+        "training_episodes": 65536,
+        "validation_pairs": 256
+      }
+    ],
+    [
+      "unanchored-state/irrelevant-cue-null",
+      {
+        "captured_training": true,
+        "completed_updates": 1024,
+        "frozen_at_update": 1024,
+        "holdout_rows": 512,
+        "inner_rows": 2048,
+        "max_parameter_difference": 0.0,
+        "parameter_scalars_checked": 2178572,
+        "parameter_tensors_checked": 23,
+        "reader_fit_started_after_update": 1024,
+        "refit_rows": 2560,
+        "remaining_trainable_tensors": 0,
+        "training_episodes": 65536,
+        "validation_pairs": 256
+      }
+    ],
+    [
+      "unanchored-both/relevant-cue",
+      {
+        "captured_training": true,
+        "completed_updates": 1024,
+        "frozen_at_update": 1024,
+        "holdout_rows": 512,
+        "inner_rows": 2048,
+        "max_parameter_difference": 0.0,
+        "parameter_scalars_checked": 2178572,
+        "parameter_tensors_checked": 23,
+        "reader_fit_started_after_update": 1024,
+        "refit_rows": 2560,
+        "remaining_trainable_tensors": 0,
+        "training_episodes": 65536,
+        "validation_pairs": 256
+      }
+    ],
+    [
+      "unanchored-both/irrelevant-cue-null",
+      {
+        "captured_training": true,
+        "completed_updates": 1024,
+        "frozen_at_update": 1024,
+        "holdout_rows": 512,
+        "inner_rows": 2048,
+        "max_parameter_difference": 0.0,
+        "parameter_scalars_checked": 2178572,
+        "parameter_tensors_checked": 23,
+        "reader_fit_started_after_update": 1024,
+        "refit_rows": 2560,
+        "remaining_trainable_tensors": 0,
+        "training_episodes": 65536,
+        "validation_pairs": 256
+      }
+    ]
+  ]
+}

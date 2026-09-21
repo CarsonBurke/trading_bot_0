@@ -1,0 +1,62 @@
+{
+  "actual": {
+    "captured_training": true,
+    "completed_updates": 1024,
+    "frozen_at_update": 1024,
+    "holdout_rows": 512,
+    "inner_rows": 2048,
+    "max_parameter_difference": 0.0,
+    "parameter_scalars_checked": 2178572,
+    "parameter_tensors_checked": 23,
+    "reader_fit_started_after_update": 1024,
+    "refit_rows": 2560,
+    "remaining_trainable_tensors": 0,
+    "training_episodes": 65536,
+    "validation_pairs": 256
+  },
+  "configuration": {
+    "d_model": 128,
+    "dropout": 0.0,
+    "features": {
+      "day_of_week": false,
+      "market": false,
+      "session_gap": false,
+      "spy": false,
+      "time_of_day": false,
+      "volume": true
+    },
+    "ffn": 256,
+    "future_calendar": false,
+    "heads": 2,
+    "horizon_loss": "uniform",
+    "horizon_mean": "free",
+    "jepa": {
+      "directions": 256,
+      "prediction_weight": 1.0,
+      "predictor_width": 256,
+      "reconstruction_weight": 0.0,
+      "seed": 20260919,
+      "sigreg_weight": 0.09,
+      "views": 8
+    },
+    "jepa_mode": "unanchored",
+    "layers": 2,
+    "min_history": 256,
+    "patch_len": 16,
+    "pred_len": 192,
+    "reader_norm": "none",
+    "seq_len": 512,
+    "sigreg_placement": "both",
+    "x0_lambdas": "enabled"
+  },
+  "elapsed_seconds": 2.314472622,
+  "objective_contract": "temporal-jepa-unanchored-v1;config={\"predictor_width\":256,\"prediction_weight\":1.0,\"sigreg_weight\":0.09,\"reconstruction_weight\":0.0,\"directions\":256,\"views\":8,\"seed\":20260919};offsets-patches=[1,2,4,8,12];horizons-bars=[16, 32, 64, 128, 192];reader-norm=none;placement=both;observation=unconstrained-shared-full-width-patch-embedding(causal-prefix-normalization);state=actual-pre-final-rms-causal-reader;target=attached-nonoverlapping-future-observation;projector=none;predictor=direct-state-mlp;objective=prediction-weight*masked-latent-mse+placement-weighted-sigreg;sigreg-sites=local-observation-and-or-state-no-target-duplicate;both=same-draws-and-mask-half-weight-each;population=valid-batch-rows-per-sampled-source-view;mask=complete-source-patch-and-minimum-history;positions=minimum-history-source-through-final-context-patch;forecast=not-forwarded-no-loss-frozen-allocation;reconstruction=none;decision-loss=none;stop-gradient=none;gradient-surgery=none;initialization=fresh;selection=completed-fixed-budget;readers=fit-only-after-full-store-freeze;precision=bf16-backbone-fp32-objective;future-calendar=false;pair-mask=complete-source-patch-and-minimum-history-and-complete-target-patch;latent-reduction=mean-over-valid-source-offset-pairs-and-features;sigreg-reduction=mean-over-eligible-views-of-N-times-epps-pulley",
+  "protocol": "memory-protocol.json",
+  "reader_order": [
+    "frozen-ridge-full",
+    "frozen-ridge-recomputed-recent",
+    "frozen-ridge-local"
+  ],
+  "schema": "causal-delayed-cue-unanchored-memory-task-v1",
+  "task": "unanchored-both/relevant-cue"
+}

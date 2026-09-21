@@ -1,0 +1,12 @@
+{
+  "evidence": null,
+  "failure": "unanchored-state: trainer exited 101",
+  "finished_at": "2026-09-21T02:03:32.415127+00:00",
+  "idempotency_key": "lejepa-3ea5ef7f61f27be9c5c2c2ca496d1e18180be7b6cf0a260f8ea1a595ca622898-unanchored-state",
+  "plan_sha256": "3ea5ef7f61f27be9c5c2c2ca496d1e18180be7b6cf0a260f8ea1a595ca622898",
+  "shared_identity_sha256": null,
+  "started_at": "2026-09-21T02:03:19.917846+00:00",
+  "status": "failed",
+  "task": "unanchored-state",
+  "wall_seconds": 12.49724243300443
+}

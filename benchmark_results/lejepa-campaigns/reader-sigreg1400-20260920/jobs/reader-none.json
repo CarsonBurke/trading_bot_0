@@ -1,0 +1,9 @@
+{
+  "after_success": [],
+  "id": 8640,
+  "idempotency_key": "lejepa-948821c4b5f65648dd0d56395d8a0b8aae5ea2b057f03ad16151aa0f62fe0fa1-reader-none",
+  "plan_sha256": "948821c4b5f65648dd0d56395d8a0b8aae5ea2b057f03ad16151aa0f62fe0fa1",
+  "request_sha256": "6a4506218ab5d943f2ebe37c7b475fb66ded504e2cc636a0def4699a43596029",
+  "submitted_at": "2026-09-20T21:35:10.850617+00:00",
+  "task": "reader-none"
+}

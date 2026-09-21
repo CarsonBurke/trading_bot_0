@@ -1,0 +1,755 @@
+{
+  "schema": "causal-reader-sigreg-execution-v1",
+  "campaign": "reader-sigreg1400-20260920",
+  "proposal": {
+    "reader_interface": "pre-final-RMS contextual state consumed directly by the existing forecast head",
+    "shared_reader_norm": "none",
+    "internal_normalization": "unchanged",
+    "semantic_objective": "existing full-coupling undecimated forecasting NLL only",
+    "total_sigreg_weight": 0.09,
+    "placements": {
+      "reader-none": "off",
+      "reader-local": "local",
+      "reader-state": "state",
+      "reader-both": "both"
+    },
+    "both_split": [
+      0.5,
+      0.5
+    ],
+    "primary": "equal mean market-neutral close MSE/persistence at horizons 1,8,16,32,64,128,192",
+    "secondary": "frozen future, delayed future, delayed recall readouts; recall is not evidence of future usefulness",
+    "comparison_scope": "four fresh identical-reader arms; old normalized-reader leader is a separate reference"
+  },
+  "queue_policy": {
+    "max_parallel_runs": 1,
+    "max_attempts": 1,
+    "priority": 0
+  },
+  "reference_plan": "benchmark_results/lejepa-campaigns/temporal-moments1400-20260920/plan.json",
+  "campaign_validation": {
+    "accepted_fresh_arms": [
+      "reader-none",
+      "reader-local",
+      "reader-state",
+      "reader-both"
+    ],
+    "refused_cases": [
+      "missing fresh control",
+      "wrong reader normalization",
+      "swapped placement",
+      "latent objective contamination",
+      "moment objective contamination",
+      "future calendar contamination",
+      "duplicate overriding CLI flag",
+      "equals-style overriding CLI flag",
+      "changed total weight"
+    ],
+    "authenticated_unchanged_reference_endpoints": 14,
+    "legacy_and_reader_controls_distinct": true,
+    "endpoint_refusals": [
+      "omitted normalization",
+      "wrong placement",
+      "bool weight",
+      "wrong weight",
+      "wrong projection count",
+      "wrong draw seed"
+    ]
+  },
+  "cargo_check": {
+    "command": [
+      "./torch-env.sh",
+      "cargo",
+      "check",
+      "-p",
+      "trading_bot_0",
+      "-p",
+      "shared",
+      "-p",
+      "report_cli",
+      "-p",
+      "trading-bot-tui"
+    ],
+    "exit_code": 0,
+    "library_warnings": 31
+  },
+  "assets": {
+    "tests": {
+      "path": "/home/marvin/Documents/repositories/trading_bot_0/benchmark_results/reader-sigreg-20260920-assets/library-tests",
+      "source": "/var/tmp/cargo-build/a0/1fb30e0f0e2b3c/release/build/trading_bot_0/735888772b722b5a/out/trading_bot_0-735888772b722b5a",
+      "sha256": "095b4f1edfd43b37f573399d08b7ccd74ae272f8479258d79cf3e1e5b6be3300"
+    },
+    "trainer": {
+      "path": "/home/marvin/Documents/repositories/trading_bot_0/benchmark_results/reader-sigreg-20260920-assets/trading_bot_0-v2",
+      "source": "/home/marvin/Documents/repositories/trading_bot_0/target/release/trading_bot_0",
+      "sha256": "cb64ab3cad997fa29c7ecf9c70d5c1e89ecdac8b5a927773e357311ee96be3cd"
+    },
+    "report_cli": {
+      "path": "/home/marvin/Documents/repositories/trading_bot_0/benchmark_results/reader-sigreg-20260920-assets/report_cli",
+      "source": "/home/marvin/Documents/repositories/trading_bot_0/target/release/report_cli",
+      "sha256": "a366a2b2723264b39d9580e15b53e816227640ca7e833a2eeebc1e507355af01"
+    },
+    "initial_trainer": {
+      "path": "/home/marvin/Documents/repositories/trading_bot_0/benchmark_results/reader-sigreg-20260920-assets/trading_bot_0",
+      "source": "/home/marvin/Documents/repositories/trading_bot_0/target/release/trading_bot_0",
+      "sha256": "6c2a87cd80b887be4581e4f4741de5eb0336889a25327eaa0b026c88a359b010"
+    },
+    "memory_trainer": {
+      "path": "/home/marvin/Documents/repositories/trading_bot_0/benchmark_results/reader-sigreg-20260920-assets/trading_bot_0-memory",
+      "source": "/home/marvin/Documents/repositories/trading_bot_0/target/release/trading_bot_0",
+      "sha256": "de37d5308d9da9f2ae8037f80bdf0cd3dfadc66ad60a30015f186a83fa2ea75a"
+    }
+  },
+  "contract_job": {
+    "id": 8631,
+    "name": "reader-sigreg-contracts-20260920",
+    "state": "queued",
+    "eligibility": "waiting_for_higher_priority: job 8628 (pri 1)",
+    "maxParallelRuns": 1,
+    "priority": 0,
+    "cwd": "/home/marvin/Documents/repositories/trading_bot_0",
+    "args": [
+      "/home/marvin/Documents/repositories/trading_bot_0/benchmark_results/reader-sigreg-20260920-assets/library-tests",
+      "torch::timexer_segment::jepa::tests",
+      "torch::timexer_segment::jepa_eval::tests",
+      "torch::timexer_segment::model::tests::reader_",
+      "torch::timexer_segment::model::tests::cuda_reader_",
+      "torch::timexer_segment::model::tests::cuda_jepa_",
+      "torch::timexer_segment::accuracy::tests",
+      "--test-threads=1"
+    ],
+    "maxAttempts": 1,
+    "retryDelayMs": 0,
+    "timeLimitMs": 300000,
+    "readySequence": 7999,
+    "attemptCount": 0,
+    "createdAt": 1789939270962,
+    "updatedAt": 1789939270962,
+    "attempts": []
+  },
+  "cli_options_verified": [
+    "--reader-norm",
+    "--sigreg-placement",
+    "--jepa-sigreg-weight"
+  ],
+  "selected_contract_tests": [
+    "torch::timexer_segment::accuracy::tests::calibration_target_reach_must_precede_both_final_origin_panels_strictly",
+    "torch::timexer_segment::accuracy::tests::comparison_deltas_preserve_signed_information_and_undefined_horizons",
+    "torch::timexer_segment::accuracy::tests::geometry_allows_recipe_controls_but_rejects_changed_source_or_target",
+    "torch::timexer_segment::accuracy::tests::named_paths_keep_equals_in_the_path_and_reject_missing_identity",
+    "torch::timexer_segment::jepa::tests::cuda_jepa_resident_randomness_refreshes_reproducibly_without_advancing_torch_rng",
+    "torch::timexer_segment::jepa::tests::cuda_jepa_sigreg_uses_batch_population_and_never_pools_time_views",
+    "torch::timexer_segment::jepa::tests::cuda_jepa_targets_are_attached_and_invalid_or_short_history_pairs_have_zero_gradient",
+    "torch::timexer_segment::jepa::tests::cuda_reader_both_is_the_same_draw_convex_combination_and_masks_have_zero_gradient",
+    "torch::timexer_segment::jepa::tests::cuda_sigreg_allows_persistent_population_diversity_without_pooling_time_or_singletons",
+    "torch::timexer_segment::jepa_eval::tests::chronological_selection_purges_actual_target_reach_and_timestamp_ties",
+    "torch::timexer_segment::jepa_eval::tests::chronology_reaches_the_last_supported_delayed_future_endpoint",
+    "torch::timexer_segment::jepa_eval::tests::common_probe_origin_cannot_move_with_objective_horizon_count",
+    "torch::timexer_segment::jepa_eval::tests::conditional_baseline_uses_only_valid_training_pairs_per_horizon",
+    "torch::timexer_segment::jepa_eval::tests::cuda_ridge_refit_uses_extra_training_rows_without_retuning_penalty",
+    "torch::timexer_segment::jepa_eval::tests::delayed_masks_exclude_unavailable_and_invalid_intervals_not_unneeded_gaps",
+    "torch::timexer_segment::jepa_eval::tests::delayed_return_endpoints_use_the_last_observed_source_bar",
+    "torch::timexer_segment::jepa_eval::tests::feature_second_moment_spectrum_retains_constant_energy",
+    "torch::timexer_segment::jepa_eval::tests::masked_moment_error_matches_paired_residuals_after_merging_mask_patterns",
+    "torch::timexer_segment::jepa_eval::tests::missing_intermediate_bar_masks_return_without_turning_it_into_zero_label",
+    "torch::timexer_segment::jepa_eval::tests::partition_authentication_rejects_validation_as_training_and_duplicates",
+    "torch::timexer_segment::model::tests::cuda_jepa_capture_keeps_metrics_uncontaminated_and_outside_optimizer_pool",
+    "torch::timexer_segment::model::tests::cuda_jepa_conditional_targets_use_source_statistics_complete_intervals_and_no_target_gradient",
+    "torch::timexer_segment::model::tests::cuda_jepa_future_observations_cannot_change_earlier_states_or_predictions",
+    "torch::timexer_segment::model::tests::cuda_jepa_latent_only_forecast_trains_readout_without_anchor_gradient",
+    "torch::timexer_segment::model::tests::cuda_jepa_optional_heads_preserve_off_initialization_and_forecasting",
+    "torch::timexer_segment::model::tests::cuda_jepa_target_projector_never_enters_forecasting_or_changes_shared_initialization",
+    "torch::timexer_segment::model::tests::cuda_reader_capture_refreshes_populations_and_retained_diagnostics_survive_replay",
+    "torch::timexer_segment::model::tests::cuda_reader_placements_share_causal_forecasts_and_the_actual_unnormalized_probe_interface",
+    "torch::timexer_segment::model::tests::cuda_reader_sigreg_uses_complete_source_patches_and_actual_valid_history_without_future_masks",
+    "torch::timexer_segment::model::tests::reader_contract_rejects_mixed_objectives_and_authenticates_even_the_unregularized_reader"
+  ],
+  "contract_result": {
+    "job": 8631,
+    "state": "succeeded",
+    "exit_code": 0,
+    "passed": 30,
+    "failed": 0,
+    "ignored": 0,
+    "test_seconds": 1.62
+  },
+  "accepted_review_findings": [
+    {
+      "source": "ReaderCoreReview",
+      "finding": "diagnose-temporal-sigreg falsely reported reader training SIGReg weight zero when JEPA off",
+      "fix": "record actual total and per-site training weights plus reader_norm and placement; standalone gradient remains standalone"
+    }
+  ],
+  "review_interpretation_limits": [
+    "Full SIGReg contrast includes mean/scale control; not isolation of higher-order Gaussianity. Normalized-reader full-none leader scored separately.",
+    "Local pre-RMS scale changes are largely invisible to the normalized trunk; deliberate local-placement control.",
+    "Frozen ridge improvements measure readout accessibility, not increased stored information.",
+    "Delayed-future widths vary by lead; raw-error slope is not lead-only degradation."
+  ],
+  "plan_command": [
+    "python3",
+    "benchmarks/lejepa_campaign.py",
+    "plan",
+    "--executable",
+    "/home/marvin/Documents/repositories/trading_bot_0/benchmark_results/reader-sigreg-20260920-assets/trading_bot_0-v2",
+    "--report-cli",
+    "/home/marvin/Documents/repositories/trading_bot_0/benchmark_results/reader-sigreg-20260920-assets/report_cli",
+    "--data-dir",
+    "long_data/bars",
+    "--data-contract",
+    "/home/marvin/Documents/repositories/trading_bot_0/benchmark_results/lejepa-campaigns/temporal-moments1400-20260920/pinned/expected-data-contract.json",
+    "--output-root",
+    "benchmark_results/lejepa-campaigns",
+    "--campaign",
+    "reader-sigreg1400-20260920",
+    "--suite",
+    "temporal-reader-sigreg",
+    "--reference-plan",
+    "/home/marvin/Documents/repositories/trading_bot_0/benchmark_results/lejepa-campaigns/temporal-moments1400-20260920/plan.json",
+    "--max-steps",
+    "1400",
+    "--seed",
+    "20260919",
+    "--batch-size",
+    "256",
+    "--eval-every",
+    "350",
+    "--eval-origins",
+    "2048",
+    "--probe-fit-origins",
+    "2048",
+    "--eval-batch-size",
+    "64",
+    "--arm-timeout-seconds",
+    "900",
+    "--select",
+    "reader-none",
+    "--select",
+    "reader-local",
+    "--select",
+    "reader-state",
+    "--select",
+    "reader-both"
+  ],
+  "plan_sha256": "948821c4b5f65648dd0d56395d8a0b8aae5ea2b057f03ad16151aa0f62fe0fa1",
+  "model_jobs": {
+    "reader-none": {
+      "after_success": [],
+      "id": 8640,
+      "idempotency_key": "lejepa-948821c4b5f65648dd0d56395d8a0b8aae5ea2b057f03ad16151aa0f62fe0fa1-reader-none",
+      "plan_sha256": "948821c4b5f65648dd0d56395d8a0b8aae5ea2b057f03ad16151aa0f62fe0fa1",
+      "request_sha256": "6a4506218ab5d943f2ebe37c7b475fb66ded504e2cc636a0def4699a43596029",
+      "submitted_at": "2026-09-20T21:35:10.850617+00:00",
+      "task": "reader-none"
+    },
+    "reader-local": {
+      "after_success": [],
+      "id": 8641,
+      "idempotency_key": "lejepa-948821c4b5f65648dd0d56395d8a0b8aae5ea2b057f03ad16151aa0f62fe0fa1-reader-local",
+      "plan_sha256": "948821c4b5f65648dd0d56395d8a0b8aae5ea2b057f03ad16151aa0f62fe0fa1",
+      "request_sha256": "75c4a5fb9e3861204435be8e8fc371a7f39e1875e5ce7b2904ae92459b45dbf9",
+      "submitted_at": "2026-09-20T21:35:10.879811+00:00",
+      "task": "reader-local"
+    },
+    "reader-state": {
+      "after_success": [],
+      "id": 8642,
+      "idempotency_key": "lejepa-948821c4b5f65648dd0d56395d8a0b8aae5ea2b057f03ad16151aa0f62fe0fa1-reader-state",
+      "plan_sha256": "948821c4b5f65648dd0d56395d8a0b8aae5ea2b057f03ad16151aa0f62fe0fa1",
+      "request_sha256": "0dc50c87b4789cadc9317af7f4219d31e02f69ea80b31e8d69e45a96639a0631",
+      "submitted_at": "2026-09-20T21:35:10.909552+00:00",
+      "task": "reader-state"
+    },
+    "reader-both": {
+      "after_success": [],
+      "id": 8643,
+      "idempotency_key": "lejepa-948821c4b5f65648dd0d56395d8a0b8aae5ea2b057f03ad16151aa0f62fe0fa1-reader-both",
+      "plan_sha256": "948821c4b5f65648dd0d56395d8a0b8aae5ea2b057f03ad16151aa0f62fe0fa1",
+      "request_sha256": "b2bac8cee2d0b9e94db0c7e655b0bc8ae659fb801944b62a70902b1a7b2083df",
+      "submitted_at": "2026-09-20T21:35:10.938676+00:00",
+      "task": "reader-both"
+    }
+  },
+  "collector_job": 8644,
+  "accuracy_command": [
+    "/home/marvin/Documents/repositories/trading_bot_0/benchmark_results/reader-sigreg-20260920-assets/trading_bot_0-v2",
+    "compare-timexer-accuracy",
+    "--reference-run",
+    "training/runs/lejepa-fixed1400-20260919-forecast",
+    "--data-dir",
+    "long_data/bars",
+    "--output",
+    "benchmark_results/accuracy-reader-sigreg-20260920",
+    "--research-run",
+    "decoupled-lattice-1400=training/runs/lejepa-fixed1400-20260919-forecast",
+    "--research-run",
+    "rms-full-none-1400=training/runs/lejepa-full-none1400-20260920-full-none-forecast",
+    "--research-run",
+    "reader-none=/home/marvin/Documents/repositories/trading_bot_0/training/runs/reader-sigreg1400-20260920-reader-none",
+    "--research-run",
+    "reader-local=/home/marvin/Documents/repositories/trading_bot_0/training/runs/reader-sigreg1400-20260920-reader-local",
+    "--research-run",
+    "reader-state=/home/marvin/Documents/repositories/trading_bot_0/training/runs/reader-sigreg1400-20260920-reader-state",
+    "--research-run",
+    "reader-both=/home/marvin/Documents/repositories/trading_bot_0/training/runs/reader-sigreg1400-20260920-reader-both"
+  ],
+  "accuracy_job": {
+    "id": 8646,
+    "name": "reader-sigreg-accuracy-20260920",
+    "state": "queued",
+    "eligibility": "waiting_for_dependencies: jobs [8644]",
+    "maxParallelRuns": 1,
+    "priority": 0,
+    "cwd": "/home/marvin/Documents/repositories/trading_bot_0",
+    "args": [
+      "/home/marvin/Documents/repositories/trading_bot_0/benchmark_results/reader-sigreg-20260920-assets/trading_bot_0-v2",
+      "compare-timexer-accuracy",
+      "--reference-run",
+      "training/runs/lejepa-fixed1400-20260919-forecast",
+      "--data-dir",
+      "long_data/bars",
+      "--output",
+      "benchmark_results/accuracy-reader-sigreg-20260920",
+      "--research-run",
+      "decoupled-lattice-1400=training/runs/lejepa-fixed1400-20260919-forecast",
+      "--research-run",
+      "rms-full-none-1400=training/runs/lejepa-full-none1400-20260920-full-none-forecast",
+      "--research-run",
+      "reader-none=/home/marvin/Documents/repositories/trading_bot_0/training/runs/reader-sigreg1400-20260920-reader-none",
+      "--research-run",
+      "reader-local=/home/marvin/Documents/repositories/trading_bot_0/training/runs/reader-sigreg1400-20260920-reader-local",
+      "--research-run",
+      "reader-state=/home/marvin/Documents/repositories/trading_bot_0/training/runs/reader-sigreg1400-20260920-reader-state",
+      "--research-run",
+      "reader-both=/home/marvin/Documents/repositories/trading_bot_0/training/runs/reader-sigreg1400-20260920-reader-both"
+    ],
+    "maxAttempts": 1,
+    "retryDelayMs": 0,
+    "timeLimitMs": 300000,
+    "attemptCount": 0,
+    "createdAt": 1789940318206,
+    "updatedAt": 1789940318206,
+    "dependencies": [
+      {
+        "parent": 8644,
+        "condition": "succeeded",
+        "parentState": "queued"
+      }
+    ],
+    "attempts": []
+  },
+  "rms_probe_command": [
+    "/home/marvin/Documents/repositories/trading_bot_0/benchmark_results/reader-sigreg-20260920-assets/trading_bot_0-v2",
+    "evaluate-jepa",
+    "--run-root",
+    "training/runs/lejepa-full-none1400-20260920-full-none-forecast",
+    "--data-dir",
+    "long_data/bars",
+    "--output",
+    "benchmark_results/reader-sigreg-probes-20260920-rms-reference",
+    "--batch-size",
+    "64"
+  ],
+  "rms_probe_job": {
+    "id": 8647,
+    "name": "reader-sigreg-rms-probes-20260920",
+    "state": "queued",
+    "eligibility": "waiting_for_higher_priority: job 8637 (pri 1)",
+    "maxParallelRuns": 1,
+    "priority": 0,
+    "cwd": "/home/marvin/Documents/repositories/trading_bot_0",
+    "args": [
+      "/home/marvin/Documents/repositories/trading_bot_0/benchmark_results/reader-sigreg-20260920-assets/trading_bot_0-v2",
+      "evaluate-jepa",
+      "--run-root",
+      "training/runs/lejepa-full-none1400-20260920-full-none-forecast",
+      "--data-dir",
+      "long_data/bars",
+      "--output",
+      "benchmark_results/reader-sigreg-probes-20260920-rms-reference",
+      "--batch-size",
+      "64"
+    ],
+    "maxAttempts": 1,
+    "retryDelayMs": 0,
+    "timeLimitMs": 300000,
+    "readySequence": 8010,
+    "attemptCount": 0,
+    "createdAt": 1789940318235,
+    "updatedAt": 1789940318235,
+    "dependencies": [
+      {
+        "parent": 8631,
+        "condition": "succeeded",
+        "parentState": "succeeded",
+        "resolution": "satisfied",
+        "parentOutcome": "succeeded",
+        "resolvedAt": 1789940318235
+      }
+    ],
+    "attempts": []
+  },
+  "both_diagnostic_command": [
+    "/home/marvin/Documents/repositories/trading_bot_0/benchmark_results/reader-sigreg-20260920-assets/trading_bot_0-v2",
+    "diagnose-temporal-sigreg",
+    "--run-root",
+    "training/runs/reader-sigreg1400-20260920-reader-both",
+    "--data-dir",
+    "long_data/bars",
+    "--output",
+    "benchmark_results/reader-sigreg-diagnostic-20260920-both",
+    "--batch-size",
+    "256"
+  ],
+  "both_diagnostic_job": {
+    "id": 8648,
+    "name": "reader-sigreg-both-diagnostic-20260920",
+    "state": "queued",
+    "eligibility": "waiting_for_dependencies: jobs [8643]",
+    "maxParallelRuns": 1,
+    "priority": 0,
+    "cwd": "/home/marvin/Documents/repositories/trading_bot_0",
+    "args": [
+      "/home/marvin/Documents/repositories/trading_bot_0/benchmark_results/reader-sigreg-20260920-assets/trading_bot_0-v2",
+      "diagnose-temporal-sigreg",
+      "--run-root",
+      "training/runs/reader-sigreg1400-20260920-reader-both",
+      "--data-dir",
+      "long_data/bars",
+      "--output",
+      "benchmark_results/reader-sigreg-diagnostic-20260920-both",
+      "--batch-size",
+      "256"
+    ],
+    "maxAttempts": 1,
+    "retryDelayMs": 0,
+    "timeLimitMs": 300000,
+    "attemptCount": 0,
+    "createdAt": 1789940318260,
+    "updatedAt": 1789940318260,
+    "dependencies": [
+      {
+        "parent": 8643,
+        "condition": "succeeded",
+        "parentState": "queued"
+      }
+    ],
+    "attempts": []
+  },
+  "memory_command": [
+    "/home/marvin/Documents/repositories/trading_bot_0/benchmark_results/reader-sigreg-20260920-assets/trading_bot_0-memory",
+    "benchmark-jepa-memory",
+    "--reader-sigreg",
+    "--output",
+    "benchmark_results/reader-sigreg-memory-20260920",
+    "--steps",
+    "1024",
+    "--batch-size",
+    "64",
+    "--validation-pairs",
+    "256",
+    "--eval-every",
+    "128",
+    "--seed",
+    "20260919",
+    "--learning-rate",
+    "0.001"
+  ],
+  "memory_job": {
+    "id": 8649,
+    "name": "reader-sigreg-delayed-cue-20260920",
+    "state": "queued",
+    "eligibility": "waiting_for_higher_priority: job 8637 (pri 1)",
+    "maxParallelRuns": 1,
+    "priority": 0,
+    "cwd": "/home/marvin/Documents/repositories/trading_bot_0",
+    "args": [
+      "/home/marvin/Documents/repositories/trading_bot_0/benchmark_results/reader-sigreg-20260920-assets/trading_bot_0-memory",
+      "benchmark-jepa-memory",
+      "--reader-sigreg",
+      "--output",
+      "benchmark_results/reader-sigreg-memory-20260920",
+      "--steps",
+      "1024",
+      "--batch-size",
+      "64",
+      "--validation-pairs",
+      "256",
+      "--eval-every",
+      "128",
+      "--seed",
+      "20260919",
+      "--learning-rate",
+      "0.001"
+    ],
+    "maxAttempts": 1,
+    "retryDelayMs": 0,
+    "timeLimitMs": 900000,
+    "readySequence": 8011,
+    "attemptCount": 0,
+    "createdAt": 1789940389678,
+    "updatedAt": 1789940389678,
+    "dependencies": [
+      {
+        "parent": 8631,
+        "condition": "succeeded",
+        "parentState": "succeeded",
+        "resolution": "satisfied",
+        "parentOutcome": "succeeded",
+        "resolvedAt": 1789940389678
+      }
+    ],
+    "attempts": []
+  },
+  "memory_cli_validation": {
+    "valid_selector_reaches_output_refusal": true,
+    "mixed_reader_and_legacy_selector_refused": true
+  },
+  "review_resolution": {
+    "core": "one provenance bug corrected; no remaining core findings",
+    "protocol": "no authentication/leakage bug; four interpretation suggestions resolved without altering approved placement contract; reviewer acknowledged 1400-step correction"
+  },
+  "last_compile": {
+    "command": [
+      "./torch-env.sh",
+      "cargo",
+      "check",
+      "-p",
+      "trading_bot_0"
+    ],
+    "exit_code": 0,
+    "library_warnings": 31
+  },
+  "queue_blocker": {
+    "observed_state": "all four market arms and memory job not yet admitted",
+    "running_jobs": [
+      8633,
+      8634,
+      8635,
+      8636
+    ],
+    "higher_priority_jobs": [
+      8637,
+      8638,
+      8645
+    ],
+    "policy": "retain priority zero and exclusive GPU admission; do not preempt or alter other workloads",
+    "resolved": true
+  },
+  "completed_outcomes": {
+    "8631": {
+      "state": "succeeded",
+      "attempts": [
+        {
+          "id": 6798,
+          "jobId": 8631,
+          "number": 1,
+          "state": "succeeded",
+          "maxParallelRuns": 1,
+          "exitCode": 0,
+          "createdAt": 1789939945106,
+          "finishedAt": 1789939948697,
+          "logDir": "/home/marvin/.local/state/mlqueue/attempts/6798"
+        }
+      ]
+    },
+    "8640": {
+      "state": "succeeded",
+      "attempts": [
+        {
+          "id": 6806,
+          "jobId": 8640,
+          "number": 1,
+          "state": "succeeded",
+          "maxParallelRuns": 1,
+          "exitCode": 0,
+          "createdAt": 1789940727809,
+          "finishedAt": 1789940984454,
+          "logDir": "/home/marvin/.local/state/mlqueue/attempts/6806"
+        }
+      ]
+    },
+    "8641": {
+      "state": "succeeded",
+      "attempts": [
+        {
+          "id": 6815,
+          "jobId": 8641,
+          "number": 1,
+          "state": "succeeded",
+          "maxParallelRuns": 1,
+          "exitCode": 0,
+          "createdAt": 1789942485959,
+          "finishedAt": 1789942737654,
+          "logDir": "/home/marvin/.local/state/mlqueue/attempts/6815"
+        }
+      ]
+    },
+    "8642": {
+      "state": "succeeded",
+      "attempts": [
+        {
+          "id": 6816,
+          "jobId": 8642,
+          "number": 1,
+          "state": "succeeded",
+          "maxParallelRuns": 1,
+          "exitCode": 0,
+          "createdAt": 1789942737659,
+          "finishedAt": 1789942997604,
+          "logDir": "/home/marvin/.local/state/mlqueue/attempts/6816"
+        }
+      ]
+    },
+    "8643": {
+      "state": "succeeded",
+      "attempts": [
+        {
+          "id": 6817,
+          "jobId": 8643,
+          "number": 1,
+          "state": "succeeded",
+          "maxParallelRuns": 1,
+          "exitCode": 0,
+          "createdAt": 1789942997608,
+          "finishedAt": 1789943257254,
+          "logDir": "/home/marvin/.local/state/mlqueue/attempts/6817"
+        }
+      ]
+    },
+    "8644": {
+      "state": "succeeded",
+      "attempts": [
+        {
+          "id": 6820,
+          "jobId": 8644,
+          "number": 1,
+          "state": "succeeded",
+          "maxParallelRuns": 1,
+          "exitCode": 0,
+          "createdAt": 1789943288609,
+          "finishedAt": 1789943292054,
+          "logDir": "/home/marvin/.local/state/mlqueue/attempts/6820"
+        }
+      ]
+    },
+    "8646": {
+      "state": "succeeded",
+      "attempts": [
+        {
+          "id": 6822,
+          "jobId": 8646,
+          "number": 1,
+          "state": "succeeded",
+          "maxParallelRuns": 1,
+          "exitCode": 0,
+          "createdAt": 1789943303910,
+          "finishedAt": 1789943321904,
+          "logDir": "/home/marvin/.local/state/mlqueue/attempts/6822"
+        }
+      ]
+    },
+    "8647": {
+      "state": "succeeded",
+      "attempts": [
+        {
+          "id": 6818,
+          "jobId": 8647,
+          "number": 1,
+          "state": "succeeded",
+          "maxParallelRuns": 1,
+          "exitCode": 0,
+          "createdAt": 1789943257260,
+          "finishedAt": 1789943268505,
+          "logDir": "/home/marvin/.local/state/mlqueue/attempts/6818"
+        }
+      ]
+    },
+    "8648": {
+      "state": "succeeded",
+      "attempts": [
+        {
+          "id": 6821,
+          "jobId": 8648,
+          "number": 1,
+          "state": "succeeded",
+          "maxParallelRuns": 1,
+          "exitCode": 0,
+          "createdAt": 1789943292061,
+          "finishedAt": 1789943303904,
+          "logDir": "/home/marvin/.local/state/mlqueue/attempts/6821"
+        }
+      ]
+    },
+    "8649": {
+      "state": "succeeded",
+      "attempts": [
+        {
+          "id": 6819,
+          "jobId": 8649,
+          "number": 1,
+          "state": "succeeded",
+          "maxParallelRuns": 1,
+          "exitCode": 0,
+          "createdAt": 1789943268511,
+          "finishedAt": 1789943288605,
+          "logDir": "/home/marvin/.local/state/mlqueue/attempts/6819"
+        }
+      ]
+    }
+  },
+  "final_validation": {
+    "delayed_report_bases": [
+      "timexer_segment_jepa_delayed_recall_ratio",
+      "timexer_segment_jepa_delayed_recall_correlation",
+      "timexer_segment_jepa_delayed_recall_error",
+      "timexer_segment_jepa_delayed_recall_count",
+      "timexer_segment_jepa_delayed_recall_penalty",
+      "timexer_segment_jepa_delayed_future_ratio",
+      "timexer_segment_jepa_delayed_future_correlation",
+      "timexer_segment_jepa_delayed_future_error",
+      "timexer_segment_jepa_delayed_future_count",
+      "timexer_segment_jepa_delayed_future_penalty"
+    ],
+    "delayed_panel_directories": {
+      "rms-full-none": "benchmark_results/reader-sigreg-probes-20260920-rms-reference",
+      "reader-none": "training/runs/reader-sigreg1400-20260920-reader-none/gens/0",
+      "reader-local": "training/runs/reader-sigreg1400-20260920-reader-local/gens/0",
+      "reader-state": "training/runs/reader-sigreg1400-20260920-reader-state/gens/0",
+      "reader-both": "training/runs/reader-sigreg1400-20260920-reader-both/gens/0"
+    },
+    "all_ten_reports_per_directory": true,
+    "memory_tasks_completed": 8,
+    "memory_updates_per_task": 1024,
+    "paired_input_equality_verified": true,
+    "diagnostic_training_sigreg_weights_verified": {
+      "latent": 1.0,
+      "standalone_sigreg": 0.09,
+      "training_sigreg": 0.09,
+      "training_sigreg_sites": {
+        "latent_target": 0.0,
+        "local": 0.045,
+        "state": 0.045
+      }
+    },
+    "all_market_graph_capture_flags": true,
+    "collection_endpoints": 18
+  },
+  "final_accuracy_protocol": {
+    "path": "benchmark_results/accuracy-reader-sigreg-20260920/accuracy-protocol.json",
+    "sha256": "76a9b6edee06e23bf2577ed5248b225dc2ed9c667616a17d4a1258f694d6fecb"
+  },
+  "complete_sha256": "146da43a7cb43c73680ce57fee8cbbdce51781fca524417e8b036cd1eb108876",
+  "decision": {
+    "reader_norm": "rms",
+    "sigreg_placement": "off",
+    "retained_run": "training/runs/lejepa-full-none1400-20260920-full-none-forecast",
+    "promoted_new_treatment": false,
+    "scope": "fixed seed, predeclared full-data budget, total SIGReg weight .09; not a global optimum claim"
+  },
+  "cleanup": {
+    "temporary_endpoint_fixtures_removed": true,
+    "pinned_executables_and_immutable_receipts_retained": true,
+    "evidence_links_exist": true
+  }
+}

@@ -1,0 +1,178 @@
+{
+  "args": {
+    "batch_size": 64,
+    "eval_every": 128,
+    "jepa_modes": [
+      "off",
+      "latent-one",
+      "latent-multi",
+      "anchored",
+      "anchored-no-sigreg",
+      "anchored-reconstruct"
+    ],
+    "learning_rate": 0.001,
+    "output": "benchmark_results/reader-sigreg-memory-20260920",
+    "reader_sigreg": true,
+    "seed": 20260919,
+    "steps": 1024,
+    "validation_pairs": 256
+  },
+  "arms": [
+    [
+      "reader-none",
+      {
+        "d_model": 128,
+        "dropout": 0.0,
+        "features": {
+          "day_of_week": false,
+          "market": false,
+          "session_gap": false,
+          "spy": false,
+          "time_of_day": false,
+          "volume": true
+        },
+        "ffn": 256,
+        "future_calendar": false,
+        "heads": 2,
+        "horizon_loss": "uniform",
+        "horizon_mean": "free",
+        "jepa": {
+          "directions": 256,
+          "prediction_weight": 1.0,
+          "predictor_width": 256,
+          "reconstruction_weight": 1.0,
+          "seed": 20260919,
+          "sigreg_weight": 0.09,
+          "views": 8
+        },
+        "layers": 2,
+        "min_history": 256,
+        "patch_len": 16,
+        "pred_len": 192,
+        "reader_norm": "none",
+        "seq_len": 512,
+        "x0_lambdas": "enabled"
+      }
+    ],
+    [
+      "reader-local",
+      {
+        "d_model": 128,
+        "dropout": 0.0,
+        "features": {
+          "day_of_week": false,
+          "market": false,
+          "session_gap": false,
+          "spy": false,
+          "time_of_day": false,
+          "volume": true
+        },
+        "ffn": 256,
+        "future_calendar": false,
+        "heads": 2,
+        "horizon_loss": "uniform",
+        "horizon_mean": "free",
+        "jepa": {
+          "directions": 256,
+          "prediction_weight": 1.0,
+          "predictor_width": 256,
+          "reconstruction_weight": 1.0,
+          "seed": 20260919,
+          "sigreg_weight": 0.09,
+          "views": 8
+        },
+        "layers": 2,
+        "min_history": 256,
+        "patch_len": 16,
+        "pred_len": 192,
+        "reader_norm": "none",
+        "seq_len": 512,
+        "sigreg_placement": "local",
+        "x0_lambdas": "enabled"
+      }
+    ],
+    [
+      "reader-state",
+      {
+        "d_model": 128,
+        "dropout": 0.0,
+        "features": {
+          "day_of_week": false,
+          "market": false,
+          "session_gap": false,
+          "spy": false,
+          "time_of_day": false,
+          "volume": true
+        },
+        "ffn": 256,
+        "future_calendar": false,
+        "heads": 2,
+        "horizon_loss": "uniform",
+        "horizon_mean": "free",
+        "jepa": {
+          "directions": 256,
+          "prediction_weight": 1.0,
+          "predictor_width": 256,
+          "reconstruction_weight": 1.0,
+          "seed": 20260919,
+          "sigreg_weight": 0.09,
+          "views": 8
+        },
+        "layers": 2,
+        "min_history": 256,
+        "patch_len": 16,
+        "pred_len": 192,
+        "reader_norm": "none",
+        "seq_len": 512,
+        "sigreg_placement": "state",
+        "x0_lambdas": "enabled"
+      }
+    ],
+    [
+      "reader-both",
+      {
+        "d_model": 128,
+        "dropout": 0.0,
+        "features": {
+          "day_of_week": false,
+          "market": false,
+          "session_gap": false,
+          "spy": false,
+          "time_of_day": false,
+          "volume": true
+        },
+        "ffn": 256,
+        "future_calendar": false,
+        "heads": 2,
+        "horizon_loss": "uniform",
+        "horizon_mean": "free",
+        "jepa": {
+          "directions": 256,
+          "prediction_weight": 1.0,
+          "predictor_width": 256,
+          "reconstruction_weight": 1.0,
+          "seed": 20260919,
+          "sigreg_weight": 0.09,
+          "views": 8
+        },
+        "layers": 2,
+        "min_history": 256,
+        "patch_len": 16,
+        "pred_len": 192,
+        "reader_norm": "none",
+        "seq_len": 512,
+        "sigreg_placement": "both",
+        "x0_lambdas": "enabled"
+      }
+    ]
+  ],
+  "executable_sha256": "de37d5308d9da9f2ae8037f80bdf0cd3dfadc66ad60a30015f186a83fa2ea75a",
+  "interpretation": "controlled causal old-cue use under matched recent inputs; not market-performance evidence",
+  "schema": "causal-delayed-cue-memory-v1",
+  "tasks": [
+    "relevant-cue",
+    "irrelevant-cue-null"
+  ],
+  "training_stream_xor": 8206846953913944927,
+  "validation_stream_xor": 12793988012382445105
+}

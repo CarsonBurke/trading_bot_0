@@ -1,0 +1,35 @@
+
+running 30 tests
+test torch::timexer_segment::accuracy::tests::calibration_target_reach_must_precede_both_final_origin_panels_strictly ... ok
+test torch::timexer_segment::accuracy::tests::comparison_deltas_preserve_signed_information_and_undefined_horizons ... ok
+test torch::timexer_segment::accuracy::tests::geometry_allows_recipe_controls_but_rejects_changed_source_or_target ... ok
+test torch::timexer_segment::accuracy::tests::named_paths_keep_equals_in_the_path_and_reject_missing_identity ... ok
+test torch::timexer_segment::jepa::tests::cuda_jepa_resident_randomness_refreshes_reproducibly_without_advancing_torch_rng ... ok
+test torch::timexer_segment::jepa::tests::cuda_jepa_sigreg_uses_batch_population_and_never_pools_time_views ... ok
+test torch::timexer_segment::jepa::tests::cuda_jepa_targets_are_attached_and_invalid_or_short_history_pairs_have_zero_gradient ... ok
+test torch::timexer_segment::jepa::tests::cuda_reader_both_is_the_same_draw_convex_combination_and_masks_have_zero_gradient ... ok
+test torch::timexer_segment::jepa::tests::cuda_sigreg_allows_persistent_population_diversity_without_pooling_time_or_singletons ... ok
+test torch::timexer_segment::jepa_eval::tests::chronological_selection_purges_actual_target_reach_and_timestamp_ties ... ok
+test torch::timexer_segment::jepa_eval::tests::chronology_reaches_the_last_supported_delayed_future_endpoint ... ok
+test torch::timexer_segment::jepa_eval::tests::common_probe_origin_cannot_move_with_objective_horizon_count ... ok
+test torch::timexer_segment::jepa_eval::tests::conditional_baseline_uses_only_valid_training_pairs_per_horizon ... ok
+test torch::timexer_segment::jepa_eval::tests::cuda_ridge_refit_uses_extra_training_rows_without_retuning_penalty ... ok
+test torch::timexer_segment::jepa_eval::tests::delayed_masks_exclude_unavailable_and_invalid_intervals_not_unneeded_gaps ... ok
+test torch::timexer_segment::jepa_eval::tests::delayed_return_endpoints_use_the_last_observed_source_bar ... ok
+test torch::timexer_segment::jepa_eval::tests::feature_second_moment_spectrum_retains_constant_energy ... ok
+test torch::timexer_segment::jepa_eval::tests::masked_moment_error_matches_paired_residuals_after_merging_mask_patterns ... ok
+test torch::timexer_segment::jepa_eval::tests::missing_intermediate_bar_masks_return_without_turning_it_into_zero_label ... ok
+test torch::timexer_segment::jepa_eval::tests::partition_authentication_rejects_validation_as_training_and_duplicates ... ok
+test torch::timexer_segment::model::tests::cuda_jepa_capture_keeps_metrics_uncontaminated_and_outside_optimizer_pool ... ok
+test torch::timexer_segment::model::tests::cuda_jepa_conditional_targets_use_source_statistics_complete_intervals_and_no_target_gradient ... ok
+test torch::timexer_segment::model::tests::cuda_jepa_future_observations_cannot_change_earlier_states_or_predictions ... ok
+test torch::timexer_segment::model::tests::cuda_jepa_latent_only_forecast_trains_readout_without_anchor_gradient ... ok
+test torch::timexer_segment::model::tests::cuda_jepa_optional_heads_preserve_off_initialization_and_forecasting ... ok
+test torch::timexer_segment::model::tests::cuda_jepa_target_projector_never_enters_forecasting_or_changes_shared_initialization ... ok
+test torch::timexer_segment::model::tests::cuda_reader_capture_refreshes_populations_and_retained_diagnostics_survive_replay ... ok
+test torch::timexer_segment::model::tests::cuda_reader_placements_share_causal_forecasts_and_the_actual_unnormalized_probe_interface ... ok
+test torch::timexer_segment::model::tests::cuda_reader_sigreg_uses_complete_source_patches_and_actual_valid_history_without_future_masks ... ok
+test torch::timexer_segment::model::tests::reader_contract_rejects_mixed_objectives_and_authenticates_even_the_unregularized_reader ... ok
+
+test result: ok. 30 passed; 0 failed; 0 ignored; 0 measured; 1223 filtered out; finished in 1.62s
+

@@ -1,0 +1,260 @@
+{
+  "args": {
+    "batch_size": 64,
+    "eval_every": 128,
+    "jepa_modes": [
+      "off",
+      "latent-one",
+      "latent-multi",
+      "anchored",
+      "anchored-no-sigreg",
+      "anchored-reconstruct"
+    ],
+    "learning_rate": 0.001,
+    "output": "benchmark_results/unanchored-sigreg-memory-20260920",
+    "reader_sigreg": false,
+    "seed": 20260919,
+    "steps": 1024,
+    "unanchored_sigreg": true,
+    "validation_pairs": 256
+  },
+  "arms": [
+    [
+      "unanchored-off",
+      {
+        "d_model": 128,
+        "dropout": 0.0,
+        "features": {
+          "day_of_week": false,
+          "market": false,
+          "session_gap": false,
+          "spy": false,
+          "time_of_day": false,
+          "volume": true
+        },
+        "ffn": 256,
+        "future_calendar": false,
+        "heads": 2,
+        "horizon_loss": "uniform",
+        "horizon_mean": "free",
+        "jepa": {
+          "directions": 256,
+          "prediction_weight": 1.0,
+          "predictor_width": 256,
+          "reconstruction_weight": 0.0,
+          "seed": 20260919,
+          "sigreg_weight": 0.09,
+          "views": 8
+        },
+        "jepa_mode": "unanchored",
+        "layers": 2,
+        "min_history": 256,
+        "patch_len": 16,
+        "pred_len": 192,
+        "reader_norm": "none",
+        "seq_len": 512,
+        "x0_lambdas": "enabled"
+      }
+    ],
+    [
+      "unanchored-local",
+      {
+        "d_model": 128,
+        "dropout": 0.0,
+        "features": {
+          "day_of_week": false,
+          "market": false,
+          "session_gap": false,
+          "spy": false,
+          "time_of_day": false,
+          "volume": true
+        },
+        "ffn": 256,
+        "future_calendar": false,
+        "heads": 2,
+        "horizon_loss": "uniform",
+        "horizon_mean": "free",
+        "jepa": {
+          "directions": 256,
+          "prediction_weight": 1.0,
+          "predictor_width": 256,
+          "reconstruction_weight": 0.0,
+          "seed": 20260919,
+          "sigreg_weight": 0.09,
+          "views": 8
+        },
+        "jepa_mode": "unanchored",
+        "layers": 2,
+        "min_history": 256,
+        "patch_len": 16,
+        "pred_len": 192,
+        "reader_norm": "none",
+        "seq_len": 512,
+        "sigreg_placement": "local",
+        "x0_lambdas": "enabled"
+      }
+    ],
+    [
+      "unanchored-state",
+      {
+        "d_model": 128,
+        "dropout": 0.0,
+        "features": {
+          "day_of_week": false,
+          "market": false,
+          "session_gap": false,
+          "spy": false,
+          "time_of_day": false,
+          "volume": true
+        },
+        "ffn": 256,
+        "future_calendar": false,
+        "heads": 2,
+        "horizon_loss": "uniform",
+        "horizon_mean": "free",
+        "jepa": {
+          "directions": 256,
+          "prediction_weight": 1.0,
+          "predictor_width": 256,
+          "reconstruction_weight": 0.0,
+          "seed": 20260919,
+          "sigreg_weight": 0.09,
+          "views": 8
+        },
+        "jepa_mode": "unanchored",
+        "layers": 2,
+        "min_history": 256,
+        "patch_len": 16,
+        "pred_len": 192,
+        "reader_norm": "none",
+        "seq_len": 512,
+        "sigreg_placement": "state",
+        "x0_lambdas": "enabled"
+      }
+    ],
+    [
+      "unanchored-both",
+      {
+        "d_model": 128,
+        "dropout": 0.0,
+        "features": {
+          "day_of_week": false,
+          "market": false,
+          "session_gap": false,
+          "spy": false,
+          "time_of_day": false,
+          "volume": true
+        },
+        "ffn": 256,
+        "future_calendar": false,
+        "heads": 2,
+        "horizon_loss": "uniform",
+        "horizon_mean": "free",
+        "jepa": {
+          "directions": 256,
+          "prediction_weight": 1.0,
+          "predictor_width": 256,
+          "reconstruction_weight": 0.0,
+          "seed": 20260919,
+          "sigreg_weight": 0.09,
+          "views": 8
+        },
+        "jepa_mode": "unanchored",
+        "layers": 2,
+        "min_history": 256,
+        "patch_len": 16,
+        "pred_len": 192,
+        "reader_norm": "none",
+        "seq_len": 512,
+        "sigreg_placement": "both",
+        "x0_lambdas": "enabled"
+      }
+    ]
+  ],
+  "executable_sha256": "a2e49f0639443c00eebc977a881b5c241593ff134d2e0c8826c8119a6dca76f2",
+  "interpretation": "controlled causal old-cue use under matched recent inputs; not market-performance evidence",
+  "schema": "causal-delayed-cue-unanchored-memory-v1",
+  "tasks": [
+    "relevant-cue",
+    "irrelevant-cue-null"
+  ],
+  "training_stream_xor": 8206846953913944927,
+  "unanchored_protocol": {
+    "argv": [
+      "/home/marvin/Documents/repositories/trading_bot_0/benchmark_results/unanchored-sigreg-20260920-assets/trading_bot_0-v2",
+      "benchmark-jepa-memory",
+      "--unanchored-sigreg",
+      "--output",
+      "benchmark_results/unanchored-sigreg-memory-20260920",
+      "--steps",
+      "1024",
+      "--batch-size",
+      "64",
+      "--validation-pairs",
+      "256",
+      "--eval-every",
+      "128",
+      "--seed",
+      "20260919",
+      "--learning-rate",
+      "0.001"
+    ],
+    "both_site_weight": 0.045,
+    "decision_loss": false,
+    "endpoint_selection": "fixed completed budget; no intermediate downstream evaluation or validation selection",
+    "feature_equality_assertions": "exact recent prices,aux,validity,market,anchor and source sigma/range; recent/local paired feature MSE <= 1e-12",
+    "forecast_head_evaluated": false,
+    "forecast_loss": false,
+    "future_calendar": false,
+    "gradient_surgery": false,
+    "horizon_decimation": "none",
+    "initialization": "fresh-random-per-placement-and-task-no-warmstart",
+    "latent_offsets": [
+      1,
+      2,
+      4,
+      8,
+      12
+    ],
+    "ordered_stages": [
+      "fresh initialization",
+      "1024 attached JEPA+SIGReg-only updates",
+      "destroy optimizer and captured graph",
+      "freeze complete parameter store",
+      "snapshot every parameter",
+      "generate independent train-only reader panels under no_grad",
+      "select and refit three frozen readers",
+      "generate and score held-out matched pairs",
+      "assert all parameter snapshots exactly unchanged"
+    ],
+    "paired_innovations": "identical innovations within each +/-cue pair; same validation RNG across placements and relevant/null tasks",
+    "paired_validation_seed": 12793988012398376454,
+    "parameter_seed": 20260919,
+    "planned_independent_tasks": 8,
+    "planned_pretraining_episodes_per_task": 65536,
+    "planned_updates_per_task": 1024,
+    "prediction_weight": 1.0,
+    "pretraining_seed": 8206846953934070632,
+    "reader_features": [
+      "frozen-ridge-full",
+      "frozen-ridge-recomputed-recent",
+      "frozen-ridge-local"
+    ],
+    "reader_holdout_rows": 512,
+    "reader_holdout_seed": 6100671665980000762,
+    "reader_holdout_stream_xor": 6100671665999602125,
+    "reader_inner_rows": 2048,
+    "reader_inner_seed": 14912565824237111474,
+    "reader_inner_stream_xor": 14912565824223813765,
+    "reader_norm": "none",
+    "reader_refit_rows": 2560,
+    "reader_selection": "existing CUDA ridge penalty grid; select only independent training holdout then refit inner+holdout",
+    "reader_targets": "source-anchored future close log returns; source bar319; horizons16,32,64,128,192",
+    "reconstruction_loss": false,
+    "scale_coupling": "full",
+    "sigreg_seed": 20260919,
+    "sigreg_total_weight": 0.09,
+    "target_stop_gradient": false
+  },
+  "validation_stream_xor": 12793988012382445105
+}
