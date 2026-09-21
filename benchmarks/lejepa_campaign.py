@@ -34,6 +34,9 @@ TEMPORAL_PROJECTED_NAMES = ("temporal-projected", "temporal-projected-no-sigreg"
 SIGN_NAMES = ("temporal-projected-sign",)
 CONDITIONAL_NAMES = ("conditional", "conditional-full-none")
 UNANCHORED_TEMPORAL_NAMES = ("unanchored-temporal", "unanchored-temporal-no-sigreg")
+UNANCHORED_TEMPORAL_STATE_NAMES = ("unanchored-temporal-state",)
+UNANCHORED_TEMPORAL_COMBINED_NAMES = (
+    *UNANCHORED_TEMPORAL_NAMES, *UNANCHORED_TEMPORAL_STATE_NAMES)
 MOMENT_FIELDS = ("decision_mse_weight", "temporal_moment_weight")
 SIGN_WEIGHT = 0.05
 MOMENT_WEIGHTS = {
@@ -102,6 +105,36 @@ UNANCHORED_TEMPORAL_CONTRACT = {
     "numerics": "native-bf16-cuda-graphs-no-gradient-accumulation-no-chunking",
     "protocol": UNANCHORED_PROTOCOL,
 }
+UNANCHORED_TEMPORAL_COMBINED_CONTRACT = {
+    "required_fresh_arms": list(UNANCHORED_TEMPORAL_COMBINED_NAMES),
+    "allowed_model_differences": ["jepa_mode", "jepa.sigreg_weight", "sigreg_placement"],
+    "jepa_modes": {
+        "unanchored-temporal": "unanchored-temporal-projected",
+        "unanchored-temporal-no-sigreg": "unanchored-temporal-projected-no-sigreg",
+        "unanchored-temporal-state": "unanchored-temporal-projected",
+    },
+    "jepa_sigreg_weights": {
+        "unanchored-temporal": 0.09,
+        "unanchored-temporal-no-sigreg": 0.0,
+        "unanchored-temporal-state": 0.045,
+    },
+    "reader_placements": {
+        "unanchored-temporal": "off",
+        "unanchored-temporal-no-sigreg": "off",
+        "unanchored-temporal-state": "state",
+    },
+    "recipe": "full-none", "reader_norm": "none",
+    "initialization": "fresh-random-no-warmstart-no-supervised-reuse",
+    "pretraining": "attached-future-q-delta-jepa-plus-target-and-reader-state-sigreg",
+    "target_gradient": "attached-no-stop-gradient-no-gradient-surgery",
+    "forecast_loss_weight": 0.0, "decision_mse_weight": 0.0, "temporal_moment_weight": 0.0,
+    "jepa": UNANCHORED_TEMPORAL_CONFIG, "offsets": [1, 2, 4, 8, 12],
+    "sigreg": "target-per-offset-and-reader-state; fixed .09 aggregate budget",
+    "reader_fitting": "after-final-representation-freeze-only",
+    "primary_comparison": "held-out-frozen-cuda-ridge-probes-not-online-forecast-head",
+    "numerics": "native-bf16-cuda-graphs-no-gradient-accumulation-no-chunking",
+    "protocol": UNANCHORED_PROTOCOL,
+}
 UNANCHORED_PROBE_PROTOCOL = {
     "primary_report": "timexer_segment_jepa_probe_ratio",
     "series": "full-state", "horizons_bars": [16, 32, 64, 128, 192],
@@ -150,6 +183,7 @@ SUITES = {
     "temporal-moments": (BASELINE, "full-none-forecast", *MOMENT_WEIGHTS),
     "temporal-reader-sigreg": (BASELINE, *READER_PLACEMENTS),
     "temporal-unanchored-temporal": UNANCHORED_TEMPORAL_NAMES,
+    "temporal-unanchored-combined": UNANCHORED_TEMPORAL_COMBINED_NAMES,
     "temporal-unanchored-sigreg": tuple(UNANCHORED_PLACEMENTS),
 }
 RECIPES = {
@@ -194,6 +228,19 @@ def json_bytes(value):
 
 def identity_digest(value):
     return hashlib.sha256(json_bytes(value)).hexdigest()
+def snapshot(source, destination, executable=False):
+    source = Path(source).resolve(strict=True)
+    if executable:
+        with source.open("rb") as stream:
+            if stream.read(4) != b"\x7fELF" or not os.access(source, os.X_OK):
+                raise ValueError(f"explicit executable must be an ELF binary, not a mutable launcher: {source}")
+    before = sha256(source)
+    with source.open("rb") as reader, destination.open("xb") as writer:
+        shutil.copyfileobj(reader, writer)
+    if before != sha256(destination) or before != sha256(source):
+        raise ValueError(f"source changed while being pinned: {source}")
+    destination.chmod(0o555 if executable else 0o444)
+    return {"source": str(source), "path": str(destination), "sha256": before}
 
 
 def write_new(path, value):
@@ -230,23 +277,6 @@ def positive(value):
     if number <= 0:
         raise argparse.ArgumentTypeError("must be positive")
     return number
-
-
-def snapshot(source, destination, executable=False):
-    source = Path(source).resolve(strict=True)
-    if executable:
-        with source.open("rb") as stream:
-            if stream.read(4) != b"\x7fELF" or not os.access(source, os.X_OK):
-                raise ValueError(f"explicit executable must be an ELF binary, not a mutable launcher: {source}")
-    before = sha256(source)
-    with source.open("rb") as reader, destination.open("xb") as writer:
-        shutil.copyfileobj(reader, writer)
-    if before != sha256(destination) or before != sha256(source):
-        raise ValueError(f"source changed while being pinned: {source}")
-    destination.chmod(0o555 if executable else 0o444)
-    return {"source": str(source), "path": str(destination), "sha256": before}
-
-
 def arm_specs(suite, selected):
     names = selected or SUITES[suite]
     if len(set(names)) != len(names) or set(names) - set(SUITES[suite]):
@@ -266,20 +296,23 @@ def arm_specs(suite, selected):
     modes.update({
         "unanchored-temporal": "unanchored-temporal-projected",
         "unanchored-temporal-no-sigreg": "unanchored-temporal-projected-no-sigreg",
+        "unanchored-temporal-state": "unanchored-temporal-projected",
     })
-    placements = READER_PLACEMENTS | UNANCHORED_PLACEMENTS
+    placements = READER_PLACEMENTS | UNANCHORED_PLACEMENTS | {
+        "unanchored-temporal-state": "state",
+    }
     return [
         {"name": label, "jepa_mode": modes.get(label, "off"),
          "recipe": "full-none" if label in (
              "full-none-forecast", "conditional-full-none", *MOMENT_WEIGHTS, *SIGN_NAMES,
-             *placements, *UNANCHORED_TEMPORAL_NAMES
+             *placements, *UNANCHORED_TEMPORAL_COMBINED_NAMES
          ) else "decoupled-lattice",
          **dict(zip(MOMENT_FIELDS, MOMENT_WEIGHTS.get(label, (0.0, 0.0)))),
          "decision_sign_weight": SIGN_WEIGHT if label in SIGN_NAMES else 0.0,
          **({"reader_norm": "none", "sigreg_placement": placements[label]}
             if label in placements else
             {"reader_norm": "none", "sigreg_placement": "off"}
-            if label in UNANCHORED_TEMPORAL_NAMES else READER_DEFAULTS)}
+            if label in UNANCHORED_TEMPORAL_COMBINED_NAMES else READER_DEFAULTS)}
         for label in SUITES[suite] if label in names
     ]
 
@@ -305,11 +338,13 @@ def sign_weight(arm):
 def reader_settings(arm):
     """Omitted legacy fields are RMS/off, never a new unconstrained control."""
     values = {field: arm.get(field, default) for field, default in READER_DEFAULTS.items()}
-    placements = READER_PLACEMENTS | UNANCHORED_PLACEMENTS
+    placements = READER_PLACEMENTS | UNANCHORED_PLACEMENTS | {
+        "unanchored-temporal-state": "state",
+    }
     expected = ({"reader_norm": "none", "sigreg_placement": placements[arm["name"]]}
                 if arm["name"] in placements else
                 {"reader_norm": "none", "sigreg_placement": "off"}
-                if arm["name"] in UNANCHORED_TEMPORAL_NAMES else READER_DEFAULTS)
+                if arm["name"] in UNANCHORED_TEMPORAL_COMBINED_NAMES else READER_DEFAULTS)
     if values != expected:
         raise ValueError(f"{arm['name']}: reader normalization or SIGReg placement differs from its named treatment")
     return values
@@ -339,7 +374,7 @@ def recipe_for(plan, arm):
             arm["jepa_mode"] != "unanchored" or recipe != "full-none"
             or plan["common_config"].get("future-calendar") != "false"):
         raise ValueError(f"{arm['name']}: unanchored SIGReg requires attached temporal JEPA full-none")
-    if arm["name"] in UNANCHORED_TEMPORAL_NAMES and (
+    if arm["name"] in UNANCHORED_TEMPORAL_COMBINED_NAMES and (
             arm["jepa_mode"] not in (
                 "unanchored-temporal-projected", "unanchored-temporal-projected-no-sigreg")
             or recipe != "full-none"
@@ -361,16 +396,18 @@ def arm_command(plan, arm):
         command += [f"--{key}", str(value)]
     for field, value in moment_weights(arm).items():
         command += [f"--{field.replace('_', '-')}", str(value)]
-    if sign_weight(arm) > 0.0:
-        command += ["--decision-sign-weight", str(sign_weight(arm))]
     if plan["suite"] in (
             "temporal-reader-sigreg", "temporal-unanchored-sigreg",
-            "temporal-unanchored-temporal"):
+            "temporal-unanchored-temporal", "temporal-unanchored-combined"):
         for field, value in reader_settings(arm).items():
             command += [f"--{field.replace('_', '-')}", value]
-    if arm["name"] in UNANCHORED_TEMPORAL_NAMES:
+    if arm["name"] in UNANCHORED_TEMPORAL_COMBINED_NAMES:
         sigreg_config = UNANCHORED_TEMPORAL_CONFIG | {
-            "sigreg_weight": 0.09 if arm["name"] == "unanchored-temporal" else 0.0,
+            "sigreg_weight": (
+                0.045 if arm["name"] == "unanchored-temporal-state"
+                else 0.09 if arm["name"] == "unanchored-temporal"
+                else 0.0
+            ),
         }
     else:
         sigreg_config = (UNANCHORED_SIGREG_CONFIG if arm["name"] in UNANCHORED_PLACEMENTS
@@ -381,13 +418,20 @@ def arm_command(plan, arm):
 
 def validate_unanchored_suite(plan):
     suite = plan.get("suite")
-    if suite not in ("temporal-unanchored-sigreg", "temporal-unanchored-temporal"):
-        if ("unanchored_contract" in plan or "unanchored_temporal_contract" in plan or any(
-                arm["name"] in {*UNANCHORED_PLACEMENTS, *UNANCHORED_TEMPORAL_NAMES}
-                or arm["jepa_mode"] in (
-                    "unanchored", "unanchored-temporal-projected",
-                    "unanchored-temporal-projected-no-sigreg")
-                for arm in plan["arms"])):
+    if suite not in (
+            "temporal-unanchored-sigreg",
+            "temporal-unanchored-temporal",
+            "temporal-unanchored-combined"):
+        if ("unanchored_contract" in plan or "unanchored_temporal_contract" in plan
+                or "unanchored_temporal_combined_contract" in plan or any(
+                    arm["name"] in {
+                        *UNANCHORED_PLACEMENTS,
+                        *UNANCHORED_TEMPORAL_COMBINED_NAMES,
+                    }
+                    or arm["jepa_mode"] in (
+                        "unanchored", "unanchored-temporal-projected",
+                        "unanchored-temporal-projected-no-sigreg")
+                    for arm in plan["arms"])):
             raise ValueError("unanchored treatments require a named unanchored suite")
         return
     if plan["schema"] != SCHEMA:
@@ -399,12 +443,19 @@ def validate_unanchored_suite(plan):
         expected_names = set(UNANCHORED_PLACEMENTS)
         expected_baseline = "unanchored-none"
         expected_differences = ["sigreg_placement"]
-    else:
+    elif suite == "temporal-unanchored-temporal":
         if json_bytes(plan.get("unanchored_temporal_contract")) != json_bytes(UNANCHORED_TEMPORAL_CONTRACT):
             raise ValueError("unanchored temporal immutable pretraining contract differs")
         expected_names = set(UNANCHORED_TEMPORAL_NAMES)
         expected_baseline = "unanchored-temporal-no-sigreg"
         expected_differences = ["jepa_mode", "jepa.sigreg_weight"]
+    else:
+        if json_bytes(plan.get("unanchored_temporal_combined_contract")) != json_bytes(
+                UNANCHORED_TEMPORAL_COMBINED_CONTRACT):
+            raise ValueError("unanchored temporal combined immutable contract differs")
+        expected_names = set(UNANCHORED_TEMPORAL_COMBINED_NAMES)
+        expected_baseline = "unanchored-temporal-no-sigreg"
+        expected_differences = ["jepa_mode", "jepa.sigreg_weight", "sigreg_placement"]
     if plan.get("reference") or plan.get("recovered_references"):
         raise ValueError("unanchored suites require fresh initialization of all arms")
     if (plan.get("protocol_baseline") != expected_baseline
@@ -578,7 +629,10 @@ def plan(args):
                 "basis-weight": "uniform", "future-calendar": "false", "x0-lambdas": "disabled"}
     if any(common[key] != value for key, value in required.items()):
         raise ValueError("shared baseline must be causal, uncalibrated 192-bar decoupled+lattice; choose a named suite for recipe treatments")
-    if args.suite in ("temporal-unanchored-sigreg", "temporal-unanchored-temporal"):
+    if args.suite in (
+            "temporal-unanchored-sigreg",
+            "temporal-unanchored-temporal",
+            "temporal-unanchored-combined"):
         if args.reference_plan or args.recovered_reference:
             raise ValueError("unanchored suites start clean: no reference or recovered checkpoints")
         protocol = vars(args) | {"schedule_budget": args.max_steps}
@@ -642,11 +696,17 @@ def plan(args):
         manifest["protocol_baseline"] = "unanchored-none"
         manifest["allowed_model_differences"] = ["sigreg_placement"]
         manifest["completion"] = "all four fresh attached-target temporal JEPA arms finish exactly 1400 steps, freeze the complete representation, and fit and score held-out readers; authenticate objective packet and frozen binary probe reports; no online forecast acceptance or automatic winner"
-    if args.suite == "temporal-unanchored-temporal":
+    elif args.suite == "temporal-unanchored-temporal":
         manifest["unanchored_temporal_contract"] = UNANCHORED_TEMPORAL_CONTRACT
         manifest["protocol_baseline"] = "unanchored-temporal-no-sigreg"
         manifest["allowed_model_differences"] = ["jepa_mode", "jepa.sigreg_weight"]
         manifest["completion"] = "both fresh unanchored temporal delta JEPA arms finish exactly 1400 steps, freeze the complete representation, and fit and score held-out readers; no online forecast acceptance"
+    elif args.suite == "temporal-unanchored-combined":
+        manifest["unanchored_temporal_combined_contract"] = UNANCHORED_TEMPORAL_COMBINED_CONTRACT
+        manifest["protocol_baseline"] = "unanchored-temporal-no-sigreg"
+        manifest["allowed_model_differences"] = [
+            "jepa_mode", "jepa.sigreg_weight", "sigreg_placement"]
+        manifest["completion"] = "three fresh unanchored temporal JEPA arms finish exactly 1400 steps, freeze the complete representation, and fit and score held-out readers; authenticate target and reader-state objective packets; no online forecast acceptance"
     inherited_sources = []
     existing = set()
     if reference:
@@ -685,7 +745,10 @@ def plan(args):
     if selected & existing:
         raise ValueError("selected model already exists in reference; use --select for only missing treatments")
     available = selected | existing
-    if args.suite not in ("temporal-unanchored-sigreg", "temporal-unanchored-temporal") and BASELINE_KEY not in available:
+    if args.suite not in (
+            "temporal-unanchored-sigreg",
+            "temporal-unanchored-temporal",
+            "temporal-unanchored-combined") and BASELINE_KEY not in available:
         raise ValueError(f"include {BASELINE}, or --reference-plan containing its completed matched endpoint")
     if args.suite == "temporal-moments" and FULL_NONE_KEY not in available:
         raise ValueError("temporal-moments requires its matched full-none-forecast control, selected or inherited")
@@ -833,40 +896,58 @@ def follow(args):
 
 
 def unanchored_checkpoint_contract(arm):
-    if arm["name"] in UNANCHORED_TEMPORAL_NAMES:
-        sigreg_weight = 0.09 if arm["name"] == "unanchored-temporal" else 0.0
+    if arm["name"] in UNANCHORED_TEMPORAL_COMBINED_NAMES:
+        placement = "state" if arm["name"] == "unanchored-temporal-state" else "off"
+        sigreg_weight = (
+            0.045 if arm["name"] == "unanchored-temporal-state"
+            else 0.09 if arm["name"] == "unanchored-temporal"
+            else 0.0
+        )
         config = {
             "predictor_width": 256, "prediction_weight": 1.0,
             "sigreg_weight": sigreg_weight, "reconstruction_weight": 0.0,
             "directions": 256, "views": 8, "seed": 0,
         }
         regularized = sigreg_weight > 0.
-        sigreg = "per-offset-temporal-target-population-sigreg" if regularized else "none"
-        objective = (
-            "prediction-weight*masked-temporal-delta-mse+target-sigreg-weight*per-offset-population-sigreg"
-            if regularized else "prediction-weight*masked-temporal-delta-mse"
-        )
+        target_sigreg = "per-offset-temporal-target-population-sigreg" if regularized else "none"
+        reader_sigreg = "reader-state-population-sigreg" if placement != "off" else "none"
+        objective = {
+            (True, True): "prediction-weight*masked-temporal-delta-mse+target-sigreg-weight*per-offset-population-sigreg+reader-sigreg-weight*state-population-sigreg",
+            (True, False): "prediction-weight*masked-temporal-delta-mse+target-sigreg-weight*per-offset-population-sigreg",
+            (False, False): "prediction-weight*masked-temporal-delta-mse",
+        }[(regularized, placement != "off")]
         objective_contract = (
             f"temporal-jepa-unanchored-projected-v1;mode={arm['jepa_mode']};"
             f"config={json.dumps(config, separators=(',', ':'))};"
             "offsets-patches=[1,2,4,8,12];horizons-bars=[16, 32, 64, 128, 192];"
-            "reader-norm=none;placement=off;observation=unconstrained-shared-full-width-patch-embedding(causal-prefix-normalization);"
+            f"reader-norm=none;placement={placement};"
+            "observation=unconstrained-shared-full-width-patch-embedding(causal-prefix-normalization);"
             "state=actual-pre-final-rms-causal-reader;"
             "target=attached-nonoverlapping-future-q-delta(observation);"
             "projector=pointwise-d-model-gelu-d-model-no-normalization-no-dropout;"
-            f"predictor=direct-state-mlp;objective={objective};sigreg={sigreg};"
+            f"predictor=direct-state-mlp;objective={objective};"
+            f"sigreg=target:{target_sigreg}+reader:{reader_sigreg};"
             "population=independent-valid-batch-rows-per-offset-view;"
             "mask=complete-source-patch-and-target-patch;"
             "forecast=not-forwarded-no-loss-frozen-allocation;reconstruction=none;decision=none;future-calendar=false"
         )
         return {
             "schema": "temporal-jepa-unanchored-projected-v1", "initialization": "fresh-random",
-            "objective": ("attached-temporal-projected-jepa-plus-per-offset-target-sigreg"
-                          if regularized else "attached-temporal-projected-jepa-no-sigreg"),
+            "objective": (
+                "attached-temporal-projected-jepa-plus-per-offset-target-and-reader-state-sigreg"
+                if placement != "off" else
+                "attached-temporal-projected-jepa-plus-per-offset-target-sigreg"
+                if regularized else "attached-temporal-projected-jepa-no-sigreg"),
             "objective_contract": objective_contract, "prediction_weight": 1.0,
-            "sigreg_total_weight": sigreg_weight, "sigreg_placement": "off",
-            "sigreg_site_weights": {"local": 0.0, "state": 0.0, "target": sigreg_weight},
-            "sigreg_scope": "independent-population-per-offset" if regularized else "none",
+            "sigreg_total_weight": 0.09 if placement != "off" else sigreg_weight,
+            "sigreg_placement": placement,
+            "sigreg_site_weights": {
+                "local": 0.0, "state": sigreg_weight if placement == "state" else 0.0,
+                "target": sigreg_weight if regularized else 0.0,
+            },
+            "sigreg_scope": (
+                "independent-population-per-offset-and-reader-state" if placement != "off"
+                else "independent-population-per-offset" if regularized else "none"),
             "offsets_patches": [1, 2, 4, 8, 12],
             "target": "attached-future-q-minus-source-q",
             "forecast_weight": 0.0, "reconstruction_weight": 0.0, "decision_weight": 0.0,
@@ -942,23 +1023,35 @@ def binary_report_rows(plan, root, base):
 def unanchored_probe_evidence(plan, arm, root):
     objective = binary_report_rows(plan, root, "timexer_segment_jepa_objective").get(plan["max_steps"], {})
     contract = unanchored_checkpoint_contract(arm)
-    if arm["name"] in UNANCHORED_TEMPORAL_NAMES:
-        target_sigreg = contract["sigreg_total_weight"]
+    if arm["name"] in UNANCHORED_TEMPORAL_COMBINED_NAMES:
+        weights = contract["sigreg_site_weights"]
+        target_weight = weights["target"]
+        reader_weight = weights["state"]
         required = (
             "temporal projected-target delta MSE",
             "temporal projected-target delta persistence MSE",
             "total optimization objective",
         )
-        if target_sigreg > 0.:
+        if target_weight > 0.:
             required += ("temporal projected-target delta SIGReg",)
+        if reader_weight > 0.:
+            required += ("reader state SIGReg", "reader SIGReg weighted contribution")
         for field in required:
             if not math.isfinite(objective.get(field, math.nan)):
                 raise ValueError(f"{arm['name']}: objective packet lacks finite {field} at the completed endpoint")
-        regularizer = target_sigreg * objective.get("temporal projected-target delta SIGReg", 0.0)
-        if not math.isclose(objective["total optimization objective"],
-                            objective["temporal projected-target delta MSE"] + regularizer,
-                            rel_tol=1e-5, abs_tol=1e-7):
-            raise ValueError(f"{arm['name']}: temporal objective includes an undeclared loss")
+        target_regularizer = target_weight * objective.get(
+            "temporal projected-target delta SIGReg", 0.0)
+        reader_regularizer = objective.get("reader SIGReg weighted contribution", 0.0)
+        if reader_weight > 0. and not math.isclose(
+                reader_regularizer, reader_weight * objective["reader state SIGReg"],
+                rel_tol=1e-5, abs_tol=1e-7):
+            raise ValueError(f"{arm['name']}: reader-state objective disagrees with declared placement weight")
+        if not math.isclose(
+                objective["total optimization objective"],
+                objective["temporal projected-target delta MSE"]
+                + target_regularizer + reader_regularizer,
+                rel_tol=1e-5, abs_tol=1e-7):
+            raise ValueError(f"{arm['name']}: temporal combined objective includes an undeclared loss")
     else:
         weights = contract["sigreg_site_weights"]
         active_fields = tuple(f"reader {site} SIGReg" for site in ("local", "state") if weights[site] > 0)
@@ -1013,14 +1106,24 @@ def endpoint_evidence(plan, arm):
     if model.get("jepa_mode", "off") != arm["jepa_mode"]:
         raise ValueError(f"{arm['name']}: objective arm differs")
     recipe = recipe_for(plan, arm)
-    unanchored = arm["name"] in {*UNANCHORED_PLACEMENTS, *UNANCHORED_TEMPORAL_NAMES}
+    unanchored = arm["name"] in {
+        *UNANCHORED_PLACEMENTS, *UNANCHORED_TEMPORAL_COMBINED_NAMES}
     if unanchored:
         validate_unanchored_suite(plan)
-        if json_bytes(checkpoint.get("unanchored_contract")) != json_bytes(unanchored_checkpoint_contract(arm)):
+        if json_bytes(checkpoint.get("unanchored_contract")) != json_bytes(
+                unanchored_checkpoint_contract(arm)):
             raise ValueError(f"{arm['name']}: endpoint does not authenticate fresh attached-only pretraining and frozen downstream readers")
-        expected_jepa = (UNANCHORED_TEMPORAL_CONFIG | {
-            "sigreg_weight": 0.09 if arm["name"] == "unanchored-temporal" else 0.0,
-        } if arm["name"] in UNANCHORED_TEMPORAL_NAMES else UNANCHORED_SIGREG_CONFIG)
+        expected_jepa = (
+            UNANCHORED_TEMPORAL_CONFIG | {
+                "sigreg_weight": (
+                    0.045 if arm["name"] == "unanchored-temporal-state"
+                    else 0.09 if arm["name"] == "unanchored-temporal"
+                    else 0.0
+                ),
+            }
+            if arm["name"] in UNANCHORED_TEMPORAL_COMBINED_NAMES
+            else UNANCHORED_SIGREG_CONFIG
+        )
         if json_bytes(model.get("jepa")) != json_bytes(expected_jepa):
             raise ValueError(f"{arm['name']}: endpoint JEPA configuration differs from the exact immutable contract")
     for field, value in reader_settings(arm).items():
@@ -1106,8 +1209,8 @@ def endpoint_evidence(plan, arm):
     reports = sorted(root.glob("gens/0/*.report.bin"))
     if not reports:
         raise ValueError(f"{arm['name']}: missing generation-zero binary reports")
-    if arm["name"] in UNANCHORED_TEMPORAL_NAMES:
-        treatment_fields = ("jepa_mode", "jepa")
+    if arm["name"] in UNANCHORED_TEMPORAL_COMBINED_NAMES:
+        treatment_fields = ("jepa_mode", "jepa", "sigreg_placement")
     else:
         treatment_fields = ("sigreg_placement",) if unanchored else MODEL_TREATMENTS
     shared_model = {key: value for key, value in model.items()
@@ -1264,16 +1367,24 @@ def collection_evidence(path, manifest, digest):
                 "revalidation_certificate_sha256": record["sha256"],
                 "original_failed_receipt_sha256": record["original_failed_receipt_sha256"],
             }
-    if manifest.get("suite") in ("temporal-unanchored-sigreg", "temporal-unanchored-temporal"):
-        expected = (set(UNANCHORED_PLACEMENTS)
-                    if manifest["suite"] == "temporal-unanchored-sigreg"
-                    else set(UNANCHORED_TEMPORAL_NAMES))
+    if manifest.get("suite") in (
+            "temporal-unanchored-sigreg",
+            "temporal-unanchored-temporal",
+            "temporal-unanchored-combined"):
+        expected = (
+            set(UNANCHORED_PLACEMENTS)
+            if manifest["suite"] == "temporal-unanchored-sigreg"
+            else set(UNANCHORED_TEMPORAL_COMBINED_NAMES)
+        )
         if (len(endpoints) != len(expected)
                 or {endpoint["name"] for endpoint in endpoints} != expected
                 or any(endpoint["reused"] for endpoint in endpoints)):
             raise ValueError("collection requires exactly the declared fresh unanchored endpoints")
-        control_name = ("unanchored-none" if manifest["suite"] == "temporal-unanchored-sigreg"
-                        else "unanchored-temporal-no-sigreg")
+        control_name = (
+            "unanchored-none"
+            if manifest["suite"] == "temporal-unanchored-sigreg"
+            else "unanchored-temporal-no-sigreg"
+        )
         control = next(endpoint for endpoint in endpoints if endpoint["name"] == control_name)
         baseline = {"name": control_name, "source_arm": control_name, "run_root": control["run_root"]}
     elif baseline is None:
@@ -1286,17 +1397,31 @@ def collection_evidence(path, manifest, digest):
     complete = {
         "schema": "lejepa-matched-comparison-complete-v2", "plan_sha256": digest,
         "finished_at": utc_now(), "arms": [arm["name"] for arm in manifest["arms"]],
-        "protocol_baseline": baseline, "shared_identity_sha256": identity_digest(shared_identity),
-        "allowed_model_differences": manifest["allowed_model_differences"], "endpoints": endpoints,
-        "interpretation": "matched causal uncalibrated forecast endpoints; objective, recipe and reader normalization/SIGReg placement contrasts are declared separately; latent losses are diagnostic only; no automatic winner",
+        "protocol_baseline": baseline,
+        "shared_identity_sha256": identity_digest(shared_identity),
+        "allowed_model_differences": manifest["allowed_model_differences"],
+        "endpoints": endpoints,
+        "interpretation": (
+            "matched causal uncalibrated forecast endpoints; objective, recipe and reader "
+            "normalization/SIGReg placement contrasts are declared separately; latent losses "
+            "are diagnostic only; no automatic winner"
+        ),
     }
     if manifest.get("suite") == "temporal-reader-sigreg":
         complete["reader_sigreg_contract"] = manifest["reader_sigreg_contract"]
         complete["reader_control"] = next(endpoint for endpoint in endpoints
                                           if endpoint["name"] == "reader-none" and not endpoint["reused"])
-    if manifest.get("suite") in ("temporal-unanchored-sigreg", "temporal-unanchored-temporal"):
-        contract_key = ("unanchored_contract" if manifest["suite"] == "temporal-unanchored-sigreg"
-                        else "unanchored_temporal_contract")
+    if manifest.get("suite") in (
+            "temporal-unanchored-sigreg",
+            "temporal-unanchored-temporal",
+            "temporal-unanchored-combined"):
+        contract_key = (
+            "unanchored_contract"
+            if manifest["suite"] == "temporal-unanchored-sigreg"
+            else "unanchored_temporal_contract"
+            if manifest["suite"] == "temporal-unanchored-temporal"
+            else "unanchored_temporal_combined_contract"
+        )
         complete[contract_key] = manifest[contract_key]
         complete["unanchored_control"] = control
         complete["interpretation"] = (
