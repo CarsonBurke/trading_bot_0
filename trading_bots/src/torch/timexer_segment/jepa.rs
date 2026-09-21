@@ -86,6 +86,11 @@ pub enum JepaMode {
     AnchoredTemporalProjectedNoSigreg,
     AnchoredConditional,
     AnchoredProjectedSmall,
+    /// Attached projected temporal prediction only; target SIGReg is per-offset and reader
+    /// regularization is forbidden.
+    UnanchoredTemporalProjected,
+    /// Control for unanchored temporal projected prediction without target SIGReg.
+    UnanchoredTemporalProjectedNoSigreg,
     /// Attached temporal prediction only; reader placement controls every regularizer.
     Unanchored,
 }
@@ -97,7 +102,18 @@ impl JepaMode {
         !self.enabled()
     }
     pub fn unanchored(self) -> bool {
-        self == Self::Unanchored
+        matches!(
+            self,
+            Self::Unanchored
+                | Self::UnanchoredTemporalProjected
+                | Self::UnanchoredTemporalProjectedNoSigreg
+        )
+    }
+    pub fn unanchored_temporal(self) -> bool {
+        matches!(
+            self,
+            Self::UnanchoredTemporalProjected | Self::UnanchoredTemporalProjectedNoSigreg
+        )
     }
     pub fn detached_forecast(self) -> bool {
         matches!(self, Self::LatentOne | Self::LatentMulti)
@@ -111,6 +127,7 @@ impl JepaMode {
                     | Self::AnchoredTemporalProjectedNoSigreg
                     | Self::AnchoredConditional
                     | Self::Unanchored
+                    | Self::UnanchoredTemporalProjectedNoSigreg
             )
     }
     pub fn projected(self) -> bool {
@@ -120,13 +137,18 @@ impl JepaMode {
                 | Self::AnchoredProjectedNoSigreg
                 | Self::AnchoredTemporalProjected
                 | Self::AnchoredTemporalProjectedNoSigreg
+                | Self::UnanchoredTemporalProjected
+                | Self::UnanchoredTemporalProjectedNoSigreg
                 | Self::AnchoredProjectedSmall
         )
     }
     pub fn temporal(self) -> bool {
         matches!(
             self,
-            Self::AnchoredTemporalProjected | Self::AnchoredTemporalProjectedNoSigreg
+            Self::AnchoredTemporalProjected
+                | Self::AnchoredTemporalProjectedNoSigreg
+                | Self::UnanchoredTemporalProjected
+                | Self::UnanchoredTemporalProjectedNoSigreg
         )
     }
     pub fn conditional(self) -> bool {
@@ -166,6 +188,8 @@ impl fmt::Display for JepaMode {
             Self::AnchoredTemporalProjectedNoSigreg => "anchored-temporal-projected-no-sigreg",
             Self::AnchoredConditional => "anchored-conditional",
             Self::AnchoredProjectedSmall => "anchored-projected-small",
+            Self::UnanchoredTemporalProjected => "unanchored-temporal-projected",
+            Self::UnanchoredTemporalProjectedNoSigreg => "unanchored-temporal-projected-no-sigreg",
             Self::Unanchored => "unanchored",
         })
     }
@@ -270,7 +294,17 @@ impl JepaConfig {
                     "anchored-reconstruct needs positive reconstruction weight"
                 );
             }
-            if config.jepa_mode.unanchored() {
+            if config.jepa_mode.unanchored_temporal() {
+                ensure!(
+                    self.prediction_weight == 1. && self.reconstruction_weight == 0.,
+                    "unanchored temporal projected requires prediction weight 1 and reconstruction weight 0"
+                );
+                ensure!(
+                    (config.jepa_mode.regularized() && self.sigreg_weight == 0.09)
+                        || (!config.jepa_mode.regularized() && self.sigreg_weight == 0.),
+                    "unanchored temporal projected requires SIGReg weight 0.09 or its explicit no-SIGReg control weight 0"
+                );
+            } else if config.jepa_mode.unanchored() {
                 ensure!(
                     self.prediction_weight == 1.
                         && self.sigreg_weight == 0.09
@@ -337,6 +371,26 @@ pub const UNANCHORED_DIAGNOSTIC_COUNT: i64 = 16;
 /// the weighted contribution, 3/4/5 for eligible views/valid row-view pairs/mean N, and
 /// 6/7 for local/state population standard deviation. No latent prediction loss is present.
 pub fn diagnostic_labels(config: &ModelConfig) -> Vec<&'static str> {
+    if config.jepa_mode.unanchored_temporal() {
+        return vec![
+            "temporal projected-target delta MSE",
+            "temporal projected-target delta SIGReg",
+            "unused reconstruction",
+            "temporal projected-target delta persistence MSE",
+            "valid source-target pairs",
+            "target temporal SIGReg population N",
+            "temporal projected-target delta population std",
+            "prediction population std (last source)",
+            "unused reader local SIGReg",
+            "unused reader SIGReg weighted contribution",
+            "unused reader state SIGReg",
+            "unused reader SIGReg eligible views (N >= 2)",
+            "unused reader SIGReg valid row-view pairs",
+            "unused reader SIGReg mean valid batch population per view",
+            "unused reader local population std",
+            "unused reader state population std",
+        ];
+    }
     if config.jepa_mode.unanchored() {
         return vec![
             "latent MSE",
@@ -588,6 +642,53 @@ impl JepaHeads {
         });
         (objective, diagnostics)
     }
+    fn temporal_population(
+        &self,
+        views: &RepresentationViews,
+        valid: &Tensor,
+        source_valid: &Tensor,
+        random: &JepaRandom,
+        zero: &Tensor,
+        regularized: bool,
+    ) -> (Tensor, Tensor, Tensor) {
+        let source = views
+            .target
+            .index_select(1, &random.positions)
+            .to_kind(Kind::Float);
+        let source_valid = source_valid
+            .index_select(1, &random.positions)
+            .transpose(0, 1);
+        let mut regularizer = zero.shallow_clone();
+        let mut population = zero.shallow_clone();
+        let mut target_std = zero.shallow_clone();
+        for &offset in self.offsets {
+            let positions = &random.positions + offset;
+            let valid = (&source_valid * valid.index_select(1, &positions).transpose(0, 1))
+                .to_kind(Kind::Float);
+            let target_views = (views
+                .target
+                .index_select(1, &positions)
+                .to_kind(Kind::Float)
+                - &source)
+                .transpose(0, 1);
+            let (reg, pop) = if regularized {
+                population_sigreg(&target_views, &valid, random)
+            } else {
+                (
+                    zero.shallow_clone(),
+                    valid
+                        .sum_dim_intlist([1i64].as_slice(), false, Kind::Float)
+                        .mean(Kind::Float),
+                )
+            };
+            regularizer = &regularizer + reg;
+            population = &population + pop;
+            target_std = &target_std + tch::no_grad(|| population_std(&target_views, &valid));
+        }
+        let count = self.offsets.len() as f64;
+        (regularizer / count, population / count, target_std / count)
+    }
+
     pub fn objective(
         &self,
         config: &ModelConfig,
@@ -627,6 +728,51 @@ impl JepaHeads {
         let count = mask.sum(Kind::Float);
         let latent = masked_mse(&prediction, &targets, &mask);
         let zero = Tensor::zeros([], (Kind::Float, prediction.device()));
+        if config.jepa_mode.unanchored_temporal() {
+            let (regularizer, population, target_std) = random
+                .map(|random| {
+                    self.temporal_population(
+                        views,
+                        valid,
+                        source_valid,
+                        random,
+                        &zero,
+                        config.jepa_mode.regularized(),
+                    )
+                })
+                .unwrap_or_else(|| {
+                    (
+                        zero.shallow_clone(),
+                        zero.shallow_clone(),
+                        zero.shallow_clone(),
+                    )
+                });
+            let objective =
+                &latent * config.jepa.prediction_weight + &regularizer * config.jepa.sigreg_weight;
+            let diagnostics = tch::no_grad(|| {
+                let persistence = masked_mse(&targets.zeros_like(), &targets, &mask);
+                let pred_std = population_std(
+                    &prediction.select(1, sources - 1).transpose(0, 1),
+                    &mask.select(1, sources - 1).transpose(0, 1),
+                );
+                let latent = Tensor::stack(
+                    &[
+                        latent.detach(),
+                        regularizer.detach(),
+                        zero.shallow_clone(),
+                        persistence,
+                        count,
+                        population,
+                        target_std,
+                        pred_std,
+                    ],
+                    0,
+                );
+                let reader = Tensor::zeros([8], (Kind::Float, prediction.device()));
+                Tensor::cat(&[latent, reader], 0)
+            });
+            return (objective, diagnostics);
+        }
         if config.jepa_mode.unanchored() {
             let (regularizer, reader) = reader_sigreg_objective(
                 config,
@@ -668,45 +814,14 @@ impl JepaHeads {
             return (objective, diagnostics);
         }
         let (regularizer, population, target_std) = match random {
-            Some(random) if config.jepa_mode.temporal() => {
-                let source = views
-                    .target
-                    .index_select(1, &random.positions)
-                    .to_kind(Kind::Float);
-                let source_valid = source_valid
-                    .index_select(1, &random.positions)
-                    .transpose(0, 1);
-                let mut regularizer = zero.shallow_clone();
-                let mut population = zero.shallow_clone();
-                let mut target_std = zero.shallow_clone();
-                for &offset in self.offsets {
-                    let positions = &random.positions + offset;
-                    let valid = (&source_valid * valid.index_select(1, &positions).transpose(0, 1))
-                        .to_kind(Kind::Float);
-                    let target_views = views
-                        .target
-                        .index_select(1, &positions)
-                        .to_kind(Kind::Float)
-                        - &source;
-                    let target_views = target_views.transpose(0, 1);
-                    let (reg, pop) = if config.jepa_mode.regularized() {
-                        population_sigreg(&target_views, &valid, random)
-                    } else {
-                        (
-                            zero.shallow_clone(),
-                            valid
-                                .sum_dim_intlist([1i64].as_slice(), false, Kind::Float)
-                                .mean(Kind::Float),
-                        )
-                    };
-                    regularizer = &regularizer + reg;
-                    population = &population + pop;
-                    target_std =
-                        &target_std + tch::no_grad(|| population_std(&target_views, &valid));
-                }
-                let count = self.offsets.len() as f64;
-                (regularizer / count, population / count, target_std / count)
-            }
+            Some(random) if config.jepa_mode.temporal() => self.temporal_population(
+                views,
+                valid,
+                source_valid,
+                random,
+                &zero,
+                config.jepa_mode.regularized(),
+            ),
             Some(random) => {
                 let target_views = views
                     .target
@@ -1084,6 +1199,8 @@ mod tests {
             JepaMode::AnchoredProjectedNoSigreg,
             JepaMode::AnchoredTemporalProjected,
             JepaMode::AnchoredTemporalProjectedNoSigreg,
+            JepaMode::UnanchoredTemporalProjected,
+            JepaMode::UnanchoredTemporalProjectedNoSigreg,
             JepaMode::Unanchored,
         ] {
             let mut config = ModelConfig {

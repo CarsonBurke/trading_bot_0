@@ -1656,6 +1656,8 @@ mod tests {
             JepaMode::AnchoredProjectedNoSigreg,
             JepaMode::AnchoredTemporalProjected,
             JepaMode::AnchoredTemporalProjectedNoSigreg,
+            JepaMode::UnanchoredTemporalProjected,
+            JepaMode::UnanchoredTemporalProjectedNoSigreg,
             JepaMode::AnchoredConditional,
             JepaMode::AnchoredProjectedSmall,
         ] {

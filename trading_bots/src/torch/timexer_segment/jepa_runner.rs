@@ -135,6 +135,45 @@ impl Checkpoint {
 }
 
 fn unanchored_contract(config: &ModelConfig) -> Option<serde_json::Value> {
+    if config.jepa_mode.unanchored_temporal() {
+        return Some(serde_json::json!({
+            "schema": "temporal-jepa-unanchored-projected-v1",
+            "initialization": "fresh-random",
+            "objective": if config.jepa_mode.regularized() {
+                "attached-temporal-projected-jepa-plus-per-offset-target-sigreg"
+            } else {
+                "attached-temporal-projected-jepa-no-sigreg"
+            },
+            "objective_contract": config.jepa_contract().expect("unanchored contract"),
+            "prediction_weight": config.jepa.prediction_weight,
+            "sigreg_total_weight": config.jepa.sigreg_weight,
+            "sigreg_placement": super::jepa::SigregPlacement::Off,
+            "sigreg_site_weights": {
+                "local": 0.0,
+                "state": 0.0,
+                "target": if config.jepa_mode.regularized() {
+                    config.jepa.sigreg_weight
+                } else {
+                    0.0
+                }
+            },
+            "sigreg_scope": if config.jepa_mode.regularized() {
+                "independent-population-per-offset"
+            } else {
+                "none"
+            },
+            "offsets_patches": config.jepa_mode.offsets(),
+            "target": "attached-future-q-minus-source-q",
+            "forecast_weight": 0.0,
+            "reconstruction_weight": 0.0,
+            "decision_weight": 0.0,
+            "target_stop_gradient": false,
+            "gradient_surgery": false,
+            "forecast_parameters": "allocated-at-initialization-frozen-never-forwarded-or-optimized",
+            "checkpoint_selection": "completed-fixed-budget",
+            "downstream_readers": "fit-only-after-full-store-freeze"
+        }));
+    }
     config.jepa_mode.unanchored().then(|| {
         let placement = config.sigreg_placement;
         let weight = config.jepa.sigreg_weight
@@ -553,8 +592,13 @@ pub fn train(args: TrainArgs, learning_rate: f64) -> Result<()> {
                 objective.put(step, "total optimization objective", values[2]);
                 let labels = super::jepa::diagnostic_labels(&args.model);
                 for (index, value) in values[3..].iter().enumerate() {
+                    let temporal_unanchored = args.model.jepa_mode.unanchored_temporal();
                     let reader_sigreg = !unanchored && args.model.sigreg_placement.enabled();
-                    if unanchored {
+                    if temporal_unanchored {
+                        if index >= 8 {
+                            continue;
+                        }
+                    } else if unanchored {
                         if matches!(index, 1 | 2)
                             || (index == 8 && !args.model.sigreg_placement.local())
                             || (index == 10 && !args.model.sigreg_placement.state())
@@ -576,10 +620,10 @@ pub fn train(args: TrainArgs, learning_rate: f64) -> Result<()> {
                     }
                     let destination = match index {
                         3 if reader_sigreg => &mut population,
-                        11..=13 if unanchored => &mut population,
-                        14 | 15 if unanchored => &mut geometry_curve,
                         4 | 5 => &mut population,
                         6 | 7 => &mut geometry_curve,
+                        11..=13 if unanchored => &mut population,
+                        14 | 15 if unanchored => &mut geometry_curve,
                         _ => &mut objective,
                     };
                     destination.put(step, labels[index], *value);

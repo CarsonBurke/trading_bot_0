@@ -1014,6 +1014,12 @@ impl ModelConfig {
                 "unanchored forbids forecast priors, basis transforms and forecast-head treatments"
             );
         }
+        if self.jepa_mode.unanchored_temporal() {
+            ensure!(
+                self.sigreg_placement == SigregPlacement::Off,
+                "unanchored temporal projected forbids reader SIGReg placement; its SIGReg is on per-offset target deltas"
+            );
+        }
         if self.reader_norm == ReaderNorm::None || self.sigreg_placement.enabled() {
             ensure!(
                 self.reader_norm == ReaderNorm::None,
@@ -1059,6 +1065,26 @@ impl ModelConfig {
 
     /// Complete optional objective/parameter contract for authenticated research manifests.
     pub fn jepa_contract(&self) -> Option<String> {
+        if self.jepa_mode.unanchored_temporal() {
+            let sigreg = if self.jepa_mode.regularized() {
+                "per-offset-temporal-target-population-sigreg"
+            } else {
+                "none"
+            };
+            let objective = if self.jepa_mode.regularized() {
+                "prediction-weight*masked-temporal-delta-mse+target-sigreg-weight*per-offset-population-sigreg"
+            } else {
+                "prediction-weight*masked-temporal-delta-mse"
+            };
+            return Some(format!(
+                "temporal-jepa-unanchored-projected-v1;mode={};config={};offsets-patches=[1,2,4,8,12];horizons-bars={:?};reader-norm=none;placement=off;observation=unconstrained-shared-full-width-patch-embedding(causal-prefix-normalization);state=actual-pre-final-rms-causal-reader;target=attached-nonoverlapping-future-q-delta(observation);projector=pointwise-d-model-gelu-d-model-no-normalization-no-dropout;predictor=direct-state-mlp;objective={};sigreg={};population=independent-valid-batch-rows-per-offset-view;mask=complete-source-patch-and-target-patch;forecast=not-forwarded-no-loss-frozen-allocation;reconstruction=none;decision=none;future-calendar=false",
+                self.jepa_mode,
+                serde_json::to_string(&self.jepa).expect("validated JEPA config"),
+                self.jepa_horizons(),
+                objective,
+                sigreg,
+            ));
+        }
         if self.jepa_mode.unanchored() {
             return Some(format!(
                 "temporal-jepa-unanchored-v1;config={};offsets-patches=[1,2,4,8,12];horizons-bars={:?};reader-norm=none;placement={};observation=unconstrained-shared-full-width-patch-embedding(causal-prefix-normalization);state=actual-pre-final-rms-causal-reader;target=attached-nonoverlapping-future-observation;projector=none;predictor=direct-state-mlp;objective=prediction-weight*masked-latent-mse+placement-weighted-sigreg;sigreg-sites=local-observation-and-or-state-no-target-duplicate;both=same-draws-and-mask-half-weight-each;population=valid-batch-rows-per-sampled-source-view;mask=complete-source-patch-and-minimum-history;positions=minimum-history-source-through-final-context-patch;forecast=not-forwarded-no-loss-frozen-allocation;reconstruction=none;decision-loss=none;stop-gradient=none;gradient-surgery=none;initialization=fresh;selection=completed-fixed-budget;readers=fit-only-after-full-store-freeze;precision=bf16-backbone-fp32-objective;future-calendar=false;pair-mask=complete-source-patch-and-minimum-history-and-complete-target-patch;latent-reduction=mean-over-valid-source-offset-pairs-and-features;sigreg-reduction=mean-over-eligible-views-of-N-times-epps-pulley",
