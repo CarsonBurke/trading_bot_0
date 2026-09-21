@@ -300,9 +300,13 @@ impl JepaConfig {
                     "unanchored temporal projected requires prediction weight 1 and reconstruction weight 0"
                 );
                 ensure!(
-                    (config.jepa_mode.regularized() && self.sigreg_weight == 0.09)
-                        || (!config.jepa_mode.regularized() && self.sigreg_weight == 0.),
-                    "unanchored temporal projected requires SIGReg weight 0.09 or its explicit no-SIGReg control weight 0"
+                    (!config.jepa_mode.regularized() && self.sigreg_weight == 0.)
+                        || (config.jepa_mode.regularized()
+                            && ((config.sigreg_placement == SigregPlacement::Off
+                                && self.sigreg_weight == 0.09)
+                                || (config.sigreg_placement.enabled()
+                                    && self.sigreg_weight == 0.045))),
+                    "unanchored temporal projected requires target SIGReg .09, split target/reader SIGReg .045, or explicit no-SIGReg weight 0"
                 );
             } else if config.jepa_mode.unanchored() {
                 ensure!(
@@ -381,14 +385,26 @@ pub fn diagnostic_labels(config: &ModelConfig) -> Vec<&'static str> {
             "target temporal SIGReg population N",
             "temporal projected-target delta population std",
             "prediction population std (last source)",
-            "unused reader local SIGReg",
-            "unused reader SIGReg weighted contribution",
-            "unused reader state SIGReg",
-            "unused reader SIGReg eligible views (N >= 2)",
-            "unused reader SIGReg valid row-view pairs",
-            "unused reader SIGReg mean valid batch population per view",
-            "unused reader local population std",
-            "unused reader state population std",
+            if config.sigreg_placement.local() {
+                "reader local SIGReg"
+            } else {
+                "unused reader local SIGReg"
+            },
+            if config.sigreg_placement.enabled() {
+                "reader SIGReg weighted contribution"
+            } else {
+                "unused reader SIGReg weighted contribution"
+            },
+            if config.sigreg_placement.state() {
+                "reader state SIGReg"
+            } else {
+                "unused reader state SIGReg"
+            },
+            "reader SIGReg eligible views (N >= 2)",
+            "reader SIGReg valid row-view pairs",
+            "reader SIGReg mean valid batch population per view",
+            "reader local population std",
+            "reader state population std",
         ];
     }
     if config.jepa_mode.unanchored() {
@@ -747,8 +763,23 @@ impl JepaHeads {
                         zero.shallow_clone(),
                     )
                 });
-            let objective =
-                &latent * config.jepa.prediction_weight + &regularizer * config.jepa.sigreg_weight;
+            let (reader_regularizer, reader) = if config.sigreg_placement.enabled() {
+                reader_sigreg_objective(
+                    config,
+                    &views.observation,
+                    &views.state,
+                    source_valid,
+                    random.expect("combined temporal SIGReg needs the population draw"),
+                )
+            } else {
+                (
+                    zero.shallow_clone(),
+                    Tensor::zeros([8], (Kind::Float, prediction.device())),
+                )
+            };
+            let objective = &latent * config.jepa.prediction_weight
+                + &regularizer * config.jepa.sigreg_weight
+                + reader_regularizer;
             let diagnostics = tch::no_grad(|| {
                 let persistence = masked_mse(&targets.zeros_like(), &targets, &mask);
                 let pred_std = population_std(
@@ -768,7 +799,6 @@ impl JepaHeads {
                     ],
                     0,
                 );
-                let reader = Tensor::zeros([8], (Kind::Float, prediction.device()));
                 Tensor::cat(&[latent, reader], 0)
             });
             return (objective, diagnostics);

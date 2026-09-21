@@ -1015,9 +1015,13 @@ impl ModelConfig {
             );
         }
         if self.jepa_mode.unanchored_temporal() {
+            // The clean temporal arm may split the fixed .09 regularization budget
+            // between target deltas and the actual causal reader interface.
             ensure!(
-                self.sigreg_placement == SigregPlacement::Off,
-                "unanchored temporal projected forbids reader SIGReg placement; its SIGReg is on per-offset target deltas"
+                self.jepa.sigreg_weight == 0.
+                    || self.jepa.sigreg_weight == 0.09
+                    || self.jepa.sigreg_weight == 0.045,
+                "unanchored temporal projected requires SIGReg weight 0, 0.045, or 0.09"
             );
         }
         if self.reader_norm == ReaderNorm::None || self.sigreg_placement.enabled() {
@@ -1066,23 +1070,38 @@ impl ModelConfig {
     /// Complete optional objective/parameter contract for authenticated research manifests.
     pub fn jepa_contract(&self) -> Option<String> {
         if self.jepa_mode.unanchored_temporal() {
-            let sigreg = if self.jepa_mode.regularized() {
+            let target_sigreg = if self.jepa_mode.regularized() {
                 "per-offset-temporal-target-population-sigreg"
             } else {
                 "none"
             };
-            let objective = if self.jepa_mode.regularized() {
-                "prediction-weight*masked-temporal-delta-mse+target-sigreg-weight*per-offset-population-sigreg"
+            let reader_sigreg = if self.sigreg_placement.enabled() {
+                "reader-state-population-sigreg"
             } else {
-                "prediction-weight*masked-temporal-delta-mse"
+                "none"
+            };
+            let objective = match (
+                self.jepa_mode.regularized(),
+                self.sigreg_placement.enabled(),
+            ) {
+                (true, true) => {
+                    "prediction-weight*masked-temporal-delta-mse+target-sigreg-weight*per-offset-population-sigreg+reader-sigreg-weight*state-population-sigreg"
+                }
+                (true, false) => {
+                    "prediction-weight*masked-temporal-delta-mse+target-sigreg-weight*per-offset-population-sigreg"
+                }
+                (false, false) => "prediction-weight*masked-temporal-delta-mse",
+                (false, true) => unreachable!("validated temporal reader SIGReg needs target SIGReg"),
             };
             return Some(format!(
-                "temporal-jepa-unanchored-projected-v1;mode={};config={};offsets-patches=[1,2,4,8,12];horizons-bars={:?};reader-norm=none;placement=off;observation=unconstrained-shared-full-width-patch-embedding(causal-prefix-normalization);state=actual-pre-final-rms-causal-reader;target=attached-nonoverlapping-future-q-delta(observation);projector=pointwise-d-model-gelu-d-model-no-normalization-no-dropout;predictor=direct-state-mlp;objective={};sigreg={};population=independent-valid-batch-rows-per-offset-view;mask=complete-source-patch-and-target-patch;forecast=not-forwarded-no-loss-frozen-allocation;reconstruction=none;decision=none;future-calendar=false",
+                "temporal-jepa-unanchored-projected-v1;mode={};config={};offsets-patches=[1,2,4,8,12];horizons-bars={:?};reader-norm=none;placement={};observation=unconstrained-shared-full-width-patch-embedding(causal-prefix-normalization);state=actual-pre-final-rms-causal-reader;target=attached-nonoverlapping-future-q-delta(observation);projector=pointwise-d-model-gelu-d-model-no-normalization-no-dropout;predictor=direct-state-mlp;objective={};sigreg=target:{}+reader:{};population=independent-valid-batch-rows-per-offset-view;mask=complete-source-patch-and-target-patch;forecast=not-forwarded-no-loss-frozen-allocation;reconstruction=none;decision=none;future-calendar=false",
                 self.jepa_mode,
                 serde_json::to_string(&self.jepa).expect("validated JEPA config"),
                 self.jepa_horizons(),
+                self.sigreg_placement,
                 objective,
-                sigreg,
+                target_sigreg,
+                reader_sigreg,
             ));
         }
         if self.jepa_mode.unanchored() {
