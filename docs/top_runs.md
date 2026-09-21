@@ -25,6 +25,26 @@ Protocol: `lejepa-fixed1400-20260919`; 1400 updates, batch 256, seed 20260919, f
 
 At h192, no-SIGReg JEPA = **0.997561**, full/none = 1.000512, decoupled/lattice = 1.001884. A horizon-specific win is not a global win. Latent-only one/multi-horizon close scores ≈0.99935/0.99998: not competitive.
 
+### Temporal projected-target matched comparison
+
+Same fixed-1400 full-corpus protocol above; all arms used `future-calendar=false`,
+full/none forecast geometry, cumulative targets and the anchored temporal projected target
+\(q_{t+k}-q_t\). Lower close score remains primary.
+
+| Temporal treatment | Close score ↓ | h64 direction ↑ | h64 signed IC ↑ | Run / reports |
+| --- | ---: | ---: | ---: | --- |
+| Temporal projected + per-offset SIGReg | 0.988730 | 50.68% | 0.05031 | [`temporal-projected`](../training/runs/temporal-projected1400-20260921-v2-temporal-projected/) |
+| Temporal projected, no SIGReg | 0.986919 | 52.44% | 0.06731 | [`temporal-projected-no-sigreg`](../training/runs/temporal-projected1400-20260921-v2-temporal-projected-no-sigreg/) |
+| Temporal projected + sign logistic, weight 0.05 | 0.998657 | 51.07% | 0.08190 | [`temporal-projected-sign`](../training/runs/temporal-projected-sign005-20260921-temporal-projected-sign/) |
+
+The sign arm's h64 IC is highest in this small cohort, but its aggregate close score and
+direction are worse than the no-SIGReg temporal control; this is not promotion evidence.
+Temporal delta targets are not competitive with the 0.975143 matched leader; adding SIGReg worsens
+this cohort's aggregate and h64 direction. The follow-up sign-aligned treatment is documented in
+[temporal-projected-sign005](../benchmark_results/lejepa-campaigns/temporal-projected-sign005-20260921/plan.json).
+The temporal collection is authenticated in
+[complete.json](../benchmark_results/lejepa-campaigns/temporal-projected1400-20260921-v2/complete.json).
+
 ### Supervised reader-SIGReg ablation — not an unanchored representation test
 
 Same 1400-step protocol and panels, but **all four fresh arms remove the final reader RMSNorm and receive forecasting gradients in their encoder/trunk**. Total SIGReg weight 0.09, split equally for both sites. The normalized-reader leader above is a separate normalization reference. These results evaluate adding SIGReg to supervised forecasting; they are ineligible as evidence about the user's required unanchored temporal representation learner.

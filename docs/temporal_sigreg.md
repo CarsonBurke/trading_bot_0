@@ -223,3 +223,48 @@ GPU contract job **8631 succeeded: 30 passed, zero failed or ignored**. Scoped f
 [Immutable four-arm plan](../benchmark_results/lejepa-campaigns/reader-sigreg1400-20260920/plan.json), SHA `948821c4b5f65648dd0d56395d8a0b8aae5ea2b057f03ad16151aa0f62fe0fa1`. [Execution commands, pinned assets and completed queue receipts](../benchmark_results/reader-sigreg-20260920-assets/execution.json). Jobs **8631, 8640–8644, 8646–8649 all succeeded**, one attempt each. Collection authenticated 18 inherited/new endpoints; historical failures were not overwritten. The real reader-both diagnostic CLI verified total training weight **0.09**, split **0.045 / 0.045**, with no latent-target penalty. All jobs used exclusive, normal-priority admission; market watchdog 900s plus 30s queue grace, memory watchdog 15m.
 
 Evidence: [paired market accuracy](../benchmark_results/accuracy-reader-sigreg-20260920/), [completed collection](../benchmark_results/lejepa-campaigns/reader-sigreg1400-20260920/complete.json), [normalized-reference frozen probes](../benchmark_results/reader-sigreg-probes-20260920-rms-reference/), [reader-both diagnostic](../benchmark_results/reader-sigreg-diagnostic-20260920-both/), [controlled delayed-cue reports and protocol](../benchmark_results/reader-sigreg-memory-20260920/). Reader runs and their frozen probes: [none](../training/runs/reader-sigreg1400-20260920-reader-none/), [local](../training/runs/reader-sigreg1400-20260920-reader-local/), [state](../training/runs/reader-sigreg1400-20260920-reader-state/), [both](../training/runs/reader-sigreg1400-20260920-reader-both/).
+
+## Temporal projected-target objective and decision alignment
+
+The next hypothesis is not merely “move SIGReg from state to time.” For each sampled source
+patch \(t\) and offset \(k\in\{1,2,4,8,12\}\), the projected JEPA target is changed from
+\(q_{t+k}\) to the future change \(q_{t+k}-q_t\). The prediction head sees the same source
+representation, while each offset gets its own masked SIGReg population; source rows are also
+masked by the validity of their future target patch. The persistence diagnostic is therefore the
+zero-delta baseline. This removes predictable level/slow-drift variance from the auxiliary target
+and makes the representation objective temporal rather than a collection of future snapshots.
+
+The first matched temporal campaign uses the existing decoupled/lattice, full corpus, 1400-step,
+B256, seed20260919 protocol and compares `anchored-temporal-projected` against its no-SIGReg
+control. The immutable plan is
+[temporal-projected1400-v2](../benchmark_results/lejepa-campaigns/temporal-projected1400-20260921-v2/plan.json);
+the cancelled pre-mask campaign remains preserved as failed provenance. Its acceptance criterion is
+the unchanged seven-horizon market-neutral close MSE/persistence panel, not delta latent loss.
+
+The decision score is sign agreement, not conditional-mean NLL. A fixed, default-off
+`--decision-sign-weight 0.05` treatment therefore adds an equal-horizon logistic loss to the seven
+observable normalized close targets \(y_h\):
+\[
+\frac{1}{7}\sum_h \operatorname{mean}_{b:\,m_{b,h}=1,\;y_{b,h}\ne0}
+\operatorname{softplus}(-\operatorname{sign}(y_{b,h})\,\hat y_{b,h}).
+\]
+It uses the exact existing close-target validity mask, excludes zero/undefined directions and
+does not introduce a temperature, learned parameter or second backbone pass. The treatment is
+restricted to anchored non-conditional temporal projected JEPA with cumulative targets and
+`future-calendar=false`; its scalar is emitted as the existing JEPA objective diagnostic, so no
+parallel metric channel is introduced. This is a predeclared single weight, not a validation sweep.
+The immutable plan is
+[temporal-projected-sign005](../benchmark_results/lejepa-campaigns/temporal-projected-sign005-20260921/plan.json).
+The 1400-step model job **8836 succeeded**; its existing JEPA objective report emits the new
+`decision sign logistic loss` diagnostic (endpoint **0.69292927**), proving the auxiliary follows
+the captured training path without an ad-hoc metric channel. On the unchanged validation panel,
+the sign treatment scored aggregate close MSE/persistence **0.998657**, h64 direction **51.07%**
+and h64 signed IC **0.08190**. It improves neither aggregate error nor direction over the
+no-SIGReg temporal control (**0.986919**, **52.44%**), despite the highest h64 IC in this small
+cohort. It is therefore not promoted; collection job **8837** remains queued behind unrelated
+protected GPU work, with the endpoint and failed/cancelled provenance preserved.
+
+The active unresolved question is no longer whether a sign-aligned gradient is implementable:
+whether any temporal representation objective can improve the aggregate close panel without
+sacrificing calibration remains unanswered. A direction-only or IC-only win is not promotion
+evidence.

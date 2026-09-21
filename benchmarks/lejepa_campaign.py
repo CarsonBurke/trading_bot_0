@@ -30,8 +30,11 @@ BASELINE = "decoupled-lattice-forecast"
 MODES = ("off", "latent-one", "latent-multi", "anchored", "anchored-no-sigreg", "anchored-reconstruct")
 OBJECTIVE_NAMES = (BASELINE, "latent-one", "latent-multi", "anchored", "no-sigreg", "reconstruct")
 PROJECTED_NAMES = ("projected", "projected-no-sigreg")
+TEMPORAL_PROJECTED_NAMES = ("temporal-projected", "temporal-projected-no-sigreg")
+SIGN_NAMES = ("temporal-projected-sign",)
 CONDITIONAL_NAMES = ("conditional", "conditional-full-none")
 MOMENT_FIELDS = ("decision_mse_weight", "temporal_moment_weight")
+SIGN_WEIGHT = 0.05
 MOMENT_WEIGHTS = {
     "decision-mse": (0.125, 0.0),
     "moment": (0.0, 0.125),
@@ -107,15 +110,18 @@ UNANCHORED_CONTRACT = {
     "probe_protocol": UNANCHORED_PROBE_PROTOCOL,
 }
 MODEL_TREATMENTS = (
-    "jepa_mode", "scale_coupling", "horizon_decimation", *MOMENT_FIELDS, *READER_DEFAULTS,
+    "jepa_mode", "scale_coupling", "horizon_decimation", *MOMENT_FIELDS,
+    "decision_sign_weight", *READER_DEFAULTS,
 )
-BASELINE_KEY = ("off", "decoupled-lattice", 0.0, 0.0, "rms", "off")
-FULL_NONE_KEY = ("off", "full-none", 0.0, 0.0, "rms", "off")
+BASELINE_KEY = ("off", "decoupled-lattice", 0.0, 0.0, 0.0, "rms", "off")
+FULL_NONE_KEY = ("off", "full-none", 0.0, 0.0, 0.0, "rms", "off")
 SUITES = {
     "objective-comparison": OBJECTIVE_NAMES,
     "forecasting-controls": (BASELINE, "full-none-forecast"),
     "matched-comparison": (*OBJECTIVE_NAMES, "full-none-forecast"),
     "sigreg-placement": (BASELINE, "anchored", "no-sigreg", *PROJECTED_NAMES),
+    "temporal-projected": (*TEMPORAL_PROJECTED_NAMES,),
+    "temporal-projected-sign": (BASELINE, *SIGN_NAMES),
     "temporal-conditional": (BASELINE, "full-none-forecast", *CONDITIONAL_NAMES),
     "sigreg-dimensionality": (BASELINE, "projected", "projected-small"),
     "temporal-moments": (BASELINE, "full-none-forecast", *MOMENT_WEIGHTS),
@@ -221,20 +227,26 @@ def arm_specs(suite, selected):
     names = selected or SUITES[suite]
     if len(set(names)) != len(names) or set(names) - set(SUITES[suite]):
         raise ValueError("--select names must be unique members of the named suite")
-    if suite == "temporal-reader-sigreg" and set(READER_PLACEMENTS) - set(names):
-        raise ValueError("temporal-reader-sigreg requires all four fresh reader-none/local/state/both arms")
-    if suite == "temporal-unanchored-sigreg" and set(names) != set(UNANCHORED_PLACEMENTS):
-        raise ValueError("temporal-unanchored-sigreg requires exactly four fresh unanchored-none/local/state/both arms")
     modes = dict(zip(OBJECTIVE_NAMES, MODES))
     modes.update(zip(PROJECTED_NAMES, ("anchored-projected", "anchored-projected-no-sigreg")))
+    modes.update(
+        zip(
+            TEMPORAL_PROJECTED_NAMES,
+            ("anchored-temporal-projected", "anchored-temporal-projected-no-sigreg"),
+        )
+    )
+    modes.update({name: "anchored-temporal-projected" for name in SIGN_NAMES})
     modes.update({name: "anchored-conditional" for name in CONDITIONAL_NAMES})
     modes["projected-small"] = "anchored-projected-small"
     modes.update({label: "unanchored" for label in UNANCHORED_PLACEMENTS})
     placements = READER_PLACEMENTS | UNANCHORED_PLACEMENTS
     return [
         {"name": label, "jepa_mode": modes.get(label, "off"),
-         "recipe": "full-none" if label in ("full-none-forecast", "conditional-full-none", *MOMENT_WEIGHTS, *placements) else "decoupled-lattice",
+         "recipe": "full-none" if label in (
+             "full-none-forecast", "conditional-full-none", *MOMENT_WEIGHTS, *SIGN_NAMES, *placements
+         ) else "decoupled-lattice",
          **dict(zip(MOMENT_FIELDS, MOMENT_WEIGHTS.get(label, (0.0, 0.0)))),
+         "decision_sign_weight": SIGN_WEIGHT if label in SIGN_NAMES else 0.0,
          **({"reader_norm": "none", "sigreg_placement": placements[label]}
             if label in placements else READER_DEFAULTS)}
         for label in SUITES[suite] if label in names
@@ -250,6 +262,14 @@ def moment_weights(arm):
         raise ValueError(f"{arm['name']}: weights differ from the declared temporal moment treatment")
     return dict(zip(MOMENT_FIELDS, values))
 
+def sign_weight(arm):
+    value = arm.get("decision_sign_weight", 0.0)
+    expected = SIGN_WEIGHT if arm["name"] in SIGN_NAMES else 0.0
+    if (not isinstance(value, (int, float)) or isinstance(value, bool)
+            or not math.isfinite(value) or value < 0 or value != expected):
+        raise ValueError(f"{arm['name']}: weight differs from the declared decision-sign treatment")
+    return value
+
 
 def reader_settings(arm):
     """Omitted legacy fields are RMS/off, never the new unconstrained control."""
@@ -264,7 +284,8 @@ def reader_settings(arm):
 
 def recipe_for(plan, arm):
     recipe = arm.get("recipe", "decoupled-lattice")
-    if recipe not in RECIPES or (recipe != "decoupled-lattice" and arm["jepa_mode"] not in ("off", "anchored-conditional", "unanchored")):
+    if recipe not in RECIPES or (recipe != "decoupled-lattice" and arm["jepa_mode"] not in (
+            "off", "anchored-temporal-projected", "anchored-conditional", "unanchored")):
         raise ValueError(f"{arm['name']}: unsupported objective/recipe treatment")
     if any(moment_weights(arm).values()) and (arm["jepa_mode"] != "off" or recipe != "full-none"):
         raise ValueError(f"{arm['name']}: temporal moments require forecast-only full-none")
@@ -273,6 +294,12 @@ def recipe_for(plan, arm):
             arm["jepa_mode"] != "off" or recipe != "full-none"
             or plan["common_config"].get("future-calendar") != "false"):
         raise ValueError(f"{arm['name']}: reader SIGReg requires causal forecast-only full-none")
+    if sign_weight(arm) > 0.0 and (
+            arm["jepa_mode"] != "anchored-temporal-projected"
+            or recipe != "full-none"
+            or plan["common_config"].get("future-calendar") != "false"
+            or arm.get("sigreg_placement", "off") != "off"):
+        raise ValueError(f"{arm['name']}: decision sign treatment requires anchored temporal projected full-none")
     if arm["name"] in UNANCHORED_PLACEMENTS and (
             arm["jepa_mode"] != "unanchored" or recipe != "full-none"
             or plan["common_config"].get("future-calendar") != "false"):
@@ -298,6 +325,8 @@ def arm_command(plan, arm):
         command += [f"--{key}", str(value)]
     for field, value in moment_weights(arm).items():
         command += [f"--{field.replace('_', '-')}", str(value)]
+    if sign_weight(arm) > 0.0:
+        command += ["--decision-sign-weight", str(sign_weight(arm))]
     if plan["suite"] in ("temporal-reader-sigreg", "temporal-unanchored-sigreg"):
         for field, value in reader_settings(arm).items():
             command += [f"--{field.replace('_', '-')}", value]
@@ -306,7 +335,6 @@ def arm_command(plan, arm):
     for field, value in sigreg_config.items():
         command += [f"--jepa-{field.replace('_', '-')}", str(value)]
     return command
-
 
 def validate_unanchored_suite(plan):
     if plan.get("suite") != "temporal-unanchored-sigreg":
@@ -339,6 +367,7 @@ def treatment_key(plan, arm):
     reader = reader_settings(arm)
     return (arm["jepa_mode"], recipe_for(plan, arm),
             *(arm.get(field, 0.0) for field in MOMENT_FIELDS),
+            sign_weight(arm),
             *(reader[field] for field in READER_DEFAULTS))
 
 
@@ -884,6 +913,10 @@ def endpoint_evidence(plan, arm):
         if (not isinstance(actual, (int, float)) or isinstance(actual, bool)
                 or not math.isfinite(actual) or actual != value):
             raise ValueError(f"{arm['name']}: actual {field} differs from its declared treatment")
+    actual_sign_weight = model.get("decision_sign_weight", 0.0)
+    if (not isinstance(actual_sign_weight, (int, float)) or isinstance(actual_sign_weight, bool)
+            or not math.isfinite(actual_sign_weight) or actual_sign_weight != sign_weight(arm)):
+        raise ValueError(f"{arm['name']}: actual decision_sign_weight differs from its declared treatment")
     for key, value in RECIPES[recipe].items():
         if model.get(key.replace("-", "_"), {"scale-coupling": "full", "horizon-decimation": "none"}[key]) != value:
             raise ValueError(f"{arm['name']}: actual {key} differs from declared {recipe} treatment")
