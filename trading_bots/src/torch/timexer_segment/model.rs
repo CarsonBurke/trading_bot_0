@@ -9,7 +9,8 @@ use super::{
     corpus::Batch,
     features::{Feature, FeatureSet},
     jepa::{
-        JepaConfig, JepaHeads, JepaMode, JepaRandom, RepresentationViews, CONDITIONAL_FEATURES,
+        reader_sigreg_objective, JepaConfig, JepaHeads, JepaMode, JepaRandom, ReaderNorm,
+        RepresentationViews, SigregPlacement, CONDITIONAL_FEATURES,
     },
     supervision::HorizonDecimation,
     target_basis::{self, BasisTransform, BasisWeight, TargetBasis},
@@ -701,6 +702,14 @@ pub struct ModelConfig {
     #[arg(long, value_enum, default_value_t = HorizonDecimation::None)]
     #[serde(default, skip_serializing_if = "is_undecimated")]
     pub horizon_decimation: HorizonDecimation,
+    /// Final normalization of the actual shared forecast/probe reader state.
+    #[arg(long, value_enum, default_value_t = ReaderNorm::Rms)]
+    #[serde(default, skip_serializing_if = "ReaderNorm::is_rms")]
+    pub reader_norm: ReaderNorm,
+    /// Population SIGReg on unconstrained patch observations, actual reader states, or both.
+    #[arg(long, value_enum, default_value_t = SigregPlacement::Off)]
+    #[serde(default, skip_serializing_if = "SigregPlacement::is_off")]
+    pub sigreg_placement: SigregPlacement,
     /// Optional temporal objective; `off` preserves the forecast-only path.
     #[arg(long, value_enum, default_value_t = JepaMode::Off)]
     #[serde(default, skip_serializing_if = "JepaMode::is_off")]
@@ -769,6 +778,8 @@ impl Default for ModelConfig {
             basis_stats: None,
             scale_coupling: ScaleCoupling::Full,
             horizon_decimation: HorizonDecimation::None,
+            reader_norm: ReaderNorm::Rms,
+            sigreg_placement: SigregPlacement::Off,
             jepa_mode: JepaMode::Off,
             jepa: JepaConfig::default(),
         }
@@ -956,6 +967,40 @@ impl ModelConfig {
                 self.horizon_mean
             );
         }
+        if self.jepa_mode.unanchored() {
+            ensure!(
+                self.reader_norm == ReaderNorm::None,
+                "unanchored requires --reader-norm none"
+            );
+            ensure!(
+                self.amplitude_prior == 0.
+                    && self.target_basis.is_identity()
+                    && self.basis_weight == BasisWeight::Uniform
+                    && self.basis_stats.is_none()
+                    && self.horizon_mean == HorizonMean::Free
+                    && self.horizon_loss == HorizonLoss::Uniform,
+                "unanchored forbids forecast priors, basis transforms and forecast-head treatments"
+            );
+        }
+        if self.reader_norm == ReaderNorm::None || self.sigreg_placement.enabled() {
+            ensure!(
+                self.reader_norm == ReaderNorm::None,
+                "reader SIGReg requires --reader-norm none on the actual forecast interface"
+            );
+            ensure!(
+                (!self.jepa_mode.enabled() || self.jepa_mode.unanchored())
+                    && !self.temporal_moments_enabled(),
+                "reader arms require --jepa-mode off or unanchored and no temporal-moment or decision-MSE objective"
+            );
+            ensure!(
+                !self.future_calendar,
+                "reader arms require --future-calendar false"
+            );
+            ensure!(
+                self.scale_coupling == ScaleCoupling::Full && !self.horizon_decimation.enabled(),
+                "reader arms require full scale coupling and no horizon decimation"
+            );
+        }
         self.jepa.validate(self)?;
         Ok(())
     }
@@ -968,8 +1013,29 @@ impl ModelConfig {
         self.temporal_moment_weight > 0. || self.decision_mse_weight > 0.
     }
 
+    pub fn needs_representation_random(&self) -> bool {
+        self.jepa_mode.needs_random() || self.sigreg_placement.enabled()
+    }
+
     /// Complete optional objective/parameter contract for authenticated research manifests.
     pub fn jepa_contract(&self) -> Option<String> {
+        if self.jepa_mode.unanchored() {
+            return Some(format!(
+                "temporal-jepa-unanchored-v1;config={};offsets-patches=[1,2,4,8,12];horizons-bars={:?};reader-norm=none;placement={};observation=unconstrained-shared-full-width-patch-embedding(causal-prefix-normalization);state=actual-pre-final-rms-causal-reader;target=attached-nonoverlapping-future-observation;projector=none;predictor=direct-state-mlp;objective=prediction-weight*masked-latent-mse+placement-weighted-sigreg;sigreg-sites=local-observation-and-or-state-no-target-duplicate;both=same-draws-and-mask-half-weight-each;population=valid-batch-rows-per-sampled-source-view;mask=complete-source-patch-and-minimum-history;positions=minimum-history-source-through-final-context-patch;forecast=not-forwarded-no-loss-frozen-allocation;reconstruction=none;decision-loss=none;stop-gradient=none;gradient-surgery=none;initialization=fresh;selection=completed-fixed-budget;readers=fit-only-after-full-store-freeze;precision=bf16-backbone-fp32-objective;future-calendar=false;pair-mask=complete-source-patch-and-minimum-history-and-complete-target-patch;latent-reduction=mean-over-valid-source-offset-pairs-and-features;sigreg-reduction=mean-over-eligible-views-of-N-times-epps-pulley",
+                serde_json::to_string(&self.jepa).expect("validated JEPA config"),
+                self.jepa_horizons(),
+                self.sigreg_placement,
+            ));
+        }
+        if self.reader_norm == ReaderNorm::None || self.sigreg_placement.enabled() {
+            return Some(format!(
+                "causal-reader-sigreg-v1;reader-norm={};placement={};config={};observation=unconstrained-shared-full-width-patch-embedding(causal-prefix-normalization);state=actual-pre-final-rms-causal-forecast-reader;reader=shared-forecast-full-probe-recent-probe;predictor=none;target=none;population=valid-batch-rows-per-sampled-source-view;mask=complete-source-patch-and-minimum-history;positions=minimum-history-source-through-final-context-patch-without-future-offset;both=same-draws-and-mask-half-weight-each;reduction=mean-over-views-with-N-at-least-2-of-N-times-epps-pulley;precision=bf16-backbone-fp32-regularizer;forecast=unchanged-attached-semantic-objective;future-calendar={}",
+                self.reader_norm,
+                self.sigreg_placement,
+                serde_json::to_string(&self.jepa).expect("validated representation config"),
+                self.future_calendar,
+            ));
+        }
         self.jepa_mode.enabled().then(|| {
             if self.jepa_mode.conditional() {
                 return format!(
@@ -1058,9 +1124,11 @@ impl ModelConfig {
                 + gemm(tokens, width, width)
                 + 2. * gemm(tokens, width, ffn)
                 + 2. * rows * origins * origins * width);
-        flops += gemm(tokens, horizon * known, covariate_width)
-            + gemm(tokens, head_input, HEAD_HIDDEN as f64)
-            + gemm(tokens, HEAD_HIDDEN as f64, head_outputs);
+        if !self.jepa_mode.unanchored() {
+            flops += gemm(tokens, horizon * known, covariate_width)
+                + gemm(tokens, head_input, HEAD_HIDDEN as f64)
+                + gemm(tokens, HEAD_HIDDEN as f64, head_outputs);
+        }
         // Every activation the step materializes, written once and read once. Backward pays it
         // twice more (grad-in, grad-out), hence the factor three on both totals.
         let bf16 = |elements: f64| 2. * elements;
@@ -1101,9 +1169,17 @@ impl ModelConfig {
         // product and add would. The encoder half's outputs are free - they are the very
         // tensors the next layer's norm already retains, so the stack itself adds no bytes.
         bytes += (self.layers / 2) as f64 * bf16(tokens * width);
-        bytes += bf16(tokens * (width + horizon * known + covariate_width + head_input))
-            + bf16(tokens * 2. * HEAD_HIDDEN as f64)
-            + bf16(tokens * head_outputs);
+        let reader_norm_width = if self.reader_norm == ReaderNorm::Rms {
+            width
+        } else {
+            0.
+        };
+        if !self.jepa_mode.unanchored() {
+            bytes +=
+                bf16(tokens * (reader_norm_width + horizon * known + covariate_width + head_input))
+                    + bf16(tokens * 2. * HEAD_HIDDEN as f64)
+                    + bf16(tokens * head_outputs);
+        }
         // The head geometry, the NLL and their backward are counted directly rather than
         // scaled: 74 reads-or-writes of the `[rows, origins', 1, pred_len]` fp32 channel
         // space, enumerated op by op from `CausalPatchModel::losses`.
@@ -1138,11 +1214,15 @@ impl ModelConfig {
         // Fused decoupled geometry adds one precision-workspace write and four two-vector
         // mean dots: nine fp32 traffic units, with the same backward traffic. The true NLL
         // reuses reduced scale/log terms. This is an analytical bound, not a timing claim.
-        let head_loss = fp32(tokens * horizon)
-            * match self.scale_coupling {
-                ScaleCoupling::Full => 74.,
-                ScaleCoupling::Decoupled => 83.,
-            };
+        let head_loss = if self.jepa_mode.unanchored() {
+            0.
+        } else {
+            fp32(tokens * horizon)
+                * match self.scale_coupling {
+                    ScaleCoupling::Full => 74.,
+                    ScaleCoupling::Decoupled => 83.,
+                }
+        };
         // Value residual: `layers - 1` decoder layers each `lerp` their own value against layer
         // 0's. Ten passes over one `[tokens, d_model]` bf16 activation per such layer - three
         // forward (two reads and one write) and seven backward (`grad_self` and `grad_end` at a
@@ -1239,6 +1319,22 @@ impl ModelConfig {
         } else {
             (0., 0.)
         };
+        let (reader_flops, reader_bytes) = if self.sigreg_placement.enabled() {
+            let first = (self.min_history + self.patch_len - 1) / self.patch_len - 1;
+            let views = self.jepa.views.min(self.origins() - first) as f64;
+            let directions = self.jepa.directions as f64;
+            let placements = if self.sigreg_placement == SigregPlacement::Both {
+                2.
+            } else {
+                1.
+            };
+            (
+                placements * 2. * gemm(rows * views, width, directions),
+                placements * 8. * fp32(rows * views * directions * 17.),
+            )
+        } else {
+            (0., 0.)
+        };
         let (moment_flops, moment_bytes) = if self.temporal_moments_enabled() {
             let instruments = super::temporal_moments::INSTRUMENT_WIDTH as f64;
             let decisions = super::temporal_moments::HORIZONS.len() as f64;
@@ -1265,13 +1361,14 @@ impl ModelConfig {
             (0., 0.)
         };
         StepCost {
-            matmul_flops: 3. * flops + expansion + jepa_flops + moment_flops,
+            matmul_flops: 3. * flops + expansion + jepa_flops + reader_flops + moment_flops,
             traffic_bytes: 3. * 2. * bytes
                 + head_loss
                 + value_residual
                 + expansion_bytes
                 + amplitude_prior
                 + jepa_bytes
+                + reader_bytes
                 + moment_bytes,
         }
     }
@@ -1938,7 +2035,7 @@ impl CausalPatchModel {
             &Tensor::arange(config.origins(), (Kind::Int64, device)),
             Kind::BFloat16,
         );
-        Self {
+        let model = Self {
             patch: projection(
                 path / "patch",
                 config.patch_len * (CHANNELS + aux_channels),
@@ -2048,7 +2145,17 @@ impl CausalPatchModel {
                 .temporal_moments_enabled()
                 .then(|| TemporalMoments::new(config, device)),
             config: config.clone(),
+        };
+        if config.jepa_mode.unanchored() {
+            // Preserve the initialization stream, without gradients or named optimizer enrollment.
+            for layer in [&model.head_hidden, &model.head_output] {
+                let _ = layer.ws.set_requires_grad(false);
+                if let Some(bias) = &layer.bs {
+                    let _ = bias.set_requires_grad(false);
+                }
+            }
         }
+        model
     }
 
     pub fn config(&self) -> &ModelConfig {
@@ -2268,7 +2375,7 @@ impl CausalPatchModel {
         Tensor::cat(&[prices, aux], 3).reshape([rows, origins, patch * (CHANNELS + aux_channels)])
     }
 
-    /// Patch embedding, the causal transformer stack and the final norm, narrowed to the scored
+    /// Patch embedding, the causal transformer stack and the configured reader norm, narrowed to the scored
     /// origins. Separated from [`Self::head`] so the step timing can attribute the two phases
     /// without a synchronization inside the composed forward.
     ///
@@ -2343,7 +2450,10 @@ impl CausalPatchModel {
                 next
             },
         );
-        let state = rms_norm(&state);
+        let state = match self.config.reader_norm {
+            ReaderNorm::Rms => rms_norm(&state),
+            ReaderNorm::None => state,
+        };
         if last_only {
             state.narrow(1, origins - 1, 1)
         } else {
@@ -2354,7 +2464,7 @@ impl CausalPatchModel {
     /// Frozen probes and the training objective share precisely the same representation path.
     pub fn representation_views(&self, batch: &Batch, train: bool) -> RepresentationViews {
         let stats = self.statistics(batch);
-        self.views_with_statistics(batch, &stats, train)
+        self.views_with_statistics(batch, &stats, train, true)
     }
 
     /// Recompute a genuinely short causal history ending at `source_index`, including its
@@ -2381,6 +2491,7 @@ impl CausalPatchModel {
         batch: &Batch,
         stats: &Statistics,
         train: bool,
+        include_readout_tokens: bool,
     ) -> RepresentationViews {
         let c = &self.config;
         let tokens = self.tokens(batch, stats);
@@ -2393,17 +2504,22 @@ impl CausalPatchModel {
             |heads| heads.target(&observation),
         );
         let prediction = self.jepa.as_ref().map(|heads| heads.prediction(&state));
-        // Exactly the bf16-rounded price features used by the patch embedding, without aux.
-        let reconstruction_target = tokens
-            .reshape([
-                tokens.size()[0],
-                c.origins(),
-                c.patch_len,
-                CHANNELS + c.features.channels() as i64,
-            ])
-            .narrow(-1, 0, CHANNELS)
-            .flatten(2, 3)
-            .to_kind(Kind::Float);
+        // Frozen direct-input/reconstruction readers use these features; unanchored
+        // pretraining does not allocate them or run any reconstruction computation.
+        let reconstruction_target = if include_readout_tokens {
+            tokens
+                .reshape([
+                    tokens.size()[0],
+                    c.origins(),
+                    c.patch_len,
+                    CHANNELS + c.features.channels() as i64,
+                ])
+                .narrow(-1, 0, CHANNELS)
+                .flatten(2, 3)
+                .to_kind(Kind::Float)
+        } else {
+            Tensor::new()
+        };
         let conditional = self
             .jepa
             .as_ref()
@@ -2419,7 +2535,7 @@ impl CausalPatchModel {
         }
     }
 
-    /// One backbone pass for forecast and temporal objectives; conditional targets are fixed data.
+    /// One backbone pass. Unanchored returns before any forecast head or label computation.
     pub(super) fn jepa_losses(
         &self,
         batch: &Batch,
@@ -2428,7 +2544,34 @@ impl CausalPatchModel {
         random: Option<&JepaRandom>,
     ) -> Losses {
         let stats = self.statistics(batch);
-        let views = self.views_with_statistics(batch, &stats, train);
+        let views =
+            self.views_with_statistics(batch, &stats, train, !self.config.jepa_mode.unanchored());
+        if self.config.jepa_mode.unanchored() {
+            assert!(
+                keep.is_none(),
+                "unanchored never decimates temporal prediction pairs"
+            );
+            let c = &self.config;
+            let valid = batch
+                .valid
+                .narrow(1, 0, c.seq_len)
+                .reshape([-1, c.origins(), c.patch_len])
+                .amin([-1i64].as_slice(), false);
+            let source_valid = &valid * &stats.mask;
+            let (objective, diagnostics) = self
+                .jepa
+                .as_ref()
+                .expect("enabled JEPA heads")
+                .objective(c, &views, &valid, &source_valid, random);
+            let unavailable = Tensor::full([], f64::NAN, (Kind::Float, views.state.device()));
+            return Losses {
+                nll: unavailable.shallow_clone(),
+                mse: unavailable,
+                objective,
+                jepa: Some(diagnostics),
+                moments: None,
+            };
+        }
         let head_state = if self.config.jepa_mode.detached_forecast() {
             views.state.detach()
         } else {
@@ -2454,6 +2597,34 @@ impl CausalPatchModel {
             let source_valid = &valid * &stats.mask;
             heads.objective(c, &views, &valid, &source_valid, random)
         };
+        losses.objective = &losses.objective + auxiliary;
+        losses.jepa = Some(diagnostics);
+        losses
+    }
+
+    /// A single backbone pass; the regularizer reads exactly the state passed to the forecast head.
+    pub(super) fn reader_sigreg_losses(
+        &self,
+        batch: &Batch,
+        train: bool,
+        random: &JepaRandom,
+    ) -> Losses {
+        let c = &self.config;
+        let stats = self.statistics(batch);
+        let observation = linear(&self.tokens(batch, &stats), &self.patch);
+        let x0 = rms_norm(&observation.dropout(c.dropout, train));
+        let state = self.trunk(&x0, train, false, c.origins());
+        let head = self.head(batch, &state, false);
+        let (targets, mask) = self.targets(batch, &stats, false);
+        let mut losses = self.losses(&head, &stats, &targets, &mask);
+        let source_valid = batch
+            .valid
+            .narrow(1, 0, c.seq_len)
+            .reshape([-1, c.origins(), c.patch_len])
+            .amin([-1i64].as_slice(), false)
+            * &stats.mask;
+        let (auxiliary, diagnostics) =
+            reader_sigreg_objective(c, &observation, &state, &source_valid, random);
         losses.objective = &losses.objective + auxiliary;
         losses.jepa = Some(diagnostics);
         losses
@@ -3844,7 +4015,7 @@ pub fn nll_elements(prediction: &Tensor, log_scale: &Tensor, target: &Tensor) ->
 }
 
 pub struct Losses {
-    /// True forecasting metric value, never an auxiliary penalty.
+    /// True forecasting metric value, never an auxiliary penalty; NaN when no forecast is run.
     pub nll: Tensor,
     pub mse: Tensor,
     /// The scalar to backpropagate, including configured auxiliary terms.
@@ -3944,6 +4115,8 @@ mod tests {
             basis_stats: None,
             scale_coupling: ScaleCoupling::Full,
             horizon_decimation: HorizonDecimation::None,
+            reader_norm: ReaderNorm::Rms,
+            sigreg_placement: SigregPlacement::Off,
             jepa_mode: JepaMode::Off,
             jepa: JepaConfig::default(),
         }
@@ -7604,6 +7777,341 @@ mod tests {
         }
     }
 
+    fn unanchored_gpu_config(placement: SigregPlacement) -> ModelConfig {
+        ModelConfig {
+            reader_norm: ReaderNorm::None,
+            sigreg_placement: placement,
+            jepa: JepaConfig {
+                reconstruction_weight: 0.,
+                directions: 16,
+                views: 2,
+                ..Default::default()
+            },
+            ..jepa_gpu_config(JepaMode::Unanchored)
+        }
+    }
+
+    #[test]
+    fn unanchored_refuses_semantic_anchors_and_nonclean_recipes() {
+        let clean = unanchored_gpu_config(SigregPlacement::Off);
+        let incompatible: [fn(&mut ModelConfig); 12] = [
+            |c| c.reader_norm = ReaderNorm::Rms,
+            |c| c.future_calendar = true,
+            |c| c.scale_coupling = ScaleCoupling::Decoupled,
+            |c| c.horizon_decimation = HorizonDecimation::Lattice,
+            |c| c.temporal_moment_weight = 0.1,
+            |c| c.decision_mse_weight = 0.1,
+            |c| c.amplitude_prior = 0.1,
+            |c| c.horizon_loss = HorizonLoss::Inverse,
+            |c| c.jepa.prediction_weight = 0.5,
+            |c| c.jepa.sigreg_weight = 0.,
+            |c| c.jepa.reconstruction_weight = 1.,
+            |c| c.seq_len = 128,
+        ];
+        for placement in [
+            SigregPlacement::Off,
+            SigregPlacement::Local,
+            SigregPlacement::State,
+            SigregPlacement::Both,
+        ] {
+            let mut config = clean.clone();
+            config.sigreg_placement = placement;
+            config.validate().unwrap();
+            for mutate in incompatible {
+                let mut invalid = config.clone();
+                mutate(&mut invalid);
+                assert!(
+                    invalid.validate().is_err(),
+                    "accepted unclean unanchored config: {invalid:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn cuda_unanchored_placements_share_initialization_and_select_actual_reader_interfaces() {
+        let _rng = crate::torch::test_rng::exclusive();
+        if std::env::var("TIMEXER_SEGMENT_GPU_TEST").as_deref() != Ok("1") {
+            return;
+        }
+        assert!(tch::Cuda::is_available());
+        crate::torch::cuda::cfg::configure_cuda();
+        let _backward = crate::torch::cuda::cfg::disable_autograd_multithreading();
+        let device = Device::Cuda(0);
+        let mut initial: Option<std::collections::HashMap<String, Tensor>> = None;
+        let mut after_init_rng: Option<Tensor> = None;
+        for placement in [
+            SigregPlacement::Off,
+            SigregPlacement::Local,
+            SigregPlacement::State,
+            SigregPlacement::Both,
+        ] {
+            tch::manual_seed(94721);
+            tch::Cuda::manual_seed_all(94721);
+            let config = unanchored_gpu_config(placement);
+            let store = nn::VarStore::new(device);
+            let model = CausalPatchModel::new(&store.root(), &config);
+            let variables = store.variables();
+            if let Some(initial) = &initial {
+                assert_eq!(variables.len(), initial.len());
+                for (name, parameter) in &variables {
+                    assert!(
+                        parameter.equal(&initial[name]),
+                        "placement changed initialization of {name}"
+                    );
+                }
+            } else {
+                initial = Some(
+                    variables
+                        .iter()
+                        .map(|(name, p)| (name.clone(), p.copy()))
+                        .collect(),
+                );
+            }
+            let next_random = Tensor::randn([32], (Kind::Float, device));
+            if let Some(expected) = &after_init_rng {
+                assert!(
+                    next_random.equal(expected),
+                    "placement changed CUDA initialization RNG"
+                );
+            } else {
+                after_init_rng = Some(next_random);
+            }
+            let batch = synthetic(&config, &[16; 4]).to_device(device);
+            let stats = model.statistics(&batch);
+            let views = model.representation_views(&batch, false);
+            assert_eq!(views.state.kind(), Kind::BFloat16);
+            assert!(views.target.equal(&views.observation));
+            let mut random = JepaRandom::new(&config, device);
+            random.refresh().unwrap();
+            let source_valid = batch
+                .valid
+                .narrow(1, 0, config.seq_len)
+                .reshape([-1, config.origins(), config.patch_len])
+                .amin([-1i64].as_slice(), false)
+                * stats.mask;
+            let valid = source_valid
+                .index_select(1, &random.positions)
+                .transpose(0, 1);
+            let actual = |values: &Tensor| {
+                super::super::jepa::population_sigreg(
+                    &values
+                        .index_select(1, &random.positions)
+                        .transpose(0, 1)
+                        .to_kind(Kind::Float),
+                    &valid,
+                    &random,
+                )
+                .0
+                .double_value(&[])
+            };
+            let expected_local = if placement.local() {
+                actual(&views.observation)
+            } else {
+                0.
+            };
+            let expected_state = if placement.state() {
+                actual(&views.state)
+            } else {
+                0.
+            };
+            let losses = model.jepa_losses(&batch, false, None, Some(&random));
+            let diagnostic = losses.jepa.as_ref().unwrap();
+            assert_eq!(
+                diagnostic.size(),
+                [super::super::jepa::UNANCHORED_DIAGNOSTIC_COUNT]
+            );
+            assert!(losses.nll.double_value(&[]).is_nan() && losses.mse.double_value(&[]).is_nan());
+            assert_eq!(diagnostic.double_value(&[1]), 0., "duplicate target SIGReg");
+            assert_eq!(
+                diagnostic.double_value(&[2]),
+                0.,
+                "reconstruction objective"
+            );
+            assert!((diagnostic.double_value(&[8]) - expected_local).abs() < 1e-5);
+            assert!((diagnostic.double_value(&[10]) - expected_state).abs() < 1e-5);
+            let weight = if placement == SigregPlacement::Both {
+                0.045
+            } else {
+                0.09
+            };
+            assert!(diagnostic
+                .get(9)
+                .equal(&((diagnostic.get(8) + diagnostic.get(10)) * weight)));
+            assert!(losses
+                .objective
+                .equal(&(diagnostic.get(0) + diagnostic.get(9))));
+        }
+    }
+
+    #[test]
+    fn cuda_unanchored_future_forecast_labels_cannot_change_objective_or_representation_gradients()
+    {
+        let _rng = crate::torch::test_rng::exclusive();
+        if std::env::var("TIMEXER_SEGMENT_GPU_TEST").as_deref() != Ok("1") {
+            return;
+        }
+        assert!(tch::Cuda::is_available());
+        crate::torch::cuda::cfg::configure_cuda();
+        let _backward = crate::torch::cuda::cfg::disable_autograd_multithreading();
+        let device = Device::Cuda(0);
+        for placement in [
+            SigregPlacement::Off,
+            SigregPlacement::Local,
+            SigregPlacement::State,
+            SigregPlacement::Both,
+        ] {
+            let config = unanchored_gpu_config(placement);
+            let store = nn::VarStore::new(device);
+            let model = CausalPatchModel::new(&store.root(), &config);
+            let batch = synthetic(&config, &[16; 4]).to_device(device);
+            let mut changed = batch.resident(device);
+            batch.upload(&mut changed).unwrap();
+            let _ = changed
+                .log_prices
+                .narrow(1, config.seq_len, config.pred_len)
+                .fill_(7.);
+            let _ = changed
+                .aux
+                .narrow(1, config.seq_len, config.pred_len)
+                .fill_(-11.);
+            let _ = changed
+                .market_cum
+                .narrow(1, config.seq_len, config.pred_len)
+                .fill_(3.);
+            let _ = changed
+                .valid
+                .narrow(1, config.seq_len, config.pred_len)
+                .fill_(0.);
+            let mut random = JepaRandom::new(&config, device);
+            random.refresh().unwrap();
+            let before = model.jepa_losses(&batch, false, None, Some(&random));
+            before.objective.backward();
+            assert!(
+                model
+                    .patch
+                    .ws
+                    .grad()
+                    .abs()
+                    .sum(Kind::Float)
+                    .double_value(&[])
+                    > 0.
+            );
+            assert!(
+                model.blocks[0]
+                    .output
+                    .ws
+                    .grad()
+                    .abs()
+                    .sum(Kind::Float)
+                    .double_value(&[])
+                    > 0.,
+                "attached temporal JEPA did not train the causal trunk"
+            );
+            let variables = store.variables();
+            let gradients: std::collections::HashMap<_, _> = variables
+                .iter()
+                .filter_map(|(name, p)| p.grad().defined().then(|| (name.clone(), p.grad().copy())))
+                .collect();
+            for (name, parameter) in &variables {
+                if name.starts_with("head.") {
+                    assert!(
+                        !parameter.requires_grad() && !parameter.grad().defined(),
+                        "forecast parameter trained: {name}"
+                    );
+                }
+                parameter.shallow_clone().zero_grad();
+            }
+            // Poisoning the unused forecast head also must not affect the objective.
+            tch::no_grad(|| {
+                let _ = model.head_hidden.ws.shallow_clone().fill_(f64::NAN);
+                let _ = model.head_output.ws.shallow_clone().fill_(f64::NAN);
+            });
+            let after = model.jepa_losses(&changed, false, None, Some(&random));
+            assert!(before.objective.equal(&after.objective));
+            assert!(before.jepa.unwrap().equal(&after.jepa.unwrap()));
+            after.objective.backward();
+            for (name, expected) in gradients {
+                assert!(
+                    variables[&name].grad().equal(&expected),
+                    "forecast-only labels changed gradient of {name}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn cuda_unanchored_capture_all_placements_preserves_frozen_forecast_and_diagnostic_packets() {
+        use super::super::compute::{Engine, OptimizerKind, RecipeKnobs, CAPTURE_AFTER_STEPS};
+        let _rng = crate::torch::test_rng::exclusive();
+        if std::env::var("TIMEXER_SEGMENT_GPU_TEST").as_deref() != Ok("1") {
+            return;
+        }
+        assert!(tch::Cuda::is_available());
+        crate::torch::cuda::cfg::configure_cuda();
+        let _backward = crate::torch::cuda::cfg::disable_autograd_multithreading();
+        let device = Device::Cuda(0);
+        for placement in [
+            SigregPlacement::Off,
+            SigregPlacement::Local,
+            SigregPlacement::State,
+            SigregPlacement::Both,
+        ] {
+            let config = unanchored_gpu_config(placement);
+            let store = nn::VarStore::new(device);
+            let model = CausalPatchModel::new(&store.root(), &config);
+            let batch = synthetic(&config, &[16; 4]).to_device(device);
+            let forecast: Vec<_> = store
+                .variables()
+                .into_iter()
+                .filter(|(name, _)| name.starts_with("head."))
+                .map(|(name, p)| (name, p.copy()))
+                .collect();
+            let patch_before = model.patch.ws.detach().copy();
+            let trunk_before = model.blocks[0].output.ws.detach().copy();
+            let mut engine = Engine::new(
+                &store,
+                0.001,
+                RecipeKnobs::reference(config.x0_lambdas),
+                false,
+                OptimizerKind::PolarExpress,
+            )
+            .unwrap();
+            engine.timed_step(&model, &batch).unwrap();
+            for _ in 1..CAPTURE_AFTER_STEPS {
+                engine.step(&model, &batch).unwrap();
+            }
+            let captured = engine.arm_step_graph(&model, &batch).unwrap();
+            assert!(engine.step_graph_captured());
+            let saved = captured.copied();
+            let _ = batch.valid.select(0, 0).fill_(0.);
+            let replay = engine.step(&model, &batch).unwrap();
+            let packet = replay.jepa.as_ref().unwrap();
+            assert!(replay.nll.double_value(&[]).is_nan() && replay.mse.double_value(&[]).is_nan());
+            assert_eq!(packet.double_value(&[13]), 3.);
+            assert_eq!(captured.jepa.as_ref().unwrap().double_value(&[13]), 4.);
+            assert!(replay.objective.equal(&(packet.get(0) + packet.get(9))));
+            if placement == SigregPlacement::Off {
+                assert_eq!(packet.double_value(&[9]), 0.);
+            }
+            for _ in 0..3 {
+                engine.step(&model, &batch).unwrap();
+            }
+            assert!(captured.objective.equal(&saved.objective));
+            assert!(captured.jepa.unwrap().equal(&saved.jepa.unwrap()));
+            let variables = store.variables();
+            for (name, initial) in forecast {
+                assert!(
+                    variables[&name].equal(&initial),
+                    "optimizer or decay modified frozen forecast {name}"
+                );
+                assert!(!variables[&name].grad().defined());
+            }
+            assert!(!model.patch.ws.equal(&patch_before));
+            assert!(!model.blocks[0].output.ws.equal(&trunk_before));
+        }
+    }
+
     #[test]
     fn cuda_jepa_future_observations_cannot_change_earlier_states_or_predictions() {
         let _rng = crate::torch::test_rng::exclusive();
@@ -8369,5 +8877,321 @@ mod tests {
             "optimizer/next replay overwrote retained temporal diagnostics"
         );
         assert!(!captured.moments.as_ref().unwrap().requires_grad());
+    }
+
+    #[test]
+    fn reader_contract_rejects_mixed_objectives_and_authenticates_even_the_unregularized_reader() {
+        let control = ModelConfig {
+            reader_norm: ReaderNorm::None,
+            future_calendar: false,
+            seq_len: 32,
+            min_history: 32,
+            ..small_config()
+        };
+        let mut contracts = std::collections::HashSet::new();
+        for placement in [
+            SigregPlacement::Off,
+            SigregPlacement::Local,
+            SigregPlacement::State,
+            SigregPlacement::Both,
+        ] {
+            let config = ModelConfig {
+                sigreg_placement: placement,
+                ..control.clone()
+            };
+            config.validate().unwrap();
+            assert!(contracts.insert(config.jepa_contract().unwrap()));
+            assert_eq!(config.needs_representation_random(), placement.enabled());
+            let encoded = serde_json::to_string(&config).unwrap();
+            assert_eq!(
+                serde_json::from_str::<ModelConfig>(&encoded).unwrap(),
+                config
+            );
+        }
+        // A source at the final context patch is legal without any future JEPA target.
+        let enabled = ModelConfig {
+            sigreg_placement: SigregPlacement::State,
+            ..control.clone()
+        };
+        for invalid in [
+            ModelConfig {
+                reader_norm: ReaderNorm::Rms,
+                ..enabled.clone()
+            },
+            ModelConfig {
+                jepa_mode: JepaMode::Anchored,
+                ..enabled.clone()
+            },
+            ModelConfig {
+                temporal_moment_weight: 0.1,
+                ..enabled.clone()
+            },
+            ModelConfig {
+                decision_mse_weight: 0.1,
+                ..enabled.clone()
+            },
+            ModelConfig {
+                future_calendar: true,
+                ..enabled.clone()
+            },
+            ModelConfig {
+                scale_coupling: ScaleCoupling::Decoupled,
+                ..enabled.clone()
+            },
+            ModelConfig {
+                horizon_decimation: HorizonDecimation::Lattice,
+                ..enabled.clone()
+            },
+            ModelConfig {
+                jepa: JepaConfig {
+                    sigreg_weight: 0.,
+                    ..enabled.jepa.clone()
+                },
+                ..enabled.clone()
+            },
+            ModelConfig {
+                future_calendar: true,
+                ..control
+            },
+        ] {
+            assert!(
+                invalid.validate().is_err(),
+                "accepted incompatible reader config: {invalid:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn cuda_reader_placements_share_causal_forecasts_and_the_actual_unnormalized_probe_interface() {
+        use super::super::compute::Engine;
+        let _rng = crate::torch::test_rng::exclusive();
+        if std::env::var("TIMEXER_SEGMENT_GPU_TEST").as_deref() != Ok("1") {
+            return;
+        }
+        assert!(tch::Cuda::is_available());
+        crate::torch::cuda::cfg::configure_cuda();
+        let _backward = crate::torch::cuda::cfg::disable_autograd_multithreading();
+        let config = ModelConfig {
+            reader_norm: ReaderNorm::None,
+            ..jepa_gpu_config(JepaMode::Off)
+        };
+        let batch = synthetic(&config, &[16, 16, 16, 16]).to_device(Device::Cuda(0));
+        let mut reference: Option<(Tensor, Tensor, Tensor)> = None;
+        for placement in [
+            SigregPlacement::Off,
+            SigregPlacement::Local,
+            SigregPlacement::State,
+            SigregPlacement::Both,
+        ] {
+            let config = ModelConfig {
+                sigreg_placement: placement,
+                ..config.clone()
+            };
+            tch::manual_seed(942);
+            let store = nn::VarStore::new(Device::Cuda(0));
+            let mut model = CausalPatchModel::new(&store.root(), &config);
+            live_head(&model);
+            let stats = model.statistics(&batch);
+            let views = tch::no_grad(|| model.representation_views(&batch, false));
+            let forecast = tch::no_grad(|| model.forward(&batch, &stats, false, false));
+            assert!(forecast
+                .0
+                .equal(&tch::no_grad(|| model.head(&batch, &views.state, false)).0));
+            assert!(views.state.select(1, 15).equal(&tch::no_grad(
+                || model.representation_state_at_recent(&batch, 15, 16)
+            )));
+            assert!(
+                !views.state.equal(&rms_norm(&views.state)),
+                "reader state was still RMS-normalized"
+            );
+            assert!(
+                views.prediction.is_none() && model.jepa.is_none(),
+                "a discarded auxiliary head entered the reader arm"
+            );
+            let losses = Engine::forward_loss(&model, &batch, false, None);
+            if let Some((head, nll, mse)) = &reference {
+                assert!(
+                    head.equal(&forecast.0),
+                    "placement altered the semantic forecast"
+                );
+                assert!(nll.equal(&losses.nll));
+                assert!(mse.equal(&losses.mse));
+            } else {
+                assert!(losses.jepa.is_none());
+                assert!(losses.objective.equal(&losses.nll));
+                reference = Some((
+                    forecast.0.copy(),
+                    losses.nll.detach().copy(),
+                    losses.mse.copy(),
+                ));
+            }
+            let gradient = Tensor::run_backward(&[&losses.nll], &[&model.patch.ws], false, false);
+            assert!(
+                gradient[0].abs().sum(Kind::Float).double_value(&[]) > 0.,
+                "forecast gradient was detached from the reader"
+            );
+
+            // Toggle only final RMS on the same live weights: every public state path must agree.
+            model.config.reader_norm = ReaderNorm::Rms;
+            let normalized = tch::no_grad(|| model.representation_views(&batch, false));
+            assert!(normalized.state.equal(&rms_norm(&views.state)));
+            model.config.reader_norm = ReaderNorm::None;
+            let mut changed = batch.resident(Device::Cuda(0));
+            batch.upload(&mut changed).unwrap();
+            let _ = changed.log_prices.narrow(1, 48, 32).fill_(2.);
+            let _ = changed.aux.narrow(1, 48, 32).fill_(-7.);
+            let after = tch::no_grad(|| model.representation_views(&changed, false));
+            let after_forecast =
+                tch::no_grad(|| model.forward(&changed, &model.statistics(&changed), false, false));
+            assert!(views
+                .state
+                .narrow(1, 0, 3)
+                .equal(&after.state.narrow(1, 0, 3)));
+            assert!(forecast
+                .0
+                .narrow(1, 0, 3)
+                .equal(&after_forecast.0.narrow(1, 0, 3)));
+            assert!(!views
+                .state
+                .narrow(1, 3, 2)
+                .equal(&after.state.narrow(1, 3, 2)));
+            let recent = tch::no_grad(|| model.representation_state_at_recent(&changed, 10, 3));
+            let _ = changed.log_prices.narrow(1, 0, 64).fill_(9.);
+            let _ = changed.aux.narrow(1, 0, 64).fill_(4.);
+            assert!(recent.equal(&tch::no_grad(
+                || model.representation_state_at_recent(&changed, 10, 3)
+            )));
+        }
+    }
+
+    #[test]
+    fn cuda_reader_sigreg_uses_complete_source_patches_and_actual_valid_history_without_future_masks(
+    ) {
+        let _rng = crate::torch::test_rng::exclusive();
+        if std::env::var("TIMEXER_SEGMENT_GPU_TEST").as_deref() != Ok("1") {
+            return;
+        }
+        assert!(tch::Cuda::is_available());
+        crate::torch::cuda::cfg::configure_cuda();
+        let config = ModelConfig {
+            reader_norm: ReaderNorm::None,
+            sigreg_placement: SigregPlacement::Both,
+            jepa: JepaConfig {
+                views: 2,
+                directions: 16,
+                ..Default::default()
+            },
+            ..jepa_gpu_config(JepaMode::Off)
+        };
+        let store = nn::VarStore::new(Device::Cuda(0));
+        let model = CausalPatchModel::new(&store.root(), &config);
+        let batch = synthetic(&config, &[0, 0, 0, 0]).to_device(Device::Cuda(0));
+        let _ = batch.valid.select(0, 0).narrow(0, 20, 1).fill_(0.);
+        let _ = batch.valid.select(0, 1).narrow(0, 0, 16).fill_(0.);
+        let _ = batch.valid.select(0, 2).narrow(0, 250, 1).fill_(0.);
+        let mut random = JepaRandom::new(&config, Device::Cuda(0));
+        random.refresh().unwrap();
+        random
+            .positions
+            .copy_(&Tensor::from_slice(&[1i64, 15]).to_device(Device::Cuda(0)));
+        let losses = model.reader_sigreg_losses(&batch, false, &random);
+        let diagnostics = losses.jepa.unwrap();
+        // First sampled source has rows 2/3; final source has rows 0/1/3 despite absent futures.
+        assert_eq!(diagnostics.double_value(&[3]), 2.);
+        assert_eq!(diagnostics.double_value(&[4]), 5.);
+        assert_eq!(diagnostics.double_value(&[5]), 2.5);
+        assert!(
+            (diagnostics.double_value(&[1])
+                - 0.5
+                    * config.jepa.sigreg_weight
+                    * (diagnostics.double_value(&[0]) + diagnostics.double_value(&[2])))
+            .abs()
+                < 1e-5
+        );
+        assert!(!diagnostics.requires_grad());
+    }
+
+    #[test]
+    fn cuda_reader_capture_refreshes_populations_and_retained_diagnostics_survive_replay() {
+        use super::super::compute::{Engine, OptimizerKind, RecipeKnobs, CAPTURE_AFTER_STEPS};
+        let _rng = crate::torch::test_rng::exclusive();
+        if std::env::var("TIMEXER_SEGMENT_GPU_TEST").as_deref() != Ok("1") {
+            return;
+        }
+        assert!(tch::Cuda::is_available());
+        crate::torch::cuda::cfg::configure_cuda();
+        let _backward = crate::torch::cuda::cfg::disable_autograd_multithreading();
+        for placement in [
+            SigregPlacement::Off,
+            SigregPlacement::Local,
+            SigregPlacement::State,
+            SigregPlacement::Both,
+        ] {
+            let config = ModelConfig {
+                reader_norm: ReaderNorm::None,
+                sigreg_placement: placement,
+                jepa: JepaConfig {
+                    directions: 16,
+                    views: 2,
+                    ..Default::default()
+                },
+                ..jepa_gpu_config(JepaMode::Off)
+            };
+            let store = nn::VarStore::new(Device::Cuda(0));
+            let model = CausalPatchModel::new(&store.root(), &config);
+            let batch = synthetic(&config, &[16, 16, 16, 16]).to_device(Device::Cuda(0));
+            let mut engine = Engine::new(
+                &store,
+                0.001,
+                RecipeKnobs::reference(config.x0_lambdas),
+                false,
+                OptimizerKind::PolarExpress,
+            )
+            .unwrap();
+            engine.timed_step(&model, &batch).unwrap();
+            for _ in 1..CAPTURE_AFTER_STEPS {
+                engine.step(&model, &batch).unwrap();
+            }
+            let captured = engine.arm_step_graph(&model, &batch).unwrap();
+            assert!(engine.step_graph_captured());
+            let saved = captured.copied();
+            // Every sampled view loses one batch row, so the observable population must refresh.
+            let _ = batch.valid.select(0, 0).fill_(0.);
+            let reference = tch::no_grad(|| {
+                let stats = model.statistics(&batch);
+                let head = model.forward(&batch, &stats, false, false);
+                let (targets, mask) = model.targets(&batch, &stats, false);
+                model.losses(&head, &stats, &targets, &mask)
+            });
+            let replay = engine.step(&model, &batch).unwrap();
+            assert!((replay.nll.double_value(&[]) - reference.nll.double_value(&[])).abs() < 1e-5);
+            assert!((replay.mse.double_value(&[]) - reference.mse.double_value(&[])).abs() < 1e-5);
+            if placement.enabled() {
+                let diagnostic = replay.jepa.as_ref().unwrap();
+                assert_eq!(diagnostic.double_value(&[5]), 3.);
+                assert_eq!(captured.jepa.as_ref().unwrap().double_value(&[5]), 4.);
+                assert!(
+                    (replay.objective.double_value(&[])
+                        - reference.objective.double_value(&[])
+                        - diagnostic.double_value(&[1]))
+                    .abs()
+                        < 1e-5
+                );
+            } else {
+                assert!(replay.jepa.is_none());
+                assert!(replay.objective.equal(&replay.nll));
+            }
+            for _ in 0..3 {
+                engine.step(&model, &batch).unwrap();
+            }
+            assert!(captured.nll.equal(&saved.nll));
+            assert!(captured.objective.equal(&saved.objective));
+            if placement.enabled() {
+                assert!(
+                    captured.jepa.unwrap().equal(&saved.jepa.unwrap()),
+                    "replay or optimizer overwrote retained diagnostics"
+                );
+            }
+        }
     }
 }

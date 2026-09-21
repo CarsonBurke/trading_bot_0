@@ -1,4 +1,4 @@
-//! Temporal attached-target LeJEPA and fixed conditional characteristic prediction on CausalPatch.
+//! Causal-reader population SIGReg, temporal attached-target LeJEPA and fixed conditional prediction.
 //! A view is a position; its population is the independent batch axis, never flattened time.
 use anyhow::{ensure, Result};
 use rand::{Rng, SeedableRng};
@@ -15,6 +15,61 @@ use crate::torch::cuda;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
 #[serde(rename_all = "kebab-case")]
+pub enum ReaderNorm {
+    #[default]
+    Rms,
+    None,
+}
+impl ReaderNorm {
+    pub fn is_rms(&self) -> bool {
+        *self == Self::Rms
+    }
+}
+impl fmt::Display for ReaderNorm {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Rms => "rms",
+            Self::None => "none",
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
+#[serde(rename_all = "kebab-case")]
+pub enum SigregPlacement {
+    #[default]
+    Off,
+    Local,
+    State,
+    Both,
+}
+impl SigregPlacement {
+    pub fn enabled(self) -> bool {
+        self != Self::Off
+    }
+    pub fn is_off(&self) -> bool {
+        !self.enabled()
+    }
+    pub fn local(self) -> bool {
+        matches!(self, Self::Local | Self::Both)
+    }
+    pub fn state(self) -> bool {
+        matches!(self, Self::State | Self::Both)
+    }
+}
+impl fmt::Display for SigregPlacement {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Off => "off",
+            Self::Local => "local",
+            Self::State => "state",
+            Self::Both => "both",
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
+#[serde(rename_all = "kebab-case")]
 pub enum JepaMode {
     #[default]
     Off,
@@ -27,6 +82,8 @@ pub enum JepaMode {
     AnchoredProjectedNoSigreg,
     AnchoredConditional,
     AnchoredProjectedSmall,
+    /// Attached temporal prediction only; reader placement controls every regularizer.
+    Unanchored,
 }
 impl JepaMode {
     pub fn enabled(self) -> bool {
@@ -35,21 +92,39 @@ impl JepaMode {
     pub fn is_off(&self) -> bool {
         !self.enabled()
     }
+    pub fn unanchored(self) -> bool {
+        self == Self::Unanchored
+    }
     pub fn detached_forecast(self) -> bool {
         matches!(self, Self::LatentOne | Self::LatentMulti)
     }
     pub fn regularized(self) -> bool {
         self.enabled()
-            && !matches!(self, Self::AnchoredNoSigreg | Self::AnchoredProjectedNoSigreg | Self::AnchoredConditional)
+            && !matches!(
+                self,
+                Self::AnchoredNoSigreg
+                    | Self::AnchoredProjectedNoSigreg
+                    | Self::AnchoredConditional
+                    | Self::Unanchored
+            )
     }
     pub fn projected(self) -> bool {
-        matches!(self, Self::AnchoredProjected | Self::AnchoredProjectedNoSigreg | Self::AnchoredProjectedSmall)
+        matches!(
+            self,
+            Self::AnchoredProjected
+                | Self::AnchoredProjectedNoSigreg
+                | Self::AnchoredProjectedSmall
+        )
     }
     pub fn conditional(self) -> bool {
         self == Self::AnchoredConditional
     }
     pub fn target_width(self, d_model: i64) -> i64 {
-        if self == Self::AnchoredProjectedSmall { 16 } else { d_model }
+        if self == Self::AnchoredProjectedSmall {
+            16
+        } else {
+            d_model
+        }
     }
     /// Legacy nonregularized modes retain their sampled population diagnostics and RNG stream.
     pub fn needs_random(self) -> bool {
@@ -76,6 +151,7 @@ impl fmt::Display for JepaMode {
             Self::AnchoredProjectedNoSigreg => "anchored-projected-no-sigreg",
             Self::AnchoredConditional => "anchored-conditional",
             Self::AnchoredProjectedSmall => "anchored-projected-small",
+            Self::Unanchored => "unanchored",
         })
     }
 }
@@ -179,6 +255,20 @@ impl JepaConfig {
                     "anchored-reconstruct needs positive reconstruction weight"
                 );
             }
+            if config.jepa_mode.unanchored() {
+                ensure!(
+                    self.prediction_weight == 1.
+                        && self.sigreg_weight == 0.09
+                        && self.reconstruction_weight == 0.,
+                    "unanchored requires prediction weight 1, total SIGReg weight 0.09 (placement off disables it), and reconstruction weight 0"
+                );
+            }
+        }
+        if config.sigreg_placement.enabled() {
+            ensure!(
+                self.sigreg_weight > 0.,
+                "enabled reader SIGReg needs positive weight; use --sigreg-placement off for the control"
+            );
         }
         Ok(())
     }
@@ -204,17 +294,18 @@ pub struct RepresentationViews {
     /// `[B,O,target_width]` attached latent targets: q(observation) in projected modes, otherwise
     /// the observation itself. The deterministic pointwise q is never an input to the trunk.
     pub target: Tensor,
-    /// `[B,O,d_model]` contextual causal states after the trunk's final norm.
+    /// `[B,O,d_model]` actual causal forecast-reader states, with `reader_norm` applied.
     pub state: Tensor,
     /// `[B,O-Kmax,K,target_width]`, or last dimension 10 for conditional characteristic prediction.
     pub prediction: Option<Tensor>,
     /// `[B,O,patch_len*4]` fixed normalized price features, never exogenous coordinates.
+    /// Undefined only inside unanchored training; public views retain these for frozen readers.
     pub reconstruction_target: Tensor,
     pub conditional: Option<ConditionalTargets>,
     pub horizons: Vec<i64>,
 }
 
-/// Fixed diagnostic slots in `Losses::jepa`, detached fp32 [8]. No term is forecast NLL.
+/// Legacy diagnostic slots in `Losses::jepa`, detached fp32 [8]. No term is forecast NLL.
 /// 0 latent MSE; 1 population SIGReg; 2 price-token reconstruction MSE;
 /// 3 latent persistence MSE; 4 valid source-target pairs; 5 mean valid population N per view;
 /// 6 target population std at sampled positions; 7 predictor population std at the last
@@ -222,9 +313,58 @@ pub struct RepresentationViews {
 /// Conditional mode uses slots 0/3 for CF MSE/psi(0) persistence, leaves slots 1/2 unused,
 /// and reports batch population statistics for the fixed ten-dimensional characteristic targets.
 pub const DIAGNOSTIC_COUNT: i64 = 8;
-pub fn diagnostic_labels(mode: JepaMode) -> [&'static str; 8] {
+/// Unanchored preserves the latent eight slots and appends the independent reader packet.
+/// Slots 1/2 are zero unavailable target-SIGReg/reconstruction terms, never overwritten.
+/// Slots 8..16 are local SIGReg, weighted placement sum, state SIGReg, eligible views,
+/// row-view pairs, mean N, local std and state std, including population diagnostics for off.
+pub const UNANCHORED_DIAGNOSTIC_COUNT: i64 = 16;
+/// Reader placement uses slots 0/2 for raw local/state SIGReg (zero when inactive), 1 for
+/// the weighted contribution, 3/4/5 for eligible views/valid row-view pairs/mean N, and
+/// 6/7 for local/state population standard deviation. No latent prediction loss is present.
+pub fn diagnostic_labels(config: &ModelConfig) -> Vec<&'static str> {
+    if config.jepa_mode.unanchored() {
+        return vec![
+            "latent MSE",
+            "unused target SIGReg",
+            "unused reconstruction",
+            "latent persistence MSE",
+            "valid source-target pairs",
+            "latent sampled population N",
+            "observation population std",
+            "prediction population std (last source)",
+            "reader local SIGReg",
+            "reader SIGReg weighted contribution",
+            "reader state SIGReg",
+            "reader SIGReg eligible views (N >= 2)",
+            "reader SIGReg valid row-view pairs",
+            "reader SIGReg mean valid batch population per view",
+            "reader local population std",
+            "reader state population std",
+        ];
+    }
+    if config.sigreg_placement.enabled() {
+        return vec![
+            if config.sigreg_placement.local() {
+                "reader local SIGReg"
+            } else {
+                "unused local SIGReg"
+            },
+            "reader SIGReg weighted contribution",
+            if config.sigreg_placement.state() {
+                "reader state SIGReg"
+            } else {
+                "unused state SIGReg"
+            },
+            "reader SIGReg eligible views (N >= 2)",
+            "reader SIGReg valid row-view pairs",
+            "reader SIGReg mean valid batch population per view",
+            "reader local population std",
+            "reader state population std",
+        ];
+    }
+    let mode = config.jepa_mode;
     if mode.conditional() {
-        return [
+        return vec![
             "conditional CF MSE",
             "unused SIGReg",
             "unused reconstruction",
@@ -235,14 +375,18 @@ pub fn diagnostic_labels(mode: JepaMode) -> [&'static str; 8] {
             "conditional CF prediction population std (last source)",
         ];
     }
-    [
+    vec![
         "latent MSE",
         "population SIGReg",
         "price-token reconstruction MSE",
         "latent persistence MSE",
         "valid source-target pairs",
         "SIGReg population N",
-        if mode.projected() { "projected-target population std" } else { "observation population std" },
+        if mode.projected() {
+            "projected-target population std"
+        } else {
+            "observation population std"
+        },
         "prediction population std (last source)",
     ]
 }
@@ -266,7 +410,11 @@ impl JepaHeads {
     pub fn new(path: nn::Path, config: &ModelConfig) -> Self {
         let z = config.d_model;
         let hidden = config.jepa.predictor_width;
-        let output_dim = if config.jepa_mode.conditional() { CONDITIONAL_FEATURES } else { config.jepa_mode.target_width(z) };
+        let output_dim = if config.jepa_mode.conditional() {
+            CONDITIONAL_FEATURES
+        } else {
+            config.jepa_mode.target_width(z)
+        };
         Self {
             predictor_hidden: projection(&path / "predictor_hidden", z, hidden, true),
             predictor: projection(
@@ -284,16 +432,23 @@ impl JepaHeads {
                 )
             }),
             // Allocate only after the existing heads, preserving their initialization stream.
-            target_projector: config.jepa_mode.projected().then(|| (
-                projection(&path / "target_hidden", z, z, true),
-                projection(&path / "target_output", z, output_dim, true),
-            )),
+            target_projector: config.jepa_mode.projected().then(|| {
+                (
+                    projection(&path / "target_hidden", z, z, true),
+                    projection(&path / "target_output", z, output_dim, true),
+                )
+            }),
             output_dim,
             offsets: config.jepa_mode.offsets(),
             conditional: config.jepa_mode.conditional().then(|| {
-                let scale: Vec<f32> = config.jepa_horizons().iter().map(|&h| (h as f32).sqrt()).collect();
+                let scale: Vec<f32> = config
+                    .jepa_horizons()
+                    .iter()
+                    .map(|&h| (h as f32).sqrt())
+                    .collect();
                 ConditionalGeometry {
-                    frequencies: Tensor::from_slice(&CONDITIONAL_FREQUENCIES).to_device(path.device()),
+                    frequencies: Tensor::from_slice(&CONDITIONAL_FREQUENCIES)
+                        .to_device(path.device()),
                     horizon_scale: Tensor::from_slice(&scale).to_device(path.device()),
                     persistence: Tensor::from_slice(&[1f32, 0., 1., 0., 1., 0., 1., 0., 1., 0.])
                         .to_device(path.device()),
@@ -321,18 +476,28 @@ impl JepaHeads {
         ])
     }
     pub fn conditional_targets(
-        &self, config: &ModelConfig, batch: &Batch, stats: &Statistics,
+        &self,
+        config: &ModelConfig,
+        batch: &Batch,
+        stats: &Statistics,
     ) -> Option<ConditionalTargets> {
         let geometry = self.conditional.as_ref()?;
         Some(tch::no_grad(|| {
             let sources = config.origins() - self.offsets.last().unwrap();
             // Origin closes/market levels are strided data views, not normalized future tokens.
-            let selected = |values: &Tensor| Tensor::stack(
-                &self.offsets.iter().map(|&k| values.narrow(1, k, sources)).collect::<Vec<_>>(),
-                2,
-            );
+            let selected = |values: &Tensor| {
+                Tensor::stack(
+                    &self
+                        .offsets
+                        .iter()
+                        .map(|&k| values.narrow(1, k, sources))
+                        .collect::<Vec<_>>(),
+                    2,
+                )
+            };
             let source = |values: &Tensor| values.narrow(1, 0, sources).unsqueeze(-1);
-            let neutral = selected(&stats.log_close) - source(&stats.log_close)
+            let neutral = selected(&stats.log_close)
+                - source(&stats.log_close)
                 - source(&stats.beta) * (selected(&stats.market) - source(&stats.market));
             let y = neutral / (source(&stats.sigma) * &geometry.horizon_scale);
             let phases = y.unsqueeze(-1) * &geometry.frequencies;
@@ -341,37 +506,60 @@ impl JepaHeads {
             // Prefix INVALID counts make every t+1..=t+h bar load-bearing without constructing
             // dense [B,O,4,192] targets or even [B,O,192] validity windows.
             let valid = batch.valid.narrow(1, 0, config.seq_len);
-            let invalid = valid.eq(0.).to_kind(Kind::Float).cumsum(1, Kind::Float)
+            let invalid = valid
+                .eq(0.)
+                .to_kind(Kind::Float)
+                .cumsum(1, Kind::Float)
                 .reshape([-1, config.origins(), config.patch_len])
                 .select(2, config.patch_len - 1);
-            let interval = (selected(&invalid) - source(&invalid)).eq(0.).to_kind(Kind::Float);
-            let source_valid = valid.reshape([-1, config.origins(), config.patch_len])
-                .narrow(1, 0, sources).amin([-1i64].as_slice(), false)
+            let interval = (selected(&invalid) - source(&invalid))
+                .eq(0.)
+                .to_kind(Kind::Float);
+            let source_valid = valid
+                .reshape([-1, config.origins(), config.patch_len])
+                .narrow(1, 0, sources)
+                .amin([-1i64].as_slice(), false)
                 * stats.mask.narrow(1, 0, sources);
-            ConditionalTargets { values, mask: interval * source_valid.unsqueeze(-1) }
+            ConditionalTargets {
+                values,
+                mask: interval * source_valid.unsqueeze(-1),
+            }
         }))
     }
     pub fn conditional_objective(
-        &self, config: &ModelConfig, views: &RepresentationViews, targets: &ConditionalTargets,
+        &self,
+        config: &ModelConfig,
+        views: &RepresentationViews,
+        targets: &ConditionalTargets,
     ) -> (Tensor, Tensor) {
         let geometry = self.conditional.as_ref().expect("conditional geometry");
-        let prediction = views.prediction.as_ref().expect("conditional predictor").to_kind(Kind::Float);
+        let prediction = views
+            .prediction
+            .as_ref()
+            .expect("conditional predictor")
+            .to_kind(Kind::Float);
         let mse = masked_mse(&prediction, &targets.values, &targets.mask);
         let objective = &mse * config.jepa.prediction_weight;
         let diagnostics = tch::no_grad(|| {
             let last = prediction.size()[1] - 1;
             let valid = targets.mask.select(1, last).transpose(0, 1);
             let zero = Tensor::zeros([], (Kind::Float, prediction.device()));
-            Tensor::stack(&[
-                mse.detach(),
-                zero.shallow_clone(),
-                zero,
-                masked_mse(&geometry.persistence, &targets.values, &targets.mask),
-                targets.mask.sum(Kind::Float),
-                targets.mask.sum_dim_intlist([0i64].as_slice(), false, Kind::Float).mean(Kind::Float),
-                population_std(&targets.values.select(1, last).transpose(0, 1), &valid),
-                population_std(&prediction.select(1, last).transpose(0, 1), &valid),
-            ], 0)
+            Tensor::stack(
+                &[
+                    mse.detach(),
+                    zero.shallow_clone(),
+                    zero,
+                    masked_mse(&geometry.persistence, &targets.values, &targets.mask),
+                    targets.mask.sum(Kind::Float),
+                    targets
+                        .mask
+                        .sum_dim_intlist([0i64].as_slice(), false, Kind::Float)
+                        .mean(Kind::Float),
+                    population_std(&targets.values.select(1, last).transpose(0, 1), &valid),
+                    population_std(&prediction.select(1, last).transpose(0, 1), &valid),
+                ],
+                0,
+            )
         });
         (objective, diagnostics)
     }
@@ -410,6 +598,46 @@ impl JepaHeads {
         let count = mask.sum(Kind::Float);
         let latent = masked_mse(&prediction, &targets, &mask);
         let zero = Tensor::zeros([], (Kind::Float, prediction.device()));
+        if config.jepa_mode.unanchored() {
+            let (regularizer, reader) = reader_sigreg_objective(
+                config,
+                &views.observation,
+                &views.state,
+                source_valid,
+                random.expect("unanchored shares the population draw in all four placements"),
+            );
+            let objective = &latent * config.jepa.prediction_weight + regularizer;
+            let diagnostics = tch::no_grad(|| {
+                let persistence = masked_mse(
+                    &views
+                        .target
+                        .narrow(1, 0, sources)
+                        .unsqueeze(2)
+                        .to_kind(Kind::Float),
+                    &targets,
+                    &mask,
+                );
+                let pred_std = population_std(
+                    &prediction.select(1, sources - 1).transpose(0, 1),
+                    &mask.select(1, sources - 1).transpose(0, 1),
+                );
+                let latent = Tensor::stack(
+                    &[
+                        latent.detach(),
+                        zero.shallow_clone(),
+                        zero,
+                        persistence,
+                        count,
+                        reader.select(0, 5),
+                        reader.select(0, 6),
+                        pred_std,
+                    ],
+                    0,
+                );
+                Tensor::cat(&[latent, reader], 0)
+            });
+            return (objective, diagnostics);
+        }
         let (regularizer, population, target_std) = match random {
             Some(random) => {
                 let target_views = views
@@ -537,6 +765,8 @@ pub(super) struct JepaRandom {
 impl JepaRandom {
     pub fn new(config: &ModelConfig, device: Device) -> Self {
         let first = (config.min_history + config.patch_len - 1) / config.patch_len - 1;
+        // Sources need no future target: keep the final context patch eligible. Legacy JEPA
+        // sampled populations already use this full range independently of prediction offsets.
         let views = config.jepa.views.min(config.origins() - first);
         let width = config.jepa_mode.target_width(config.d_model);
         let knots = Tensor::linspace(0., 3., 17, (Kind::Float, device));
@@ -545,10 +775,7 @@ impl JepaRandom {
         let _ = coefficients.narrow(0, 0, 1).fill_(0.1875);
         let _ = coefficients.narrow(0, 16, 1).fill_(0.1875);
         Self {
-            directions: Tensor::zeros(
-                [width, config.jepa.directions],
-                (Kind::Float, device),
-            ),
+            directions: Tensor::zeros([width, config.jepa.directions], (Kind::Float, device)),
             positions: Tensor::zeros([views], (Kind::Int64, device)),
             coefficients: coefficients * &normal_ecf,
             knots,
@@ -610,7 +837,11 @@ impl JepaRandom {
 
 /// Epps-Pulley statistic at each view independently. Invalid rows are absent from that view's
 /// population; N is its actual valid batch count. Views with N<2 contribute no statistic.
-pub(super) fn population_sigreg(embeddings: &Tensor, valid: &Tensor, random: &JepaRandom) -> (Tensor, Tensor) {
+pub(super) fn population_sigreg(
+    embeddings: &Tensor,
+    valid: &Tensor,
+    random: &JepaRandom,
+) -> (Tensor, Tensor) {
     let count = valid.sum_dim_intlist([1i64].as_slice(), false, Kind::Float);
     let denominator = count.clamp_min(1.).reshape([-1, 1, 1]);
     let phase =
@@ -628,6 +859,65 @@ pub(super) fn population_sigreg(embeddings: &Tensor, valid: &Tensor, random: &Je
     let loss = (integrated * &count * &eligible).sum(Kind::Float)
         / eligible.sum(Kind::Float).clamp_min(1.);
     (loss, count.mean(Kind::Float))
+}
+
+/// Regularize the actual shared interfaces, without an auxiliary head or a temporal population.
+/// Both placements use the exact same directions, source positions and complete-history mask.
+pub(super) fn reader_sigreg_objective(
+    config: &ModelConfig,
+    observation: &Tensor,
+    state: &Tensor,
+    source_valid: &Tensor,
+    random: &JepaRandom,
+) -> (Tensor, Tensor) {
+    assert!(config.sigreg_placement.enabled() || config.jepa_mode.unanchored());
+    assert_eq!(config.reader_norm, ReaderNorm::None);
+    let sample = |values: &Tensor| {
+        values
+            .index_select(1, &random.positions)
+            .transpose(0, 1)
+            .to_kind(Kind::Float)
+    };
+    let valid = source_valid
+        .index_select(1, &random.positions)
+        .transpose(0, 1);
+    let local_views = sample(observation);
+    let state_views = sample(state);
+    let zero = Tensor::zeros([], (Kind::Float, state.device()));
+    let local = if config.sigreg_placement.local() {
+        population_sigreg(&local_views, &valid, random).0
+    } else {
+        zero.shallow_clone()
+    };
+    let contextual = if config.sigreg_placement.state() {
+        population_sigreg(&state_views, &valid, random).0
+    } else {
+        zero
+    };
+    let weight = config.jepa.sigreg_weight
+        * if config.sigreg_placement == SigregPlacement::Both {
+            0.5
+        } else {
+            1.
+        };
+    let objective = (&local + &contextual) * weight;
+    let diagnostics = tch::no_grad(|| {
+        let count = valid.sum_dim_intlist([1i64].as_slice(), false, Kind::Float);
+        Tensor::stack(
+            &[
+                local.detach(),
+                objective.detach(),
+                contextual.detach(),
+                count.ge(2.).to_kind(Kind::Float).sum(Kind::Float),
+                count.sum(Kind::Float),
+                count.mean(Kind::Float),
+                population_std(&local_views, &valid),
+                population_std(&state_views, &valid),
+            ],
+            0,
+        )
+    });
+    (objective, diagnostics)
 }
 
 #[cfg(test)]
@@ -669,11 +959,28 @@ mod tests {
             return;
         };
         let _backward = crate::torch::cuda::cfg::disable_autograd_multithreading();
-        for mode in [JepaMode::AnchoredNoSigreg, JepaMode::AnchoredProjectedNoSigreg] {
-            let config = ModelConfig { jepa_mode: mode, ..config() };
+        for mode in [
+            JepaMode::AnchoredNoSigreg,
+            JepaMode::AnchoredProjectedNoSigreg,
+            JepaMode::Unanchored,
+        ] {
+            let mut config = ModelConfig {
+                jepa_mode: mode,
+                ..config()
+            };
+            if mode.unanchored() {
+                config.reader_norm = ReaderNorm::None;
+                config.future_calendar = false;
+                config.jepa.reconstruction_weight = 0.;
+            }
+            let mut random = mode.unanchored().then(|| JepaRandom::new(&config, device));
+            if let Some(random) = &mut random {
+                random.refresh().unwrap();
+            }
             let store = nn::VarStore::new(device);
             let heads = JepaHeads::new(store.root(), &config);
-            let observation = Tensor::randn([4, 16, 8], (Kind::Float, device)).set_requires_grad(true);
+            let observation =
+                Tensor::randn([4, 16, 8], (Kind::Float, device)).set_requires_grad(true);
             let state = Tensor::randn([4, 16, 8], (Kind::BFloat16, device)).set_requires_grad(true);
             let valid = Tensor::ones([4, 16], (Kind::Float, device));
             let _ = valid.narrow(1, 2, 1).fill_(0.);
@@ -689,8 +996,12 @@ mod tests {
                 horizons: config.jepa_horizons(),
             };
             let (objective, diagnostics) =
-                heads.objective(&config, &views, &valid, &source_valid, None);
+                heads.objective(&config, &views, &valid, &source_valid, random.as_ref());
             objective.backward();
+            assert!(
+                views.state.grad().abs().sum(Kind::Float).double_value(&[]) > 0.,
+                "temporal predictor detached the source state"
+            );
             let gradient = observation.grad();
             assert!(gradient.defined(), "future target encoder was detached");
             assert_eq!(
@@ -817,5 +1128,116 @@ mod tests {
             .square()
             .sum_dim_intlist([0i64].as_slice(), false, Kind::Float);
         assert!((lengths - 1.).abs().max().double_value(&[]) < 1e-6);
+    }
+
+    #[test]
+    fn cuda_reader_both_is_the_same_draw_convex_combination_and_masks_have_zero_gradient() {
+        let _rng = crate::torch::test_rng::exclusive();
+        let Some(device) = gpu() else {
+            return;
+        };
+        let _backward = crate::torch::cuda::cfg::disable_autograd_multithreading();
+        let config = ModelConfig {
+            seq_len: 64,
+            jepa_mode: JepaMode::Off,
+            reader_norm: ReaderNorm::None,
+            sigreg_placement: SigregPlacement::Both,
+            future_calendar: false,
+            jepa: JepaConfig {
+                views: 3,
+                directions: 16,
+                ..Default::default()
+            },
+            ..config()
+        };
+        config.validate().unwrap();
+        let mut random = JepaRandom::new(&config, device);
+        random.refresh().unwrap();
+        // Every legal source is sampled, including the last patch despite no future JEPA target.
+        let positions = Vec::<i64>::try_from(random.positions.to_device(Device::Cpu)).unwrap();
+        assert_eq!(
+            positions
+                .iter()
+                .copied()
+                .collect::<std::collections::BTreeSet<_>>(),
+            [1, 2, 3].into_iter().collect()
+        );
+        let observation = Tensor::randn([4, 4, 8], (Kind::Float, device)).set_requires_grad(true);
+        let state = (Tensor::randn([4, 4, 8], (Kind::Float, device)) * 2.).set_requires_grad(true);
+        let valid = Tensor::from_slice(&[
+            0f32, 0., 0., 0., 0., 1., 1., 1., 0., 1., 0., 1., 0., 1., 0., 0.,
+        ])
+        .reshape([4, 4])
+        .to_device(device);
+        let (both, diagnostics) =
+            reader_sigreg_objective(&config, &observation, &state, &valid, &random);
+        let local_config = ModelConfig {
+            sigreg_placement: SigregPlacement::Local,
+            ..config.clone()
+        };
+        let state_config = ModelConfig {
+            sigreg_placement: SigregPlacement::State,
+            ..config.clone()
+        };
+        let local = reader_sigreg_objective(&local_config, &observation, &state, &valid, &random).0;
+        let contextual =
+            reader_sigreg_objective(&state_config, &observation, &state, &valid, &random).0;
+        assert!(
+            (both.double_value(&[])
+                - 0.5 * (local.double_value(&[]) + contextual.double_value(&[])))
+            .abs()
+                < 1e-6
+        );
+        assert_eq!(diagnostics.kind(), Kind::Float);
+        assert_eq!(diagnostics.double_value(&[3]), 2.);
+        assert_eq!(diagnostics.double_value(&[4]), 6.);
+        assert_eq!(diagnostics.double_value(&[5]), 2.);
+        let local_gradient = Tensor::run_backward(&[&local], &[&observation], true, false);
+        let state_gradient = Tensor::run_backward(&[&contextual], &[&state], true, false);
+        let gradients = Tensor::run_backward(&[&both], &[&observation, &state], false, false);
+        let eligible = &valid * Tensor::from_slice(&[0f32, 1., 0., 1.]).to_device(device);
+        for (gradient, separate) in gradients
+            .iter()
+            .zip([&local_gradient[0], &state_gradient[0]])
+        {
+            assert!((gradient - separate * 0.5).abs().max().double_value(&[]) < 1e-6);
+            assert!(
+                (gradient * eligible.eq(0.).unsqueeze(-1))
+                    .abs()
+                    .max()
+                    .double_value(&[])
+                    == 0.
+            );
+            assert!(gradient.abs().sum(Kind::Float).double_value(&[]) > 0.);
+        }
+    }
+
+    #[test]
+    fn cuda_sigreg_allows_persistent_population_diversity_without_pooling_time_or_singletons() {
+        let _rng = crate::torch::test_rng::exclusive();
+        let Some(device) = gpu() else {
+            return;
+        };
+        let mut random = JepaRandom::new(&config(), device);
+        random.refresh().unwrap();
+        let rows = Tensor::randn([1, 64, 8], (Kind::Float, device));
+        let valid = Tensor::ones([1, 64], (Kind::Float, device));
+        let one = population_sigreg(&rows, &valid, &random).0;
+        // Each example is perfectly persistent through time; that does not collapse its batch population.
+        let persistent =
+            population_sigreg(&rows.repeat([4, 1, 1]), &valid.repeat([4, 1]), &random).0;
+        assert!((one.double_value(&[]) - persistent.double_value(&[])).abs() < 1e-5);
+        let collapsed = population_sigreg(&Tensor::zeros_like(&rows), &valid, &random).0;
+        assert!(one.double_value(&[]) < collapsed.double_value(&[]));
+        // Adding a view with only one valid row must not dilute the mean over eligible views.
+        let singleton = Tensor::zeros_like(&valid);
+        let _ = singleton.narrow(1, 0, 1).fill_(1.);
+        let extended = population_sigreg(
+            &Tensor::cat(&[&rows, &Tensor::full_like(&rows, 20.)], 0),
+            &Tensor::cat(&[&valid, &singleton], 0),
+            &random,
+        )
+        .0;
+        assert!((one.double_value(&[]) - extended.double_value(&[])).abs() < 1e-5);
     }
 }

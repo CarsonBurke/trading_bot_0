@@ -14,6 +14,9 @@ use super::{
 pub const FIT_PANEL_LIMIT: usize = 4096;
 pub const SCORE_PANEL_LIMIT: usize = 2048;
 const RECENT_PATCHES: i64 = 4;
+const RECALL_LAGS: [i64; 3] = [64, 256, 1024];
+const RECALL_WIDTH: i64 = 16;
+const DELAYED_FUTURE: [(i64, i64); 3] = [(16, 16), (64, 32), (128, 64)];
 const PENALTIES: [f64; 13] = [
     1e-6, 1e-5, 1e-4, 1e-3, 1e-2, 0.1, 1., 10., 100., 1e3, 1e4, 1e5, 1e6,
 ];
@@ -41,6 +44,34 @@ pub(super) fn probe_geometry(config: &ModelConfig) -> Result<(i64, Vec<i64>)> {
 pub(super) fn source_lookback_bars(config: &ModelConfig) -> Result<usize> {
     let (source, _) = probe_geometry(config)?;
     Ok((config.seq_len - (source + 1) * config.patch_len) as usize)
+}
+
+fn delayed_intervals() -> impl Iterator<Item = (i64, i64)> {
+    RECALL_LAGS
+        .into_iter()
+        .map(|lag| (-lag - RECALL_WIDTH, -lag))
+        .chain(
+            DELAYED_FUTURE
+                .into_iter()
+                .map(|(lead, width)| (lead, lead + width)),
+        )
+}
+
+/// Inclusive close endpoints, relative to the source patch's LAST observed bar.
+fn return_interval(source_bar: i64, start: i64, end: i64, bars: i64) -> Option<(i64, i64)> {
+    let (start, end) = (source_bar + start, source_bar + end);
+    (source_bar >= 0 && source_bar < bars && start >= 0 && end > start && end < bars)
+        .then_some((start, end))
+}
+
+fn probe_reach_bars(config: &ModelConfig, source: i64, horizons: &[i64]) -> i64 {
+    let source_bar = (source + 1) * config.patch_len - 1;
+    let bars = config.seq_len + config.pred_len;
+    delayed_intervals()
+        .filter_map(|(start, end)| return_interval(source_bar, start, end, bars).map(|_| end))
+        .chain(horizons.iter().copied())
+        .max()
+        .unwrap()
 }
 
 struct ProbePanel {
@@ -74,7 +105,7 @@ fn probe_panel(
     let (source, horizons) = probe_geometry(config)?;
     ensure!(fit_refs.len() <= FIT_PANEL_LIMIT && score_refs.len() <= SCORE_PANEL_LIMIT,
         "explicit probe panels exceed the declared fit={FIT_PANEL_LIMIT}/score={SCORE_PANEL_LIMIT} cache limits; select smaller fixed panels in the caller");
-    let max_h = *horizons.last().unwrap();
+    let max_h = probe_reach_bars(config, source, &horizons);
     let fit = dated(corpus, fit_refs, source, config, max_h)?;
     let validation = dated(corpus, score_refs, source, config, max_h)?;
     let first_score = validation.iter().map(|r| r.origin).min().unwrap();
@@ -191,15 +222,31 @@ pub(super) fn dated(
 /// Raw fixed-future close log returns, not normalized latent targets. An invalid origin or
 /// any missing bar in its return interval invalidates that output; zero is never a label repair.
 pub(super) fn future_targets(batch: &Batch, source_bar: i64, horizons: &[i64]) -> (Tensor, Tensor) {
+    interval_targets(batch, source_bar, horizons.iter().map(|&h| (0, h)))
+}
+
+fn interval_targets(
+    batch: &Batch,
+    source_bar: i64,
+    intervals: impl IntoIterator<Item = (i64, i64)>,
+) -> (Tensor, Tensor) {
     let close = batch.log_prices.select(2, 3);
     let mut target = Vec::new();
     let mut masks = Vec::new();
-    for &h in horizons {
-        let y = close.select(1, source_bar + h) - close.select(1, source_bar);
+    for (start, end) in intervals {
+        let Some((start, end)) = return_interval(source_bar, start, end, close.size()[1]) else {
+            // Keep the declared output axis, but do not invent observations for short contexts.
+            let unavailable = Tensor::zeros([batch.rows()], (Kind::Float, close.device()));
+            target.push(unavailable.shallow_clone());
+            masks.push(unavailable);
+            continue;
+        };
+        let y = close.select(1, end) - close.select(1, start);
         let valid = batch
             .valid
-            .narrow(1, source_bar, h + 1)
+            .narrow(1, start, end - start + 1)
             .gt(0.5)
+            .logical_and(&close.narrow(1, start, end - start + 1).isfinite())
             .all_dim(1, false)
             .logical_and(&y.isfinite());
         target.push(y.where_self(&valid, &y.zeros_like()));
@@ -212,6 +259,8 @@ struct Cache {
     features: Vec<(String, Tensor)>,
     future: Tensor,
     future_mask: Tensor,
+    delayed: Tensor,
+    delayed_mask: Tensor,
     reconstruction: Tensor,
     reconstruction_mask: Tensor,
     // (row temporal means, row temporal second moments, valid token counts).
@@ -364,6 +413,8 @@ fn cache(
     let mut feature_parts: Vec<(String, Vec<Tensor>)> = Vec::new();
     let mut future = Vec::new();
     let mut future_mask = Vec::new();
+    let mut delayed = Vec::new();
+    let mut delayed_mask = Vec::new();
     let mut reconstruction = Vec::new();
     let mut reconstruction_mask = Vec::new();
     let mut moments: Vec<(String, Vec<Tensor>, Vec<Tensor>, Vec<Tensor>)> = Vec::new();
@@ -453,6 +504,9 @@ fn cache(
             );
         future.push(y);
         future_mask.push(mask * source_valid.to_kind(Kind::Float).unsqueeze(1));
+        let (y, mask) = interval_targets(&batch, bar, delayed_intervals());
+        delayed.push(y);
+        delayed_mask.push(mask * source_valid.to_kind(Kind::Float).unsqueeze(1));
         let reconstruction_valid = source_valid.unsqueeze(1).logical_and(&target.isfinite());
         reconstruction.push(target.where_self(&reconstruction_valid, &target.zeros_like()));
         reconstruction_mask.push(reconstruction_valid.to_kind(Kind::Float));
@@ -485,6 +539,8 @@ fn cache(
             .collect(),
         future: Tensor::cat(&future, 0),
         future_mask: Tensor::cat(&future_mask, 0),
+        delayed: Tensor::cat(&delayed, 0),
+        delayed_mask: Tensor::cat(&delayed_mask, 0),
         reconstruction: Tensor::cat(&reconstruction, 0),
         reconstruction_mask: Tensor::cat(&reconstruction_mask, 0),
         token_moments: moments
@@ -785,6 +841,8 @@ pub(super) struct Score {
     pub ratio: f64,
     pub correlation: f64,
     pub count: f64,
+    pub direction: f64,
+    pub direction_count: f64,
 }
 pub(super) fn score(prediction: &Tensor, target: &Tensor, mask: &Tensor) -> Vec<Score> {
     let (prediction, target, mask) = (
@@ -805,8 +863,24 @@ pub(super) fn score(prediction: &Tensor, target: &Tensor, mask: &Tensor) -> Vec<
     .clamp_min(0.)
     .sqrt();
     let correlation = &cov / &variance;
+    let direction_mask = &mask * target.ne(0.).to_kind(Kind::Double);
+    let direction_count = direction_mask.sum_dim_intlist([0i64].as_slice(), false, Kind::Double);
+    let direction = (prediction
+        .sign()
+        .eq_tensor(&target.sign())
+        .to_kind(Kind::Double)
+        * direction_mask)
+        .sum_dim_intlist([0i64].as_slice(), false, Kind::Double)
+        / &direction_count;
     let all = Tensor::stack(
-        &[error.shallow_clone(), error / baseline, correlation, count],
+        &[
+            error.shallow_clone(),
+            error / baseline,
+            correlation,
+            count,
+            direction,
+            direction_count,
+        ],
         1,
     )
     .to_device(Device::Cpu);
@@ -816,6 +890,8 @@ pub(super) fn score(prediction: &Tensor, target: &Tensor, mask: &Tensor) -> Vec<
             ratio: all.double_value(&[i, 1]),
             correlation: all.double_value(&[i, 2]),
             count: all.double_value(&[i, 3]),
+            direction: all.double_value(&[i, 4]),
+            direction_count: all.double_value(&[i, 5]),
         })
         .collect()
 }
@@ -856,6 +932,152 @@ pub(super) fn series(
         label: label.into(),
         values: values.into_iter().map(|v| v as f32).collect(),
     }
+}
+
+fn delayed_reports(
+    output: &Path,
+    title: &str,
+    inner: &Cache,
+    holdout: &Cache,
+    validation: &Cache,
+) -> Result<()> {
+    let counts: Vec<_> = [inner, holdout, validation]
+        .into_iter()
+        .map(|cache| {
+            cache
+                .delayed_mask
+                .sum_dim_intlist([0i64].as_slice(), false, Kind::Double)
+                .to_device(Device::Cpu)
+        })
+        .collect();
+    let columns = (RECALL_LAGS.len() + DELAYED_FUTURE.len()) as i64;
+    let missing = Score {
+        mse: f64::NAN,
+        ratio: f64::NAN,
+        correlation: f64::NAN,
+        count: 0.,
+        direction: f64::NAN,
+        direction_count: 0.,
+    };
+    let mut results = Vec::new();
+    for (index, (name, x)) in validation.features.iter().enumerate() {
+        if !matches!(
+            name.as_str(),
+            "direct-input" | "observation" | "recent-state" | "full-state"
+        ) {
+            continue;
+        }
+        let a = &inner.features[index].1;
+        let b = &holdout.features[index].1;
+        // Availability and estimability come only from training. Validation never decides
+        // which penalty or coefficient to fit; missing columns remain explicitly unscored.
+        let eligible: Vec<_> = (0..columns)
+            .filter(|&h| {
+                counts[0].double_value(&[h]) > a.size()[1] as f64
+                    && counts[1].double_value(&[h]) > 0.
+            })
+            .collect();
+        let mut scores = vec![missing; columns as usize];
+        let mut penalties = vec![f64::NAN; columns as usize];
+        if !eligible.is_empty() {
+            let indices = Tensor::from_slice(&eligible).to_device(x.device());
+            let selected = |tensor: &Tensor| tensor.index_select(1, &indices);
+            // One existing CUDA ridge path, sharing its Gram/eigensolve across outputs
+            // with identical masks. Refit merges inner+holdout, not the purged rows.
+            let fitted = ridge(
+                a,
+                &selected(&inner.delayed),
+                &selected(&inner.delayed_mask),
+                b,
+                &selected(&holdout.delayed),
+                &selected(&holdout.delayed_mask),
+            )?;
+            let measured = score(
+                &fitted.predict(x),
+                &selected(&validation.delayed),
+                &selected(&validation.delayed_mask),
+            );
+            let penalty = fitted.penalty.to_device(Device::Cpu);
+            for (output, &h) in eligible.iter().enumerate() {
+                if measured[output].count > 0. {
+                    scores[h as usize] = measured[output];
+                }
+                penalties[h as usize] = penalty.double_value(&[output as i64]);
+            }
+        }
+        results.push((name, scores, penalties));
+    }
+    for (family, first, steps, axis, description) in [
+        (
+            "delayed_recall",
+            0,
+            RECALL_LAGS.map(|lag| lag as u64),
+            "completed-return end lag (observed bars before source)",
+            "PAST recall only: close(s-lag)-close(s-lag-16), lag=[64,256,1024]; decodability is not proof of reader memory or real-future benefit",
+        ),
+        (
+            "delayed_future",
+            RECALL_LAGS.len(),
+            DELAYED_FUTURE.map(|(lead, _)| lead as u64),
+            "future interval lead (observed bars after source)",
+            "REAL delayed-future intervals: close(s+lead+width)-close(s+lead), (lead,width)=[(16,16),(64,32),(128,64)]; not source-to-end cumulative returns",
+        ),
+    ] {
+        let title = format!("{title}; {description}; close denotes log close, s is source patch's LAST observed bar; every required interval bar and source patch must be valid; unsupported bounds are masked, never padded; fit needs inner valid rows > feature width and nonempty later-training selection; NaN means unavailable/unestimable/undefined, not zero error; refit inner+holdout excludes the purge gap");
+        let end = first + steps.len();
+        for (metric, unit) in [
+            ("ratio", "MSE / paired zero-return MSE"),
+            ("correlation", "signed pooled Pearson correlation"),
+            ("error", "close log-return MSE"),
+            ("count", "valid origin-target pairs"),
+            ("penalty", "ridge / mean feature eigenvalue"),
+        ] {
+            let mut plotted: Vec<_> = results
+                .iter()
+                .map(|(name, scores, penalties)| {
+                    series(
+                        if metric == "count" {
+                            format!("{name}: validation scored")
+                        } else {
+                            (*name).clone()
+                        },
+                        (first..end).map(|h| match metric {
+                            "ratio" => scores[h].ratio,
+                            "correlation" => scores[h].correlation,
+                            "error" => scores[h].mse,
+                            "count" => scores[h].count,
+                            _ => penalties[h],
+                        }),
+                    )
+                })
+                .collect();
+            if metric == "count" {
+                for (name, count) in [
+                    "inner fit available",
+                    "penalty selection available",
+                    "validation available",
+                ]
+                .into_iter()
+                .zip(&counts)
+                {
+                    plotted.push(series(
+                        name,
+                        (first..end).map(|h| count.double_value(&[h as i64])),
+                    ));
+                }
+            }
+            lines(
+                output,
+                &format!("timexer_segment_jepa_{family}_{metric}"),
+                title.clone(),
+                unit,
+                axis,
+                &steps,
+                plotted,
+            )?;
+        }
+    }
+    Ok(())
 }
 
 /// Fit once on bounded train-only refs, choose penalties in the chronologically last fifth
@@ -931,6 +1153,12 @@ pub fn evaluate(
         )
     };
     let title = format!("Frozen CUDA probes s{step}; {} train fit + {} chronological penalty rows; {} validation rows; purge inner={inner_purged} outer={outer_purged}; common patch source={source}; recent={RECENT_PATCHES} patches; {coefficient_description}, no compression; direct normalized-price input baseline {input_width}+1 coefficients; {prediction_description} uses matching horizon only; known-future covariates excluded from every readout; observation includes causal normalization; fit={} holdout={} validation={}; linear failure is not absence of information", inner.len(), holdout.len(), validation.len(), corpus.origins_sha256(&refs_of(&inner)), corpus.origins_sha256(&refs_of(&holdout)), corpus.origins_sha256(&refs_of(&validation)));
+    let title = format!(
+        "{title}; reader_norm={}; sigreg_placement={}",
+        model.config().reader_norm,
+        model.config().sigreg_placement,
+    );
+    delayed_reports(output, &title, &inner_cache, &holdout_cache, &scored)?;
     if let Some(validation) = &scored.conditional {
         conditional_reports(
             output,
@@ -955,6 +1183,8 @@ pub fn evaluate(
         ratio: f64::NAN,
         correlation: f64::NAN,
         count: 0.,
+        direction: f64::NAN,
+        direction_count: 0.,
     };
     let mut predicted_scores = vec![missing; horizons.len()];
     let mut predicted_penalties = vec![f64::NAN; horizons.len()];
@@ -1062,6 +1292,16 @@ pub fn evaluate(
             "(view MSE - full-state MSE) / persistence MSE",
             4,
         ),
+        (
+            "timexer_segment_jepa_probe_direction",
+            "sign agreement on nonzero target returns; zero prediction is a miss",
+            5,
+        ),
+        (
+            "timexer_segment_jepa_probe_direction_count",
+            "valid nonzero target returns",
+            6,
+        ),
     ] {
         lines(
             output,
@@ -1080,7 +1320,9 @@ pub fn evaluate(
                             1 => s.correlation,
                             2 => s.mse,
                             3 => s.count,
-                            _ => s.ratio - full[i].ratio,
+                            4 => s.ratio - full[i].ratio,
+                            5 => s.direction,
+                            _ => s.direction_count,
                         }),
                     )
                 })
@@ -1191,6 +1433,119 @@ pub fn evaluate(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cuda_probe_direction_excludes_zero_targets_but_not_zero_predictions() {
+        if std::env::var("TIMEXER_SEGMENT_GPU_TEST").as_deref() != Ok("1") {
+            return;
+        }
+        let device = Device::Cuda(0);
+        let prediction = Tensor::from_slice(&[1f32, 0., -1., 1., 1.])
+            .reshape([5, 1])
+            .to_device(device);
+        let target = Tensor::from_slice(&[2f32, 2., -2., 0., -2.])
+            .reshape([5, 1])
+            .to_device(device);
+        let mask = Tensor::from_slice(&[1f32, 1., 1., 1., 0.])
+            .reshape([5, 1])
+            .to_device(device);
+        let measured = score(&prediction, &target, &mask)[0];
+        assert_eq!(measured.count, 4.);
+        assert_eq!(measured.direction_count, 3.);
+        assert!((measured.direction - 2. / 3.).abs() < 1e-12);
+        let empty = score(&prediction, &Tensor::zeros_like(&target), &mask)[0];
+        assert_eq!(empty.direction_count, 0.);
+        assert!(empty.direction.is_nan());
+    }
+
+    #[test]
+    fn delayed_return_endpoints_use_the_last_observed_source_bar() {
+        let config = ModelConfig {
+            seq_len: 1280,
+            ..ModelConfig::default()
+        };
+        let (source, _) = probe_geometry(&config).unwrap();
+        let bar = (source + 1) * config.patch_len - 1;
+        assert_eq!(bar, 1087);
+        let intervals: Vec<_> = delayed_intervals()
+            .map(|(start, end)| return_interval(bar, start, end, 1280).unwrap())
+            .collect();
+        assert_eq!(
+            intervals,
+            [
+                (1007, 1023),
+                (815, 831),
+                (47, 63),
+                (1103, 1119),
+                (1151, 1183),
+                (1215, 1279),
+            ]
+        );
+        assert_eq!(return_interval(1039, -1040, -1024, 2048), None);
+        assert_eq!(return_interval(1040, -1040, -1024, 2048), Some((0, 16)));
+        assert_eq!(return_interval(bar, 128, 192, 1279), None);
+    }
+
+    #[test]
+    fn chronology_reaches_the_last_supported_delayed_future_endpoint() {
+        let config = ModelConfig {
+            seq_len: 512,
+            pred_len: 96,
+            patch_len: 8,
+            ..ModelConfig::default()
+        };
+        let (source, horizons) = probe_geometry(&config).unwrap();
+        assert_eq!(*horizons.last().unwrap(), 96);
+        assert_eq!(probe_reach_bars(&config, source, &horizons), 192);
+        // A shorter legacy panel supports (64,32), not (128,64). Purging must not
+        // timestamp nonexistent bars, nor stop at the shorter forecast ladder.
+        let shorter = ModelConfig {
+            pred_len: 48,
+            patch_len: 4,
+            ..config
+        };
+        let (source, horizons) = probe_geometry(&shorter).unwrap();
+        assert_eq!(*horizons.last().unwrap(), 48);
+        assert_eq!(probe_reach_bars(&shorter, source, &horizons), 96);
+    }
+
+    #[test]
+    fn delayed_masks_exclude_unavailable_and_invalid_intervals_not_unneeded_gaps() {
+        let packed = Tensor::zeros(
+            [2, Batch::row_width(512, 192, 0) as i64],
+            (Kind::Float, Device::Cpu),
+        );
+        let mut batch = Batch::from_packed(packed, 512, 192, 0, 16);
+        batch.log_prices.copy_(
+            &Tensor::arange(704, (Kind::Float, Device::Cpu))
+                .square()
+                .reshape([1, 704, 1])
+                .repeat([2, 1, 4]),
+        );
+        let _ = batch.valid.fill_(1.);
+        let _ = batch.valid.get(1).narrow(0, 247, 1).fill_(0.);
+        let _ = batch.valid.get(1).narrow(0, 100, 1).fill_(0.);
+        let _ = batch.valid.get(1).narrow(0, 400, 1).fill_(0.);
+        let _ = batch.log_prices.get(1).narrow(0, 500, 1).fill_(f64::NAN);
+        let (target, mask) = interval_targets(&batch, 319, delayed_intervals());
+        for (row, expected) in [[1., 1., 0., 1., 1., 1.], [0., 1., 0., 1., 0., 0.]]
+            .iter()
+            .enumerate()
+        {
+            for (column, &valid) in expected.iter().enumerate() {
+                assert_eq!(mask.double_value(&[row as i64, column as i64]), valid);
+                if valid == 1. {
+                    let (start, end) = delayed_intervals().nth(column).unwrap();
+                    let expected = (319 + end).pow(2) - (319 + start).pow(2);
+                    assert_eq!(
+                        target.double_value(&[row as i64, column as i64]),
+                        expected as f64
+                    );
+                }
+            }
+        }
+        assert_eq!(mask.sum(Kind::Float).double_value(&[]), 7.);
+    }
 
     #[test]
     fn conditional_baseline_uses_only_valid_training_pairs_per_horizon() {

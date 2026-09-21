@@ -803,7 +803,11 @@ impl Engine {
             let optimizer = Python::attach(|py| -> Result<Py<PyAny>> {
                 let torch = py.import("torch")?;
                 let parameters = PyList::empty(py);
-                for tensor in store.trainable_variables() {
+                for tensor in store
+                    .trainable_variables()
+                    .into_iter()
+                    .filter(Tensor::requires_grad)
+                {
                     ensure!(
                         tensor.kind() == Kind::Float,
                         "Adam requires FP32 master parameters"
@@ -836,7 +840,11 @@ impl Engine {
             schedule: knobs.schedule,
             applied_lr: learning_rate,
             device,
-            parameters: store.trainable_variables(),
+            parameters: store
+                .trainable_variables()
+                .into_iter()
+                .filter(Tensor::requires_grad)
+                .collect(),
             resident: None,
             step_graph,
             capture_budget: None,
@@ -1001,13 +1009,12 @@ impl Engine {
     ) -> Losses {
         let mut random = model
             .config()
-            .jepa_mode
-            .needs_random()
+            .needs_representation_random()
             .then(|| JepaRandom::new(model.config(), batch.log_prices.device()));
         if let Some(random) = &mut random {
             random
                 .refresh()
-                .expect("uploading the standalone JEPA draw");
+                .expect("uploading the standalone representation draw");
         }
         Self::forward_loss_with_random(model, batch, train, keep, random.as_ref())
     }
@@ -1021,6 +1028,17 @@ impl Engine {
     ) -> Losses {
         if model.config().jepa_mode.enabled() {
             return model.jepa_losses(batch, train, keep, random);
+        }
+        if model.config().sigreg_placement.enabled() {
+            assert!(
+                keep.is_none(),
+                "reader SIGReg does not decimate forecast supervision"
+            );
+            return model.reader_sigreg_losses(
+                batch,
+                train,
+                random.expect("reader SIGReg needs the uploaded population draw"),
+            );
         }
         let stats = model.statistics(batch);
         let head = model.forward(batch, &stats, train, false);
@@ -1059,7 +1077,7 @@ impl Engine {
         if let Some(decimation) = &mut self.decimation {
             decimation.refresh()?;
         }
-        if model.config().jepa_mode.needs_random() {
+        if model.config().needs_representation_random() {
             if self.jepa_random.is_none() {
                 self.jepa_random = Some(JepaRandom::new(model.config(), self.device));
             }
@@ -1290,7 +1308,10 @@ impl Engine {
             // Split into phases, and on the capture stream wherever one exists, so that a
             // sampled step before the capture still warms the stream the capture will use.
             let body = || {
-                if model.config().jepa_mode.enabled() || model.config().temporal_moments_enabled() {
+                if model.config().jepa_mode.enabled()
+                    || model.config().sigreg_placement.enabled()
+                    || model.config().temporal_moments_enabled()
+                {
                     let started = Instant::now();
                     let losses = Self::forward_loss_with_random(
                         model,

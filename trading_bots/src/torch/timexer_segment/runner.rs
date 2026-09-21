@@ -748,7 +748,10 @@ impl Manifest {
         let manifest: Self = serde_json::from_value(raw)?;
         manifest.model.validate()?;
         ensure!(
-            !manifest.model.jepa_mode.enabled() && manifest.model.future_calendar,
+            !manifest.model.jepa_mode.enabled()
+                && manifest.model.sigreg_placement == super::jepa::SigregPlacement::Off
+                && manifest.model.reader_norm == super::jepa::ReaderNorm::Rms
+                && manifest.model.future_calendar,
             "research parameter contracts require the authenticated LeJEPA research loader"
         );
         ensure!(
@@ -2260,8 +2263,10 @@ pub fn train(args: TrainArgs) -> Result<()> {
     ensure!(
         !args.model.jepa_mode.enabled()
             && !args.model.temporal_moments_enabled()
+            && args.model.sigreg_placement == super::jepa::SigregPlacement::Off
+            && args.model.reader_norm == super::jepa::ReaderNorm::Rms
             && args.model.future_calendar,
-        "LeJEPA, temporal moment objectives and disabled future-calendar modes require --research-panel"
+        "representation objectives, nondefault reader normalization and disabled future-calendar modes require --research-panel"
     );
     if let Some(name) = &args.run {
         RunDir::ensure_creatable(RUNS_PATH, name)?;

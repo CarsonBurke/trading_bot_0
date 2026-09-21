@@ -56,6 +56,9 @@ pub(super) struct Checkpoint {
     weights_sha256: String,
     executable_sha256: String,
     manifest_sha256: String,
+    /// Omitted for historical manifests, preserving their canonical digest.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) unanchored_contract: Option<serde_json::Value>,
 }
 
 impl Checkpoint {
@@ -77,6 +80,15 @@ impl Checkpoint {
             "research manifest digest mismatch"
         );
         checkpoint.model.validate()?;
+        ensure!(
+            checkpoint.unanchored_contract == unanchored_contract(&checkpoint.model),
+            "unanchored objective provenance is absent or differs from the model contract"
+        );
+        ensure!(
+            !checkpoint.model.jepa_mode.unanchored()
+                || checkpoint.completed_steps == checkpoint.schedule_budget,
+            "unanchored checkpoint must be the completed fixed-budget endpoint"
+        );
         ensure!(
             !checkpoint.model.future_calendar
                 && checkpoint.model.seq_len as usize == checkpoint.data.context
@@ -120,6 +132,37 @@ impl Checkpoint {
         store.freeze();
         Ok((store, model))
     }
+}
+
+fn unanchored_contract(config: &ModelConfig) -> Option<serde_json::Value> {
+    config.jepa_mode.unanchored().then(|| {
+        let placement = config.sigreg_placement;
+        let weight = config.jepa.sigreg_weight
+            * if placement == super::jepa::SigregPlacement::Both { 0.5 } else { 1. };
+        serde_json::json!({
+            "schema": "temporal-jepa-unanchored-v1",
+            "initialization": "fresh-random",
+            "objective": "attached-temporal-jepa-plus-placement-sigreg",
+            "objective_contract": config.jepa_contract().expect("unanchored contract"),
+            "prediction_weight": config.jepa.prediction_weight,
+            "sigreg_total_weight": config.jepa.sigreg_weight,
+            "sigreg_placement": placement,
+            "sigreg_site_weights": {
+                "local": if placement.local() { weight } else { 0. },
+                "state": if placement.state() { weight } else { 0. },
+                "target": 0.0
+            },
+            "offsets_patches": config.jepa_mode.offsets(),
+            "forecast_weight": 0.0,
+            "reconstruction_weight": 0.0,
+            "decision_weight": 0.0,
+            "target_stop_gradient": false,
+            "gradient_surgery": false,
+            "forecast_parameters": "allocated-at-initialization-frozen-never-forwarded-or-optimized",
+            "checkpoint_selection": "completed-fixed-budget",
+            "downstream_readers": "fit-only-after-full-store-freeze"
+        })
+    })
 }
 
 fn digest(bytes: &[u8]) -> String {
@@ -303,6 +346,8 @@ pub fn prepare(args: TrainArgs) -> Result<()> {
 }
 
 pub fn train(args: TrainArgs, learning_rate: f64) -> Result<()> {
+    args.model.validate()?;
+    let unanchored = args.model.jepa_mode.unanchored();
     ensure!(
         args.max_steps > CAPTURE_AFTER_STEPS,
         "research runs require an explicit --max-steps beyond capture warmup"
@@ -386,7 +431,7 @@ pub fn train(args: TrainArgs, learning_rate: f64) -> Result<()> {
     let corpus = Arc::new(corpus);
     tch::manual_seed(args.seed as i64);
     tch::Cuda::manual_seed_all(args.seed);
-    let store = nn::VarStore::new(device);
+    let mut store = nn::VarStore::new(device);
     let model = CausalPatchModel::new(&store.root(), &args.model);
     let schedule = LrSchedule::new(
         args.max_steps,
@@ -495,29 +540,49 @@ pub fn train(args: TrainArgs, learning_rate: f64) -> Result<()> {
                     sums.take().expect("nonempty interval") / interval_steps as f64,
                 )?;
                 ensure!(
-                    values.iter().all(|v| v.is_finite()),
+                    values[if unanchored { 2 } else { 0 }..]
+                        .iter()
+                        .all(|v| v.is_finite())
+                        && (!unanchored || (values[0].is_nan() && values[1].is_nan())),
                     "nonfinite research objective at step {step}"
                 );
-                objective.put(step, "forecast NLL (not total objective)", values[0]);
-                objective.put(step, "forecast MSE", values[1]);
+                if !unanchored {
+                    objective.put(step, "forecast NLL (not total objective)", values[0]);
+                    objective.put(step, "forecast MSE", values[1]);
+                }
                 objective.put(step, "total optimization objective", values[2]);
+                let labels = super::jepa::diagnostic_labels(&args.model);
                 for (index, value) in values[3..].iter().enumerate() {
-                    if (index == 1 && !args.model.jepa_mode.regularized())
+                    let reader_sigreg = !unanchored && args.model.sigreg_placement.enabled();
+                    if unanchored {
+                        if matches!(index, 1 | 2)
+                            || (index == 8 && !args.model.sigreg_placement.local())
+                            || (index == 10 && !args.model.sigreg_placement.state())
+                        {
+                            continue;
+                        }
+                    } else if reader_sigreg {
+                        let placement = args.model.sigreg_placement;
+                        if (index == 0 && placement == super::jepa::SigregPlacement::State)
+                            || (index == 2 && placement == super::jepa::SigregPlacement::Local)
+                        {
+                            continue;
+                        }
+                    } else if (index == 1 && !args.model.jepa_mode.regularized())
                         || (index == 2
                             && args.model.jepa_mode != super::jepa::JepaMode::AnchoredReconstruct)
                     {
                         continue;
                     }
                     let destination = match index {
+                        3 if reader_sigreg => &mut population,
+                        11..=13 if unanchored => &mut population,
+                        14 | 15 if unanchored => &mut geometry_curve,
                         4 | 5 => &mut population,
                         6 | 7 => &mut geometry_curve,
                         _ => &mut objective,
                     };
-                    destination.put(
-                        step,
-                        super::jepa::diagnostic_labels(args.model.jepa_mode)[index],
-                        *value,
-                    );
+                    destination.put(step, labels[index], *value);
                 }
                 if let Some(total) = moment_sums.take() {
                     let values = Vec::<f64>::try_from((total / interval_steps as f64).view([-1]))?;
@@ -578,23 +643,29 @@ pub fn train(args: TrainArgs, learning_rate: f64) -> Result<()> {
                         )?;
                     }
                 }
-                let evaluation_started = Instant::now();
-                let measured = score(
-                    &corpus,
-                    &model,
-                    &plan.validation_refs,
-                    args.eval_batch_size,
-                    device,
-                )?;
-                let cross_measured = score(&corpus, &model, &cross, args.eval_batch_size, device)?;
-                eval_ms += evaluation_started.elapsed().as_secs_f64() * 1000.;
-                record_forecast(
-                    &mut forecast,
-                    step,
-                    &measured,
-                    &cross_measured,
-                    args.model.pred_len as usize,
-                )?;
+                let measured = if unanchored {
+                    None
+                } else {
+                    let evaluation_started = Instant::now();
+                    let measured = score(
+                        &corpus,
+                        &model,
+                        &plan.validation_refs,
+                        args.eval_batch_size,
+                        device,
+                    )?;
+                    let cross_measured =
+                        score(&corpus, &model, &cross, args.eval_batch_size, device)?;
+                    eval_ms += evaluation_started.elapsed().as_secs_f64() * 1000.;
+                    record_forecast(
+                        &mut forecast,
+                        step,
+                        &measured,
+                        &cross_measured,
+                        args.model.pred_len as usize,
+                    )?;
+                    Some((measured, cross_measured))
+                };
                 runtime.put(
                     step,
                     "training interval milliseconds per update",
@@ -608,15 +679,21 @@ pub fn train(args: TrainArgs, learning_rate: f64) -> Result<()> {
                     "CUDA graph captured",
                     if engine.step_graph_captured() { 1. } else { 0. },
                 );
-                forecast.write(
-                    &output,
-                    "timexer_segment_jepa_forecast",
-                    "Fixed endpoint research; uncalibrated predictions, no oracle rescaling",
-                    "forecast score",
-                )?;
+                if !unanchored {
+                    forecast.write(
+                        &output,
+                        "timexer_segment_jepa_forecast",
+                        "Fixed endpoint research; uncalibrated predictions, no oracle rescaling",
+                        "forecast score",
+                    )?;
+                }
                 objective.write(&output, "timexer_segment_jepa_objective",
-                    if args.model.temporal_moments_enabled() {
+                    if unanchored {
+                        "Unanchored attached temporal JEPA plus placement SIGReg only; fixed completed budget, no forecast objective"
+                    } else if args.model.temporal_moments_enabled() {
                         "Forecast and close conditional moment objectives are distinct; no auxiliary-loss checkpoint selection"
+                    } else if args.model.sigreg_placement != super::jepa::SigregPlacement::Off {
+                        "Forecast loss and reader/local SIGReg are distinct; no geometry-loss checkpoint selection"
                     } else if args.model.jepa_mode.conditional() {
                         "Forecast and fixed conditional CF objectives are distinct; no auxiliary-loss checkpoint selection"
                     } else {
@@ -625,17 +702,27 @@ pub fn train(args: TrainArgs, learning_rate: f64) -> Result<()> {
                 population.write(
                     &output,
                     "timexer_segment_jepa_panel",
-                    if args.model.jepa_mode.conditional() {
+                    if unanchored {
+                        "Attached temporal pairs and independent batch populations at actual reader interfaces"
+                    } else if args.model.jepa_mode.conditional() {
                         "Fixed panel and realized conditional CF supervision counts"
+                    } else if args.model.sigreg_placement != super::jepa::SigregPlacement::Off {
+                        "Fixed panel and valid batch populations per causal reader view; time is not an independent population"
                     } else {
                         "Fixed panel and realized latent supervision counts"
                     },
                     "count",
                 )?;
-                if args.model.jepa_mode.enabled() {
+                if args.model.jepa_mode.enabled()
+                    || args.model.sigreg_placement != super::jepa::SigregPlacement::Off
+                {
                     geometry_curve.write(&output, "timexer_segment_jepa_geometry",
-                        if args.model.jepa_mode.conditional() {
+                        if unanchored {
+                            "Unanchored observation, prediction and actual state population spread"
+                        } else if args.model.jepa_mode.conditional() {
                             "Fixed CF targets and conditional-mean prediction spread; weak mean variation is legitimate"
+                        } else if args.model.sigreg_placement != super::jepa::SigregPlacement::Off {
+                            "Local observation and actual forecast-reader population spread; persistent states remain legal"
                         } else {
                             "Observation and conditional-mean prediction spread; unequal variance is expected"
                         }, "standard deviation")?;
@@ -646,35 +733,43 @@ pub fn train(args: TrainArgs, learning_rate: f64) -> Result<()> {
                     "Actual fixed-step research execution costs",
                     "milliseconds",
                 )?;
-                reports::write_horizon(
-                    &output,
-                    0,
-                    step,
-                    Some(HorizonSplit {
-                        curve: &measured.horizon,
-                        origins: plan.validation_refs.len(),
-                    }),
-                    None,
-                    corpus.contract.tickers.len(),
-                )?;
-                reports::write_trading(
-                    &output,
-                    0,
-                    step,
-                    Some(TradingSplit {
-                        curve: &measured.trading,
-                        portfolio: &measured.portfolio,
-                        origins: plan.validation_refs.len(),
-                    }),
-                    None,
-                    Some(TradingSplit {
-                        curve: &cross_measured.trading,
-                        portfolio: &cross_measured.portfolio,
-                        origins: cross.len(),
-                    }),
-                    corpus.contract.tickers.len(),
-                )?;
-                reports::write_supervision_occupancy(&output, 0, step, args.batch_size, &census)?;
+                if let Some((measured, cross_measured)) = &measured {
+                    reports::write_horizon(
+                        &output,
+                        0,
+                        step,
+                        Some(HorizonSplit {
+                            curve: &measured.horizon,
+                            origins: plan.validation_refs.len(),
+                        }),
+                        None,
+                        corpus.contract.tickers.len(),
+                    )?;
+                    reports::write_trading(
+                        &output,
+                        0,
+                        step,
+                        Some(TradingSplit {
+                            curve: &measured.trading,
+                            portfolio: &measured.portfolio,
+                            origins: plan.validation_refs.len(),
+                        }),
+                        None,
+                        Some(TradingSplit {
+                            curve: &cross_measured.trading,
+                            portfolio: &cross_measured.portfolio,
+                            origins: cross.len(),
+                        }),
+                        corpus.contract.tickers.len(),
+                    )?;
+                    reports::write_supervision_occupancy(
+                        &output,
+                        0,
+                        step,
+                        args.batch_size,
+                        &census,
+                    )?;
+                }
                 if let Some(decimation) = engine.drain_horizon_decimation() {
                     reports::write_horizon_decimation(
                         &output,
@@ -698,6 +793,8 @@ pub fn train(args: TrainArgs, learning_rate: f64) -> Result<()> {
     );
     drop(loader);
     drop(engine);
+    // No reader is fitted until all representation/predictor parameters have been frozen.
+    store.freeze();
     crate::torch::cuda::empty_cache();
     let probe_start = Instant::now();
     jepa_eval::evaluate(
@@ -719,6 +816,7 @@ pub fn train(args: TrainArgs, learning_rate: f64) -> Result<()> {
     store.save(&weights)?;
     let mut checkpoint = Checkpoint {
         schema: SCHEMA.into(),
+        unanchored_contract: unanchored_contract(&args.model),
         model: args.model,
         data: corpus.contract.clone(),
         seed: args.seed,
@@ -824,28 +922,30 @@ pub fn evaluate(args: EvaluateArgs) -> Result<()> {
     let device = cuda_device()?;
     let (checkpoint, corpus, plan, cross) = load_panel(&args.run_root, &args.data_dir, device)?;
     let (_store, model) = checkpoint.load_model(&args.run_root, device)?;
-    let measured = score(
-        &corpus,
-        &model,
-        &plan.validation_refs,
-        args.batch_size,
-        device,
-    )?;
-    let cross_measured = score(&corpus, &model, &cross, args.batch_size, device)?;
-    let mut forecast = Curves::default();
-    record_forecast(
-        &mut forecast,
-        checkpoint.completed_steps,
-        &measured,
-        &cross_measured,
-        checkpoint.model.pred_len as usize,
-    )?;
-    forecast.write(
-        &args.output,
-        "timexer_segment_jepa_forecast",
-        "Authenticated fixed endpoint re-evaluation; uncalibrated forecasts",
-        "forecast score",
-    )?;
+    if !checkpoint.model.jepa_mode.unanchored() {
+        let measured = score(
+            &corpus,
+            &model,
+            &plan.validation_refs,
+            args.batch_size,
+            device,
+        )?;
+        let cross_measured = score(&corpus, &model, &cross, args.batch_size, device)?;
+        let mut forecast = Curves::default();
+        record_forecast(
+            &mut forecast,
+            checkpoint.completed_steps,
+            &measured,
+            &cross_measured,
+            checkpoint.model.pred_len as usize,
+        )?;
+        forecast.write(
+            &args.output,
+            "timexer_segment_jepa_forecast",
+            "Authenticated fixed endpoint re-evaluation; uncalibrated forecasts",
+            "forecast score",
+        )?;
+    }
     jepa_eval::evaluate(
         &model,
         &corpus,

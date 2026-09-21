@@ -13,7 +13,7 @@ use tch::{Device, Kind, Tensor};
 
 use super::{
     corpus::{Batch, Corpus, WindowRef},
-    jepa::{masked_mse, population_sigreg, JepaRandom},
+    jepa::{masked_mse, population_sigreg, reader_sigreg_objective, JepaRandom},
     jepa_eval::{lines, probe_geometry, series, SCORE_PANEL_LIMIT},
     jepa_runner::load_panel,
     model::{CausalPatchModel, ModelConfig, Statistics},
@@ -547,6 +547,110 @@ fn gradient_reports(
     let stats = model.statistics(&batch);
     let views = model.representation_views(&batch, false);
     let (valid, source_valid) = masks(model, &batch, &stats);
+    if config.jepa_mode.unanchored() {
+        // A frozen common-source derivative diagnostic, never an online reader/forecast loss.
+        let prediction = views
+            .prediction
+            .as_ref()
+            .expect("unanchored predictor")
+            .select(1, source)
+            .to_kind(Kind::Float);
+        let paired = Tensor::stack(
+            &config
+                .jepa_mode
+                .offsets()
+                .iter()
+                .map(|&k| views.target.select(1, source + k))
+                .collect::<Vec<_>>(),
+            1,
+        )
+        .to_kind(Kind::Float);
+        let mask = Tensor::stack(
+            &config
+                .jepa_mode
+                .offsets()
+                .iter()
+                .map(|&k| valid.select(1, source + k))
+                .collect::<Vec<_>>(),
+            1,
+        ) * source_valid.select(1, source).unsqueeze(1);
+        let latent = masked_mse(&prediction, &paired, &mask) * config.jepa.prediction_weight;
+        let (regularizer, reader) = reader_sigreg_objective(
+            config,
+            &views.observation,
+            &views.state,
+            &source_valid,
+            random,
+        );
+        let latent_gradient = gradient(&latent, parameters);
+        let regularizer_gradient = if config.sigreg_placement.enabled() {
+            gradient(&regularizer, parameters)
+        } else {
+            parameters.iter().map(Tensor::zeros_like).collect()
+        };
+        let combined = &latent + &regularizer;
+        let combined_gradient = gradient(&combined, parameters);
+        let mut packet = Chart::default();
+        packet.push("weighted_attached_latent_MSE_common_source", latent);
+        packet.push("weighted_reader_SIGReg_diagnostic_positions", regularizer);
+        packet.push("combined_common_source_diagnostic_objective", combined);
+        for (index, label) in [
+            (8, "reader_local_SIGReg"),
+            (10, "reader_state_SIGReg"),
+            (11, "reader_SIGReg_eligible_views"),
+            (12, "reader_SIGReg_row_view_pairs"),
+            (13, "reader_SIGReg_mean_valid_N"),
+        ] {
+            if (index == 8 && !config.sigreg_placement.local())
+                || (index == 10 && !config.sigreg_placement.state())
+            {
+                continue;
+            }
+            packet.push(label, reader.select(0, index - 8));
+        }
+        let mut norms = Chart::default();
+        gradient_norms(
+            &mut norms,
+            "weighted_attached_latent_common_source",
+            &latent_gradient,
+        );
+        gradient_norms(
+            &mut norms,
+            "weighted_reader_SIGReg_diagnostic_positions",
+            &regularizer_gradient,
+        );
+        gradient_norms(
+            &mut norms,
+            "combined_common_source_diagnostic_objective",
+            &combined_gradient,
+        );
+        let mut cosines = Chart::default();
+        if config.sigreg_placement.enabled() {
+            cosines.push(
+                "reader_SIGReg_vs_attached_latent",
+                cosine(&regularizer_gradient, &latent_gradient),
+            );
+        }
+        packet.write(
+            output,
+            "gradient_packet",
+            "Unanchored frozen common-source JEPA and reader SIGReg diagnostics; no forecast head",
+            "named statistic",
+            "gradient cohort",
+            &[COHORT as u64],
+        )?;
+        norms.write(output, "gradient_norm",
+            "Unanchored weighted patch derivatives; diagnostic positions, not a sampled training step",
+            "L2 norm", "gradient cohort", &[COHORT as u64])?;
+        return cosines.write(
+            output,
+            "gradient_cosine",
+            "Unanchored attached JEPA versus actual selected reader regularization",
+            "cosine",
+            "gradient cohort",
+            &[COHORT as u64],
+        );
+    }
     let source_stats = at_source(&stats, source);
     // Authentication forbids future calendar, so a one-source head cannot gather future covariates.
     let head = model.head(&batch, &views.state.narrow(1, source, 1), false);
@@ -831,7 +935,9 @@ pub fn diagnose(args: DiagnoseArgs) -> Result<()> {
     let accuracy_horizons: Vec<i64> = DECISION_HORIZONS
         .iter()
         .copied()
-        .filter(|&h| h <= checkpoint.model.pred_len as usize)
+        .filter(|&h| {
+            !checkpoint.model.jepa_mode.unanchored() && h <= checkpoint.model.pred_len as usize
+        })
         .map(|h| h as i64)
         .collect();
     gradient_reports(
@@ -849,6 +955,14 @@ pub fn diagnose(args: DiagnoseArgs) -> Result<()> {
         let _ = parameter.set_requires_grad(false);
     }
     // Provenance only. Every measured scalar is exclusively in a registered .report.bin.
+    let placement = checkpoint.model.sigreg_placement;
+    let sigreg_weight = checkpoint.model.jepa.sigreg_weight;
+    let site_weight = sigreg_weight
+        * if placement == super::jepa::SigregPlacement::Both {
+            0.5
+        } else {
+            1.
+        };
     let provenance = serde_json::json!({
         "schema": "temporal-sigreg-common-source-diagnostic-v1",
         "run_root": args.run_root,
@@ -875,15 +989,38 @@ pub fn diagnose(args: DiagnoseArgs) -> Result<()> {
         "gradient_rows": COHORT,
         "inference_batch_size": args.batch_size,
         "gradient_parameters": ["patch.weight", "patch.bias"],
-        "weights": {"latent": checkpoint.model.jepa.prediction_weight, "standalone_sigreg": checkpoint.model.jepa.sigreg_weight,
-            "training_sigreg": if checkpoint.model.jepa_mode.regularized() { checkpoint.model.jepa.sigreg_weight } else { 0. }},
+        "weights": {"latent": checkpoint.model.jepa.prediction_weight, "standalone_sigreg": sigreg_weight,
+            "training_sigreg": if checkpoint.model.jepa_mode.regularized() || placement.enabled() { sigreg_weight } else { 0. },
+            "training_sigreg_sites": {
+                "latent_target": if checkpoint.model.jepa_mode.regularized() { sigreg_weight } else { 0. },
+                "local": if placement.local() { site_weight } else { 0. },
+                "state": if placement.state() { site_weight } else { 0. }
+            }},
+        "reader_norm": checkpoint.model.reader_norm,
+        "sigreg_placement": placement,
         "population": "independent validation rows, positions separate; no pooled time or training-context origins",
         "covariance": "CUDA fp64 centered population covariance of native BF16 outputs; min(N-1,D) sample ceiling; BF16 quantization may populate algebraic affine-null directions; participation rank is not numerical rank",
         "centering": "feature-averaged population moments on identical source-valid/target-patch-valid mask; Vtarget-Vpred is not innovation variance",
-        "forecast_gradient": "shared model.losses objective derivative, configured scale coupling and horizon weights; decoupled means surrogate gradient, not derivative of reported true NLL; undecimated one common source, evaluation dropout; zero for modes detaching the forecast encoder; not a sampled full training step",
-        "accuracy_gradient": "decoded market-neutral sigma-scaled close MSE/persistence, separately at predefined decision horizons and their equal mean; same cohort denominator, no selected horizons",
-        "latent_gradient": "shared masked_mse at common source, all real predictor horizons; attached, detached target, detached prediction; weighted as configured",
-        "sigreg_gradient": "standalone shared population_sigreg on actual target at common source plus future positions; configured weight even for off/no-SIGReg; does not assert this is a training term",
+        "forecast_gradient": if checkpoint.model.jepa_mode.unanchored() {
+            "unavailable: no forecast head forward, loss or derivative; corresponding reports omitted"
+        } else {
+            "shared model.losses objective derivative, configured scale coupling and horizon weights; decoupled means surrogate gradient, not derivative of reported true NLL; undecimated one common source, evaluation dropout; zero for modes detaching the forecast encoder; not a sampled full training step"
+        },
+        "accuracy_gradient": if checkpoint.model.jepa_mode.unanchored() {
+            "unavailable: forecast parameters remain at initialization; evaluate post-freeze readers instead"
+        } else {
+            "decoded market-neutral sigma-scaled close MSE/persistence, separately at predefined decision horizons and their equal mean; same cohort denominator, no selected horizons"
+        },
+        "latent_gradient": if checkpoint.model.jepa_mode.unanchored() {
+            "shared masked_mse at common source, all attached future-observation targets; no detached branch or gradient surgery"
+        } else {
+            "shared masked_mse at common source, all real predictor horizons; attached, detached target, detached prediction; weighted as configured"
+        },
+        "sigreg_gradient": if checkpoint.model.jepa_mode.unanchored() {
+            "shared reader_sigreg_objective at fixed common source plus future positions; exact placement and site weights, no target duplicate; zero for off; diagnostic positions replace the random training sample"
+        } else {
+            "standalone shared population_sigreg on actual target at common source plus future positions; configured weight even for off/no-SIGReg; does not assert this is a training term"
+        },
         "null": "IID N(0,I) finite-sample expected statistic is nonzero; correlated market rows need not follow IID null",
         "off_mode": "no fake predictor or latent gradient; observation, target, SIGReg and forecast diagnostics remain available",
         "updates": "none; one resident CUDA model; all parameters frozen except patch weight/bias during autograd queries"

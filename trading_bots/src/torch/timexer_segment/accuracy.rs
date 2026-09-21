@@ -65,6 +65,10 @@ fn compatible_geometry(reference: &ModelConfig, candidate: &ModelConfig) -> Resu
 
 fn matched_research(reference: &Checkpoint, candidate: &Checkpoint) -> Result<()> {
     ensure!(
+        !candidate.model.jepa_mode.unanchored(),
+        "unanchored checkpoints have no trained forecast head; compare their post-freeze reader reports instead"
+    );
+    ensure!(
         reference.data == candidate.data,
         "research corpus differs from reference"
     );
@@ -86,6 +90,8 @@ fn matched_research(reference: &Checkpoint, candidate: &Checkpoint) -> Result<()
     model.horizon_decimation = reference.model.horizon_decimation;
     model.temporal_moment_weight = reference.model.temporal_moment_weight;
     model.decision_mse_weight = reference.model.decision_mse_weight;
+    model.reader_norm = reference.model.reader_norm;
+    model.sigreg_placement = reference.model.sigreg_placement;
     ensure!(
         model == reference.model,
         "research model differs beyond the declared objective/recipe treatments"
@@ -346,6 +352,8 @@ pub fn compare(args: CompareArgs) -> Result<()> {
     ensure!(
         !reference.model.jepa_mode.enabled()
             && !reference.model.temporal_moments_enabled()
+            && reference.model.sigreg_placement == super::jepa::SigregPlacement::Off
+            && reference.model.reader_norm == super::jepa::ReaderNorm::Rms
             && reference.model.scale_coupling == ScaleCoupling::Decoupled
             && reference.model.horizon_decimation == HorizonDecimation::Lattice,
         "reference must be a forecast-only causal decoupled+lattice research run"
