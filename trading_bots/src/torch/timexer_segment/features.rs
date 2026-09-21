@@ -622,8 +622,7 @@ impl MarketSteps {
             moments.inv_sigma[slot] = sigma.recip() as f32;
             // The rank channel inserts the own value into the contributing multiset, so its
             // denominator is one larger than the contributor count and can never reach 0 or 1.
-            moments.inv_ranked[slot] =
-                (0.5 / (f64::from(self.returns.counts[slot]) + 1.0)) as f32;
+            moments.inv_ranked[slot] = (0.5 / (f64::from(self.returns.counts[slot]) + 1.0)) as f32;
             if let Some((mean, sigma)) = self.log_volume.moments(slot) {
                 moments.log_volume_mean[slot] = mean as f32;
                 moments.inv_volume_sigma[slot] = sigma.recip() as f32;
@@ -670,7 +669,9 @@ impl MarketSteps {
             slots: self.slots(),
             min_contributors: contributors.first().copied().unwrap_or(0),
             median_contributors: contributors.get(steps / 2).copied().unwrap_or(0),
-            step_std: (sum_squares / steps.max(1) as f64 - mean * mean).max(0.0).sqrt(),
+            step_std: (sum_squares / steps.max(1) as f64 - mean * mean)
+                .max(0.0)
+                .sqrt(),
             max_abs_step: largest.0,
             max_abs_step_ts: largest.1,
             dispersion_p25: quantile(1),
@@ -693,7 +694,10 @@ impl Grid {
             "off-grid exogenous timestamp span"
         );
         let slots = usize::try_from((last_ts - first_ts) / RESOLUTION_MS + 1)?;
-        ensure!(slots <= 20_000_000, "exogenous grid spans more than 190 years");
+        ensure!(
+            slots <= 20_000_000,
+            "exogenous grid spans more than 190 years"
+        );
         Ok(Self { first_ts, slots })
     }
 
@@ -890,18 +894,24 @@ pub fn market_steps(
     let defining = Defining::new(&population, min_cross_section);
     let (returns, volumes, ranges) =
         accumulate(sources, grid, |bars, invalid, returns, volumes, ranges| {
-            contributions(bars, invalid, grid, &defining, |slot, bar, previous_close| {
-                returns.push(
-                    slot,
-                    (f64::from(bar.close) / f64::from(previous_close)).ln(),
-                );
-                if let Some(volume) = log_volume(bar) {
-                    volumes.push(slot, volume);
-                }
-                if let Some(range) = log_range(bar) {
-                    ranges.push(slot, range);
-                }
-            });
+            contributions(
+                bars,
+                invalid,
+                grid,
+                &defining,
+                |slot, bar, previous_close| {
+                    returns.push(
+                        slot,
+                        (f64::from(bar.close) / f64::from(previous_close)).ln(),
+                    );
+                    if let Some(volume) = log_volume(bar) {
+                        volumes.push(slot, volume);
+                    }
+                    if let Some(range) = log_range(bar) {
+                        ranges.push(slot, range);
+                    }
+                },
+            );
         });
     MarketSteps {
         first_ts: grid.first_ts,
@@ -1051,14 +1061,20 @@ pub fn cross_section_ranks(
         .for_each(|(chunk, cursor)| {
             let scatter = &scatter;
             for (bars, invalid) in chunk.iter() {
-                contributions(bars, invalid, grid, &defining, |slot, bar, previous_close| {
-                    let at = offsets[slot] + cursor[slot] as usize;
-                    cursor[slot] += 1;
-                    let step = (f64::from(bar.close) / f64::from(previous_close)).ln() as f32;
-                    // SAFETY: see [`Scatter`]. `at` is inside slot `slot`'s segment and no
-                    // other chunk can produce it.
-                    unsafe { scatter.0.add(at).write(step) };
-                });
+                contributions(
+                    bars,
+                    invalid,
+                    grid,
+                    &defining,
+                    |slot, bar, previous_close| {
+                        let at = offsets[slot] + cursor[slot] as usize;
+                        cursor[slot] += 1;
+                        let step = (f64::from(bar.close) / f64::from(previous_close)).ln() as f32;
+                        // SAFETY: see [`Scatter`]. `at` is inside slot `slot`'s segment and no
+                        // other chunk can produce it.
+                        unsafe { scatter.0.add(at).write(step) };
+                    },
+                );
             }
         });
     drop(bases);
@@ -1265,8 +1281,7 @@ impl<'a> AuxiliaryCursor<'a> {
                 let value = match (doubled, moments) {
                     (0, _) | (_, None) => [0.0, 0.0],
                     (doubled, Some(slot)) => [
-                        normal_quantile(f64::from(doubled - 1) * f64::from(slot.inv_ranked))
-                            as f32,
+                        normal_quantile(f64::from(doubled - 1) * f64::from(slot.inv_ranked)) as f32,
                         1.0,
                     ],
                 };
@@ -1327,7 +1342,10 @@ mod tests {
         );
         assert_eq!(set.to_string(), "volume,market");
         assert_eq!(set.channels(), 4);
-        assert_eq!(FeatureSet::ALL.to_string().parse::<FeatureSet>().unwrap(), FeatureSet::ALL);
+        assert_eq!(
+            FeatureSet::ALL.to_string().parse::<FeatureSet>().unwrap(),
+            FeatureSet::ALL
+        );
         assert_eq!(FeatureSet::ALL.channels(), 22);
         // The step-matched control's input, by name: this exact string is what reproduces the
         // pre-cross-section feature set, so it is pinned rather than described.
@@ -1519,7 +1537,13 @@ mod tests {
             ..PackedBar::default()
         };
         // Slots 2..=4 are a gap for every source; B skips slot 6.
-        let a = [bar(0, 100.0), bar(1, 101.0), bar(5, 102.0), bar(6, 103.0), bar(7, 104.0)];
+        let a = [
+            bar(0, 100.0),
+            bar(1, 101.0),
+            bar(5, 102.0),
+            bar(6, 103.0),
+            bar(7, 104.0),
+        ];
         let b = [bar(0, 50.0), bar(1, 51.0), bar(5, 52.0), bar(7, 53.0)];
         let grid = Grid::new(0, 7 * step).unwrap();
         let path = market_steps(&[(&a, &[]), (&b, &[])], grid, 1).path();
@@ -1553,8 +1577,21 @@ mod tests {
         };
         // Slot 1 is an after-hours print of A alone with a wild move; slot 3 holds A and B only;
         // C misses slot 4 and its 2->5 return must not enter any step.
-        let a = [bar(0, 100.0), bar(1, 150.0), bar(2, 101.0), bar(3, 90.0), bar(4, 102.0), bar(5, 103.0)];
-        let b = [bar(0, 50.0), bar(2, 51.0), bar(3, 60.0), bar(4, 52.0), bar(5, 53.0)];
+        let a = [
+            bar(0, 100.0),
+            bar(1, 150.0),
+            bar(2, 101.0),
+            bar(3, 90.0),
+            bar(4, 102.0),
+            bar(5, 103.0),
+        ];
+        let b = [
+            bar(0, 50.0),
+            bar(2, 51.0),
+            bar(3, 60.0),
+            bar(4, 52.0),
+            bar(5, 53.0),
+        ];
         let c = [bar(0, 20.0), bar(2, 21.0), bar(5, 40.0)];
         let d = [bar(0, 10.0), bar(2, 11.0), bar(4, 12.0), bar(5, 13.0)];
         let grid = Grid::new(0, 5 * step).unwrap();
@@ -1571,7 +1608,11 @@ mod tests {
         let s5 = (ln(103.0, 102.0) + ln(53.0, 52.0) + ln(13.0, 12.0)) / 3.0;
         assert_eq!([steps.step(1), steps.step(3)], [None, None]);
         assert_eq!(
-            [steps.contributors(2), steps.contributors(4), steps.contributors(5)],
+            [
+                steps.contributors(2),
+                steps.contributors(4),
+                steps.contributors(5)
+            ],
             [4, 3, 3]
         );
         let path = steps.path();
@@ -1585,7 +1626,11 @@ mod tests {
         assert!((f64::from(series.at(4 * step)) - s4).abs() < 1e-6);
         let summary = steps.summary();
         assert_eq!(
-            (summary.steps, summary.min_contributors, summary.median_contributors),
+            (
+                summary.steps,
+                summary.min_contributors,
+                summary.median_contributors
+            ),
             (3, 3, 3)
         );
         assert_eq!(summary.max_abs_step_ts, 2 * step);
@@ -1643,7 +1688,8 @@ mod tests {
             market_cum: steps.path(),
         };
         let mut out = vec![f32::NAN; set.channels()];
-        AuxiliaryCursor::new(set, &exogenous, Some(previous), ranks).write(current, &mut out, future);
+        AuxiliaryCursor::new(set, &exogenous, Some(previous), ranks)
+            .write(current, &mut out, future);
         out
     }
 
@@ -1666,8 +1712,15 @@ mod tests {
         // A's own step at slot 1 IS defined - its previous valid bar is one interval earlier -
         // so what zeroes both channels here is the slot rule alone, not a missing own return.
         let set: FeatureSet = "market,dispersion,cross-section-z".parse().unwrap();
-        let written =
-            auxiliary_row(&set, &steps, single_series(&a, &[], grid), &a[0], &a[1], false, &[]);
+        let written = auxiliary_row(
+            &set,
+            &steps,
+            single_series(&a, &[], grid),
+            &a[0],
+            &a[1],
+            false,
+            &[],
+        );
         assert_eq!(written, vec![0.0; 6]);
     }
 
@@ -1685,13 +1738,27 @@ mod tests {
         let pair = market_steps(&[(&a[..], &[][..]), (&b[..], &[][..])], grid, 2);
         let sigma = (ra - rb).abs() / 2.0;
         assert!((pair.dispersion(1).unwrap() - sigma).abs() < 1e-15);
-        let written =
-            auxiliary_row(&set, &pair, single_series(&a, &[], grid), &a[0], &a[1], false, &[]);
+        let written = auxiliary_row(
+            &set,
+            &pair,
+            single_series(&a, &[], grid),
+            &a[0],
+            &a[1],
+            false,
+            &[],
+        );
         assert!((f64::from(written[0]) - sigma.ln()).abs() < 1e-6);
         assert!((written[2] - 1.0).abs() < 1e-5);
         assert_eq!([written[1], written[3]], [1.0, 1.0]);
-        let written =
-            auxiliary_row(&set, &pair, single_series(&b, &[], grid), &b[0], &b[1], false, &[]);
+        let written = auxiliary_row(
+            &set,
+            &pair,
+            single_series(&b, &[], grid),
+            &b[0],
+            &b[1],
+            false,
+            &[],
+        );
         assert!((written[2] + 1.0).abs() < 1e-5);
         // THREE tickers: the population standard deviation as the mean of squared deviations,
         // a different arithmetic path from the streaming `E[x²] - mean²` the accumulator runs.
@@ -1705,8 +1772,15 @@ mod tests {
             (((ra - mean).powi(2) + (rb - mean).powi(2) + (rc - mean).powi(2)) / 3.0).sqrt();
         assert!((trio.step(1).unwrap() - mean).abs() < 1e-15);
         assert!((trio.dispersion(1).unwrap() - sigma).abs() < 1e-15);
-        let written =
-            auxiliary_row(&set, &trio, single_series(&c, &[], grid), &c[0], &c[1], false, &[]);
+        let written = auxiliary_row(
+            &set,
+            &trio,
+            single_series(&c, &[], grid),
+            &c[0],
+            &c[1],
+            false,
+            &[],
+        );
         assert!((f64::from(written[0]) - sigma.ln()).abs() < 1e-6);
         assert!((f64::from(written[2]) - (rc - mean) / sigma).abs() < 1e-5);
         assert_eq!([written[1], written[3]], [1.0, 1.0]);
@@ -1734,8 +1808,15 @@ mod tests {
         // The slot defines a dispersion, so that channel is live; the z is not, because D has
         // no five-minute own return to standardize - exactly `single_series`'s rule.
         let set: FeatureSet = "dispersion,cross-section-z".parse().unwrap();
-        let written =
-            auxiliary_row(&set, &steps, single_series(&d, &[], grid), &d[0], &d[1], false, &[]);
+        let written = auxiliary_row(
+            &set,
+            &steps,
+            single_series(&d, &[], grid),
+            &d[0],
+            &d[1],
+            false,
+            &[],
+        );
         assert_eq!(written[1], 1.0);
         assert_eq!([written[2], written[3]], [0.0, 0.0]);
     }
@@ -1769,7 +1850,10 @@ mod tests {
                 false,
                 &[rank],
             );
-            assert!((f64::from(written[0]) - expected).abs() < 1e-6, "{written:?}");
+            assert!(
+                (f64::from(written[0]) - expected).abs() < 1e-6,
+                "{written:?}"
+            );
             assert_eq!(written[1], 1.0);
         }
 
@@ -1803,7 +1887,10 @@ mod tests {
         ];
         let flat_steps = market_steps(&flat, grid, 3);
         let flat_ranks = cross_section_ranks(&flat, grid, &flat_steps);
-        assert_eq!([flat_ranks[0][1], flat_ranks[1][1], flat_ranks[2][1]], [5, 5, 5]);
+        assert_eq!(
+            [flat_ranks[0][1], flat_ranks[1][1], flat_ranks[2][1]],
+            [5, 5, 5]
+        );
         let written = auxiliary_row(
             &set,
             &flat_steps,
@@ -1824,7 +1911,10 @@ mod tests {
         ];
         let tied_steps = market_steps(&tied, grid, 3);
         let tied_ranks = cross_section_ranks(&tied, grid, &tied_steps);
-        assert_eq!([tied_ranks[0][1], tied_ranks[1][1], tied_ranks[2][1]], [4, 4, 7]);
+        assert_eq!(
+            [tied_ranks[0][1], tied_ranks[1][1], tied_ranks[2][1]],
+            [4, 4, 7]
+        );
         let written = auxiliary_row(
             &set,
             &tied_steps,
@@ -1834,7 +1924,10 @@ mod tests {
             false,
             &tied_ranks[0][1..],
         );
-        assert!((f64::from(written[0]) + 0.318_639_363_964_375).abs() < 1e-6, "{written:?}");
+        assert!(
+            (f64::from(written[0]) + 0.318_639_363_964_375).abs() < 1e-6,
+            "{written:?}"
+        );
         assert_eq!(written[1], 1.0);
 
         // An INVALID previous bar: D's previous valid bar is two intervals back, so it has no
@@ -2100,9 +2193,23 @@ mod tests {
         assert_eq!([all[13], all[15], all[17], all[19], all[21]], [1.0; 5]);
         assert!(all[12] < 0.0);
         // A prints the slot's largest of three returns, so its plotting position is 3/4.
-        assert!((f64::from(all[16]) - 0.674_489_750_196_081_7).abs() < 1e-6, "{all:?}");
-        assert!([all[14], all[18], all[20]].iter().all(|value| *value != 0.0), "{all:?}");
-        assert_eq!(FeatureSet::ALL.channel_mask(Feature::known_future)[12..], [false; 10]);
-        assert_eq!(FeatureSet::ALL.channel_mask(Feature::sigma_scaled)[12..], [false; 10]);
+        assert!(
+            (f64::from(all[16]) - 0.674_489_750_196_081_7).abs() < 1e-6,
+            "{all:?}"
+        );
+        assert!(
+            [all[14], all[18], all[20]]
+                .iter()
+                .all(|value| *value != 0.0),
+            "{all:?}"
+        );
+        assert_eq!(
+            FeatureSet::ALL.channel_mask(Feature::known_future)[12..],
+            [false; 10]
+        );
+        assert_eq!(
+            FeatureSet::ALL.channel_mask(Feature::sigma_scaled)[12..],
+            [false; 10]
+        );
     }
 }

@@ -346,9 +346,8 @@ impl CoefficientMoments {
         let target = transform.rotate(&targets.narrow(2, close, 1).to_kind(Kind::Float));
         let mean = transform.rotate(&prediction.narrow(2, close, 1).to_kind(Kind::Float));
         let rows = row_mask(mask);
-        let reduce = |tensor: Tensor| {
-            tensor.sum_dim_intlist([0i64, 1, 2].as_slice(), false, Kind::Double)
-        };
+        let reduce =
+            |tensor: Tensor| tensor.sum_dim_intlist([0i64, 1, 2].as_slice(), false, Kind::Double);
         for slot in &mut self.count {
             *slot += rows.sum(Kind::Double).double_value(&[]);
         }
@@ -960,8 +959,8 @@ fn dct_matrix(n: usize) -> Vec<f64> {
             _ => (2.0 / n as f64).sqrt(),
         };
         for h in 0..n {
-            rows[k * n + h] = alpha
-                * (std::f64::consts::PI * (h as f64 + 0.5) * k as f64 / n as f64).cos();
+            rows[k * n + h] =
+                alpha * (std::f64::consts::PI * (h as f64 + 0.5) * k as f64 / n as f64).cos();
         }
     }
     rows
@@ -1061,11 +1060,16 @@ mod tests {
             let mut exact = 0.0f64;
             for k in 0..192usize {
                 for l in 0..192usize {
-                    let dot: f64 = (0..192).map(|h| rows[k * 192 + h] * rows[l * 192 + h]).sum();
+                    let dot: f64 = (0..192)
+                        .map(|h| rows[k * 192 + h] * rows[l * 192 + h])
+                        .sum();
                     exact = exact.max((dot - f64::from(u8::from(k == l))).abs());
                 }
             }
-            assert!(exact < 1e-12, "{basis} is not orthonormal in fp64: {exact:e}");
+            assert!(
+                exact < 1e-12,
+                "{basis} is not orthonormal in fp64: {exact:e}"
+            );
         }
     }
 
@@ -1078,14 +1082,21 @@ mod tests {
         // Coefficient 0 is the whole-window mean: every entry 1/√192.
         let dc = 1.0 / (192.0f64).sqrt();
         for h in 0..192 {
-            assert!((rows[h] - dc).abs() < 1e-12, "row 0 entry {h} is {}", rows[h]);
+            assert!(
+                (rows[h] - dc).abs() < 1e-12,
+                "row 0 entry {h} is {}",
+                rows[h]
+            );
         }
         // Full rank, proven by orthonormality: `WᵀW = I` means `W` is invertible, so the map
         // is a bijection and restricts nothing. Also check the cascade at other odd tails.
         for length in [1usize, 2, 3, 5, 6, 7, 12, 96, 191, 192] {
             let rows = haar_matrix(length).unwrap();
             let defect = orthonormality_defect(&rows, length);
-            assert!(defect <= ORTHONORMALITY_TOLERANCE, "length {length}: {defect:e}");
+            assert!(
+                defect <= ORTHONORMALITY_TOLERANCE,
+                "length {length}: {defect:e}"
+            );
         }
     }
 
@@ -1101,7 +1112,9 @@ mod tests {
         // Total variance is basis-invariant: `tr(W·C·Wᵀ) = tr(C) = Σ h`.
         let total: f64 = prior.iter().sum();
         for basis in [TargetBasis::Haar, TargetBasis::Dct] {
-            let rotated: f64 = prior_variance(&basis.matrix(192).unwrap(), 192).iter().sum();
+            let rotated: f64 = prior_variance(&basis.matrix(192).unwrap(), 192)
+                .iter()
+                .sum();
             assert!(
                 (rotated - total).abs() < 1e-6 * total,
                 "{basis} moved the total prior variance: {rotated} vs {total}"
@@ -1151,12 +1164,18 @@ mod tests {
                 .unwrap_err()
                 .to_string();
             assert!(error.contains("leakage"), "{partition}: {error}");
-            assert!(error.contains(&partition.to_string()), "{partition}: {error}");
+            assert!(
+                error.contains(&partition.to_string()),
+                "{partition}: {error}"
+            );
         }
         let fitted =
             BasisStatistics::fit(TargetBasis::Dct, 8, FitPartition::Training, &good, None).unwrap();
         assert_eq!(fitted.whitening_partition, FitPartition::Training);
-        assert!(fitted.whitening.iter().all(|scale| (scale - 2.0).abs() < 1e-12));
+        assert!(fitted
+            .whitening
+            .iter()
+            .all(|scale| (scale - 2.0).abs() < 1e-12));
         // The SNR side is refused on the SELECTION partition specifically, which is the one a
         // careless fit would reach for.
         let error = BasisStatistics::fit(
@@ -1179,18 +1198,30 @@ mod tests {
         let fitted =
             BasisStatistics::fit(TargetBasis::Dct, 8, FitPartition::Training, &good, None).unwrap();
         fitted.authenticate(TargetBasis::Dct, 8).unwrap();
-        let error = fitted.authenticate(TargetBasis::Haar, 8).unwrap_err().to_string();
+        let error = fitted
+            .authenticate(TargetBasis::Haar, 8)
+            .unwrap_err()
+            .to_string();
         assert!(error.contains("not interchangeable"), "{error}");
-        let error = fitted.authenticate(TargetBasis::Dct, 16).unwrap_err().to_string();
+        let error = fitted
+            .authenticate(TargetBasis::Dct, 16)
+            .unwrap_err()
+            .to_string();
         assert!(error.contains("16"), "{error}");
         let mut tampered = fitted.clone();
         tampered.whitening[3] *= 1.01;
-        let error = tampered.authenticate(TargetBasis::Dct, 8).unwrap_err().to_string();
+        let error = tampered
+            .authenticate(TargetBasis::Dct, 8)
+            .unwrap_err()
+            .to_string();
         assert!(error.contains("digest"), "{error}");
         let mut stale = fitted.clone();
         stale.format = "timexer-segment-target-basis-v0".into();
         stale.sha256 = stale.digest().unwrap();
-        let error = stale.authenticate(TargetBasis::Dct, 8).unwrap_err().to_string();
+        let error = stale
+            .authenticate(TargetBasis::Dct, 8)
+            .unwrap_err()
+            .to_string();
         assert!(error.contains("format"), "{error}");
     }
 
@@ -1220,10 +1251,19 @@ mod tests {
         // The unmeasured coefficient falls back to weight 1 before normalization, not to 0.
         assert!(weights[2] > weights[1], "{weights:?}");
         // Uniform weights need no artifact at all; SNR weights without one are refused.
-        let bare =
-            BasisStatistics::fit(TargetBasis::Dct, 4, FitPartition::Training, &moments(4, 1.), None)
-                .unwrap();
-        assert!(bare.snr_weights().unwrap_err().to_string().contains("no SNR measurement"));
+        let bare = BasisStatistics::fit(
+            TargetBasis::Dct,
+            4,
+            FitPartition::Training,
+            &moments(4, 1.),
+            None,
+        )
+        .unwrap();
+        assert!(bare
+            .snr_weights()
+            .unwrap_err()
+            .to_string()
+            .contains("no SNR measurement"));
     }
 
     /// A non-orthonormal map is refused at construction. The failure mode this guards is exactly
@@ -1247,19 +1287,28 @@ mod tests {
     #[test]
     fn cumulative_rotation_and_prior_are_bit_exact_identities() {
         let _rng = crate::torch::test_rng::shared();
-        let transform =
-            BasisTransform::new(TargetBasis::Cumulative, BasisWeight::Uniform, 192, None, Device::Cpu)
-                .unwrap();
+        let transform = BasisTransform::new(
+            TargetBasis::Cumulative,
+            BasisWeight::Uniform,
+            192,
+            None,
+            Device::Cpu,
+        )
+        .unwrap();
         let values = Tensor::randn([3, 5, 4, 192], (Kind::Float, Device::Cpu)) * 7.0;
         let rotated = transform.rotate(&values);
         assert!(
             rotated.equal(&values),
             "the identity rotation moved {} of {} elements",
-            rotated.not_equal_tensor(&values).sum(Kind::Int64).int64_value(&[]),
+            rotated
+                .not_equal_tensor(&values)
+                .sum(Kind::Int64)
+                .int64_value(&[]),
             values.numel()
         );
         // The pre-knob prior, built exactly as `CausalPatchModel::new` builds it.
-        let horizon = (Tensor::arange(192, (Kind::Float, Device::Cpu)) + 1.0).reshape([1, 1, 1, 192]);
+        let horizon =
+            (Tensor::arange(192, (Kind::Float, Device::Cpu)) + 1.0).reshape([1, 1, 1, 192]);
         assert!(
             transform.half_log_prior().equal(&(horizon.log() * 0.5)),
             "the cumulative coefficient prior is not bit-for-bit ½·ln h"
@@ -1269,7 +1318,10 @@ mod tests {
         let log_scale = Tensor::randn([2, 3, 4, 192], (Kind::Float, Device::Cpu)) * 0.5;
         let derived = transform.horizon_log_scale(&log_scale);
         let worst = (&derived - &log_scale).abs().max().double_value(&[]);
-        assert!(worst < 1e-5, "the identity covariance round trip is off by {worst:e}");
+        assert!(
+            worst < 1e-5,
+            "the identity covariance round trip is off by {worst:e}"
+        );
     }
 
     /// The derived horizon variance IS the diagonal of `Wᵀ diag(τ²) W`, checked against an
@@ -1285,10 +1337,9 @@ mod tests {
                 BasisTransform::new(basis, BasisWeight::Uniform, n as i64, None, Device::Cpu)
                     .unwrap();
             let log_scale = Tensor::randn([1, 1, 1, n as i64], (Kind::Float, Device::Cpu)) * 0.7;
-            let tau: Vec<f64> = Vec::<f64>::try_from(
-                (&log_scale * 2.0).exp().to_kind(Kind::Double).reshape([-1]),
-            )
-            .unwrap();
+            let tau: Vec<f64> =
+                Vec::<f64>::try_from((&log_scale * 2.0).exp().to_kind(Kind::Double).reshape([-1]))
+                    .unwrap();
             let derived: Vec<f64> = Vec::<f64>::try_from(
                 (transform.horizon_log_scale(&log_scale) * 2.0)
                     .exp()
@@ -1346,9 +1397,14 @@ mod tests {
     #[test]
     fn coefficient_moments_recover_a_planted_amplitude_defect() {
         let _rng = crate::torch::test_rng::shared();
-        let transform =
-            BasisTransform::new(TargetBasis::Haar, BasisWeight::Uniform, 12, None, Device::Cpu)
-                .unwrap();
+        let transform = BasisTransform::new(
+            TargetBasis::Haar,
+            BasisWeight::Uniform,
+            12,
+            None,
+            Device::Cpu,
+        )
+        .unwrap();
         let targets = Tensor::randn([64, 3, 4, 12], (Kind::Float, Device::Cpu));
         let prediction = &targets * 3.8;
         let mask = Tensor::ones([64, 3, 1, 12], (Kind::Float, Device::Cpu));
@@ -1361,7 +1417,10 @@ mod tests {
             .enumerate()
         {
             assert!((rho - 1.0).abs() < 1e-4, "coefficient {k} ρ̂ = {rho}");
-            assert!((beta - 1.0 / 3.8).abs() < 1e-4, "coefficient {k} β̂ = {beta}");
+            assert!(
+                (beta - 1.0 / 3.8).abs() < 1e-4,
+                "coefficient {k} β̂ = {beta}"
+            );
         }
     }
 }

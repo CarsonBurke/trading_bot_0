@@ -257,7 +257,10 @@ fn accumulate(
 ) {
     pairs.clear();
     for &name in members {
-        let (f, y) = (forecast[name * width + horizon], outcome[name * width + horizon]);
+        let (f, y) = (
+            forecast[name * width + horizon],
+            outcome[name * width + horizon],
+        );
         if f.is_finite() && y.is_finite() {
             pairs.push((f, y));
         }
@@ -335,7 +338,8 @@ pub fn measure(
     );
     let horizons = panel_horizons(frames)?;
     let width = horizons.len();
-    let mut outcomes: HashMap<i64, &Vec<(usize, Vec<f32>)>> = HashMap::with_capacity(realized.len());
+    let mut outcomes: HashMap<i64, &Vec<(usize, Vec<f32>)>> =
+        HashMap::with_capacity(realized.len());
     for (timestamp, rows) in realized {
         ensure!(
             outcomes.insert(*timestamp, rows).is_none(),
@@ -419,7 +423,10 @@ pub fn measure(
         for index in 0..width {
             pairs.clear();
             for name in 0..names {
-                let (f, y) = (forecast[name * width + index], outcome[name * width + index]);
+                let (f, y) = (
+                    forecast[name * width + index],
+                    outcome[name * width + index],
+                );
                 if f.is_finite() && y.is_finite() {
                     pairs.push((f, y));
                 }
@@ -428,7 +435,10 @@ pub fn measure(
                 per_horizon[index].push(ic);
             }
             for name in 0..names {
-                let (s, y) = (deviation[name * width + index], outcome[name * width + index]);
+                let (s, y) = (
+                    deviation[name * width + index],
+                    outcome[name * width + index],
+                );
                 if s.is_finite() && s > 0. && y.is_finite() {
                     coverage[index].push(y, s);
                 }
@@ -564,8 +574,11 @@ pub fn measure(
             ic.is_finite().then(|| (ic, cohort.se[position]))
         });
         if let Some((full, full_se)) = matched {
-            let full_allowed =
-                REFERENCE_TOLERANCE.max(if full_se.is_finite() { 4. * full_se } else { 0. });
+            let full_allowed = REFERENCE_TOLERANCE.max(if full_se.is_finite() {
+                4. * full_se
+            } else {
+                0.
+            });
             if (full - reference).abs() > full_allowed {
                 diagnostics.warnings.push(format!(
                     "h{horizon} IC {full:.4} on the scorer's OWN population disagrees with the \
@@ -773,7 +786,11 @@ impl BookDiagnostics {
             (Some((position, ic, se)), true) => {
                 let combined = (se * se + self.aggregated_ic_se * self.aggregated_ic_se).sqrt();
                 let delta = self.aggregated_ic - ic;
-                let sigmas = if combined > 0. { delta / combined } else { f64::NAN };
+                let sigmas = if combined > 0. {
+                    delta / combined
+                } else {
+                    f64::NAN
+                };
                 let call = if sigmas >= 2. {
                     "cross-horizon aggregation BEATS the best single horizon"
                 } else if sigmas <= -2. {
@@ -785,9 +802,7 @@ impl BookDiagnostics {
                 lines.push(format!(
                     "{call}: aggregate IC {:.4} (SE {:.4}) vs h{} {ic:.4}, {delta:+.4} = \
                      {sigmas:+.2} SE (unpaired, so conservative)",
-                    self.aggregated_ic,
-                    self.aggregated_ic_se,
-                    self.horizons[position]
+                    self.aggregated_ic, self.aggregated_ic_se, self.horizons[position]
                 ));
             }
             _ => lines.push(
@@ -953,7 +968,10 @@ mod tests {
                 quotes.push((index, 1.0, path(&mean, &deviation)));
                 rows.push((
                     index,
-                    outcome.iter().map(|value| *value as f32).collect::<Vec<f32>>(),
+                    outcome
+                        .iter()
+                        .map(|value| *value as f32)
+                        .collect::<Vec<f32>>(),
                 ));
             }
             frames.push((timestamp, quotes));
@@ -1242,7 +1260,10 @@ mod tests {
                 quotes.push((index, 1.0, path(&outcome, &flat(1.))));
                 rows.push((
                     index,
-                    outcome.iter().map(|value| *value as f32).collect::<Vec<f32>>(),
+                    outcome
+                        .iter()
+                        .map(|value| *value as f32)
+                        .collect::<Vec<f32>>(),
                 ));
             }
             frames.push((timestamp, quotes));

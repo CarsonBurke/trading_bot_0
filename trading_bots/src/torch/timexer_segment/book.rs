@@ -2,7 +2,7 @@
 //! (origin, ticker) in sigma units; this module turns one such path into a per-name expected
 //! residual return and then into a dollar-neutral, capped, vol-targeted cross-sectional book.
 //! Nothing here touches cash, shares or fills - the account replay consumes these weights.
-use anyhow::{Result, ensure};
+use anyhow::{ensure, Result};
 use clap::{Args, ValueEnum};
 use serde::{Deserialize, Serialize};
 
@@ -161,8 +161,7 @@ impl BookConfig {
             "target vol must be finite and nonnegative"
         );
         ensure!(
-            self.no_trade_band_cost_multiple.is_finite()
-                && self.no_trade_band_cost_multiple >= 0.0,
+            self.no_trade_band_cost_multiple.is_finite() && self.no_trade_band_cost_multiple >= 0.0,
             "no-trade band multiple must be finite and nonnegative"
         );
         ensure!(
@@ -285,8 +284,7 @@ pub fn name_edge(path: &HorizonPath, sigma: f64, cfg: &BookConfig) -> Option<Nam
     // head nearest the trade horizon carries the dispersion the calibration check measured, and
     // it is carried to the holding period diffusively rather than by rescaling `var_rate`, whose
     // per-bar form would scale variance with the square of the horizon.
-    let risk_var =
-        (var_rates[nearest] * bars[nearest] * horizon * sigma * sigma).max(VAR_FLOOR);
+    let risk_var = (var_rates[nearest] * bars[nearest] * horizon * sigma * sigma).max(VAR_FLOOR);
     if !mu.is_finite() || !var.is_finite() || !risk_var.is_finite() {
         return None;
     }
@@ -522,7 +520,11 @@ fn raw_weight(name: &Name, cfg: &BookConfig) -> f64 {
 }
 
 fn in_side(weight: f64, positive: bool) -> bool {
-    if positive { weight > 0.0 } else { weight < 0.0 }
+    if positive {
+        weight > 0.0
+    } else {
+        weight < 0.0
+    }
 }
 
 /// Water-fill one side of the book to `side_target` gross without breaching `cap` on any name.
@@ -724,7 +726,12 @@ mod tests {
         let target = target_weights(&spread_frame(400, 1.0), &cfg);
         assert_eq!(target.active, 80);
         let long: f64 = target.weights.iter().filter(|w| **w > 0.0).sum();
-        let short: f64 = target.weights.iter().filter(|w| **w < 0.0).map(|w| -w).sum();
+        let short: f64 = target
+            .weights
+            .iter()
+            .filter(|w| **w < 0.0)
+            .map(|w| -w)
+            .sum();
         assert!((long - short).abs() < 1e-9, "long {long} short {short}");
         assert!(target.net.abs() < 1e-9, "net {}", target.net);
         assert!(

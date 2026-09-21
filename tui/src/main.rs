@@ -795,8 +795,11 @@ impl App {
         // Sort by filename for consistent ordering, with the headline panels pulled to the
         // front: alphabetical order would bury the one chart that answers "is this run
         // beating its baseline at all" in the middle of its own family.
-        self.latest_meta_charts
-            .sort_by(|a, b| headline_rank(a).cmp(&headline_rank(b)).then_with(|| a.cmp(b)));
+        self.latest_meta_charts.sort_by(|a, b| {
+            headline_rank(a)
+                .cmp(&headline_rank(b))
+                .then_with(|| a.cmp(b))
+        });
 
         Ok(())
     }

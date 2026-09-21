@@ -355,7 +355,8 @@ impl Blocks {
             if last_target >= first_origin {
                 violations += 1;
             }
-            if tightest.is_none_or(|(_, target, origin)| first_origin - last_target < origin - target)
+            if tightest
+                .is_none_or(|(_, target, origin)| first_origin - last_target < origin - target)
             {
                 tightest = Some((ticker, last_target, first_origin));
             }
@@ -599,9 +600,7 @@ impl Moments {
         if pooled.persistence <= 0. {
             return f64::NAN;
         }
-        (pooled.anchor_square
-            + 2. * pooled.anchor_offset
-            + pooled.offset_square
+        (pooled.anchor_square + 2. * pooled.anchor_offset + pooled.offset_square
             - 2. * (pooled.anchor_target + pooled.offset_target)
             + pooled.persistence)
             / pooled.persistence
@@ -779,7 +778,10 @@ impl MeanCalibration {
             .collect();
         let amplitude_cost: Vec<f64> = solved
             .iter()
-            .map(|row| row.as_ref().map_or(f64::NAN, |solved| solved.amplitude_cost))
+            .map(|row| {
+                row.as_ref()
+                    .map_or(f64::NAN, |solved| solved.amplitude_cost)
+            })
             .collect();
         let estimator = format!(
             "exact 2x2 least squares in (close anchor, intrabar offset) pooled over {} channels, \
@@ -1186,9 +1188,7 @@ fn solve_horizon(moments: &Moments, horizon: usize) -> Option<Solved> {
     let residual = pooled.persistence
         - anchor.unwrap_or(0.) * pooled.anchor_target
         - offset.unwrap_or(0.) * pooled.offset_target;
-    let uncalibrated = pooled.anchor_square
-        + 2. * pooled.anchor_offset
-        + pooled.offset_square
+    let uncalibrated = pooled.anchor_square + 2. * pooled.anchor_offset + pooled.offset_square
         - 2. * (pooled.anchor_target + pooled.offset_target)
         + pooled.persistence;
     if !(residual > 0.) {
@@ -1342,10 +1342,7 @@ fn roughness_matrix(axis: &[f64]) -> Vec<f64> {
     let n = axis.len();
     let mut matrix = vec![0.; n * n];
     for index in 1..n - 1 {
-        let (left, right) = (
-            axis[index] - axis[index - 1],
-            axis[index + 1] - axis[index],
-        );
+        let (left, right) = (axis[index] - axis[index - 1], axis[index + 1] - axis[index]);
         let span = left + right;
         let curvature = 2. / span;
         let row = [
@@ -1522,8 +1519,7 @@ mod tests {
                 // `Σf² = ΣC² + ΣO²` here, so the population is a coherent (f, y) pair rather
                 // than three unrelated sums.
                 let forecast_square = anchor_square + offset_square;
-                let forecast_target =
-                    moments.anchor_target[cell] + moments.offset_target[cell];
+                let forecast_target = moments.anchor_target[cell] + moments.offset_target[cell];
                 moments.target_square[cell] =
                     (forecast_target / rho).powi(2) / forecast_square.max(f64::MIN_POSITIVE);
                 moments.target[cell] = 0.;
@@ -1568,7 +1564,10 @@ mod tests {
         for horizon in 0..horizons {
             let solved = solve_horizon(&flat, horizon).expect("a rank-1 design still identifies");
             let anchor = solved.anchor.expect("the anchor column carries energy");
-            assert!((anchor - 1. / anchor_error(horizon)).abs() < 1e-9, "{anchor}");
+            assert!(
+                (anchor - 1. / anchor_error(horizon)).abs() < 1e-9,
+                "{anchor}"
+            );
             assert_eq!(solved.offset, None);
             assert!(solved.anchor_weight > 0. && solved.offset_weight == 0.);
         }
@@ -1700,7 +1699,10 @@ mod tests {
         // Every OTHER horizon is untouched: a gate that swallowed its neighbours would zero the
         // whole book on four bad horizons.
         for horizon in [1, 40, 45, 50, 52, 64] {
-            assert!(frozen.tradable(horizon), "h={horizon} was gated by a neighbour");
+            assert!(
+                frozen.tradable(horizon),
+                "h={horizon} was gated by a neighbour"
+            );
         }
         assert_eq!(
             frozen.gated().iter().map(|(h, _)| *h).collect::<Vec<_>>(),
@@ -1715,7 +1717,10 @@ mod tests {
             refusal.starts_with("h42 at -") && !refusal.contains("h1"),
             "the refusal must name the gated horizon at its measured value: {refusal}"
         );
-        assert_eq!(frozen.sizing_refusal(&[51, 1]).as_deref(), Some("h51 unmeasured"));
+        assert_eq!(
+            frozen.sizing_refusal(&[51, 1]).as_deref(),
+            Some("h51 unmeasured")
+        );
         assert_eq!(frozen.sizing_refusal(&[45, 1]), None);
     }
 
@@ -1772,10 +1777,7 @@ mod tests {
         // identity: a smoother that leaked the anchor's decay into the second coordinate would
         // be applying the wrong correction to the intrabar spread.
         assert!(
-            fit.offset
-                .gain
-                .iter()
-                .all(|gain| (*gain - 1.).abs() < 0.05),
+            fit.offset.gain.iter().all(|gain| (*gain - 1.).abs() < 0.05),
             "the offset curve drifted off the identity it was given: {:?}",
             &fit.offset.gain[..4]
         );
@@ -1786,7 +1788,14 @@ mod tests {
         let horizons = 32;
         // A measured under-amplitude of 2.5 on 400 bars: the solve's own standard error on
         // `ln g` is far larger than `ln 2.5`, so none of it is deployable.
-        let moments = injected(horizons, CHANNELS as usize, 400., |_| 1. / 2.5, |_| 1., 0.06);
+        let moments = injected(
+            horizons,
+            CHANNELS as usize,
+            400.,
+            |_| 1. / 2.5,
+            |_| 1.,
+            0.06,
+        );
         let fit = MeanCalibration::fit(blocks(), &moments).unwrap();
         assert!(fit
             .anchor
@@ -1794,7 +1803,11 @@ mod tests {
             .iter()
             .all(|gain| (*gain - 2.5).abs() < 1e-9));
         assert!(fit.anchor.amplification_ceiling.iter().all(|c| *c == 1.));
-        assert!(fit.anchor.gain.iter().all(|gain| (*gain - 1.).abs() < 1e-12));
+        assert!(fit
+            .anchor
+            .gain
+            .iter()
+            .all(|gain| (*gain - 1.).abs() < 1e-12));
     }
 
     #[test]
@@ -1949,7 +1962,10 @@ mod tests {
             fit.intercept_refused
         );
         for horizon in 0..horizons {
-            let (close, pooled) = (fit.intercept_ceiling[horizon], pooled_intercept(&moments, horizon));
+            let (close, pooled) = (
+                fit.intercept_ceiling[horizon],
+                pooled_intercept(&moments, horizon),
+            );
             let cost = fit.amplitude_cost[horizon];
             assert!(
                 (close - 4.63e-5).abs() < 1e-9,
@@ -2001,7 +2017,8 @@ mod tests {
         with_intercept(&mut moments, 4.63e-5, 0.1);
         // One horizon where a constant forecast really could earn half the persistence MSE.
         let cell = refused_index * moments.channels + CLOSE_CHANNEL;
-        moments.target[cell] = (0.5 * moments.target_square[cell] * moments.bars[refused_index]).sqrt();
+        moments.target[cell] =
+            (0.5 * moments.target_square[cell] * moments.bars[refused_index]).sqrt();
         let fit = MeanCalibration::fit(blocks(), &moments)
             .expect("one refused horizon must not refuse the fit");
         assert_eq!(
@@ -2025,7 +2042,11 @@ mod tests {
             if horizon == refused_index {
                 continue;
             }
-            assert!(fit.anchor.weight[horizon] > 0., "h={} lost its weight", horizon + 1);
+            assert!(
+                fit.anchor.weight[horizon] > 0.,
+                "h={} lost its weight",
+                horizon + 1
+            );
             assert!(
                 (fit.anchor.gain[horizon] - 0.6).abs() < 1e-3,
                 "h={} was blanked by another horizon's refusal: {}",
@@ -2221,7 +2242,10 @@ mod tests {
         let frozen = MeanCalibration::fit(blocks(), &moments).unwrap().frozen();
         frozen.validate(horizons).unwrap();
         let refusal = frozen.validate(horizons + 1).unwrap_err().to_string();
-        assert!(refusal.contains("coefficients for a 17-horizon forecast"), "{refusal}");
+        assert!(
+            refusal.contains("coefficients for a 17-horizon forecast"),
+            "{refusal}"
+        );
         for mutate in [
             (|gain: &mut FrozenGain| gain.anchor[0] = 0.) as fn(&mut FrozenGain),
             |gain: &mut FrozenGain| gain.offset[0] = -1.,
@@ -2230,7 +2254,10 @@ mod tests {
             let mut edited = frozen.clone();
             mutate(&mut edited);
             let refusal = edited.validate(horizons).unwrap_err().to_string();
-            assert!(refusal.contains("finite and strictly positive"), "{refusal}");
+            assert!(
+                refusal.contains("finite and strictly positive"),
+                "{refusal}"
+            );
         }
     }
 
@@ -2274,13 +2301,16 @@ mod tests {
             (measured - predicted).abs() < 1e-12,
             "gained ratio {measured} against the closed form {predicted}"
         );
-        assert!((moments.channel_gained_ratio(0, 0, 1., 1.) - moments.channel_ratio(0, 0)).abs() < 1e-12);
+        assert!(
+            (moments.channel_gained_ratio(0, 0, 1., 1.) - moments.channel_ratio(0, 0)).abs()
+                < 1e-12
+        );
         // A per-horizon gain is a positive scalar within the horizon, so it multiplies the
         // uncentered correlation's numerator and its own standard deviation by the same factor:
         // ρ is invariant, exactly, and every rank statistic with it.
         let gained: Vec<f64> = forecast.iter().map(|f| gain * f).collect();
-        let gained_rho = dot(&gained, &target)
-            / (dot(&gained, &gained).sqrt() * dot(&target, &target).sqrt());
+        let gained_rho =
+            dot(&gained, &target) / (dot(&gained, &gained).sqrt() * dot(&target, &target).sqrt());
         let raw_rho = dot(&forecast, &target)
             / (dot(&forecast, &forecast).sqrt() * dot(&target, &target).sqrt());
         assert!(
@@ -2362,7 +2392,9 @@ mod tests {
         let base = 1_700_000_000_000i64;
         let at = |slot: i64| base + slot * step;
         let block = |ticker: usize, first: i64, last: i64| -> Vec<DatedOrigin> {
-            (first..last).map(|slot| (ticker, at(slot), at(slot + 2))).collect()
+            (first..last)
+                .map(|slot| (ticker, at(slot), at(slot + 2)))
+                .collect()
         };
         // LONG: fit [100, 140), scored [155, 200). SHORT: fit [60, 100), scored [110, 130).
         let calibration = [block(0, 100, 140), block(1, 60, 100)].concat();
@@ -2370,7 +2402,9 @@ mod tests {
         // The pooled guard compares LONG's last target (slot 141) against SHORT's first scored
         // origin (slot 110) and refuses a split in which no ticker shares a bar with itself.
         let pooled = |rows: &[DatedOrigin]| -> Vec<(i64, i64)> {
-            rows.iter().map(|(_, origin, target)| (*origin, *target)).collect()
+            rows.iter()
+                .map(|(_, origin, target)| (*origin, *target))
+                .collect()
         };
         let refusal = Blocks::spanning(&pooled(&calibration), &pooled(&evaluation))
             .unwrap_err()
@@ -2405,6 +2439,9 @@ mod tests {
         let refusal = Blocks::per_ticker(&block(0, 100, 140), &block(1, 150, 200), 2, name)
             .unwrap_err()
             .to_string();
-        assert!(refusal.contains("no ticker carries origins in both"), "{refusal}");
+        assert!(
+            refusal.contains("no ticker carries origins in both"),
+            "{refusal}"
+        );
     }
 }

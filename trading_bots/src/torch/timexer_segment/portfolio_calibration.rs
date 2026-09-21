@@ -11,7 +11,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use anyhow::{Context, Result, ensure};
+use anyhow::{ensure, Context, Result};
 use chrono::{NaiveDate, TimeZone};
 use chrono_tz::America::New_York;
 

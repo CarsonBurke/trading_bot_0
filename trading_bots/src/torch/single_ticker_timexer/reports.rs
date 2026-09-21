@@ -41,10 +41,17 @@ pub fn write_benchmark(
         grouped.entry(label).or_default().push(*value);
     }
     fs::create_dir_all(directory)?;
-    chart(directory, "timexer_performance",
+    chart(
+        directory,
+        "timexer_performance",
         &format!("{ticker} TimeXer CUDA performance; batch={batch_size}, steps={steps}"),
-        "paired trial", "milliseconds / origins per second / parameter error",
-        grouped.into_iter().map(|(label, values)| series(label, values)).collect())
+        "paired trial",
+        "milliseconds / origins per second / parameter error",
+        grouped
+            .into_iter()
+            .map(|(label, values)| series(label, values))
+            .collect(),
+    )
 }
 
 pub fn write_training(directory: &Path, step: usize, loss: f64, learning_rate: f64) -> Result<()> {

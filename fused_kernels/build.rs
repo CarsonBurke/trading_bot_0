@@ -187,7 +187,10 @@ fn main() -> Result<()> {
     // linked fine. `trading_bots/build.rs` already solves exactly this; these are the same
     // three link arguments, and they apply to this package's own bin and tests.
     println!("cargo:rustc-link-search=native={}", torch.lib_dir.display());
-    println!("cargo:rustc-link-arg=-Wl,-rpath={}", torch.lib_dir.display());
+    println!(
+        "cargo:rustc-link-arg=-Wl,-rpath={}",
+        torch.lib_dir.display()
+    );
     println!("cargo:rustc-link-arg=-Wl,--no-as-needed");
     println!("cargo:rustc-link-arg=-ltorch");
     println!("cargo:rustc-link-arg=-lc10");

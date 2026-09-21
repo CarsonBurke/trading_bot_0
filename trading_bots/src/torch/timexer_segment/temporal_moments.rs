@@ -230,6 +230,25 @@ impl TemporalMoments {
                 .to_kind(Kind::Float),
         }
     }
+    /// Equal-horizon logistic loss for the observable sign decision. Zero targets are
+    /// deliberately excluded because their direction is undefined; the close forecast remains
+    /// in source-sigma*sqrt(h) units so this adds no hidden per-horizon calibration.
+    pub fn decision_sign_loss(&self, decision: &DecisionValues) -> Tensor {
+        let finite = decision.target.isfinite().to_kind(Kind::Float);
+        let active = &decision.mask * finite * decision.target.ne(0.).to_kind(Kind::Float);
+        let target = decision
+            .target
+            .where_self(&active.gt(0.), &decision.target.zeros_like());
+        let margin = &decision.prediction * target.sign();
+        let rows = active.sum_dim_intlist([0i64].as_slice(), false, Kind::Float);
+        let horizon_loss = ((-&margin).softplus() * &active).sum_dim_intlist(
+            [0i64].as_slice(),
+            false,
+            Kind::Float,
+        ) / rows.clamp_min(1.);
+        let present = rows.gt(0.).to_kind(Kind::Float);
+        (&horizon_loss * &present).sum(Kind::Float) / present.sum(Kind::Float).clamp_min(1.)
+    }
 
     /// Each (source,horizon) population contains batch rows only. Two BMMs avoid materializing
     /// [B,O,H,F]: [O,H,B]@[O,B,F] gives the summed moment, and its diagonal needs only
@@ -352,6 +371,27 @@ mod tests {
             0.,
             "a singleton horizon contributed a fake pair"
         );
+    }
+
+    #[test]
+    fn decision_sign_loss_excludes_zero_targets_and_pushes_correct_margin() {
+        let prediction =
+            Tensor::zeros([1, 1, 7], (Kind::Float, Device::Cpu)).set_requires_grad(true);
+        let target = Tensor::zeros([1, 1, 7], (Kind::Float, Device::Cpu));
+        let mask = Tensor::ones([1, 1, 7], (Kind::Float, Device::Cpu));
+        let _ = target.select(2, 0).fill_(1.);
+        let _ = target.select(2, 1).fill_(-1.);
+        let loss = geometry().decision_sign_loss(&DecisionValues {
+            prediction: prediction.shallow_clone(),
+            target,
+            mask,
+        });
+        assert!((loss.double_value(&[]) - (2f64.ln())).abs() < 1e-6);
+        loss.backward();
+        let grad = prediction.grad();
+        assert!(grad.double_value(&[0, 0, 0]) < 0.);
+        assert!(grad.double_value(&[0, 0, 1]) > 0.);
+        assert_eq!(grad.double_value(&[0, 0, 2]), 0.);
     }
 
     #[test]

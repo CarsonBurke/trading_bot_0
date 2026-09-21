@@ -166,7 +166,9 @@ pub(crate) fn check_objective(loss: &Tensor) -> Result<()> {
             Ok(py.import("torch")?.getattr("_assert_async")?.unbind())
         })?;
         let finite = crate::torch::fa4::tensor_object(py, &loss.isfinite())?;
-        assert.bind(py).call1((finite, "nonfinite TimeXer training objective"))?;
+        assert
+            .bind(py)
+            .call1((finite, "nonfinite TimeXer training objective"))?;
         Ok(())
     })
 }
@@ -274,7 +276,12 @@ pub fn train(args: TrainArgs) -> Result<()> {
         reports::write_evaluation(&run.gens, epoch, &evaluation)?;
         if args.model != ModelKind::RawTimeXer {
             super::candles::write_windows(
-                &dataset, &model, device, epoch, step, &run.gens.join(epoch.to_string()),
+                &dataset,
+                &model,
+                device,
+                epoch,
+                step,
+                &run.gens.join(epoch.to_string()),
             )?;
         }
         if score < best_loss {

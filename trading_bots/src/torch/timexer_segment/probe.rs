@@ -188,7 +188,10 @@ const MS_PER_YEAR: f64 = 365.25 * 86_400_000.;
 /// while fit-block AGE varies, which is exactly the control the extraction ladder does not
 /// provide, and equal-duration tranches would confound the two.
 pub fn chronological_tranches(stamps: &[i64], count: usize) -> Result<Vec<usize>> {
-    ensure!(count >= 2, "a recency slope needs at least two tranches, got {count}");
+    ensure!(
+        count >= 2,
+        "a recency slope needs at least two tranches, got {count}"
+    );
     ensure!(!stamps.is_empty(), "no fit origins to tranche");
     let mut sorted: Vec<i64> = stamps.to_vec();
     sorted.sort_unstable();
@@ -230,7 +233,10 @@ impl Recency {
     /// `None` when the horizon was not probed, so a caller can never silently read zero for a
     /// quantity that was not measured.
     pub fn discount(&self, horizon: usize) -> Option<f64> {
-        self.horizons.iter().position(|probed| *probed == horizon).map(|index| self.discount[index])
+        self.horizons
+            .iter()
+            .position(|probed| *probed == horizon)
+            .map(|index| self.discount[index])
     }
 
     /// Slope by least squares on (age in years, IC), then the discount at the head's age deficit.
@@ -255,15 +261,20 @@ impl Recency {
             tranche_ic.len(),
             horizons.len()
         );
-        let weighted: f64 = tranches.iter().map(|(count, mid)| *count as f64 * *mid as f64).sum();
+        let weighted: f64 = tranches
+            .iter()
+            .map(|(count, mid)| *count as f64 * *mid as f64)
+            .sum();
         let total: f64 = tranches.iter().map(|(count, _)| *count as f64).sum();
         ensure!(total > 0., "the fit tranches hold no origins");
         let centre = weighted / total;
         let age_gap_years = (centre - head_last_target_ms as f64) / MS_PER_YEAR;
         // Recency in years, POSITIVE for a more recent tranche, so a positive slope means "a
         // fresher fit block scores better" and the discount comes out positive.
-        let age: Vec<f64> =
-            tranches.iter().map(|(_, mid)| (*mid as f64 - centre) / MS_PER_YEAR).collect();
+        let age: Vec<f64> = tranches
+            .iter()
+            .map(|(_, mid)| (*mid as f64 - centre) / MS_PER_YEAR)
+            .collect();
         let mean_age = age.iter().sum::<f64>() / age.len() as f64;
         let spread: f64 = age.iter().map(|value| (value - mean_age).powi(2)).sum();
         let mut slope_per_year = Vec::with_capacity(horizons.len());
@@ -321,7 +332,10 @@ pub fn verdict(report: &ProbeReport, recency: Option<&Recency>) -> World {
     // failed to route, while a FAILURE under that advantage is if anything stronger evidence of
     // an information ceiling than the flat band suggests. A discount that is missing, negative
     // or not finite contributes nothing, so an unmeasured discount can never loosen the gate.
-    if gaps.iter().any(|(horizon, gap)| *gap >= WORLD_A_GAIN + discount(*horizon)) {
+    if gaps
+        .iter()
+        .any(|(horizon, gap)| *gap >= WORLD_A_GAIN + discount(*horizon))
+    {
         return World::ExtractionFailure;
     }
     if gaps.iter().all(|(_, gap)| gap.abs() <= WORLD_B_BAND) {
@@ -441,14 +455,18 @@ impl Partitions {
             scored.len()
         );
         let dated = |rows: &[DatedRef]| -> Vec<(i64, i64)> {
-            rows.iter().map(|(_, origin, reach)| (*origin, *reach)).collect()
+            rows.iter()
+                .map(|(_, origin, reach)| (*origin, *reach))
+                .collect()
         };
         // Origin disjointness FIRST, on the full populations, before anything is trimmed. A
         // shared origin is a different bug from an interleaved block and deserves to be named
         // as one; running it after the cut would let a genuinely overlapping pair be reported
         // as a wall-clock alignment failure.
-        let scored_set: HashSet<(usize, usize)> =
-            scored.iter().map(|(r, _, _)| (r.ticker, r.origin)).collect();
+        let scored_set: HashSet<(usize, usize)> = scored
+            .iter()
+            .map(|(r, _, _)| (r.ticker, r.origin))
+            .collect();
         let shared = fit
             .iter()
             .filter(|(r, _, _)| scored_set.contains(&(r.ticker, r.origin)))
@@ -459,9 +477,16 @@ impl Partitions {
              rows it reports out-of-sample scores for",
             fit.len()
         );
-        let fit_reach = fit.iter().map(|(_, _, reach)| *reach).max().expect("nonempty");
-        let kept: Vec<DatedRef> =
-            scored.iter().copied().filter(|(_, origin, _)| *origin > fit_reach).collect();
+        let fit_reach = fit
+            .iter()
+            .map(|(_, _, reach)| *reach)
+            .max()
+            .expect("nonempty");
+        let kept: Vec<DatedRef> = scored
+            .iter()
+            .copied()
+            .filter(|(_, origin, _)| *origin > fit_reach)
+            .collect();
         let outer_purged = scored.len() - kept.len();
         let share = outer_purged as f64 / scored.len() as f64;
         ensure!(
@@ -490,13 +515,20 @@ impl Partitions {
         let index = ((stamps.len() as f64 * (1. - LAMBDA_HOLDOUT_SHARE)).floor() as usize)
             .min(stamps.len() - 1);
         let cutoff = stamps[index];
-        let holdout: Vec<DatedRef> =
-            fit.iter().copied().filter(|(_, origin, _)| *origin >= cutoff).collect();
+        let holdout: Vec<DatedRef> = fit
+            .iter()
+            .copied()
+            .filter(|(_, origin, _)| *origin >= cutoff)
+            .collect();
         ensure!(
             !holdout.is_empty(),
             "the penalty-selection holdout is empty at cutoff {cutoff}"
         );
-        let first_holdout_origin = holdout.iter().map(|(_, origin, _)| *origin).min().expect("nonempty");
+        let first_holdout_origin = holdout
+            .iter()
+            .map(|(_, origin, _)| *origin)
+            .min()
+            .expect("nonempty");
         let inner: Vec<DatedRef> = fit
             .iter()
             .copied()
@@ -508,8 +540,10 @@ impl Partitions {
              no purged inner block to fit coefficients on"
         );
         let inner_blocks = Blocks::spanning(&dated(&inner), &dated(&holdout))?;
-        let holdout_set: HashSet<(usize, usize)> =
-            holdout.iter().map(|(r, _, _)| (r.ticker, r.origin)).collect();
+        let holdout_set: HashSet<(usize, usize)> = holdout
+            .iter()
+            .map(|(r, _, _)| (r.ticker, r.origin))
+            .collect();
         let inner_shared = inner
             .iter()
             .filter(|(r, _, _)| holdout_set.contains(&(r.ticker, r.origin)))
@@ -672,7 +706,9 @@ impl HostMoments {
         let latent_mean = self.latent_sum.get(index) / count;
         let target_mean = self.target_sum.double_value(&[index]) / count;
         let covariance = self.gram.get(index) / count
-            - latent_mean.reshape([-1, 1]).matmul(&latent_mean.reshape([1, -1]));
+            - latent_mean
+                .reshape([-1, 1])
+                .matmul(&latent_mean.reshape([1, -1]));
         let cross = self.cross.get(index) / count - &latent_mean * target_mean;
         Ok(Centred {
             count,
@@ -757,7 +793,10 @@ pub fn fit_all(
              (eigenvalues span {smallest:.3e} to {largest:.3e}); the accumulation is wrong"
         );
         let mean_eigenvalue = eigenvalues.mean(Kind::Double).double_value(&[]);
-        let rotated = eigenvectors.transpose(0, 1).matmul(&selection.cross.reshape([-1, 1])).reshape([-1]);
+        let rotated = eigenvectors
+            .transpose(0, 1)
+            .matmul(&selection.cross.reshape([-1, 1]))
+            .reshape([-1]);
         let evaluation = holdout.centred(index)?;
         let full_moments = full.centred(index)?;
         let (full_eigenvalues, full_eigenvectors) = full_moments.covariance.linalg_eigh("L");
@@ -785,12 +824,20 @@ pub fn fit_all(
             // diagnostic that says whether the transfer to the scored split degraded.
             let mut best: Option<(f64, HoldoutFit)> = None;
             for penalty in &grid {
-                let weight = reconstruct(&eigenvectors, &eigenvalues, &rotated, kept, penalty * mean_eigenvalue);
-                let intercept = selection.target_mean
-                    - weight.dot(&selection.latent_mean).double_value(&[]);
+                let weight = reconstruct(
+                    &eigenvectors,
+                    &eigenvalues,
+                    &rotated,
+                    kept,
+                    penalty * mean_eigenvalue,
+                );
+                let intercept =
+                    selection.target_mean - weight.dot(&selection.latent_mean).double_value(&[]);
                 let measured = holdout_fit(holdout, index, &evaluation, &weight, intercept);
                 if measured.error.is_finite()
-                    && best.as_ref().is_none_or(|(_, seen)| measured.error < seen.error)
+                    && best
+                        .as_ref()
+                        .is_none_or(|(_, seen)| measured.error < seen.error)
                 {
                     best = Some((*penalty, measured));
                 }
@@ -803,7 +850,13 @@ pub fn fit_all(
                 },
             ));
             let scaled = penalty * full_mean;
-            let weight = reconstruct(&full_eigenvectors, &full_eigenvalues, &full_rotated, kept, scaled);
+            let weight = reconstruct(
+                &full_eigenvectors,
+                &full_eigenvalues,
+                &full_rotated,
+                kept,
+                scaled,
+            );
             let intercept =
                 full_moments.target_mean - weight.dot(&full_moments.latent_mean).double_value(&[]);
             let retained_low = full_eigenvalues.double_value(&[width - kept]);
@@ -875,7 +928,13 @@ fn holdout_fit(
     let linear = weight.dot(&latent_sum).double_value(&[]);
     let forecast_sum = linear + intercept * count;
     let quadratic = weight
-        .dot(&moments.gram.get(index).matmul(&weight.reshape([-1, 1])).reshape([-1]))
+        .dot(
+            &moments
+                .gram
+                .get(index)
+                .matmul(&weight.reshape([-1, 1]))
+                .reshape([-1]),
+        )
         .double_value(&[]);
     let forecast_square = quadratic + 2. * intercept * linear + intercept * intercept * count;
     let joint = weight.dot(&moments.cross.get(index)).double_value(&[])
@@ -908,7 +967,11 @@ pub const SCALING_LEVELS: usize = 7;
 /// `i-1`", so the shells are disjoint, they partition the population, and prefix-merging their
 /// moments reconstructs every nested fit set at the cost of ONE pass.
 pub fn scaling_shells(ladder: &[Vec<bool>]) -> Result<Vec<usize>> {
-    ensure!(ladder.len() >= 3, "a scaling curve needs at least three rungs, got {}", ladder.len());
+    ensure!(
+        ladder.len() >= 3,
+        "a scaling curve needs at least three rungs, got {}",
+        ladder.len()
+    );
     let rows = ladder[0].len();
     for (index, rung) in ladder.iter().enumerate() {
         ensure!(
@@ -918,7 +981,9 @@ pub fn scaling_shells(ladder: &[Vec<bool>]) -> Result<Vec<usize>> {
         );
     }
     for index in 1..ladder.len() {
-        let escaped = (0..rows).filter(|row| ladder[index - 1][*row] && !ladder[index][*row]).count();
+        let escaped = (0..rows)
+            .filter(|row| ladder[index - 1][*row] && !ladder[index][*row])
+            .count();
         ensure!(
             escaped == 0,
             "ladder rung {} drops {escaped} rows that rung {} kept, so the rungs are not nested \
@@ -978,8 +1043,10 @@ pub struct ScalingCurve {
 /// is a deterministic scan. That is the whole reason the exponent is gridded rather than
 /// optimized - it makes the result a function of the data and the grid alone.
 pub fn fit_scaling(rungs: &[ScalingRung]) -> Result<ScalingCurve> {
-    let usable: Vec<&ScalingRung> =
-        rungs.iter().filter(|rung| rung.ic.is_finite() && rung.origins > 0).collect();
+    let usable: Vec<&ScalingRung> = rungs
+        .iter()
+        .filter(|rung| rung.ic.is_finite() && rung.origins > 0)
+        .collect();
     ensure!(
         usable.len() >= 3,
         "a three-parameter curve needs at least three rungs with a measured IC, got {}",
@@ -1035,12 +1102,7 @@ pub struct ProbeBank {
 impl ProbeBank {
     /// Column order is class-major then horizon, which is the layout [`PairedScorer`] assumes
     /// for its forecaster blocks.
-    pub fn new(
-        fits: &[ProbeFit],
-        horizons: &[usize],
-        width: i64,
-        device: Device,
-    ) -> Result<Self> {
+    pub fn new(fits: &[ProbeFit], horizons: &[usize], width: i64, device: Device) -> Result<Self> {
         let classes = ProbeClass::all();
         ensure!(
             fits.len() == classes.len() * horizons.len() && !horizons.is_empty(),
@@ -1057,7 +1119,10 @@ impl ProbeBank {
                     .iter()
                     .find(|fit| fit.class == *class && fit.horizon == *horizon)
                     .with_context(|| {
-                        format!("no {} was fitted at h={horizon}", class.label(width as usize))
+                        format!(
+                            "no {} was fitted at h={horizon}",
+                            class.label(width as usize)
+                        )
                     })?;
                 columns.push(fit.weight.shallow_clone());
                 intercepts.push(fit.intercept);
@@ -1245,8 +1310,8 @@ impl PairedScorer {
                 );
                 let forecast_variance = at(8, column) / count - forecast_mean * forecast_mean;
                 let joint = at(11, column) / count - forecast_mean * target_mean;
-                let offset =
-                    (2. * forecast_mean * target_mean - forecast_mean * forecast_mean) / persistence;
+                let offset = (2. * forecast_mean * target_mean - forecast_mean * forecast_mean)
+                    / persistence;
                 let demeaned = if forecast_variance > 0. {
                     joint * joint / forecast_variance / persistence
                 } else {
@@ -1352,10 +1417,9 @@ impl ProbeReport {
     pub fn attach(&mut self, fits: &[ProbeFit], width: usize) {
         for forecaster in self.forecasters.iter_mut() {
             for score in forecaster.per_horizon.iter_mut() {
-                let Some(fit) = fits
-                    .iter()
-                    .find(|fit| fit.horizon == score.horizon && fit.class.label(width) == forecaster.label)
-                else {
+                let Some(fit) = fits.iter().find(|fit| {
+                    fit.horizon == score.horizon && fit.class.label(width) == forecaster.label
+                }) else {
                     continue;
                 };
                 forecaster.parameters = fit.parameters;
@@ -1431,15 +1495,26 @@ mod tests {
             ic: 0.08 - 0.9 * (origins as f64).powf(-0.5),
             ic_se: 0.001,
         };
-        let rungs: Vec<ScalingRung> =
-            [6_800usize, 13_600, 27_200, 54_400, 108_800, 217_600, 433_721].map(rung).to_vec();
+        let rungs: Vec<ScalingRung> = [
+            6_800usize, 13_600, 27_200, 54_400, 108_800, 217_600, 433_721,
+        ]
+        .map(rung)
+        .to_vec();
         let curve = fit_scaling(&rungs).unwrap();
         // Tolerances are the GRID's resolution, not a hope: the exponent grid is 61 geometric
         // points from 0.05 to 2.0, so consecutive candidates differ by a factor of 40^(1/60) =
         // 1.0634 and the nearest one to 0.5 can be 3.2% away. The intercept absorbs that
         // mismatch, which is why the asymptote lands within 2e-4 rather than exactly.
-        assert!((curve.asymptote - 0.08).abs() < 5e-4, "asymptote {}", curve.asymptote);
-        assert!((curve.exponent - 0.5).abs() < 0.5 * 0.032, "exponent {}", curve.exponent);
+        assert!(
+            (curve.asymptote - 0.08).abs() < 5e-4,
+            "asymptote {}",
+            curve.asymptote
+        );
+        assert!(
+            (curve.exponent - 0.5).abs() < 0.5 * 0.032,
+            "exponent {}",
+            curve.exponent
+        );
         assert!(curve.residual < 5e-5, "residual {}", curve.residual);
         // Fewer than three rungs cannot pin three parameters and is refused rather than fitted.
         assert!(fit_scaling(&rungs[..2]).is_err());
@@ -1464,15 +1539,25 @@ mod tests {
             key(&partitions.scored),
         );
         assert!(!inner.is_empty() && !holdout.is_empty() && !scored_keys.is_empty());
-        assert!(inner.is_disjoint(&holdout), "penalty rows were also fitted on");
-        assert!(inner.is_disjoint(&scored_keys), "coefficients were fitted on scored rows");
-        assert!(holdout.is_disjoint(&scored_keys), "the penalty was chosen on scored rows");
+        assert!(
+            inner.is_disjoint(&holdout),
+            "penalty rows were also fitted on"
+        );
+        assert!(
+            inner.is_disjoint(&scored_keys),
+            "coefficients were fitted on scored rows"
+        );
+        assert!(
+            holdout.is_disjoint(&scored_keys),
+            "the penalty was chosen on scored rows"
+        );
         // Disjointness of ORIGINS is necessary and not sufficient: cumulative targets overlap.
         // Both purges are stated in target-bar time and both must be strictly positive.
         assert!(partitions.outer.purge_gap_ms > 0);
         assert!(partitions.inner_blocks.purge_gap_ms > 0);
         assert_eq!(
-            partitions.inner_blocks.calibration_last_target_ms + partitions.inner_blocks.purge_gap_ms,
+            partitions.inner_blocks.calibration_last_target_ms
+                + partitions.inner_blocks.purge_gap_ms,
             partitions.inner_blocks.evaluation_first_origin_ms
         );
         // The penalty holdout is the chronologically LAST fifth, and the purge band is exactly
@@ -1483,7 +1568,8 @@ mod tests {
         assert!(partitions
             .inner
             .iter()
-            .all(|r| (r.origin as i64 + reach) * 1000 < partitions.inner_blocks.evaluation_first_origin_ms));
+            .all(|r| (r.origin as i64 + reach) * 1000
+                < partitions.inner_blocks.evaluation_first_origin_ms));
     }
 
     /// Each leakage mode is named by the error it raises, because "leakage" is three different
@@ -1498,7 +1584,9 @@ mod tests {
         // Origins 0..499, targets reaching to 507.
         let fit = dated(0, 0, 500, 8);
         // Shares its first 100 origins with the fit block: always refused, never trimmed.
-        let error = Partitions::split(&fit, &dated(0, 400, 500, 8)).unwrap_err().to_string();
+        let error = Partitions::split(&fit, &dated(0, 400, 500, 8))
+            .unwrap_err()
+            .to_string();
         assert!(error.contains("also scored origins"), "{error}");
         // Origin-disjoint but target-overlapping by 8 of 500 scored origins: 1.6% is under the
         // 5% ceiling, so those 8 are dropped and the rest is scored.
@@ -1508,7 +1596,9 @@ mod tests {
         assert!(trimmed.outer.purge_gap_ms > 0);
         // A whole scored block sitting under the fit block's reach - the shape the real corpus
         // produced, on another ticker so no origin is shared - blows the ceiling and is refused.
-        let error = Partitions::split(&fit, &dated(1, 0, 500, 8)).unwrap_err().to_string();
+        let error = Partitions::split(&fit, &dated(1, 0, 500, 8))
+            .unwrap_err()
+            .to_string();
         assert!(error.contains("past the 5% ceiling"), "{error}");
         // Origin-disjoint AND target-disjoint costs nothing.
         let clean = Partitions::split(&fit, &dated(0, 510, 500, 8)).unwrap();
@@ -1544,20 +1634,36 @@ mod tests {
         for (block, batches) in [(&mut inner, 12), (&mut holdout, 6)] {
             for _ in 0..batches {
                 stream += 1;
-                let latent = Tensor::from_slice(&normals((rows * width) as usize, stream * 977 + 1))
-                    .reshape([rows, width]);
+                let latent =
+                    Tensor::from_slice(&normals((rows * width) as usize, stream * 977 + 1))
+                        .reshape([rows, width]);
                 let signal = latent.matmul(&truth.reshape([-1, 1])).reshape([-1]);
                 let noise = Tensor::from_slice(&normals(rows as usize, stream * 977 + 2));
                 let base = &signal + &noise;
                 // Horizon 0 and horizon 1 are the SAME target, 100x apart.
                 let target = Tensor::stack(&[base.shallow_clone(), base * 100.], 1);
-                block.push(&latent, &target, &Tensor::ones([rows, horizons], (Kind::Double, cpu)));
+                block.push(
+                    &latent,
+                    &target,
+                    &Tensor::ones([rows, horizons], (Kind::Double, cpu)),
+                );
             }
         }
-        let fits = fit_all(&inner.to_host().unwrap(), &holdout.to_host().unwrap(), &[1, 8]).unwrap();
+        let fits = fit_all(
+            &inner.to_host().unwrap(),
+            &holdout.to_host().unwrap(),
+            &[1, 8],
+        )
+        .unwrap();
         for class in ProbeClass::all() {
-            let small = fits.iter().find(|f| f.horizon == 1 && f.class == class).unwrap();
-            let large = fits.iter().find(|f| f.horizon == 8 && f.class == class).unwrap();
+            let small = fits
+                .iter()
+                .find(|f| f.horizon == 1 && f.class == class)
+                .unwrap();
+            let large = fits
+                .iter()
+                .find(|f| f.horizon == 8 && f.class == class)
+                .unwrap();
             assert_eq!(
                 small.ridge, large.ridge,
                 "{class:?} chose {} at unit scale and {} at 100x, so the penalty axis is \
@@ -1631,10 +1737,19 @@ mod tests {
                 let signal = latent.matmul(&truth.reshape([-1, 1])).reshape([-1]);
                 let noisy = &signal * 0.1 + draw(2, rows as usize);
                 let target = Tensor::stack(&[noisy, draw(3, rows as usize)], 1);
-                block.push(&latent, &target, &Tensor::ones([rows, horizons], (Kind::Double, cpu)));
+                block.push(
+                    &latent,
+                    &target,
+                    &Tensor::ones([rows, horizons], (Kind::Double, cpu)),
+                );
             }
         }
-        let fits = fit_all(&inner.to_host().unwrap(), &holdout.to_host().unwrap(), &[1, 8]).unwrap();
+        let fits = fit_all(
+            &inner.to_host().unwrap(),
+            &holdout.to_host().unwrap(),
+            &[1, 8],
+        )
+        .unwrap();
         let ridge_signal = fits
             .iter()
             .find(|f| f.horizon == 1 && f.class == ProbeClass::Ridge)
@@ -1745,7 +1860,11 @@ mod tests {
         for index in 0..2 {
             let head_score = &report.forecasters[0].per_horizon[index];
             let oracle = &report.forecasters[1].per_horizon[index];
-            assert!((oracle.ic - 1.).abs() < 1e-9, "a perfect forecast scored {}", oracle.ic);
+            assert!(
+                (oracle.ic - 1.).abs() < 1e-9,
+                "a perfect forecast scored {}",
+                oracle.ic
+            );
             assert!((oracle.gap - (oracle.ic - head_score.ic)).abs() < 1e-9);
             assert_eq!(head_score.gap, 0.);
             assert_eq!(oracle.paired_cross_sections, groups as f64);
@@ -1823,7 +1942,11 @@ mod tests {
         )
         .unwrap();
         let pred_len = corpus.contract.pred_len;
-        let reach = |reference: &WindowRef| corpus.ticker(*reference).timestamp(reference.origin + pred_len);
+        let reach = |reference: &WindowRef| {
+            corpus
+                .ticker(*reference)
+                .timestamp(reference.origin + pred_len)
+        };
         let start = |reference: &WindowRef| corpus.ticker(*reference).timestamp(reference.origin);
         let global_reach = corpus.calibration_refs.iter().map(reach).max().unwrap();
         let global_first = corpus.validation_refs.iter().map(start).min().unwrap();
@@ -1852,7 +1975,11 @@ mod tests {
             "GLOBAL: last calibration target {global_reach}, first validation origin \
              {global_first}, gap {} ms ({})",
             global_first - global_reach,
-            if global_first > global_reach { "ordered" } else { "INTERLEAVED" }
+            if global_first > global_reach {
+                "ordered"
+            } else {
+                "INTERLEAVED"
+            }
         );
         println!(
             "PER TICKER: {violations} of {shared} tickers have a calibration target at or after \
@@ -1966,8 +2093,18 @@ mod tests {
             let data = &corpus.contract.tickers[*ticker];
             let hi = (*hi).min(data.valid_bars.saturating_sub(1));
             let (first, last) = (
-                corpus.ticker(WindowRef { ticker: *ticker, origin: *lo }).timestamp(*lo),
-                corpus.ticker(WindowRef { ticker: *ticker, origin: hi }).timestamp(hi),
+                corpus
+                    .ticker(WindowRef {
+                        ticker: *ticker,
+                        origin: *lo,
+                    })
+                    .timestamp(*lo),
+                corpus
+                    .ticker(WindowRef {
+                        ticker: *ticker,
+                        origin: hi,
+                    })
+                    .timestamp(hi),
             );
             train_first = train_first.min(first);
             train_last = train_last.max(last);
@@ -1990,7 +2127,12 @@ mod tests {
                 continue;
             }
             for ordinal in *lo..=hi {
-                let stamp = corpus.ticker(WindowRef { ticker: *ticker, origin: ordinal }).timestamp(ordinal);
+                let stamp = corpus
+                    .ticker(WindowRef {
+                        ticker: *ticker,
+                        origin: ordinal,
+                    })
+                    .timestamp(ordinal);
                 if stamp >= floor && candidates.contains(&stamp) {
                     hit.insert(stamp);
                 }
@@ -2018,7 +2160,10 @@ mod tests {
                 }
                 if hit.contains(&stamp) {
                     exact += 1;
-                    if train_last_of.get(&reference.ticker).is_some_and(|end| *end >= stamp) {
+                    if train_last_of
+                        .get(&reference.ticker)
+                        .is_some_and(|end| *end >= stamp)
+                    {
                         same_ticker += 1;
                     }
                 }

@@ -29,8 +29,13 @@ pub struct BenchmarkArgs {
 
 fn tensors(batch: &Batch) -> [&Tensor; 7] {
     [
-        &batch.endogenous, &batch.exogenous, &batch.validity, &batch.future_clock,
-        &batch.targets, &batch.bins, &batch.weights,
+        &batch.endogenous,
+        &batch.exogenous,
+        &batch.validity,
+        &batch.future_clock,
+        &batch.targets,
+        &batch.bins,
+        &batch.weights,
     ]
 }
 
@@ -41,18 +46,27 @@ fn synchronize(device: Device) {
 }
 
 pub fn run(args: BenchmarkArgs) -> Result<()> {
-    ensure!(args.batch_size > 0 && args.steps >= 32 && args.warmup >= 8,
-        "benchmark requires a positive batch size, at least 32 measured steps and 8 warmups");
+    ensure!(
+        args.batch_size > 0 && args.steps >= 32 && args.warmup >= 8,
+        "benchmark requires a positive batch size, at least 32 measured steps and 8 warmups"
+    );
     ensure!(!args.output.exists(), "benchmark output already exists");
     let ticker = runner::configured_ticker(args.ticker.as_deref())?;
     let device = runner::cuda_device()?;
     let _backward = crate::torch::cuda::cfg::disable_autograd_multithreading();
     let mut dataset = Dataset::load(&args.data_dir, &ticker)?;
     let origins = dataset.origins(Split::Train).to_vec();
-    ensure!(origins.len() >= args.batch_size, "insufficient training origins");
-    let rows: Vec<Vec<usize>> = (0..args.steps + args.warmup).map(|i| {
-        (0..args.batch_size).map(|j| origins[(i * 7919 + j * 997) % origins.len()]).collect()
-    }).collect();
+    ensure!(
+        origins.len() >= args.batch_size,
+        "insufficient training origins"
+    );
+    let rows: Vec<Vec<usize>> = (0..args.steps + args.warmup)
+        .map(|i| {
+            (0..args.batch_size)
+                .map(|j| origins[(i * 7919 + j * 997) % origins.len()])
+                .collect()
+        })
+        .collect();
     let initial_memory = cuda_memory(false)?;
     let prepared = Instant::now();
     dataset.prepare(device);
@@ -69,7 +83,11 @@ pub fn run(args: BenchmarkArgs) -> Result<()> {
     let mut measurements = Vec::new();
     // Alternate order to reduce clock/temperature bias. Both paths use the repaired BF16 model.
     for trial in 0..3 {
-        for cached in if trial % 2 == 0 { [false, true] } else { [true, false] } {
+        for cached in if trial % 2 == 0 {
+            [false, true]
+        } else {
+            [true, false]
+        } {
             for selected in &rows[..args.warmup] {
                 let _ = batch(&dataset, selected, device, cached)?;
             }
@@ -83,7 +101,11 @@ pub fn run(args: BenchmarkArgs) -> Result<()> {
             measurements.push((format!("{} batch ms", label(cached)), ms));
         }
         let mut states = Vec::new();
-        for cached in if trial % 2 == 0 { [false, true] } else { [true, false] } {
+        for cached in if trial % 2 == 0 {
+            [false, true]
+        } else {
+            [true, false]
+        } {
             tch::manual_seed(super::FROZEN_SEEDS[0] as i64);
             Cuda::manual_seed_all(super::FROZEN_SEEDS[0]);
             let store = nn::VarStore::new(device);
@@ -99,13 +121,21 @@ pub fn run(args: BenchmarkArgs) -> Result<()> {
                 }
                 let batch = batch(&dataset, selected, device, cached)?;
                 optimizer.zero_grad();
-                let logits = model.forward(&batch.endogenous, &batch.exogenous,
-                    &batch.validity, &batch.future_clock, true);
+                let logits = model.forward(
+                    &batch.endogenous,
+                    &batch.exogenous,
+                    &batch.validity,
+                    &batch.future_clock,
+                    true,
+                );
                 let loss = runner::hard_loss(&logits, &batch.bins, &batch.weights);
                 if cached {
                     runner::check_objective(&loss)?;
                 } else {
-                    ensure!(loss.double_value(&[]).is_finite(), "nonfinite reference objective");
+                    ensure!(
+                        loss.double_value(&[]).is_finite(),
+                        "nonfinite reference objective"
+                    );
                 }
                 loss.backward();
                 optimizer.step();
@@ -113,39 +143,75 @@ pub fn run(args: BenchmarkArgs) -> Result<()> {
             }
             synchronize(device);
             let ms = started.elapsed().as_secs_f64() * 1000. / args.steps as f64;
-            ensure!(loss_sum.double_value(&[]).is_finite(), "nonfinite benchmark objective");
-            measurements.push((format!("{} peak CUDA bytes including cache", label(cached)), cuda_memory(false)? as f64));
+            ensure!(
+                loss_sum.double_value(&[]).is_finite(),
+                "nonfinite benchmark objective"
+            );
+            measurements.push((
+                format!("{} peak CUDA bytes including cache", label(cached)),
+                cuda_memory(false)? as f64,
+            ));
             measurements.push((format!("{} training step ms", label(cached)), ms));
-            measurements.push((format!("{} training origins per second", label(cached)),
-                args.batch_size as f64 * 1000. / ms));
+            measurements.push((
+                format!("{} training origins per second", label(cached)),
+                args.batch_size as f64 * 1000. / ms,
+            ));
             let mut parameters: Vec<_> = store.variables().into_iter().collect();
             parameters.sort_by(|a, b| a.0.cmp(&b.0));
-            let parameters: Vec<_> = parameters.into_iter().map(|(_, value)|
-                value.detach().to_device(Device::Cpu)).collect();
+            let parameters: Vec<_> = parameters
+                .into_iter()
+                .map(|(_, value)| value.detach().to_device(Device::Cpu))
+                .collect();
             states.push(parameters);
         }
         let mut max_difference = 0.0_f64;
         for (a, b) in states[0].iter().zip(&states[1]) {
             let difference = (a - b).abs().max().double_value(&[]);
-            ensure!(difference.is_finite(), "nonfinite updated benchmark parameters");
+            ensure!(
+                difference.is_finite(),
+                "nonfinite updated benchmark parameters"
+            );
             max_difference = max_difference.max(difference);
         }
-        measurements.push(("parameter maximum absolute difference".to_owned(), max_difference));
-        ensure!(max_difference <= 1e-6, "optimized updates differ from reference: {max_difference}");
+        measurements.push((
+            "parameter maximum absolute difference".to_owned(),
+            max_difference,
+        ));
+        ensure!(
+            max_difference <= 1e-6,
+            "optimized updates differ from reference: {max_difference}"
+        );
     }
     measurements.push(("cache preparation ms".to_owned(), preparation_ms));
     measurements.push(("resident cache bytes".to_owned(), cache_memory as f64));
-    reports::write_benchmark(&args.output, &ticker, args.batch_size, args.steps, &measurements)?;
-    println!("TimeXer performance and equivalence reports: {}", args.output.display());
+    reports::write_benchmark(
+        &args.output,
+        &ticker,
+        args.batch_size,
+        args.steps,
+        &measurements,
+    )?;
+    println!(
+        "TimeXer performance and equivalence reports: {}",
+        args.output.display()
+    );
     Ok(())
 }
 
 fn label(cached: bool) -> &'static str {
-    if cached { "optimized" } else { "reference" }
+    if cached {
+        "optimized"
+    } else {
+        "reference"
+    }
 }
 
 fn batch(dataset: &Dataset, rows: &[usize], device: Device, cached: bool) -> Result<Batch> {
-    if cached { dataset.batch(rows, device) } else { dataset.batch_reference(rows, device) }
+    if cached {
+        dataset.batch(rows, device)
+    } else {
+        dataset.batch_reference(rows, device)
+    }
 }
 
 fn cuda_memory(reset: bool) -> Result<u64> {

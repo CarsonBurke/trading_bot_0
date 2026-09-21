@@ -50,9 +50,7 @@ pub(crate) fn copy_nonblocking(dst: &mut Tensor, src: &Tensor) -> Result<(), Str
 /// The pinned allocator comes from torch's CUDA hooks, so this needs a CUDA-enabled torch;
 /// callers that may run without a device must allocate pageable instead.
 pub(crate) fn empty_pinned(size: &[i64]) -> Result<Tensor, String> {
-    let ptr = unsafe {
-        torch_sys::at_empty_pinned_float(size.as_ptr(), size.len() as libc::c_int)
-    };
+    let ptr = unsafe { torch_sys::at_empty_pinned_float(size.as_ptr(), size.len() as libc::c_int) };
     read_torch_error()?;
     if ptr.is_null() {
         return Err("pinned host allocation returned no tensor".into());

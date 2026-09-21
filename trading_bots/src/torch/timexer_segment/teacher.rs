@@ -312,7 +312,10 @@ impl CeilingAccumulator {
         // there is no bar before the first. `previous_d` is one more shift of the SAME
         // difference, never a second differencing of the target.
         let previous_d = Tensor::cat(
-            &[d.narrow(1, 0, 1).zeros_like(), d.narrow(1, 0, self.pred_len - 1)],
+            &[
+                d.narrow(1, 0, 1).zeros_like(),
+                d.narrow(1, 0, self.pred_len - 1),
+            ],
             1,
         );
         add(&mut self.sum_dlag, &d * &previous_d);
@@ -349,7 +352,8 @@ impl CeilingAccumulator {
                 1,
             )
         };
-        let lag_covariance = cross(&self.sum_dlag, &self.sum_d, &shift(&self.sum_d)).cumsum(1, Kind::Double);
+        let lag_covariance =
+            cross(&self.sum_dlag, &self.sum_d, &shift(&self.sum_d)).cumsum(1, Kind::Double);
         let lag_scale = (&per_bar * shift(&per_bar))
             .clamp_min(0.)
             .sqrt()
@@ -368,12 +372,14 @@ impl CeilingAccumulator {
             .logical_and(&ic.isfinite())
             .to_kind(Kind::Double);
 
-        let tally = |usable: &Tensor| usable.sum_dim_intlist([0i64].as_slice(), false, Kind::Double);
+        let tally =
+            |usable: &Tensor| usable.sum_dim_intlist([0i64].as_slice(), false, Kind::Double);
         let mean = |value: &Tensor, usable: &Tensor, total: &Tensor| {
-            value
-                .masked_fill(&usable.eq(0.), 0.)
-                .sum_dim_intlist([0i64].as_slice(), false, Kind::Double)
-                / total
+            value.masked_fill(&usable.eq(0.), 0.).sum_dim_intlist(
+                [0i64].as_slice(),
+                false,
+                Kind::Double,
+            ) / total
         };
         let ceiling_of = |ratio: &Tensor| {
             let square: Tensor = 1. - leak * ratio;
@@ -422,8 +428,8 @@ impl CeilingAccumulator {
         // `∂θ/∂ρ̄ = -1`, and every timestamp contributes one scalar to the variance of that
         // combination.
         let scale = &ceiling * &mean_variance * 2.;
-        let statistic = &diagonal * (-leak / &scale) + &variance * (leak * &mean_diagonal
-            / (&scale * &mean_variance))
+        let statistic = &diagonal * (-leak / &scale)
+            + &variance * (leak * &mean_diagonal / (&scale * &mean_variance))
             - &ic;
         let gap_error = self.standard_error(&statistic, &paired, &paired_count);
         let ic_error = self.standard_error(&ic, &paired, &paired_count);
@@ -532,9 +538,11 @@ impl CeilingAccumulator {
     /// weakest possible evidence.
     fn standard_error(&self, statistic: &Tensor, usable: &Tensor, total: &Tensor) -> Tensor {
         let sum = |value: &Tensor| {
-            value
-                .masked_fill(&usable.eq(0.), 0.)
-                .sum_dim_intlist([0i64].as_slice(), false, Kind::Double)
+            value.masked_fill(&usable.eq(0.), 0.).sum_dim_intlist(
+                [0i64].as_slice(),
+                false,
+                Kind::Double,
+            )
         };
         let mean = sum(statistic) / total;
         let variance = sum(&(statistic - &mean).square()) / (total - 1.).clamp_min(1.);
@@ -824,10 +832,7 @@ pub(super) fn write_information_ceiling(
             &curve.wide_ceiling,
         ),
         line(format!("{FULL} student IC"), &curve.student_ic),
-        line(
-            format!("{FULL} ceiling minus student IC"),
-            &curve.gap,
-        ),
+        line(format!("{FULL} ceiling minus student IC"), &curve.gap),
         line(
             format!("{FULL} standard error of the paired ceiling minus student IC"),
             &curve.gap_error,
@@ -851,7 +856,9 @@ pub(super) fn write_information_ceiling(
         // their LABELS, not in the documentation: a reader who quotes a number off this panel
         // must be unable to quote it without the condition it is true under.
         line(
-            format!("{FULL} accumulation-bound ceiling IC, no serial assumption, vacuous past h 20"),
+            format!(
+                "{FULL} accumulation-bound ceiling IC, no serial assumption, vacuous past h 20"
+            ),
             &curve.accumulation_ceiling,
         ),
         line(
@@ -914,7 +921,10 @@ pub(super) fn write_variance_ratio(
         .first()
         .ok_or_else(|| anyhow::anyhow!("a variance-ratio chart needs at least one population"))?;
     let horizon = first.variance_ratio.len();
-    ensure!(horizon > 0, "a variance-ratio curve needs at least one horizon");
+    ensure!(
+        horizon > 0,
+        "a variance-ratio curve needs at least one horizon"
+    );
     let mut series = Vec::with_capacity(populations.len() * 2);
     for (split, curve) in populations {
         ensure!(
@@ -969,16 +979,23 @@ pub(super) fn write_return_autocorrelation(
     step: usize,
     populations: &[(&str, &CeilingCurve)],
 ) -> Result<()> {
-    let (_, first) = *populations.first().ok_or_else(|| {
-        anyhow::anyhow!("an autocorrelation chart needs at least one population")
-    })?;
+    let (_, first) = *populations
+        .first()
+        .ok_or_else(|| anyhow::anyhow!("an autocorrelation chart needs at least one population"))?;
     let horizon = first.lag_autocorrelation.len();
-    ensure!(horizon > 0, "an autocorrelation curve needs at least one horizon");
+    ensure!(
+        horizon > 0,
+        "an autocorrelation curve needs at least one horizon"
+    );
     let mut series = Vec::with_capacity(populations.len() * 2);
     for (split, curve) in populations {
         series.push(ReportSeries {
             label: format!("{split} measured lag-1 cross-sectional autocorrelation"),
-            values: curve.lag_autocorrelation.iter().map(|v| *v as f32).collect(),
+            values: curve
+                .lag_autocorrelation
+                .iter()
+                .map(|v| *v as f32)
+                .collect(),
         });
         series.push(ReportSeries {
             label: format!("{split} lag-1 autocorrelation the variance ratio implies under MA(1)"),
@@ -1033,10 +1050,7 @@ fn bottleneck_teacher(future: &Tensor, width: i64, horizons: &[i64]) -> Tensor {
     let selector = Tensor::zeros([pred_len, width], (Kind::Float, future.device()));
     for (slot, horizon) in horizons.iter().enumerate() {
         if (slot as i64) < width {
-            let _ = selector
-                .get(horizon - 1)
-                .get(slot as i64)
-                .fill_(1.);
+            let _ = selector.get(horizon - 1).get(slot as i64).fill_(1.);
         }
     }
     future.matmul(&selector)
@@ -1053,8 +1067,11 @@ mod tests {
         let centre = |t: &Tensor| t - t.mean_dim([0i64].as_slice(), true, Kind::Float);
         let (a, b) = (centre(left), centre(right));
         let numerator = (&a * &b).sum_dim_intlist([0i64].as_slice(), false, Kind::Double);
-        let denominator = (a.square().sum_dim_intlist([0i64].as_slice(), false, Kind::Double)
-            * b.square().sum_dim_intlist([0i64].as_slice(), false, Kind::Double))
+        let denominator = (a
+            .square()
+            .sum_dim_intlist([0i64].as_slice(), false, Kind::Double)
+            * b.square()
+                .sum_dim_intlist([0i64].as_slice(), false, Kind::Double))
         .sqrt();
         Vec::<f64>::try_from(numerator / denominator).unwrap()
     }
@@ -1135,7 +1152,9 @@ mod tests {
             .finish(one_bar)
             .unwrap();
         // The oracle forecast: the target itself, which is the strongest possible leak.
-        let leaked = accumulate(&[(increments, targets)]).finish(one_bar).unwrap();
+        let leaked = accumulate(&[(increments, targets)])
+            .finish(one_bar)
+            .unwrap();
         assert!(honest.ceiling.iter().all(|value| value.is_finite()));
         assert_eq!(
             honest.ceiling, leaked.ceiling,
@@ -1304,7 +1323,10 @@ mod tests {
                 // conditional mean up to a per-horizon positive scalar - and a within-timestamp
                 // correlation is invariant to that scalar, so this student sits exactly on the
                 // ceiling at every horizon.
-                (increments, drift.expand([names, HORIZONS], true).contiguous())
+                (
+                    increments,
+                    drift.expand([names, HORIZONS], true).contiguous(),
+                )
             })
             .collect();
         let (signal, unpredictable) = (signal_sd * signal_sd, noise_sd * noise_sd);

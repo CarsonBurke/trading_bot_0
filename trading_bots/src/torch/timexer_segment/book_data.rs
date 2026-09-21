@@ -18,16 +18,16 @@
 use super::{
     book::{self, Aggregation, BookConfig, BookFrame, BookQuote, HorizonPath, Weighting},
     book_diagnostics,
-    corpus::{Batch, Corpus, RESOLUTION_MS, WindowRef},
+    corpus::{Batch, Corpus, WindowRef, RESOLUTION_MS},
     model::CausalPatchModel,
     portfolio::{
         self, AccountEvaluation, CommissionTier, CostSource, Forecast, PortfolioConfig, Tape,
     },
     portfolio_data, reports,
-    runner::{Prefetcher, load_checkpoint},
+    runner::{load_checkpoint, Prefetcher},
 };
 use crate::torch::train::portfolio_cost::{BarCostModel, CostCalibration};
-use anyhow::{Context, Result, ensure};
+use anyhow::{ensure, Context, Result};
 use clap::Args;
 use serde::{Deserialize, Serialize};
 use std::{
@@ -711,7 +711,11 @@ fn row(name: &str, aum: f64, evaluation: &AccountEvaluation) -> Row {
     let get = |key: &str| evaluation.summary.get(key).copied().unwrap_or(f64::NAN);
     let either = |primary: &str, fallback: f64| {
         let value = get(primary);
-        if value.is_finite() { value } else { fallback }
+        if value.is_finite() {
+            value
+        } else {
+            fallback
+        }
     };
     // The same measurement the report panels annualize with, so the table's `ann_ret` and the
     // charted `annualized net return` cannot disagree about the window's length.
@@ -1116,7 +1120,9 @@ pub fn evaluate_book(args: BookEvaluateArgs) -> Result<()> {
             &panel,
             &labels,
             &args.book,
-            reproduction.as_ref().map(|ic| (BOOK_HORIZONS.as_slice(), ic)),
+            reproduction
+                .as_ref()
+                .map(|ic| (BOOK_HORIZONS.as_slice(), ic)),
         )?;
         record(
             &mut summary,
@@ -1259,7 +1265,10 @@ pub fn evaluate_book(args: BookEvaluateArgs) -> Result<()> {
     for (_, cfg, cells) in &designs {
         let book = build_book(&tape, &built, cfg, &account, &costs);
         let read = |key: &str| book.summary.get(key).copied().unwrap_or(0.0);
-        let (mean_gross, selected) = (read("book_mean_gross_fraction"), read("book_breadth_selected"));
+        let (mean_gross, selected) = (
+            read("book_mean_gross_fraction"),
+            read("book_breadth_selected"),
+        );
         // The same (design, size, fee schedule) cell can appear twice by construction - once in
         // the AUM sweep and once in the design sweep - and `simulate` is the expensive half.
         let mut seen: BTreeMap<(u64, &'static str), usize> = BTreeMap::new();
@@ -1294,7 +1303,11 @@ pub fn evaluate_book(args: BookEvaluateArgs) -> Result<()> {
                     .insert("breadth_selected_count".into(), *selected);
                 point.values.insert("breadth_banded_count".into(), *banded);
             }
-            record(&mut evaluation.summary, "book_min_trade_usd", config.min_trade);
+            record(
+                &mut evaluation.summary,
+                "book_min_trade_usd",
+                config.min_trade,
+            );
             record(
                 &mut evaluation.summary,
                 "book_name_notional_usd",

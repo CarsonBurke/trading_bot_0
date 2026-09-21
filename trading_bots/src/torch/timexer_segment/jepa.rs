@@ -80,6 +80,10 @@ pub enum JepaMode {
     AnchoredReconstruct,
     AnchoredProjected,
     AnchoredProjectedNoSigreg,
+    /// Predict per-offset changes in the projected target, and SIGReg those changes.
+    AnchoredTemporalProjected,
+    /// Control for temporal projected prediction without SIGReg.
+    AnchoredTemporalProjectedNoSigreg,
     AnchoredConditional,
     AnchoredProjectedSmall,
     /// Attached temporal prediction only; reader placement controls every regularizer.
@@ -104,6 +108,7 @@ impl JepaMode {
                 self,
                 Self::AnchoredNoSigreg
                     | Self::AnchoredProjectedNoSigreg
+                    | Self::AnchoredTemporalProjectedNoSigreg
                     | Self::AnchoredConditional
                     | Self::Unanchored
             )
@@ -113,7 +118,15 @@ impl JepaMode {
             self,
             Self::AnchoredProjected
                 | Self::AnchoredProjectedNoSigreg
+                | Self::AnchoredTemporalProjected
+                | Self::AnchoredTemporalProjectedNoSigreg
                 | Self::AnchoredProjectedSmall
+        )
+    }
+    pub fn temporal(self) -> bool {
+        matches!(
+            self,
+            Self::AnchoredTemporalProjected | Self::AnchoredTemporalProjectedNoSigreg
         )
     }
     pub fn conditional(self) -> bool {
@@ -149,6 +162,8 @@ impl fmt::Display for JepaMode {
             Self::AnchoredReconstruct => "anchored-reconstruct",
             Self::AnchoredProjected => "anchored-projected",
             Self::AnchoredProjectedNoSigreg => "anchored-projected-no-sigreg",
+            Self::AnchoredTemporalProjected => "anchored-temporal-projected",
+            Self::AnchoredTemporalProjectedNoSigreg => "anchored-temporal-projected-no-sigreg",
             Self::AnchoredConditional => "anchored-conditional",
             Self::AnchoredProjectedSmall => "anchored-projected-small",
             Self::Unanchored => "unanchored",
@@ -375,7 +390,7 @@ pub fn diagnostic_labels(config: &ModelConfig) -> Vec<&'static str> {
             "conditional CF prediction population std (last source)",
         ];
     }
-    vec![
+    let mut labels = vec![
         "latent MSE",
         "population SIGReg",
         "price-token reconstruction MSE",
@@ -388,7 +403,17 @@ pub fn diagnostic_labels(config: &ModelConfig) -> Vec<&'static str> {
             "observation population std"
         },
         "prediction population std (last source)",
-    ]
+    ];
+    if mode.temporal() {
+        labels[0] = "temporal projected-target delta MSE";
+        labels[1] = "temporal projected-target delta SIGReg";
+        labels[3] = "temporal projected-target delta persistence MSE";
+        labels[6] = "temporal projected-target delta population std";
+    }
+    if config.decision_sign_enabled() {
+        labels.push("decision sign logistic loss");
+    }
+    labels
 }
 
 struct ConditionalGeometry {
@@ -585,7 +610,7 @@ impl JepaHeads {
             .to_kind(Kind::Float);
         let sources = prediction.size()[1];
         // Attached targets: the observation encoder (and optional q) receives target gradients.
-        let targets = Tensor::stack(
+        let mut targets = Tensor::stack(
             &self
                 .offsets
                 .iter()
@@ -594,6 +619,10 @@ impl JepaHeads {
             2,
         )
         .to_kind(Kind::Float);
+        if config.jepa_mode.temporal() {
+            let source = views.target.narrow(1, 0, sources).unsqueeze(2);
+            targets = &targets - &source;
+        }
         let mask = pair_mask(valid, source_valid, self.offsets);
         let count = mask.sum(Kind::Float);
         let latent = masked_mse(&prediction, &targets, &mask);
@@ -639,6 +668,45 @@ impl JepaHeads {
             return (objective, diagnostics);
         }
         let (regularizer, population, target_std) = match random {
+            Some(random) if config.jepa_mode.temporal() => {
+                let source = views
+                    .target
+                    .index_select(1, &random.positions)
+                    .to_kind(Kind::Float);
+                let source_valid = source_valid
+                    .index_select(1, &random.positions)
+                    .transpose(0, 1);
+                let mut regularizer = zero.shallow_clone();
+                let mut population = zero.shallow_clone();
+                let mut target_std = zero.shallow_clone();
+                for &offset in self.offsets {
+                    let positions = &random.positions + offset;
+                    let valid = (&source_valid * valid.index_select(1, &positions).transpose(0, 1))
+                        .to_kind(Kind::Float);
+                    let target_views = views
+                        .target
+                        .index_select(1, &positions)
+                        .to_kind(Kind::Float)
+                        - &source;
+                    let target_views = target_views.transpose(0, 1);
+                    let (reg, pop) = if config.jepa_mode.regularized() {
+                        population_sigreg(&target_views, &valid, random)
+                    } else {
+                        (
+                            zero.shallow_clone(),
+                            valid
+                                .sum_dim_intlist([1i64].as_slice(), false, Kind::Float)
+                                .mean(Kind::Float),
+                        )
+                    };
+                    regularizer = &regularizer + reg;
+                    population = &population + pop;
+                    target_std =
+                        &target_std + tch::no_grad(|| population_std(&target_views, &valid));
+                }
+                let count = self.offsets.len() as f64;
+                (regularizer / count, population / count, target_std / count)
+            }
             Some(random) => {
                 let target_views = views
                     .target
@@ -687,15 +755,19 @@ impl JepaHeads {
                 }
             + &reconstruction * config.jepa.reconstruction_weight;
         let diagnostics = tch::no_grad(|| {
-            let persistence = masked_mse(
-                &views
-                    .target
-                    .narrow(1, 0, sources)
-                    .unsqueeze(2)
-                    .to_kind(Kind::Float),
-                &targets,
-                &mask,
-            );
+            let persistence = if config.jepa_mode.temporal() {
+                masked_mse(&targets.zeros_like(), &targets, &mask)
+            } else {
+                masked_mse(
+                    &views
+                        .target
+                        .narrow(1, 0, sources)
+                        .unsqueeze(2)
+                        .to_kind(Kind::Float),
+                    &targets,
+                    &mask,
+                )
+            };
             let pred_std = population_std(
                 &prediction.select(1, sources - 1).transpose(0, 1),
                 &mask.select(1, sources - 1).transpose(0, 1),
@@ -765,9 +837,15 @@ pub(super) struct JepaRandom {
 impl JepaRandom {
     pub fn new(config: &ModelConfig, device: Device) -> Self {
         let first = (config.min_history + config.patch_len - 1) / config.patch_len - 1;
-        // Sources need no future target: keep the final context patch eligible. Legacy JEPA
-        // sampled populations already use this full range independently of prediction offsets.
-        let views = config.jepa.views.min(config.origins() - first);
+        // Temporal projected targets need every sampled source plus its furthest future
+        // offset. Other modes retain the legacy full source population, including the final
+        // context patch.
+        let last_exclusive = if config.jepa_mode.temporal() {
+            config.origins() - config.jepa_mode.offsets().last().copied().unwrap()
+        } else {
+            config.origins()
+        };
+        let views = config.jepa.views.min(last_exclusive - first);
         let width = config.jepa_mode.target_width(config.d_model);
         let knots = Tensor::linspace(0., 3., 17, (Kind::Float, device));
         let normal_ecf = (-knots.square() * 0.5).exp();
@@ -782,7 +860,7 @@ impl JepaRandom {
             normal_ecf,
             rng: ChaCha8Rng::seed_from_u64(config.jepa.seed ^ 0x4a45_5041_5349_4752),
             values: vec![0.; (width * config.jepa.directions) as usize],
-            candidates: (first..config.origins()).collect(),
+            candidates: (first..last_exclusive).collect(),
             device,
         }
     }
@@ -953,6 +1031,48 @@ mod tests {
     }
 
     #[test]
+    fn temporal_projected_objective_uses_per_offset_target_deltas() {
+        let config = ModelConfig {
+            jepa_mode: JepaMode::AnchoredTemporalProjectedNoSigreg,
+            ..config()
+        };
+        let store = nn::VarStore::new(Device::Cpu);
+        let heads = JepaHeads::new(store.root(), &config);
+        let observation = Tensor::randn([2, 16, 8], (Kind::Float, Device::Cpu));
+        let target = heads.target(&observation);
+        let sources = 4;
+        let expected = Tensor::stack(
+            &config
+                .jepa_mode
+                .offsets()
+                .iter()
+                .map(|&offset| target.narrow(1, offset, sources) - target.narrow(1, 0, sources))
+                .collect::<Vec<_>>(),
+            2,
+        );
+        let prediction = Tensor::zeros_like(&expected).set_requires_grad(true);
+        let valid = Tensor::ones([2, 16], (Kind::Float, Device::Cpu));
+        let views = RepresentationViews {
+            prediction: Some(prediction),
+            observation: observation.shallow_clone(),
+            target,
+            state: Tensor::zeros([2, 16, 8], (Kind::BFloat16, Device::Cpu)),
+            reconstruction_target: Tensor::zeros([2, 16, 64], (Kind::Float, Device::Cpu)),
+            conditional: None,
+            horizons: config.jepa_horizons(),
+        };
+        let (objective, diagnostics) = heads.objective(&config, &views, &valid, &valid, None);
+        let mask = Tensor::ones([2, sources, 5], (Kind::Float, Device::Cpu));
+        let expected_loss = masked_mse(&Tensor::zeros_like(&expected), &expected, &mask);
+        assert!((objective.double_value(&[]) - expected_loss.double_value(&[])).abs() < 1e-6);
+        assert_eq!(
+            diagnostics.double_value(&[3]),
+            objective.double_value(&[]),
+            "temporal persistence is the zero-delta baseline"
+        );
+    }
+
+    #[test]
     fn cuda_jepa_targets_are_attached_and_invalid_or_short_history_pairs_have_zero_gradient() {
         let _rng = crate::torch::test_rng::exclusive();
         let Some(device) = gpu() else {
@@ -962,6 +1082,8 @@ mod tests {
         for mode in [
             JepaMode::AnchoredNoSigreg,
             JepaMode::AnchoredProjectedNoSigreg,
+            JepaMode::AnchoredTemporalProjected,
+            JepaMode::AnchoredTemporalProjectedNoSigreg,
             JepaMode::Unanchored,
         ] {
             let mut config = ModelConfig {
@@ -973,7 +1095,8 @@ mod tests {
                 config.future_calendar = false;
                 config.jepa.reconstruction_weight = 0.;
             }
-            let mut random = mode.unanchored().then(|| JepaRandom::new(&config, device));
+            let mut random =
+                (mode.regularized() || mode.unanchored()).then(|| JepaRandom::new(&config, device));
             if let Some(random) = &mut random {
                 random.refresh().unwrap();
             }
@@ -1004,14 +1127,15 @@ mod tests {
             );
             let gradient = observation.grad();
             assert!(gradient.defined(), "future target encoder was detached");
+            let invalid_prefix = if mode.temporal() {
+                gradient.narrow(1, 0, 1)
+            } else {
+                gradient.narrow(1, 0, 3)
+            };
             assert_eq!(
-                gradient
-                    .narrow(1, 0, 3)
-                    .abs()
-                    .sum(Kind::Float)
-                    .double_value(&[]),
+                invalid_prefix.abs().sum(Kind::Float).double_value(&[]),
                 0.,
-                "target index0 has no source; index1's source lacks history; index2 is invalid"
+                "masked source/target positions must have zero target gradient"
             );
             assert!(
                 gradient

@@ -160,12 +160,9 @@ impl AuditCache {
             .collect();
         entries.sort_unstable_by(|a, b| a.symbol.cmp(&b.symbol));
         self.dirty = entries.len() != self.entries.len()
-            || entries
-                .iter()
-                .zip(&self.entries)
-                .any(|(fresh, stored)| {
-                    fresh.symbol != stored.symbol || fresh.identity != stored.identity
-                });
+            || entries.iter().zip(&self.entries).any(|(fresh, stored)| {
+                fresh.symbol != stored.symbol || fresh.identity != stored.identity
+            });
         self.entries = entries;
     }
 
@@ -529,7 +526,10 @@ impl LoadTiming {
     pub fn phases(&self) -> Vec<(&'static str, f64)> {
         vec![
             ("directory scan and header open", self.directory_scan_ms),
-            ("bar ledger authentication (inode identity)", self.audit_ledger_ms),
+            (
+                "bar ledger authentication (inode identity)",
+                self.audit_ledger_ms,
+            ),
             ("cached artifact read and decode", self.cache_read_ms),
             ("bar audit (grid checks and SHA-256)", self.bar_audit_ms),
             ("shared partition boundaries", self.shared_bounds_ms),
@@ -543,9 +543,15 @@ impl LoadTiming {
             ("corpus load total", self.total_ms),
             ("CUDA context and device selection", self.cuda_context_ms),
             ("corpus contract and census reports", self.corpus_report_ms),
-            ("model, optimizer and captured-step allocation", self.model_build_ms),
+            (
+                "model, optimizer and captured-step allocation",
+                self.model_build_ms,
+            ),
             ("held-out and cross-section draws", self.held_out_draw_ms),
-            ("row selection and supervision census", self.row_selection_ms),
+            (
+                "row selection and supervision census",
+                self.row_selection_ms,
+            ),
             ("pre-first-step startup total", self.startup_total_ms),
             (
                 "bar records rescanned (millions)",

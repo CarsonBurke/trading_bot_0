@@ -359,7 +359,9 @@ fn cuda_allocated() -> Result<f64> {
     Python::attach(|py| -> Result<f64> {
         let cuda = py.import("torch")?.getattr("cuda")?;
         cuda.call_method0("init")?;
-        Ok(cuda.call_method1("memory_allocated", (0,))?.extract::<u64>()? as f64)
+        Ok(cuda
+            .call_method1("memory_allocated", (0,))?
+            .extract::<u64>()? as f64)
     })
 }
 
@@ -397,9 +399,7 @@ fn event_timed<T>(rounds: usize, mut operation: impl FnMut() -> T) -> Result<f64
     })?;
     let record = |event: &Py<PyAny>| -> Result<()> {
         Python::attach(|py| -> Result<()> {
-            event
-                .bind(py)
-                .call_method1("record", (stream.bind(py),))?;
+            event.bind(py).call_method1("record", (stream.bind(py),))?;
             Ok(())
         })
     };
@@ -794,7 +794,10 @@ fn paired_loss_arm(
     rounds: usize,
     repeats: usize,
 ) -> Result<PairedLoss> {
-    ensure!(rounds > 0 && repeats > 0, "the paired arm needs a round and a repeat");
+    ensure!(
+        rounds > 0 && repeats > 0,
+        "the paired arm needs a round and a repeat"
+    );
     // Warmup's cached blocks go back to the driver first, and the peak counters start here,
     // so the number this reports is THIS arm's requirement and not the whole run's history.
     crate::torch::cuda::empty_cache();
@@ -892,7 +895,8 @@ pub fn run(args: BenchmarkArgs) -> Result<()> {
         * 0.002
         + 100.0f64.ln();
     let open = &close + Tensor::randn([history_len, 1], (Kind::Float, device)) * 0.0001;
-    let high = close.maximum(&open) + Tensor::rand([history_len, 1], (Kind::Float, device)) * 0.0002;
+    let high =
+        close.maximum(&open) + Tensor::rand([history_len, 1], (Kind::Float, device)) * 0.0002;
     let low = close.minimum(&open) - Tensor::rand([history_len, 1], (Kind::Float, device)) * 0.0002;
     let log_history = Tensor::cat(&[open, high, low, close], 1);
     let aux_channels = args.model.features.channels() as i64;
@@ -1107,22 +1111,49 @@ pub fn run(args: BenchmarkArgs) -> Result<()> {
         // Named units, so each row states its own: MiB for the byte budget, milliseconds for
         // the two step times, dimensionless relative difference for the two equalities.
         summary.extend([
-            ("captured step private mempool MiB", audit.budget.pool_reservation_mib),
+            (
+                "captured step private mempool MiB",
+                audit.budget.pool_reservation_mib,
+            ),
             ("device total MiB", audit.budget.device_total_mib),
-            ("allocator reserved before warmup MiB", audit.budget.before_warmup.reserved_mib),
-            ("allocator reserved after warmup MiB", audit.budget.after_warmup.reserved_mib),
-            ("allocator reserved after empty_cache MiB", audit.budget.after_empty_cache.reserved_mib),
-            ("allocator reserved at capture end MiB", audit.budget.at_capture_end.reserved_mib),
-            ("allocator live at capture start MiB", audit.budget.at_capture_start.allocated_mib),
-            ("eager step peak allocator MiB", audit.eager_peak_allocated_mib),
+            (
+                "allocator reserved before warmup MiB",
+                audit.budget.before_warmup.reserved_mib,
+            ),
+            (
+                "allocator reserved after warmup MiB",
+                audit.budget.after_warmup.reserved_mib,
+            ),
+            (
+                "allocator reserved after empty_cache MiB",
+                audit.budget.after_empty_cache.reserved_mib,
+            ),
+            (
+                "allocator reserved at capture end MiB",
+                audit.budget.at_capture_end.reserved_mib,
+            ),
+            (
+                "allocator live at capture start MiB",
+                audit.budget.at_capture_start.allocated_mib,
+            ),
+            (
+                "eager step peak allocator MiB",
+                audit.eager_peak_allocated_mib,
+            ),
             ("eager step milliseconds", audit.eager_step_ms),
             ("captured replay step milliseconds", audit.replay_step_ms),
             (
                 "captured replay step time as a fraction of eager",
                 audit.replay_step_ms / audit.eager_step_ms,
             ),
-            ("capture vs eager objective maximum relative difference", audit.loss_max_relative),
-            ("capture vs eager parameter maximum relative difference", audit.parameter_max_relative),
+            (
+                "capture vs eager objective maximum relative difference",
+                audit.loss_max_relative,
+            ),
+            (
+                "capture vs eager parameter maximum relative difference",
+                audit.parameter_max_relative,
+            ),
             ("capture audit compared steps", audit.compared_steps as f64),
             (
                 "training step with one host objective read per step, milliseconds",
@@ -1144,9 +1175,18 @@ pub fn run(args: BenchmarkArgs) -> Result<()> {
     if let Some(paired) = &paired {
         let mean_delta = paired.composed_ms - paired.fused_ms;
         summary.extend([
-            ("paired loss chain, fused forward+backward, milliseconds", paired.fused_ms),
-            ("paired loss chain, composed-ATen forward+backward, milliseconds", paired.composed_ms),
-            ("paired loss chain delta, milliseconds (composed minus fused)", mean_delta),
+            (
+                "paired loss chain, fused forward+backward, milliseconds",
+                paired.fused_ms,
+            ),
+            (
+                "paired loss chain, composed-ATen forward+backward, milliseconds",
+                paired.composed_ms,
+            ),
+            (
+                "paired loss chain delta, milliseconds (composed minus fused)",
+                mean_delta,
+            ),
             (
                 "paired loss chain, fused arm spread across repeats, milliseconds",
                 paired.fused_drift_ms,
@@ -1165,8 +1205,14 @@ pub fn run(args: BenchmarkArgs) -> Result<()> {
             // materializes the intermediates the fusion exists to delete. It is the most
             // OOM-prone job in the batch while being the one that most needs to run, so its
             // requirement is measured rather than assumed.
-            ("paired loss chain peak allocator MiB", paired.peak_allocated_mib),
-            ("paired loss chain peak reserved MiB", paired.peak_reserved_mib),
+            (
+                "paired loss chain peak allocator MiB",
+                paired.peak_allocated_mib,
+            ),
+            (
+                "paired loss chain peak reserved MiB",
+                paired.peak_reserved_mib,
+            ),
         ]);
     }
     // Owned labels, so the per-repeat rows are built where the series are and nothing has to
@@ -1249,7 +1295,11 @@ pub fn run(args: BenchmarkArgs) -> Result<()> {
         let layers = args.model.layers as f64;
         // Two residual `addcmul`s per layer for the residual scales, plus one for the x0
         // injection when the run has one.
-        let addcmuls = if args.model.x0_lambdas.enabled() { 3. } else { 2. };
+        let addcmuls = if args.model.x0_lambdas.enabled() {
+            3.
+        } else {
+            2.
+        };
         let scaled = |row: &KernelRow| {
             let name: &str = row.name;
             let repeats = match name {

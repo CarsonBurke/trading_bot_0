@@ -335,10 +335,16 @@ impl Dataset {
         history: usize,
         future: usize,
     ) -> Result<&[CandleBar]> {
-        let start = origin.checked_sub(history).context("candle history precedes corpus")?;
-        let end = origin.checked_add(future).and_then(|i| i.checked_add(1))
+        let start = origin
+            .checked_sub(history)
+            .context("candle history precedes corpus")?;
+        let end = origin
+            .checked_add(future)
+            .and_then(|i| i.checked_add(1))
             .context("candle window index overflow")?;
-        self.candles.get(start..end).context("candle future exceeds corpus")
+        self.candles
+            .get(start..end)
+            .context("candle future exceeds corpus")
     }
     pub fn target(&self, origin: usize) -> [f64; 6] {
         targets_at(&self.closes, &self.sigmas, origin)
@@ -680,8 +686,10 @@ mod tests {
         let window = dataset.candle_window(origin, 32, 100).unwrap();
         assert_eq!(window.len(), 133);
         for (candle, bar) in window.iter().zip(&bars[origin - 32..=origin + 100]) {
-            assert_eq!([candle.open, candle.high, candle.low, candle.close],
-                [bar.open, bar.high, bar.low, bar.close]);
+            assert_eq!(
+                [candle.open, candle.high, candle.low, candle.close],
+                [bar.open, bar.high, bar.low, bar.close]
+            );
         }
         assert_eq!(window[32].close, bars[origin].close as f32);
         assert!(dataset.candle_window(0, 32, 100).is_err());

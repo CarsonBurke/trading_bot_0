@@ -649,6 +649,10 @@ pub struct ModelConfig {
     #[arg(long, default_value_t = 0.0)]
     #[serde(default, skip_serializing_if = "no_amplitude_prior")]
     pub temporal_moment_weight: f64,
+    /// Logistic sign loss on the seven observable decision-horizon close forecasts.
+    #[arg(long, default_value_t = 0.0)]
+    #[serde(default, skip_serializing_if = "no_amplitude_prior")]
+    pub decision_sign_weight: f64,
     /// Matched direct close-MSE control at the seven temporal-moment decision horizons.
     #[arg(long, default_value_t = 0.0)]
     #[serde(default, skip_serializing_if = "no_amplitude_prior")]
@@ -772,6 +776,7 @@ impl Default for ModelConfig {
             horizon_mean: HorizonMean::Free,
             amplitude_prior: 0.0,
             temporal_moment_weight: 0.0,
+            decision_sign_weight: 0.0,
             decision_mse_weight: 0.0,
             target_basis: TargetBasis::Cumulative,
             basis_weight: BasisWeight::Uniform,
@@ -838,9 +843,36 @@ impl ModelConfig {
             self.temporal_moment_weight.is_finite()
                 && self.temporal_moment_weight >= 0.
                 && self.decision_mse_weight.is_finite()
-                && self.decision_mse_weight >= 0.,
-            "--temporal-moment-weight and --decision-mse-weight must be finite and non-negative"
+                && self.decision_mse_weight >= 0.
+                && self.decision_sign_weight.is_finite()
+                && self.decision_sign_weight >= 0.,
+            "--temporal-moment-weight, --decision-mse-weight and --decision-sign-weight must be finite and non-negative"
         );
+        if self.decision_sign_weight > 0. {
+            ensure!(
+                self.jepa_mode.enabled()
+                    && !self.jepa_mode.unanchored()
+                    && !self.jepa_mode.conditional(),
+                "--decision-sign-weight requires an anchored non-conditional JEPA forecast path"
+            );
+            ensure!(
+                self.sigreg_placement == SigregPlacement::Off,
+                "--decision-sign-weight cannot be combined with reader SIGReg"
+            );
+            ensure!(
+                self.target_basis.is_identity()
+                    && !matches!(self.horizon_mean, HorizonMean::Increment { .. }),
+                "--decision-sign-weight requires cumulative, non-increment means"
+            );
+            ensure!(
+                !self.future_calendar,
+                "--decision-sign-weight requires --future-calendar false"
+            );
+            ensure!(
+                self.pred_len >= *super::temporal_moments::HORIZONS.last().unwrap(),
+                "--decision-sign-weight requires all seven decision horizons through 192"
+            );
+        }
         if self.temporal_moments_enabled() {
             ensure!(
                 !self.jepa_mode.enabled(),
@@ -1013,6 +1045,14 @@ impl ModelConfig {
         self.temporal_moment_weight > 0. || self.decision_mse_weight > 0.
     }
 
+    pub fn decision_sign_enabled(&self) -> bool {
+        self.decision_sign_weight > 0.
+    }
+
+    fn temporal_geometry_enabled(&self) -> bool {
+        self.temporal_moments_enabled() || self.decision_sign_enabled()
+    }
+
     pub fn needs_representation_random(&self) -> bool {
         self.jepa_mode.needs_random() || self.sigreg_placement.enabled()
     }
@@ -1049,21 +1089,32 @@ impl ModelConfig {
                     self.future_calendar,
                 );
             }
-            let target = if self.jepa_mode == JepaMode::AnchoredProjectedSmall {
+            let target = if self.jepa_mode.temporal() {
+                "attached-nonoverlapping-future-q-delta(observation);projector=pointwise-d_model-gelu-d_model-no-normalization-no-dropout;forecast-input=original-observation;sigreg=per-offset-temporal-delta"
+            } else if self.jepa_mode == JepaMode::AnchoredProjectedSmall {
                 "attached-nonoverlapping-future-q(observation);projector=pointwise-d_model-gelu-16-no-normalization-no-dropout;forecast-input=original-observation"
             } else if self.jepa_mode.projected() {
                 "attached-nonoverlapping-future-q(observation);projector=pointwise-d_model-gelu-d_model-no-normalization-no-dropout;forecast-input=original-observation"
             } else {
                 "attached-nonoverlapping-future-observation"
             };
+            let decision_objective = if self.decision_sign_enabled() {
+                format!(
+                    ";decision-sign-weight={};objective=forecast-plus-decision-sign-logistic",
+                    self.decision_sign_weight
+                )
+            } else {
+                String::new()
+            };
             format!(
-                "temporal-lejepa-v1;mode={};config={};horizons-bars={:?};observation=unconstrained-shared-full-width-patch-embedding(causal-prefix-normalization);target={};predictor=direct-state-mlp;population=batch-rows-per-view;reconstruction=normalized-local-price-tokens;forecast-detached={};future-calendar={}",
+                "temporal-lejepa-v1;mode={};config={};horizons-bars={:?};observation=unconstrained-shared-full-width-patch-embedding(causal-prefix-normalization);target={};predictor=direct-state-mlp;population=batch-rows-per-view;reconstruction=normalized-local-price-tokens;forecast-detached={};future-calendar={}{}",
                 self.jepa_mode,
                 serde_json::to_string(&self.jepa).expect("validated JEPA config"),
                 self.jepa_horizons(),
                 target,
                 self.jepa_mode.detached_forecast(),
                 self.future_calendar,
+                decision_objective,
             )
         })
     }
@@ -1297,7 +1348,6 @@ impl ModelConfig {
                 // Selected close/market endpoints, interval prefix counts and fixed CF phases;
                 // no second dense forecast target and no random sphere projection.
                 traffic += 4. * fp32(rows * self.seq_len as f64)
-                    + 8. * fp32(sources * offsets.len() as f64);
             }
             if self.jepa_mode.projected() {
                 arithmetic += 3. * (gemm(tokens, width, width) + gemm(tokens, width, output_dim));
@@ -1335,10 +1385,9 @@ impl ModelConfig {
         } else {
             (0., 0.)
         };
-        let (moment_flops, moment_bytes) = if self.temporal_moments_enabled() {
+        let (moment_flops, moment_bytes) = if self.temporal_geometry_enabled() {
             let instruments = super::temporal_moments::INSTRUMENT_WIDTH as f64;
             let decisions = super::temporal_moments::HORIZONS.len() as f64;
-            // One fixed Fourier projection, one summed-moment BMM and one diagonal BMM.
             // Fixed instruments have no gradient; only moment-enabled arms differentiate BMMs.
             let passes = if self.temporal_moment_weight > 0. {
                 2.
@@ -2142,7 +2191,7 @@ impl CausalPatchModel {
                 .enabled()
                 .then(|| JepaHeads::new(path / "jepa", config)),
             temporal_moments: config
-                .temporal_moments_enabled()
+                .temporal_geometry_enabled()
                 .then(|| TemporalMoments::new(config, device)),
             config: config.clone(),
         };
@@ -2598,7 +2647,22 @@ impl CausalPatchModel {
             heads.objective(c, &views, &valid, &source_valid, random)
         };
         losses.objective = &losses.objective + auxiliary;
-        losses.jepa = Some(diagnostics);
+        let decision_sign = if c.decision_sign_enabled() {
+            let geometry = self
+                .temporal_moments
+                .as_ref()
+                .expect("decision sign geometry enabled");
+            let decision = geometry.select(self, &head, &targets, &mask);
+            let loss = geometry.decision_sign_loss(&decision);
+            losses.objective = &losses.objective + &loss * c.decision_sign_weight;
+            Some(loss.detach())
+        } else {
+            None
+        };
+        losses.jepa = Some(match decision_sign {
+            Some(loss) => Tensor::cat(&[diagnostics, loss.unsqueeze(0)], 0),
+            None => diagnostics,
+        });
         losses
     }
 
@@ -4109,6 +4173,7 @@ mod tests {
             horizon_mean: HorizonMean::Free,
             amplitude_prior: 0.0,
             temporal_moment_weight: 0.0,
+            decision_sign_weight: 0.0,
             decision_mse_weight: 0.0,
             target_basis: TargetBasis::Cumulative,
             basis_weight: BasisWeight::Uniform,
@@ -8124,6 +8189,8 @@ mod tests {
         for mode in [
             JepaMode::Anchored,
             JepaMode::AnchoredProjected,
+            JepaMode::AnchoredTemporalProjected,
+            JepaMode::AnchoredTemporalProjectedNoSigreg,
             JepaMode::AnchoredProjectedSmall,
             JepaMode::AnchoredConditional,
         ] {

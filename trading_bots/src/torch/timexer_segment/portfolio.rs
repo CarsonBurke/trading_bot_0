@@ -3,7 +3,7 @@ use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
-use anyhow::{Result, bail, ensure};
+use anyhow::{bail, ensure, Result};
 use chrono::{Datelike, TimeZone, Utc};
 use clap::Args;
 use serde::{Deserialize, Serialize};
@@ -198,7 +198,10 @@ impl PortfolioConfig {
             ("tiered cap", self.tiered_cap_fraction),
             ("clearing per share", self.clearing_per_share),
             ("exchange per share", self.exchange_per_share_remove),
-            ("exchange rebate per share", self.exchange_rebate_per_share_add),
+            (
+                "exchange rebate per share",
+                self.exchange_rebate_per_share_add,
+            ),
             ("SEC fee", self.sec_fee_per_million),
             ("TAF fee", self.taf_per_share),
             ("TAF cap", self.taf_cap),
@@ -818,9 +821,14 @@ impl<'a> AllocationContext<'a> {
         if shares < 0.0 && !self.assets[i].shortable && !self.config.allow_assumed_short {
             return 0;
         }
-        let magnitude = share_limit(shares.abs().round())
-            .min(share_limit(self.config.max_weight * self.equity / a.marks[i]));
-        if shares < 0.0 { -magnitude } else { magnitude }
+        let magnitude = share_limit(shares.abs().round()).min(share_limit(
+            self.config.max_weight * self.equity / a.marks[i],
+        ));
+        if shares < 0.0 {
+            -magnitude
+        } else {
+            magnitude
+        }
     }
     /// The supplied vector shrunk `scale` of the way from the held book toward `desired`.
     ///
@@ -1905,10 +1913,7 @@ pub fn simulate(
                     "breadth_min_trade_suppressed_count",
                     b.min_trade_suppressed as f64,
                 ),
-                (
-                    "breadth_rounding_deleted_count",
-                    b.rounding_deleted as f64,
-                ),
+                ("breadth_rounding_deleted_count", b.rounding_deleted as f64),
                 ("requested_turnover_fraction", requested_turnover),
                 ("ramp_scale_fraction", b.ramp_scale),
             ] {
@@ -2064,10 +2069,7 @@ pub fn simulate(
         "book_funding_gross_ceiling".into(),
         2.0 / (1.0 + config.initial_margin),
     );
-    summary.insert(
-        "book_forced_decision_count".into(),
-        forced_decisions as f64,
-    );
+    summary.insert("book_forced_decision_count".into(), forced_decisions as f64);
     if breadth_decisions > 0 {
         let per_decision = breadth_decisions as f64;
         for (key, value) in [
@@ -2584,8 +2586,22 @@ mod tests {
         let c = PortfolioConfig::default();
         let quantity = 1_000.0;
         let taf_and_cat = (quantity * c.taf_per_share).min(c.taf_cap) + quantity * c.cat_per_share;
-        let before = trade_cost(-1_000, 50.0, &c, &CostSource::Flat, 0, c.sec_fee_zero_from_ms - 1);
-        let after = trade_cost(-1_000, 50.0, &c, &CostSource::Flat, 0, c.sec_fee_zero_from_ms);
+        let before = trade_cost(
+            -1_000,
+            50.0,
+            &c,
+            &CostSource::Flat,
+            0,
+            c.sec_fee_zero_from_ms - 1,
+        );
+        let after = trade_cost(
+            -1_000,
+            50.0,
+            &c,
+            &CostSource::Flat,
+            0,
+            c.sec_fee_zero_from_ms,
+        );
         assert!(before.regulatory > after.regulatory);
         assert!((after.regulatory - taf_and_cat).abs() < 1e-12);
         for ts in [c.sec_fee_zero_from_ms - 1, c.sec_fee_zero_from_ms] {
@@ -2616,8 +2632,7 @@ mod tests {
             let quantity = shares.unsigned_abs() as f64;
             let notional = quantity * mid;
             let execution_notional = notional
-                * (1.0
-                    + shares.signum() as f64 * (c.spread_bps * 0.5 + c.slippage_bps) / 10_000.0);
+                * (1.0 + shares.signum() as f64 * (c.spread_bps * 0.5 + c.slippage_bps) / 10_000.0);
             let costs = trade_cost(
                 shares,
                 mid,

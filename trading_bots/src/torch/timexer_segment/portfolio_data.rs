@@ -1,12 +1,12 @@
 use super::{
     calibration::{FrozenGain, Pairing},
-    corpus::{Batch, Corpus, CorpusTicker, RESOLUTION_MS, WindowRef},
+    corpus::{Batch, Corpus, CorpusTicker, WindowRef, RESOLUTION_MS},
     model::CausalPatchModel,
     portfolio::{self, AccountEvaluation, Asset, Forecast, Frame, Quote, Tape},
     portfolio_calibration,
     runner::{PortfolioEvaluateArgs, Prefetcher},
 };
-use anyhow::{Context, Result, ensure};
+use anyhow::{ensure, Context, Result};
 use chrono::{NaiveDate, TimeZone, Timelike};
 use chrono_tz::America::New_York;
 use clap::Args;

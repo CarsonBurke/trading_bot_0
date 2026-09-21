@@ -117,9 +117,7 @@ const DECIMATION_STREAM: u64 = 0x6465_6369_6d5f_7068;
 ///
 /// [`Self::None`] allocates no buffer and emits no multiply at all, so the control arm is
 /// bit-for-bit the pre-knob objective rather than merely equal to it.
-#[derive(
-    Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, ValueEnum, Hash,
-)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, ValueEnum, Hash)]
 #[serde(rename_all = "kebab-case")]
 pub enum HorizonDecimation {
     #[default]
@@ -377,9 +375,7 @@ impl DecimationInterval {
 /// `cum(A → A+h)` of a phased origin is an exact linear combination of two lattice-supervised
 /// cumulative returns. So the support changes and the ceiling does not, which is precisely why
 /// this is a regularizer against tokenization-specific memorization and not a data fix.
-#[derive(
-    Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, ValueEnum, Hash,
-)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, ValueEnum, Hash)]
 #[serde(rename_all = "kebab-case")]
 pub enum PatchPhase {
     /// One shared phase for the whole universe: today's corpus, exactly.
@@ -475,10 +471,7 @@ impl RowSelection {
         }
         let mut parts = Vec::new();
         if self.stride_multiple > 1 {
-            parts.push(format!(
-                "every {}th row per ticker",
-                self.stride_multiple
-            ));
+            parts.push(format!("every {}th row per ticker", self.stride_multiple));
         }
         if self.fraction < 1. {
             parts.push(format!("{:.4} of the pool at random", self.fraction));
@@ -898,10 +891,7 @@ fn deciles(corpus: &Corpus, refs: &[WindowRef]) -> [f64; 10] {
             || (i64::MAX, i64::MIN),
             |(lo, hi), &ts| (lo.min(ts), hi.max(ts)),
         )
-        .reduce(
-            || (i64::MAX, i64::MIN),
-            |a, b| (a.0.min(b.0), a.1.max(b.1)),
-        );
+        .reduce(|| (i64::MAX, i64::MIN), |a, b| (a.0.min(b.0), a.1.max(b.1)));
     let span = (last - first).max(1) as f64;
     let mut counts = [0u64; 10];
     for ts in stamps {
@@ -922,10 +912,7 @@ fn deciles(corpus: &Corpus, refs: &[WindowRef]) -> [f64; 10] {
 /// miscounted. Two sorted event lists merged with a running sum, per residue, per ticker:
 /// `O(rows log rows)` in total and independent of how many origins the corpus holds, which is
 /// what makes this affordable at 31 million supervised origins.
-fn multiplicity_histogram(
-    by_ticker: &[Vec<usize>],
-    geometry: SupervisionGeometry,
-) -> Vec<u64> {
+fn multiplicity_histogram(by_ticker: &[Vec<usize>], geometry: SupervisionGeometry) -> Vec<u64> {
     let width = geometry.origins_per_row + 1;
     let stride = geometry.stride as i64;
     let window = geometry.window as i64;
@@ -1048,7 +1035,10 @@ mod tests {
                     < f32::EPSILON));
                 assert_eq!(
                     kept[horizon_index] as usize,
-                    survivors.iter().filter(|o| **o >= plan.first_active).count(),
+                    survivors
+                        .iter()
+                        .filter(|o| **o >= plan.first_active)
+                        .count(),
                     "the realized survivor count must be the mask the host uploaded"
                 );
             }
@@ -1071,15 +1061,25 @@ mod tests {
         // interior outcome rather than about the row lattice alone: `5744 mod 192` is exactly
         // `192 - 16`, so the off-lattice residues carry 30 too.
         assert!(geometry.has_uniform_interior());
-        assert_eq!(geometry.window % geometry.row_stride, geometry.row_stride - geometry.stride);
+        assert_eq!(
+            geometry.window % geometry.row_stride,
+            geometry.row_stride - geometry.stride
+        );
         // And it is a property of the geometry, not a law: shift `--min-history` by one patch
         // and the interior splits between 29 and 30.
-        assert!(!SupervisionGeometry::new(6000, 16, 272, 192).unwrap().has_uniform_interior());
+        assert!(!SupervisionGeometry::new(6000, 16, 272, 192)
+            .unwrap()
+            .has_uniform_interior());
         // `min_history` sits exactly on a patch boundary here; one bar more must not change
         // which boundary is the first active origin, and one bar past it must.
-        assert_eq!(SupervisionGeometry::new(6000, 16, 241, 192).unwrap(), PRODUCTION);
         assert_eq!(
-            SupervisionGeometry::new(6000, 16, 257, 192).unwrap().origins_per_row,
+            SupervisionGeometry::new(6000, 16, 241, 192).unwrap(),
+            PRODUCTION
+        );
+        assert_eq!(
+            SupervisionGeometry::new(6000, 16, 257, 192)
+                .unwrap()
+                .origins_per_row,
             359
         );
         // A row stride that is not a multiple of the origin stride has no multiplicity at all.
@@ -1161,9 +1161,7 @@ mod tests {
     fn the_unseen_probability_matches_the_falling_factorial_product() {
         let (population, successes, draws) = (2_455_276usize, 30usize, 512_000usize);
         let reference: f64 = (0..successes)
-            .map(|j| {
-                (population - draws - j) as f64 / (population - j) as f64
-            })
+            .map(|j| (population - draws - j) as f64 / (population - j) as f64)
             .product();
         let closed = hypergeometric_below(population, successes, draws, 1);
         assert!(
@@ -1315,17 +1313,33 @@ mod tests {
                 seed: 7,
             },
         ] {
-            assert!(!selection.summary().contains('='), "{}", selection.summary());
+            assert!(
+                !selection.summary().contains('='),
+                "{}",
+                selection.summary()
+            );
         }
     }
 
     #[test]
     fn an_unusable_selection_is_refused_before_the_pool_is_touched() {
         for selection in [
-            RowSelection { fraction: 0., ..RowSelection::identity(1) },
-            RowSelection { fraction: 1.5, ..RowSelection::identity(1) },
-            RowSelection { fraction: f64::NAN, ..RowSelection::identity(1) },
-            RowSelection { stride_multiple: 0, ..RowSelection::identity(1) },
+            RowSelection {
+                fraction: 0.,
+                ..RowSelection::identity(1)
+            },
+            RowSelection {
+                fraction: 1.5,
+                ..RowSelection::identity(1)
+            },
+            RowSelection {
+                fraction: f64::NAN,
+                ..RowSelection::identity(1)
+            },
+            RowSelection {
+                stride_multiple: 0,
+                ..RowSelection::identity(1)
+            },
         ] {
             assert!(selection.validate().is_err(), "{selection:?}");
         }
@@ -1378,7 +1392,13 @@ mod tests {
             })
             .collect();
         for ticker in ["AAA", "BBB"] {
-            write_bar_file(&bar_file_path(&directory.0, ticker, 300), ticker, 300, &bars).unwrap();
+            write_bar_file(
+                &bar_file_path(&directory.0, ticker, 300),
+                ticker,
+                300,
+                &bars,
+            )
+            .unwrap();
         }
         // A ticker whose valid-bar ordinals differ from its raw indices, so the phase shift is
         // applied on the same filtered ordinals the enumeration used.
@@ -1393,7 +1413,10 @@ mod tests {
             &quarantined,
         )
         .unwrap();
-        let features = FeatureSet { spy: false, ..FeatureSet::ALL };
+        let features = FeatureSet {
+            spy: false,
+            ..FeatureSet::ALL
+        };
         let (context, pred_len, common_context) = (64usize, 8usize, 64usize);
         // `patch_len` 4 and `--min-history` 20 against a 64-bar context: 16 origins per row,
         // the first four masked out, so 12 active origins reaching 44 bars back and an interior
@@ -1536,8 +1559,7 @@ mod tests {
         // geometry's `0.75^30 = 0.018%`.
         let expected = control.mean_multiplicity() * 0.25;
         assert!(
-            thinned.mean_multiplicity() > expected
-                && thinned.mean_multiplicity() < expected + 1.,
+            thinned.mean_multiplicity() > expected && thinned.mean_multiplicity() < expected + 1.,
             "a quarter pool must carry about a quarter of the exposures: {} against {expected}",
             thinned.mean_multiplicity()
         );
@@ -1609,7 +1631,10 @@ mod tests {
         corpus.train_refs = enumerated.clone();
         select(
             &mut corpus,
-            RowSelection { patch_phase: PatchPhase::Random, ..RowSelection::identity(20260905) },
+            RowSelection {
+                patch_phase: PatchPhase::Random,
+                ..RowSelection::identity(20260905)
+            },
             geometry,
         )
         .unwrap();
@@ -1617,7 +1642,10 @@ mod tests {
         corpus.train_refs = enumerated.clone();
         select(
             &mut corpus,
-            RowSelection { patch_phase: PatchPhase::Random, ..RowSelection::identity(1) },
+            RowSelection {
+                patch_phase: PatchPhase::Random,
+                ..RowSelection::identity(1)
+            },
             geometry,
         )
         .unwrap();
@@ -1632,7 +1660,10 @@ mod tests {
         assert!(purged > 0);
         select(
             &mut holed,
-            RowSelection { patch_phase: PatchPhase::Random, ..RowSelection::identity(20260905) },
+            RowSelection {
+                patch_phase: PatchPhase::Random,
+                ..RowSelection::identity(20260905)
+            },
             geometry,
         )
         .unwrap();

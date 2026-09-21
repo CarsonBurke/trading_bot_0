@@ -138,8 +138,7 @@ const MIXING_UNIT: &str = "learned mixing coefficient (dimensionless)";
 /// so a normalized axis would erase the quantity being reported. Zero is a real reading -
 /// a parameter whose step is disabled moves at rate zero - and is distinguishable from a
 /// floored schedule, which holds 0.15 of its peak and never reaches 0.
-const LR_UNIT: &str =
-    "learning rate (absolute; higher = larger parameter step; 0 = family frozen)";
+const LR_UNIT: &str = "learning rate (absolute; higher = larger parameter step; 0 = family frozen)";
 
 /// Distinct units stay on separate axes; endpoint utility is not a backtest return stream.
 const GAIN_UNIT: &str = "share of the persistence MSE (dimensionless; > 0 = gain, and the three \
@@ -601,7 +600,8 @@ pub fn horizon_track(
             Some(HorizonPoint {
                 horizon: h,
                 neutral_ratio: horizon.mse.get(i)? / horizon.persistence_mse.get(i)?,
-                raw_ratio: horizon.absolute_mse.get(i)? / horizon.absolute_persistence_mse.get(i)?,
+                raw_ratio: horizon.absolute_mse.get(i)?
+                    / horizon.absolute_persistence_mse.get(i)?,
                 close_ratio: *trading.close_mse_ratio.get(i)?,
                 best_scale_ratio: *trading.best_scale_mse_ratio.get(i)?,
                 optimal_gain,
@@ -695,11 +695,13 @@ pub fn write_recipe_scalars(
         "report steps must increase"
     );
     ensure!(
-        history.iter().all(|(_, scalars)| scalars.len() == last.len()
-            && scalars
-                .iter()
-                .zip(last)
-                .all(|((name, value), (expected, _))| name == expected && value.is_finite())),
+        history
+            .iter()
+            .all(|(_, scalars)| scalars.len() == last.len()
+                && scalars
+                    .iter()
+                    .zip(last)
+                    .all(|((name, value), (expected, _))| name == expected && value.is_finite())),
         "every recipe-scalar point must carry the same finite, identically ordered scalars"
     );
     let steps: Vec<u64> = history.iter().map(|(step, _)| *step as u64).collect();
@@ -784,9 +786,7 @@ pub fn write_metrics(output: &Path, points: &[Metrics]) -> Result<()> {
     // is how a reader mistakes one split's number for another's.
     ensure!(
         points.windows(2).all(|p| p[0].step < p[1].step
-            || (p[0].step == p[1].step
-                && !p[0].validation_is_full
-                && p[1].validation_is_full)),
+            || (p[0].step == p[1].step && !p[0].validation_is_full && p[1].validation_is_full)),
         "report steps must increase, except for one held-out full point sharing the last \
          step's held-out sample point"
     );
@@ -974,12 +974,16 @@ pub fn write_metrics(output: &Path, points: &[Metrics]) -> Result<()> {
             // them. It belongs here and not on a base of its own: it is a dimensionless ratio
             // against the same persistence prior and it reads against the same parity line.
             scored(
-                &format!("{SAMPLE} selection objective (horizon-weighted close best-scale MSE ratio)"),
+                &format!(
+                    "{SAMPLE} selection objective (horizon-weighted close best-scale MSE ratio)"
+                ),
                 false,
                 |p| p.validation_scale_free_objective,
             ),
             scored(
-                &format!("{FULL} selection objective (horizon-weighted close best-scale MSE ratio)"),
+                &format!(
+                    "{FULL} selection objective (horizon-weighted close best-scale MSE ratio)"
+                ),
                 true,
                 |p| p.validation_scale_free_objective,
             ),
@@ -993,18 +997,24 @@ pub fn write_metrics(output: &Path, points: &[Metrics]) -> Result<()> {
         ScaleKind::Linear,
         &scope,
         vec![
-            series("training objective NLL", |p| p.train_nll.unwrap_or(f64::NAN)),
+            series("training objective NLL", |p| {
+                p.train_nll.unwrap_or(f64::NAN)
+            }),
             scored(&format!("{SAMPLE} objective NLL"), false, |p| {
                 p.validation_objective_nll
             }),
             scored(&format!("{FULL} objective NLL"), true, |p| {
                 p.validation_objective_nll
             }),
-            scored(&format!("{SAMPLE} unweighted NLL"), false, |p| p.validation_nll),
+            scored(&format!("{SAMPLE} unweighted NLL"), false, |p| {
+                p.validation_nll
+            }),
             scored(&format!("{SAMPLE} persistence NLL"), false, |p| {
                 p.persistence_nll
             }),
-            scored(&format!("{FULL} unweighted NLL"), true, |p| p.validation_nll),
+            scored(&format!("{FULL} unweighted NLL"), true, |p| {
+                p.validation_nll
+            }),
             scored(&format!("{FULL} persistence NLL"), true, |p| {
                 p.persistence_nll
             }),
@@ -1073,7 +1083,11 @@ pub fn write_metrics(output: &Path, points: &[Metrics]) -> Result<()> {
         ScaleKind::Linear,
         &scope,
         vec![
-            scored(&format!("training minus {SAMPLE} objective NLL"), false, gap),
+            scored(
+                &format!("training minus {SAMPLE} objective NLL"),
+                false,
+                gap,
+            ),
             scored(&format!("training minus {FULL} objective NLL"), true, gap),
             series("no gap 0.0", |_| 0.),
         ],
@@ -1192,7 +1206,9 @@ pub fn write_metrics(output: &Path, points: &[Metrics]) -> Result<()> {
         // rather than a title fact, because it moves: a draw whose timestamps thin out reads
         // as a noisier IC, and the two are only separable if the count has its own trajectory.
         let mut population = per_horizon("contributing cross-sections", |p| p.cross_sections);
-        population.extend(per_horizon("valid target bar-channels", |p| p.valid_elements));
+        population.extend(per_horizon("valid target bar-channels", |p| {
+            p.valid_elements
+        }));
         chart(
             "timexer_segment_horizon_steps_population",
             "how much data is behind each horizon's statistics, per step?",
@@ -1231,9 +1247,10 @@ pub fn write_metrics(output: &Path, points: &[Metrics]) -> Result<()> {
         let mut gain = per_horizon("uncalibrated close MSE-optimal forecast gain", |p| {
             p.optimal_gain
         });
-        gain.extend(per_horizon("calibrated close MSE-optimal forecast gain", |p| {
-            p.calibrated_optimal_gain
-        }));
+        gain.extend(per_horizon(
+            "calibrated close MSE-optimal forecast gain",
+            |p| p.calibrated_optimal_gain,
+        ));
         gain.push(series("perfect amplitude calibration 1.0", |_| 1.));
         chart(
             "timexer_segment_horizon_steps_gain",
@@ -1380,17 +1397,19 @@ pub fn write_metrics(output: &Path, points: &[Metrics]) -> Result<()> {
                 });
             }
             split.push(ReportSeries {
-                label: format!("in-period minus out-of-period cross-sectional IC at horizon {horizon}"),
+                label: format!(
+                    "in-period minus out-of-period cross-sectional IC at horizon {horizon}"
+                ),
                 values: axis
                     .iter()
-                    .map(|&step| {
-                        match (at(step, true, horizon), at(step, false, horizon)) {
+                    .map(
+                        |&step| match (at(step, true, horizon), at(step, false, horizon)) {
                             (Some(inside), Some(outside)) => {
                                 (inside.cross_sectional_ic - outside.cross_sectional_ic) as f32
                             }
                             _ => f32::NAN,
-                        }
-                    })
+                        },
+                    )
                     .collect(),
             });
             split.push(ReportSeries {
@@ -1400,15 +1419,17 @@ pub fn write_metrics(output: &Path, points: &[Metrics]) -> Result<()> {
                 ),
                 values: axis
                     .iter()
-                    .map(|&step| {
-                        match (at(step, true, horizon), at(step, false, horizon)) {
-                            (Some(inside), Some(outside)) => (inside
-                                .cross_sectional_ic_se
-                                .hypot(outside.cross_sectional_ic_se))
-                                as f32,
+                    .map(
+                        |&step| match (at(step, true, horizon), at(step, false, horizon)) {
+                            (Some(inside), Some(outside)) => {
+                                (inside
+                                    .cross_sectional_ic_se
+                                    .hypot(outside.cross_sectional_ic_se))
+                                    as f32
+                            }
                             _ => f32::NAN,
-                        }
-                    })
+                        },
+                    )
                     .collect(),
             });
         }
@@ -1647,7 +1668,8 @@ pub fn write_horizon(
                 &curve.absolute_persistence_mse
             ]
             .iter()
-            .all(|values| values.len() == horizon && values.iter().all(|v| v.is_finite() && *v >= 0.)),
+            .all(|values| values.len() == horizon
+                && values.iter().all(|v| v.is_finite() && *v >= 0.)),
             "invalid per-horizon metrics"
         );
         let rate_curves = [&curve.win_rate, &curve.hit_rate, &curve.up_fraction];
@@ -1892,7 +1914,9 @@ pub fn write_trading(
                 .map(|(ic, se)| ic + sign * se)
                 .collect();
             signal.push(trading_series(
-                format!("{split} close cross-sectional IC {edge} (iid approximation, not confidence)"),
+                format!(
+                    "{split} close cross-sectional IC {edge} (iid approximation, not confidence)"
+                ),
                 &band,
                 horizon,
             )?);
@@ -2198,14 +2222,13 @@ pub fn write_trading(
             },
         )?;
     }
-    for (index, (suffix, payoff, per_bar)) in [
-        "", "_cost_0p5", "_cost_1", "_cost_2", "_cost_5", "_cost_10",
-    ]
-    .into_iter()
-    .zip(bps)
-    .zip(rate)
-    .map(|((suffix, payoff), per_bar)| (suffix, payoff, per_bar))
-    .enumerate()
+    for (index, (suffix, payoff, per_bar)) in
+        ["", "_cost_0p5", "_cost_1", "_cost_2", "_cost_5", "_cost_10"]
+            .into_iter()
+            .zip(bps)
+            .zip(rate)
+            .map(|((suffix, payoff), per_bar)| (suffix, payoff, per_bar))
+            .enumerate()
     {
         let cost = costs[index];
         for (quantity, unit, series) in [
@@ -2213,7 +2236,9 @@ pub fn write_trading(
             ("rate", RATE_UNIT_BPS, per_bar),
         ] {
             write_report(
-                output.join(format!("timexer_segment_utility_{quantity}{suffix}.report.bin")),
+                output.join(format!(
+                    "timexer_segment_utility_{quantity}{suffix}.report.bin"
+                )),
                 &Report {
                     title: format!(
                         "CausalPatch e{epoch} s{step} | raw {quantity}, {cost} bps/side | \
@@ -2262,18 +2287,78 @@ pub(super) fn write_account(
         "synchronized account | validation (checkpoint-selection exposed, not terminal test) | epoch {epoch} step {step}"
     );
     let panels: [(&str, &str, &[AccountPoint], &str); 12] = [
-        ("timexer_segment_account_value", "account value and cash", &result.points, "USD"),
-        ("timexer_segment_account_costs", "cumulative execution and borrow costs", &result.points, "USD"),
-        ("timexer_segment_account_risk", "realized exposure and drawdown", &result.points, "dimensionless"),
-        ("timexer_segment_account_activity", "holdings and execution activity", &result.points, "count"),
-        ("timexer_segment_account_daily_pnl", "daily P&L and costs", &result.daily, "USD"),
-        ("timexer_segment_account_daily_return", "daily account returns", &result.daily, "dimensionless"),
-        ("timexer_segment_account_monthly_pnl", "monthly P&L and costs (partial months retained)", &result.monthly, "USD"),
-        ("timexer_segment_account_monthly_return", "monthly account returns (partial months retained)", &result.monthly, "dimensionless"),
-        ("timexer_segment_account_summary_money", "account outcome and execution costs", &summary, "USD"),
-        ("timexer_segment_account_summary_risk", "account outcome and risk", &summary, "dimensionless"),
-        ("timexer_segment_account_summary_census", "universe, signals and execution census", &summary, "count"),
-        ("timexer_segment_account_timing", "evaluation wall-clock attribution", &summary, "milliseconds"),
+        (
+            "timexer_segment_account_value",
+            "account value and cash",
+            &result.points,
+            "USD",
+        ),
+        (
+            "timexer_segment_account_costs",
+            "cumulative execution and borrow costs",
+            &result.points,
+            "USD",
+        ),
+        (
+            "timexer_segment_account_risk",
+            "realized exposure and drawdown",
+            &result.points,
+            "dimensionless",
+        ),
+        (
+            "timexer_segment_account_activity",
+            "holdings and execution activity",
+            &result.points,
+            "count",
+        ),
+        (
+            "timexer_segment_account_daily_pnl",
+            "daily P&L and costs",
+            &result.daily,
+            "USD",
+        ),
+        (
+            "timexer_segment_account_daily_return",
+            "daily account returns",
+            &result.daily,
+            "dimensionless",
+        ),
+        (
+            "timexer_segment_account_monthly_pnl",
+            "monthly P&L and costs (partial months retained)",
+            &result.monthly,
+            "USD",
+        ),
+        (
+            "timexer_segment_account_monthly_return",
+            "monthly account returns (partial months retained)",
+            &result.monthly,
+            "dimensionless",
+        ),
+        (
+            "timexer_segment_account_summary_money",
+            "account outcome and execution costs",
+            &summary,
+            "USD",
+        ),
+        (
+            "timexer_segment_account_summary_risk",
+            "account outcome and risk",
+            &summary,
+            "dimensionless",
+        ),
+        (
+            "timexer_segment_account_summary_census",
+            "universe, signals and execution census",
+            &summary,
+            "count",
+        ),
+        (
+            "timexer_segment_account_timing",
+            "evaluation wall-clock attribution",
+            &summary,
+            "milliseconds",
+        ),
     ];
     for (base, question, points, expected_unit) in panels {
         let keys: BTreeSet<&str> = points
@@ -2283,8 +2368,13 @@ pub(super) fn write_account(
             .filter(|key| {
                 let cost = matches!(
                     *key,
-                    "commission_usd" | "regulatory_usd" | "spread_usd" | "impact_usd"
-                        | "slippage_usd" | "borrow_usd" | "costs_usd"
+                    "commission_usd"
+                        | "regulatory_usd"
+                        | "spread_usd"
+                        | "impact_usd"
+                        | "slippage_usd"
+                        | "borrow_usd"
+                        | "costs_usd"
                 );
                 match base {
                     "timexer_segment_account_value" => !cost,
@@ -2690,7 +2780,9 @@ fn write_gain_panel(output: &Path, panels: &AmplitudePanels<'_>, horizon: usize)
         // legible on this panel rather than only in a log line. An unmeasured horizon draws as
         // a gap, not as a zero: a zero would read as a measured collapse.
         series.push(curve(
-            format!("{CALIBRATION} close-anchor MSE-optimal gain carried by the checkpoint, signed"),
+            format!(
+                "{CALIBRATION} close-anchor MSE-optimal gain carried by the checkpoint, signed"
+            ),
             &panels
                 .applied
                 .measured_anchor
@@ -3030,7 +3122,10 @@ pub fn write_latent_probe(
     context: &LatentProbeContext,
 ) -> Result<()> {
     let horizons = report.horizons.len();
-    ensure!(horizons > 0, "a latent probe panel needs at least one horizon");
+    ensure!(
+        horizons > 0,
+        "a latent probe panel needs at least one horizon"
+    );
     let mut series = probe_series(
         report,
         |label| format!("{FULL} {NEUTRAL} close cross-sectional IC, {label}"),
@@ -3101,7 +3196,10 @@ pub fn write_latent_probe_ratio(
     context: &LatentProbeContext,
 ) -> Result<()> {
     let horizons = report.horizons.len();
-    ensure!(horizons > 0, "a latent probe ratio panel needs at least one horizon");
+    ensure!(
+        horizons > 0,
+        "a latent probe ratio panel needs at least one horizon"
+    );
     let mut series = probe_series(
         report,
         |label| format!("{FULL} {NEUTRAL} close ratio as emitted, {label}"),
@@ -3143,7 +3241,10 @@ pub fn write_latent_probe_conditioning(
     context: &LatentProbeContext,
 ) -> Result<()> {
     let horizons = report.horizons.len();
-    ensure!(horizons > 0, "a conditioning panel needs at least one horizon");
+    ensure!(
+        horizons > 0,
+        "a conditioning panel needs at least one horizon"
+    );
     let mut series = probe_series(
         report,
         |label| format!("{label}, condition number of the solved system"),
@@ -3192,7 +3293,10 @@ pub fn write_latent_probe_scaling(
     curve: &probe::ScalingCurve,
     context: &LatentProbeContext,
 ) -> Result<()> {
-    ensure!(!curve.rungs.is_empty(), "a scaling panel needs at least one rung");
+    ensure!(
+        !curve.rungs.is_empty(),
+        "a scaling panel needs at least one rung"
+    );
     let steps: Vec<u64> = curve.rungs.iter().map(|rung| rung.origins as u64).collect();
     let fitted: Vec<f32> = curve
         .rungs
@@ -3203,7 +3307,9 @@ pub fn write_latent_probe_scaling(
         .collect();
     let series = vec![
         ReportSeries {
-            label: format!("{FULL} {NEUTRAL} close cross-sectional IC at h 1, ridge probe measured"),
+            label: format!(
+                "{FULL} {NEUTRAL} close cross-sectional IC at h 1, ridge probe measured"
+            ),
             values: curve.rungs.iter().map(|rung| rung.ic as f32).collect(),
         },
         ReportSeries {
@@ -3214,7 +3320,10 @@ pub fn write_latent_probe_scaling(
             values: fitted,
         },
         ReportSeries {
-            label: format!("extrapolated asymptote at infinite fit sample {:+.5}", curve.asymptote),
+            label: format!(
+                "extrapolated asymptote at infinite fit sample {:+.5}",
+                curve.asymptote
+            ),
             values: vec![curve.asymptote as f32; curve.rungs.len()],
         },
     ];
@@ -3252,7 +3361,10 @@ pub fn write_latent_probe_recency(
     recency: &probe::Recency,
     context: &LatentProbeContext,
 ) -> Result<()> {
-    ensure!(!recency.horizons.is_empty(), "a recency panel needs at least one horizon");
+    ensure!(
+        !recency.horizons.is_empty(),
+        "a recency panel needs at least one horizon"
+    );
     let mut series: Vec<ReportSeries> = recency
         .tranches
         .iter()
@@ -3309,32 +3421,71 @@ mod tests {
         let entry = Tensor::full([20], 1.01_f64.ln(), cpu);
         let sigma = Tensor::ones([20], cpu);
         let groups = Tensor::zeros([20], (Kind::Int64, Device::Cpu));
-        let evaluate = |valid: Tensor| super::super::utility::evaluate(
-            &forecast, &scale, &target, &valid, &sigma, &entry, &groups, 1,
-        ).unwrap();
+        let evaluate = |valid: Tensor| {
+            super::super::utility::evaluate(
+                &forecast, &scale, &target, &valid, &sigma, &entry, &groups, 1,
+            )
+            .unwrap()
+        };
         let complete = evaluate(Tensor::ones([20, 1], cpu));
         let missing = evaluate(Tensor::zeros([20, 1], cpu));
         let curve = trading_curve(1);
         write_trading(
-            &root, 1, 1000,
-            Some(TradingSplit { curve: &curve, portfolio: &missing, origins: 20 }),
-            Some(TradingSplit { curve: &curve, portfolio: &complete, origins: 20 }),
-            None, 20,
-        ).unwrap();
+            &root,
+            1,
+            1000,
+            Some(TradingSplit {
+                curve: &curve,
+                portfolio: &missing,
+                origins: 20,
+            }),
+            Some(TradingSplit {
+                curve: &curve,
+                portfolio: &complete,
+                origins: 20,
+            }),
+            None,
+            20,
+        )
+        .unwrap();
         let value = |base: &str, label: &str| {
             let report = read_report(&root.join(format!("{base}.report.bin"))).unwrap();
             let ReportKind::IndexedLines { steps, series } = report.kind else {
                 panic!("utility outcomes must retain their decision horizons");
             };
             assert_eq!(steps, vec![1]);
-            series.iter().find(|series| series.label == label).unwrap().values[0] as f64
+            series
+                .iter()
+                .find(|series| series.label == label)
+                .unwrap()
+                .values[0] as f64
         };
         let gross = (1.02 / 1.01 - 1.) * 1e4;
         let net = gross - 10. * (1. + 1.02 / 1.01);
-        assert!((value("timexer_segment_utility_payoff", "held-out full equal long") - gross).abs() < 1e-4);
-        assert!((value("timexer_segment_utility_payoff_cost_10", "held-out full equal long") - net).abs() < 1e-4);
-        assert_eq!(value("timexer_segment_utility_payoff_cost_10", "held-out full cash"), 0.);
-        assert!(value("timexer_segment_utility_payoff", "held-out sample equal long").is_nan());
+        assert!(
+            (value("timexer_segment_utility_payoff", "held-out full equal long") - gross).abs()
+                < 1e-4
+        );
+        assert!(
+            (value(
+                "timexer_segment_utility_payoff_cost_10",
+                "held-out full equal long"
+            ) - net)
+                .abs()
+                < 1e-4
+        );
+        assert_eq!(
+            value(
+                "timexer_segment_utility_payoff_cost_10",
+                "held-out full cash"
+            ),
+            0.
+        );
+        assert!(value(
+            "timexer_segment_utility_payoff",
+            "held-out sample equal long"
+        )
+        .is_nan());
         assert!(value("timexer_segment_utility_breakeven", "held-out full cash").is_nan());
         fs::remove_dir_all(root).unwrap();
     }
@@ -3559,8 +3710,8 @@ mod tests {
     /// step axis, split routing and values as a reader of the `.report.bin` sees them.
     #[test]
     fn the_step_indexed_horizon_and_gap_panels_carry_matched_step_values() {
-        let root = std::env::temp_dir()
-            .join(format!("timexer-horizon-steps-{}", uuid::Uuid::new_v4()));
+        let root =
+            std::env::temp_dir().join(format!("timexer-horizon-steps-{}", uuid::Uuid::new_v4()));
         let mut points = vec![
             point(1000, false, 2.25, 192),
             point(2000, false, 2.08, 192),
@@ -3581,8 +3732,9 @@ mod tests {
             panic!("the headline panel must be step-indexed");
         };
         let selection = |split: &str| -> Vec<f32> {
-            let label =
-                format!("{split} selection objective (horizon-weighted close best-scale MSE ratio)");
+            let label = format!(
+                "{split} selection objective (horizon-weighted close best-scale MSE ratio)"
+            );
             series
                 .iter()
                 .find(|s| s.label == label)
@@ -3593,7 +3745,10 @@ mod tests {
         let sample_selection = selection(SAMPLE);
         assert!((sample_selection[0] - 0.991).abs() < 1e-6);
         assert!((sample_selection[1] - 0.984).abs() < 1e-6);
-        assert!(sample_selection[2].is_nan(), "the sample series leaked the epoch-end point");
+        assert!(
+            sample_selection[2].is_nan(),
+            "the sample series leaked the epoch-end point"
+        );
         let full_selection = selection(FULL);
         assert!(full_selection[0].is_nan() && full_selection[1].is_nan());
         assert!((full_selection[2] - 0.979).abs() < 1e-6);
@@ -3794,8 +3949,11 @@ mod tests {
                     &horizon_curve(192),
                     &{
                         let mut curve = cross_curve(192);
-                        curve.cross_sectional_ic =
-                            curve.cross_sectional_ic.iter().map(|ic| ic * scale).collect();
+                        curve.cross_sectional_ic = curve
+                            .cross_sectional_ic
+                            .iter()
+                            .map(|ic| ic * scale)
+                            .collect();
                         curve
                     },
                     Some(&anchor_gain(192)),
@@ -3805,8 +3963,8 @@ mod tests {
             .collect();
         write_metrics(&root, &points).unwrap();
 
-        let signal = read_report(root.join("timexer_segment_horizon_steps_signal.report.bin"))
-            .unwrap();
+        let signal =
+            read_report(root.join("timexer_segment_horizon_steps_signal.report.bin")).unwrap();
         assert_eq!(signal.y_label.as_deref(), Some(IC_UNIT));
         let ReportKind::IndexedLines { steps, series } = &signal.kind else {
             panic!("the signal panel must be step-indexed");
@@ -3876,7 +4034,10 @@ mod tests {
                 .find(|s| s.label == label)
                 .unwrap_or_else(|| panic!("{label} missing from {base}"));
             assert_eq!(found.values.len(), 3, "{base} dropped an evaluation");
-            assert!(found.values.iter().all(|v| (v - expected as f32).abs() < 1e-6));
+            assert!(found
+                .values
+                .iter()
+                .all(|v| (v - expected as f32).abs() < 1e-6));
         }
         fs::remove_dir_all(&root).unwrap();
     }
@@ -3889,7 +4050,8 @@ mod tests {
     /// the absence.
     #[test]
     fn an_unmeasured_cross_section_reads_as_absent_and_never_as_zero() {
-        let root = std::env::temp_dir().join(format!("timexer-signal-nan-{}", uuid::Uuid::new_v4()));
+        let root =
+            std::env::temp_dir().join(format!("timexer-signal-nan-{}", uuid::Uuid::new_v4()));
         let mut points = vec![point(1000, false, 2.2, 192), point(2000, false, 2.1, 192)];
         // No cross-section pass at all at the second step: the split's own row is missing, not
         // zero.
@@ -3951,15 +4113,17 @@ mod horizon_loss_weight_tests {
     /// which one is lying.
     #[test]
     fn the_horizon_weight_chart_states_the_weighting_and_refuses_an_unnormalized_one() {
-        let root = std::env::temp_dir()
-            .join(format!("timexer-horizon-weight-{}", uuid::Uuid::new_v4()));
+        let root =
+            std::env::temp_dir().join(format!("timexer-horizon-weight-{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&root).unwrap();
         let path = root.join("timexer_segment_horizon_loss_weight.report.bin");
         // `cutoff:2` over eight horizons: mean 1 means the two trained horizons carry 4.
         let weights = vec![4., 4., 0., 0., 0., 0., 0., 0.];
         write_horizon_loss_weight(&root, 1, 2000, "cutoff:2", &weights).unwrap();
         let report = read_report(&path).unwrap();
-        assert!(report.title.contains("what does the objective weight at each horizon?"));
+        assert!(report
+            .title
+            .contains("what does the objective weight at each horizon?"));
         assert!(
             report.title.contains("cutoff:2") && report.title.contains("2 of 8 horizons trained"),
             "{}",
@@ -4019,10 +4183,7 @@ pub fn write_lr_trajectory(
         return Ok(());
     }
     ensure!(
-        trajectory
-            .steps()
-            .windows(2)
-            .all(|pair| pair[0] < pair[1]),
+        trajectory.steps().windows(2).all(|pair| pair[0] < pair[1]),
         "report steps must increase"
     );
     let series: Vec<ReportSeries> = trajectory
@@ -4038,7 +4199,10 @@ pub fn write_lr_trajectory(
         series
             .iter()
             .all(|family| family.values.len() == trajectory.steps().len()
-                && family.values.iter().all(|rate| rate.is_finite() && *rate >= 0.)),
+                && family
+                    .values
+                    .iter()
+                    .all(|rate| rate.is_finite() && *rate >= 0.)),
         "every family must carry one finite non-negative rate per recorded step"
     );
     let shape = match schedule.cooldown_start() {
@@ -4087,10 +4251,8 @@ mod lr_trajectory_tests {
         // Building a model is a DRAW from the process-global generator, so this has to stay out
         // of the seeded tests' sections even though it does not care what it draws.
         let _rng = crate::torch::test_rng::shared();
-        let root = std::env::temp_dir().join(format!(
-            "timexer-lr-trajectory-{}",
-            std::process::id()
-        ));
+        let root =
+            std::env::temp_dir().join(format!("timexer-lr-trajectory-{}", std::process::id()));
         fs::create_dir_all(&root).unwrap();
         let config = ModelConfig {
             seq_len: 96,
@@ -4105,7 +4267,8 @@ mod lr_trajectory_tests {
         };
         let store = nn::VarStore::new(Device::Cpu);
         let _model = CausalPatchModel::new(&store.root(), &config);
-        let schedule = LrSchedule::new(5000, NANOGPT_COOLDOWN_FRAC, NANOGPT_COOLDOWN_FLOOR).unwrap();
+        let schedule =
+            LrSchedule::new(5000, NANOGPT_COOLDOWN_FRAC, NANOGPT_COOLDOWN_FLOOR).unwrap();
         let mut engine = crate::torch::timexer_segment::compute::Engine::new(
             &store,
             0.008,
@@ -4130,8 +4293,7 @@ mod lr_trajectory_tests {
 
         let report = read_report(&path).unwrap();
         assert!(
-            shared::report::TIMEXER_SEGMENT_REPORT_BASES
-                .contains(&"timexer_segment_lr_trajectory"),
+            shared::report::TIMEXER_SEGMENT_REPORT_BASES.contains(&"timexer_segment_lr_trajectory"),
             "the panel is written but unregistered, so the TUI never scans for it"
         );
         assert_eq!(report.y_label.as_deref(), Some(LR_UNIT));
@@ -4188,10 +4350,8 @@ mod amplitude_report_tests {
     #[test]
     fn a_measured_unit_gain_is_charted_as_1_and_not_as_a_missing_series() {
         use crate::torch::timexer_segment::calibration::{Blocks, FrozenGain, Moments};
-        let root = std::env::temp_dir().join(format!(
-            "timexer-identity-gain-{}",
-            uuid::Uuid::new_v4()
-        ));
+        let root =
+            std::env::temp_dir().join(format!("timexer-identity-gain-{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&root).unwrap();
         let horizon = 8;
         let cells = horizon * 4;
@@ -4238,8 +4398,7 @@ mod amplitude_report_tests {
             }],
         };
         write_amplitude(&root, &panels).unwrap();
-        let report =
-            read_report(root.join("timexer_segment_calibration_gain.report.bin")).unwrap();
+        let report = read_report(root.join("timexer_segment_calibration_gain.report.bin")).unwrap();
         let ReportKind::IndexedLines { steps, series } = &report.kind else {
             panic!("the gain panel must be a horizon-indexed line chart");
         };
@@ -4263,7 +4422,8 @@ mod amplitude_report_tests {
     #[test]
     fn the_fitted_amplitude_panels_separate_training_from_held_out_gain_and_name_the_gate() {
         use crate::torch::timexer_segment::calibration::{Blocks, MeanCalibration, Moments};
-        let root = std::env::temp_dir().join(format!("timexer-fitted-gain-{}", uuid::Uuid::new_v4()));
+        let root =
+            std::env::temp_dir().join(format!("timexer-fitted-gain-{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&root).unwrap();
         let horizon = 8;
         let cells = horizon * 4;
@@ -4294,10 +4454,8 @@ mod amplitude_report_tests {
                     moments.anchor_target[cell] = anchor_square * anchor_gain(bar);
                     moments.offset_target[cell] = offset_square;
                     let forecast_square = anchor_square + offset_square;
-                    let forecast_target =
-                        moments.anchor_target[cell] + moments.offset_target[cell];
-                    moments.target_square[cell] =
-                        (forecast_target / 0.1).powi(2) / forecast_square;
+                    let forecast_target = moments.anchor_target[cell] + moments.offset_target[cell];
+                    moments.target_square[cell] = (forecast_target / 0.1).powi(2) / forecast_square;
                 }
             }
             moments
@@ -4358,16 +4516,26 @@ mod amplitude_report_tests {
         };
         assert_eq!(
             label("close-anchor gain applied while scoring").values,
-            applied.anchor.iter().map(|g| *g as f32).collect::<Vec<f32>>()
+            applied
+                .anchor
+                .iter()
+                .map(|g| *g as f32)
+                .collect::<Vec<f32>>()
         );
         assert_eq!(
             label("intrabar-offset gain applied while scoring").values,
-            applied.offset.iter().map(|g| *g as f32).collect::<Vec<f32>>()
+            applied
+                .offset
+                .iter()
+                .map(|g| *g as f32)
+                .collect::<Vec<f32>>()
         );
         // All four DECODED channels' own optima, which is what generalizing the close-only fit
         // to every channel is visible as.
         for channel in ["open", "high", "low", "close"] {
-            let series = label(&format!("{CALIBRATION} {channel} MSE-optimal gain (fitted on)"));
+            let series = label(&format!(
+                "{CALIBRATION} {channel} MSE-optimal gain (fitted on)"
+            ));
             assert!(series.values.iter().all(|value| value.is_finite()));
         }
         // THE mechanism series, and it must be the ONLY one carrying the training split word:
@@ -4386,7 +4554,9 @@ mod amplitude_report_tests {
         );
         // The held-out sweep against that flat training curve, on the same base and the same
         // unit, which is the only reason they may share an axis.
-        let held_out = label(&format!("{SAMPLE} close MSE-optimal gain on the emitted mean"));
+        let held_out = label(&format!(
+            "{SAMPLE} close MSE-optimal gain on the emitted mean"
+        ));
         assert!(held_out.values[0] / held_out.values[horizon - 1] > 2.);
         let ceiling = label("amplification ceiling");
         assert!(ceiling.values.iter().all(|value| *value >= 1.));
@@ -4395,7 +4565,10 @@ mod amplitude_report_tests {
             .iter()
             .zip(&ceiling.values)
             .all(|(applied, bound)| *applied as f32 <= *bound));
-        assert_eq!(label("perfect amplitude calibration 1.0").values, vec![1.0f32; horizon]);
+        assert_eq!(
+            label("perfect amplitude calibration 1.0").values,
+            vec![1.0f32; horizon]
+        );
         // The gate, in the title, at its own value and with the unmeasured horizon named as
         // unmeasured rather than as a zero.
         assert!(
@@ -4405,13 +4578,18 @@ mod amplitude_report_tests {
             "{}",
             gain.title
         );
-        assert!(gain.title.contains("out-of-sample shrinkage problem or an in-sample objective one"));
+        assert!(gain
+            .title
+            .contains("out-of-sample shrinkage problem or an in-sample objective one"));
 
         // The ratio panel: its own base, its own unit, and both readings of one pass.
         let ratio =
             read_report(root.join("timexer_segment_amplitude_calibration.report.bin")).unwrap();
         assert_eq!(ratio.y_label.as_deref(), Some(BEST_SCALE_UNIT));
-        assert_ne!(gain.y_label, ratio.y_label, "a gain and an MSE ratio are different units");
+        assert_ne!(
+            gain.y_label, ratio.y_label,
+            "a gain and an MSE ratio are different units"
+        );
         let ReportKind::IndexedLines { series, .. } = &ratio.kind else {
             panic!("the ratio panel is horizon-indexed");
         };
@@ -4427,13 +4605,19 @@ mod amplitude_report_tests {
             let expected =
                 scored_moments.pooled_gained_ratio(bar, applied.anchor[bar], applied.offset[bar]);
             assert!(
-                (line(&format!("{SAMPLE} {NEUTRAL} four-channel ratio, calibrated")).values[bar]
+                (line(&format!(
+                    "{SAMPLE} {NEUTRAL} four-channel ratio, calibrated"
+                ))
+                .values[bar]
                     - expected as f32)
                     .abs()
                     < 1e-6
             );
             assert!(
-                (line(&format!("{SAMPLE} {NEUTRAL} four-channel ratio, uncalibrated")).values[bar]
+                (line(&format!(
+                    "{SAMPLE} {NEUTRAL} four-channel ratio, uncalibrated"
+                ))
+                .values[bar]
                     - scored_moments.pooled_ratio(bar) as f32)
                     .abs()
                     < 1e-6
@@ -4487,7 +4671,8 @@ mod amplitude_report_tests {
     #[test]
     fn the_calibrated_ratio_differs_from_the_uncalibrated_one_by_the_applied_gain() {
         use crate::torch::timexer_segment::calibration::{Blocks, FrozenGain, Moments};
-        let root = std::env::temp_dir().join(format!("timexer-gain-delta-{}", uuid::Uuid::new_v4()));
+        let root =
+            std::env::temp_dir().join(format!("timexer-gain-delta-{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&root).unwrap();
         let horizon = 6;
         let cells = horizon * 4;
@@ -4562,7 +4747,9 @@ mod amplitude_report_tests {
                 .unwrap_or_else(|| panic!("the ratio panel is missing {needle:?}"))
         };
         let calibrated = line(format!("{SAMPLE} {NEUTRAL} four-channel ratio, calibrated"));
-        let uncalibrated = line(format!("{SAMPLE} {NEUTRAL} four-channel ratio, uncalibrated"));
+        let uncalibrated = line(format!(
+            "{SAMPLE} {NEUTRAL} four-channel ratio, uncalibrated"
+        ));
         for bar in 0..horizon {
             let (mut anchor_square, mut offset_square, mut anchor_offset) = (0., 0., 0.);
             let (mut anchor_target, mut offset_target, mut persistence) = (0., 0., 0.);
@@ -4576,9 +4763,7 @@ mod amplitude_report_tests {
                 persistence += moments.target_square[cell];
             }
             let (gain_a, gain_o) = (applied.anchor[bar], applied.offset[bar]);
-            let expected_uncalibrated = (anchor_square
-                + 2. * anchor_offset
-                + offset_square
+            let expected_uncalibrated = (anchor_square + 2. * anchor_offset + offset_square
                 - 2. * (anchor_target + offset_target)
                 + persistence)
                 / persistence;
@@ -4682,9 +4867,7 @@ pub fn write_target_basis(
 ) -> Result<()> {
     let coefficients = correlation.len();
     ensure!(
-        coefficients > 0
-            && amplitude_gain.len() == coefficients
-            && weights.len() == coefficients,
+        coefficients > 0 && amplitude_gain.len() == coefficients && weights.len() == coefficients,
         "the coefficient panel needs one rho, one beta and one weight per coefficient, got \
          {coefficients}, {} and {}",
         amplitude_gain.len(),
@@ -4697,10 +4880,7 @@ pub fn write_target_basis(
     let series = vec![
         ReportSeries {
             label: format!("{FULL} rho-squared per coefficient"),
-            values: correlation
-                .iter()
-                .map(|rho| (rho * rho) as f32)
-                .collect(),
+            values: correlation.iter().map(|rho| (rho * rho) as f32).collect(),
         },
         ReportSeries {
             label: format!("{FULL} beta fitted amplitude gain per coefficient"),
@@ -4766,9 +4946,21 @@ mod target_basis_report_tests {
         )
         .unwrap();
         let report = read_report(&path).unwrap();
-        assert!(report.title.contains("dct coefficient axis"), "{}", report.title);
-        assert!(report.title.contains("orthonormality defect"), "{}", report.title);
-        assert!(report.title.contains("complete rotatable window"), "{}", report.title);
+        assert!(
+            report.title.contains("dct coefficient axis"),
+            "{}",
+            report.title
+        );
+        assert!(
+            report.title.contains("orthonormality defect"),
+            "{}",
+            report.title
+        );
+        assert!(
+            report.title.contains("complete rotatable window"),
+            "{}",
+            report.title
+        );
         assert!(report.y_label.as_ref().unwrap().contains("over-amplified"));
         let ReportKind::IndexedLines { steps, series } = &report.kind else {
             panic!("the coefficient panel must be an index-indexed line chart");
@@ -4777,18 +4969,42 @@ mod target_basis_report_tests {
         assert_eq!(series.len(), 4);
         // ρ² is squared here, not in the caller, so a sign convention cannot leak into a
         // variance share; and an unmeasured coefficient renders NaN, never 0.
-        assert!((series[0].values[0] - 0.04).abs() < 1e-6, "{:?}", series[0].values);
+        assert!(
+            (series[0].values[0] - 0.04).abs() < 1e-6,
+            "{:?}",
+            series[0].values
+        );
         assert!(series[0].values[2].is_nan(), "{:?}", series[0].values);
         assert!(series[1].values[2].is_nan(), "{:?}", series[1].values);
         assert_eq!(series[2].values, vec![1.0; 4]);
         let error = write_target_basis(
-            &root, 2, 2000, "haar", "snr", &[0.2, 0.1], &[1.0], &[1.0, 1.0], 1.0, 0.0, 1,
+            &root,
+            2,
+            2000,
+            "haar",
+            "snr",
+            &[0.2, 0.1],
+            &[1.0],
+            &[1.0, 1.0],
+            1.0,
+            0.0,
+            1,
         )
         .unwrap_err()
         .to_string();
         assert!(error.contains("one weight per coefficient"), "{error}");
         let error = write_target_basis(
-            &root, 2, 2000, "haar", "snr", &[0.2], &[1.0], &[1.0], 1.5, 0.0, 1,
+            &root,
+            2,
+            2000,
+            "haar",
+            "snr",
+            &[0.2],
+            &[1.0],
+            &[1.0],
+            1.5,
+            0.0,
+            1,
         )
         .unwrap_err()
         .to_string();
@@ -4871,10 +5087,11 @@ pub fn write_supervision_occupancy(
             .collect(),
     });
     ensure!(
-        series
-            .iter()
-            .all(|line| line.values.len() == axis.len()
-                && line.values.iter().all(|value| value.is_finite() && *value >= 0.)),
+        series.iter().all(|line| line.values.len() == axis.len()
+            && line
+                .values
+                .iter()
+                .all(|value| value.is_finite() && *value >= 0.)),
         "every occupancy series must carry one finite non-negative share per step"
     );
     let saturation = census.saturation_step(0.999, batch_size);
@@ -4957,7 +5174,8 @@ pub fn write_horizon_decimation(
         interval.kept[0] * per_step,
         interval.kept[interval.kept.len() - 1] * per_step,
         interval.kept[0] * per_step * interval.factors[0] as f64,
-        interval.kept[interval.kept.len() - 1] * per_step
+        interval.kept[interval.kept.len() - 1]
+            * per_step
             * interval.factors[interval.factors.len() - 1] as f64,
         interval.active_origins as f64 * batch_size as f64,
     );
@@ -5040,8 +5258,8 @@ mod supervision_occupancy_tests {
     /// census says it does - which is the whole reason the base exists.
     #[test]
     fn the_occupancy_panel_draws_the_saturation_step_the_census_predicts() {
-        let root = std::env::temp_dir()
-            .join(format!("timexer_occupancy_report_{}", std::process::id()));
+        let root =
+            std::env::temp_dir().join(format!("timexer_occupancy_report_{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(&root).unwrap();
         assert!(
@@ -5110,9 +5328,16 @@ mod supervision_occupancy_tests {
             drawn >= predicted && drawn < predicted + stride,
             "the chart saturates at {drawn}, the census predicts {predicted}"
         );
-        assert!(report.title.contains(&format!("step {predicted}")), "{}", report.title);
+        assert!(
+            report.title.contains(&format!("step {predicted}")),
+            "{}",
+            report.title
+        );
         // An empty pool is a refusal, not a blank panel.
-        let empty = SupervisionCensus { rows: 0, ..census.clone() };
+        let empty = SupervisionCensus {
+            rows: 0,
+            ..census.clone()
+        };
         assert!(write_supervision_occupancy(&root, 1, 1, 256, &empty).is_err());
         assert!(write_supervision_occupancy(&root, 1, 1, 0, &census).is_err());
         fs::remove_dir_all(&root).unwrap();
@@ -5348,9 +5573,7 @@ impl BookInterval {
     fn per_year(&self, cadence: &BookCadence) -> f64 {
         match self.source {
             BookIntervalSource::Bars(block) => cadence.bars_per_year / block.max(1) as f64,
-            BookIntervalSource::Sessions(block) => {
-                cadence.sessions_per_year / block.max(1) as f64
-            }
+            BookIntervalSource::Sessions(block) => cadence.sessions_per_year / block.max(1) as f64,
             BookIntervalSource::Months => BOOK_MONTHS_PER_YEAR,
         }
     }
@@ -5361,9 +5584,7 @@ impl BookInterval {
     fn bars(&self, cadence: &BookCadence) -> f64 {
         match self.source {
             BookIntervalSource::Bars(block) => block.max(1) as f64,
-            BookIntervalSource::Sessions(block) => {
-                block.max(1) as f64 * cadence.bars_per_session()
-            }
+            BookIntervalSource::Sessions(block) => block.max(1) as f64 * cadence.bars_per_session(),
             BookIntervalSource::Months => cadence.bars_per_year / BOOK_MONTHS_PER_YEAR,
         }
     }
@@ -5891,9 +6112,10 @@ pub(super) fn write_book(
         ),
         &|m| m.intervals[0].sortino(m.cadence.bars_per_year),
     ));
-    ratios.extend(aum_series("Calmar (annualized return / |max drawdown|)", &|m| {
-        m.calmar()
-    }));
+    ratios.extend(aum_series(
+        "Calmar (annualized return / |max drawdown|)",
+        &|m| m.calmar(),
+    ));
     ratios.push(flat("zero 0.0", 0.0, aums.len()));
     ratios.push(flat("unity 1.0", 1.0, aums.len()));
     chart(
@@ -5965,7 +6187,9 @@ pub(super) fn write_book(
     // book with a weak signal both draw thin exposure and small returns, and only this series
     // separates them.
     let mut exposure = aum_series("mean gross exposure (x equity)", &|m| m.gross_exposure);
-    exposure.extend(aum_series("mean net exposure (x equity)", &|m| m.net_exposure));
+    exposure.extend(aum_series("mean net exposure (x equity)", &|m| {
+        m.net_exposure
+    }));
     exposure.extend(aum_series("mean |net| exposure (x equity)", &|m| {
         m.absolute_net_exposure
     }));
@@ -6017,12 +6241,13 @@ pub(super) fn write_book(
         .iter()
         .filter(|(_, aum, _)| *aum == reference_aum)
         .map(|(label, _, evaluation)| {
-            let mut values = book_row(
-                evaluation
-                    .points
-                    .iter()
-                    .map(|point| point.values.get("drawdown_fraction").copied().unwrap_or(f64::NAN)),
-            );
+            let mut values = book_row(evaluation.points.iter().map(|point| {
+                point
+                    .values
+                    .get("drawdown_fraction")
+                    .copied()
+                    .unwrap_or(f64::NAN)
+            }));
             values.resize(bars, f32::NAN);
             ReportSeries {
                 label: label.clone(),
@@ -6405,8 +6630,7 @@ mod book_report_tests {
         );
         // An unmeasured cost bucket is a gap; the measured ones are exact basis points of the
         // traded notional the account reported.
-        let costs =
-            read_report(root.join("timexer_book_cost_decomposition.report.bin")).unwrap();
+        let costs = read_report(root.join("timexer_book_cost_decomposition.report.bin")).unwrap();
         let (_, costs) = lines(&costs);
         assert!(
             line(costs, "flat slippage proxy")
@@ -6491,7 +6715,12 @@ mod book_report_tests {
         let report = read_report(root.join("timexer_book_interval_return.report.bin")).unwrap();
         let (_, series) = lines(&report);
         assert!(line(series, "per five-minute bar").values[0].is_finite());
-        for unmeasured in ["per 12-bar hour", "per session", "per 5-session week", "per calendar month"] {
+        for unmeasured in [
+            "per 12-bar hour",
+            "per session",
+            "per 5-session week",
+            "per calendar month",
+        ] {
             let values = &line(series, unmeasured).values;
             assert!(
                 values.iter().all(|value| value.is_nan()),
@@ -6729,7 +6958,13 @@ mod book_report_tests {
     #[test]
     fn book_diagnostics_that_disagree_with_their_horizon_axis_are_refused() {
         let root = temp("book_report_mismatch");
-        let runs = vec![run("precision decile", 1_000_000.0, &[0.0002, -0.0001, 0.0003], 2, 0)];
+        let runs = vec![run(
+            "precision decile",
+            1_000_000.0,
+            &[0.0002, -0.0001, 0.0003],
+            2,
+            0,
+        )];
         let mut broken = diagnostics();
         broken.ic_by_horizon.pop();
         assert!(write_book(&root, 1, 1, &runs, Some(&broken)).is_err());

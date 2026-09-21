@@ -42,8 +42,7 @@ extern "C" {
         sine: *const C_tensor,
         heads: i64,
     ) -> *mut C_tensor;
-    fn fk_relu_square_backward_raw(input: *const C_tensor, grad: *const C_tensor)
-        -> *mut C_tensor;
+    fn fk_relu_square_backward_raw(input: *const C_tensor, grad: *const C_tensor) -> *mut C_tensor;
     fn fk_rope_backward_raw(
         grad: *const C_tensor,
         cosine: *const C_tensor,
@@ -377,7 +376,6 @@ pub fn decoupled_loss_geometry(
     )
 }
 
-
 /// [`loss_geometry`] with the rounding selector open, so the discovery test can prove which
 /// of the thirty-two forms ATen's build emitted and that the others disagree. The model path
 /// calls [`loss_geometry`].
@@ -485,8 +483,8 @@ fn loss_geometry_impl(
 /// traffic that says nothing about the kernel.
 pub mod raw {
     use super::{
-        fk_qk_norm_rope, fk_qk_norm_rope_backward_raw, fk_relu_square_backward_raw,
-        fk_rope_backward_raw, finish, Tensor,
+        finish, fk_qk_norm_rope, fk_qk_norm_rope_backward_raw, fk_relu_square_backward_raw,
+        fk_rope_backward_raw, Tensor,
     };
 
     /// `x <= 0 ? 0 : 2·grad·x`, from the saved forward input.
@@ -1160,7 +1158,9 @@ mod tests {
         let chosen = values
             .internal_fused_rms_norm([64], None::<&Tensor>, Some(NORM_EPS))
             .0;
-        let defaulted = values.internal_fused_rms_norm([64], None::<&Tensor>, None).0;
+        let defaulted = values
+            .internal_fused_rms_norm([64], None::<&Tensor>, None)
+            .0;
         assert!(
             !identical(&chosen, &defaulted),
             "eps=1e-6 and the resolved default agree even on a near-zero block, so this \
@@ -1209,7 +1209,9 @@ mod tests {
         tch::Cuda::is_available().then(|| CudaClaim {
             // A failing CUDA test poisons this mutex. The tests after it should report their
             // own result rather than a poison error about someone else's failure.
-            _claim: CUDA_DEVICE.lock().unwrap_or_else(|error| error.into_inner()),
+            _claim: CUDA_DEVICE
+                .lock()
+                .unwrap_or_else(|error| error.into_inner()),
             device: Device::Cuda(0),
         })
     }
@@ -1507,10 +1509,10 @@ mod tests {
             "the replayed objective does not match an eager evaluation on the same bytes"
         );
         if decoupled {
-            assert!(identical(
-                captured.5.as_ref().unwrap(),
-                eager.5.as_ref().unwrap()
-            ), "captured true NLL did not update with the head and scale-gain buffers");
+            assert!(
+                identical(captured.5.as_ref().unwrap(), eager.5.as_ref().unwrap()),
+                "captured true NLL did not update with the head and scale-gain buffers"
+            );
         }
         unsafe { torch_sys::at_cuda_graph_free(graph) };
     }
@@ -1770,7 +1772,13 @@ mod tests {
 
     const LOSS_CAP: f64 = 4.0;
 
-    fn loss_inputs(rows: i64, origins: i64, horizon: i64, device: Device, scale: f64) -> LossInputs {
+    fn loss_inputs(
+        rows: i64,
+        origins: i64,
+        horizon: i64,
+        device: Device,
+        scale: f64,
+    ) -> LossInputs {
         let float = (Kind::Float, device);
         let head = (Tensor::randn([rows, origins, 2 * LOSS_CHANNELS, horizon], float) * scale)
             .to_kind(Kind::BFloat16)
@@ -1905,8 +1913,7 @@ mod tests {
         for rounding in 0..32 {
             let (composed, composed_gradient, fused, fused_gradient) =
                 loss_pair(&inputs, &upstream, None, rounding);
-            let counts =
-                loss_differences(&composed, &composed_gradient, &fused, &fused_gradient);
+            let counts = loss_differences(&composed, &composed_gradient, &fused, &fused_gradient);
             let total: i64 = counts.iter().sum();
             println!(
                 "rounding {rounding:2}: close {}, terms {}, squares {}, gradient {}",
@@ -1972,7 +1979,10 @@ mod tests {
         );
         // The objective is a real number, not an artefact of the comparison.
         let objective = composed.terms.sum(Kind::Float).double_value(&[]);
-        assert!(objective.is_finite() && objective.abs() > 1.0, "{objective}");
+        assert!(
+            objective.is_finite() && objective.abs() > 1.0,
+            "{objective}"
+        );
     }
 
     /// The targets as the TRAINING PATH builds them, strides and all.
@@ -2012,7 +2022,12 @@ mod tests {
         assert_eq!(targets.size(), [rows, origins, LOSS_CHANNELS, horizon]);
         assert_eq!(
             targets.stride(),
-            [origins * LOSS_CHANNELS * horizon, LOSS_CHANNELS * horizon, 1, LOSS_CHANNELS],
+            [
+                origins * LOSS_CHANNELS * horizon,
+                LOSS_CHANNELS * horizon,
+                1,
+                LOSS_CHANNELS
+            ],
             "the real path's targets are channel-innermost; if this layout changed, the \
              kernel's stride arguments are being tested against the wrong thing"
         );
@@ -2169,15 +2184,8 @@ mod tests {
         }
         // The gradient of a fully masked batch is zero too, in both forms, because every
         // path to the head runs through the precision weight or the folded mask.
-        for (name, gradient) in [
-            ("composed", &composed_gradient),
-            ("fused", &fused_gradient),
-        ] {
-            let magnitude = gradient
-                .to_kind(Kind::Float)
-                .abs()
-                .max()
-                .double_value(&[]);
+        for (name, gradient) in [("composed", &composed_gradient), ("fused", &fused_gradient)] {
+            let magnitude = gradient.to_kind(Kind::Float).abs().max().double_value(&[]);
             assert_eq!(
                 magnitude, 0.0,
                 "{name} head gradient is {magnitude} under a zero mask, not exactly zero"
@@ -2281,7 +2289,10 @@ mod tests {
             let mismatch = left
                 .ne_tensor(&right)
                 .logical_or(&left.signbit().logical_xor(&right.signbit()));
-            let count = mismatch.to_kind(Kind::Int64).sum(Kind::Int64).int64_value(&[]);
+            let count = mismatch
+                .to_kind(Kind::Int64)
+                .sum(Kind::Int64)
+                .int64_value(&[]);
             if count == 0 {
                 continue;
             }
@@ -2302,7 +2313,10 @@ mod tests {
                 tally(&left.signbit()),
                 tally(&right.signbit()),
             );
-            let flat = mismatch.to_kind(Kind::Float).argmax(0, false).int64_value(&[]);
+            let flat = mismatch
+                .to_kind(Kind::Float)
+                .argmax(0, false)
+                .int64_value(&[]);
             let (token, bar) = (flat / horizon, flat % horizon);
             let at = |tensor: &Tensor, index: i64| -> String {
                 let value = tensor
@@ -2418,8 +2432,7 @@ mod tests {
         let (rows, origins, horizon, hidden) = (8i64, 375i64, 192i64, 64i64);
         let inputs = loss_inputs(rows, origins, horizon, device, 2.0);
         let upstream = Tensor::randn([2 * LOSS_CHANNELS], (Kind::Float, device));
-        let activation =
-            bf16_randn(&[rows * origins, hidden], device).set_requires_grad(true);
+        let activation = bf16_randn(&[rows * origins, hidden], device).set_requires_grad(true);
         let weight = (bf16_randn(&[hidden, 2 * LOSS_CHANNELS * horizon], device) * 0.25)
             .set_requires_grad(true);
         let shape = [rows, origins, 2 * LOSS_CHANNELS, horizon];
@@ -2454,12 +2467,8 @@ mod tests {
                 )
             };
             let objective = geometry.terms.dot(&upstream);
-            let gradients = Tensor::run_backward(
-                &[&objective],
-                &[&weight, &activation, &head],
-                false,
-                false,
-            );
+            let gradients =
+                Tensor::run_backward(&[&objective], &[&weight, &activation, &head], false, false);
             (
                 gradients[0].shallow_clone(),
                 gradients[1].shallow_clone(),
@@ -2608,9 +2617,10 @@ mod tests {
         let mut changed = targets_dense(&inputs);
         changed.head = inputs.head.detach().copy().set_requires_grad(true);
         tch::no_grad(|| {
-            changed.head.narrow(2, LOSS_CHANNELS, LOSS_CHANNELS).copy_(
-                &(inputs.head.narrow(2, LOSS_CHANNELS, LOSS_CHANNELS) + 3.5),
-            );
+            changed
+                .head
+                .narrow(2, LOSS_CHANNELS, LOSS_CHANNELS)
+                .copy_(&(inputs.head.narrow(2, LOSS_CHANNELS, LOSS_CHANNELS) + 3.5));
         });
         let (_, changed_gradient) = assert_split_pair(&changed, &ones, LOSS_CAP);
         assert!(
@@ -2639,11 +2649,17 @@ mod tests {
         );
 
         for (weights, disconnected) in [([1.0f32, 0.0, 0.0], LOSS_CHANNELS), ([0.0, 1.0, 1.0], 0)] {
-            let upstream = Tensor::from_slice(&weights).to_device(device).repeat([LOSS_CHANNELS]);
+            let upstream = Tensor::from_slice(&weights)
+                .to_device(device)
+                .repeat([LOSS_CHANNELS]);
             let (_, isolated) = assert_split_pair(&inputs, &upstream, LOSS_CAP);
             assert_eq!(
-                isolated.narrow(2, disconnected, LOSS_CHANNELS)
-                    .to_kind(Kind::Float).abs().max().double_value(&[]),
+                isolated
+                    .narrow(2, disconnected, LOSS_CHANNELS)
+                    .to_kind(Kind::Float)
+                    .abs()
+                    .max()
+                    .double_value(&[]),
                 0.0,
                 "the split quadratic leaked a gradient into its detached branch"
             );
@@ -2655,7 +2671,10 @@ mod tests {
         let train = fresh.terms.sum(Kind::Float);
         let nll = fresh.nll_terms.as_ref().unwrap().sum(Kind::Float);
         let surrogate = &nll + (&train - train.detach());
-        assert!(identical(&surrogate, &geometry.nll_terms.unwrap().sum(Kind::Float)));
+        assert!(identical(
+            &surrogate,
+            &geometry.nll_terms.unwrap().sum(Kind::Float)
+        ));
         let surrogate_gradient =
             Tensor::run_backward(&[&surrogate], &[&inputs.head], false, false).remove(0);
         assert!(identical(&surrogate_gradient, &gradient));
@@ -2669,23 +2688,40 @@ mod tests {
         let inputs = loss_inputs(2, 17, 37, device, 6.0);
         let upstream = Tensor::randn([3 * LOSS_CHANNELS], (Kind::Float, device));
         tch::no_grad(|| {
-            for (origin, value) in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY].into_iter().enumerate() {
-                let _ = inputs.head.select(0, 0).select(0, origin as i64)
-                    .narrow(0, LOSS_CHANNELS, LOSS_CHANNELS).fill_(value);
+            for (origin, value) in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY]
+                .into_iter()
+                .enumerate()
+            {
+                let _ = inputs
+                    .head
+                    .select(0, 0)
+                    .select(0, origin as i64)
+                    .narrow(0, LOSS_CHANNELS, LOSS_CHANNELS)
+                    .fill_(value);
             }
             // A zero mask must not sanitize a NaN scale; a nonfinite mask must not be
             // silently clamped. Invalid normalization scales follow IEEE, as in ATen.
             let _ = inputs.mask.select(0, 0).select(0, 0).fill_(0.0);
             let _ = inputs.weighted_mask.select(0, 0).select(0, 0).fill_(0.0);
             let _ = inputs.mask.select(0, 1).select(0, 0).fill_(f64::NAN);
-            let _ = inputs.weighted_mask.select(0, 1).select(0, 0).fill_(f64::NAN);
+            let _ = inputs
+                .weighted_mask
+                .select(0, 1)
+                .select(0, 0)
+                .fill_(f64::NAN);
             let _ = inputs.sigma.select(0, 1).select(0, 1).fill_(0.0);
             let _ = inputs.range.select(0, 1).select(0, 2).fill_(-1.0);
         });
         let (geometry, gradient) = assert_split_pair(&inputs, &upstream, LOSS_CAP);
         assert!(geometry.nll_terms.unwrap().isnan().any().int64_value(&[]) != 0);
         assert!(
-            gradient.select(0, 0).narrow(1, 0, LOSS_CHANNELS).isfinite().all().int64_value(&[]) != 0,
+            gradient
+                .select(0, 0)
+                .narrow(1, 0, LOSS_CHANNELS)
+                .isfinite()
+                .all()
+                .int64_value(&[])
+                != 0,
             "a nonfinite learned scale poisoned the scale-independent mean gradient"
         );
 
@@ -2693,8 +2729,16 @@ mod tests {
         let _ = blind.mask.fill_(0.0);
         let _ = blind.weighted_mask.fill_(0.0);
         let (geometry, gradient) = assert_split_pair(&blind, &upstream, LOSS_CAP);
-        for value in [&geometry.terms, &geometry.squares, geometry.nll_terms.as_ref().unwrap(), &gradient] {
-            assert_eq!(value.to_kind(Kind::Float).abs().max().double_value(&[]), 0.0);
+        for value in [
+            &geometry.terms,
+            &geometry.squares,
+            geometry.nll_terms.as_ref().unwrap(),
+            &gradient,
+        ] {
+            assert_eq!(
+                value.to_kind(Kind::Float).abs().max().double_value(&[]),
+                0.0
+            );
         }
     }
 
@@ -2707,7 +2751,12 @@ mod tests {
         let upstream = Tensor::randn([3 * LOSS_CHANNELS], (Kind::Float, device));
         let close_upstream = Tensor::randn(inputs.mask.size(), (Kind::Float, device));
         let (composed, composed_gradient, fused, fused_gradient) = loss_pair_mode(
-            &inputs, &upstream, Some(&close_upstream), LOSS_GEOMETRY_ROUNDING, LOSS_CAP, true,
+            &inputs,
+            &upstream,
+            Some(&close_upstream),
+            LOSS_GEOMETRY_ROUNDING,
+            LOSS_CAP,
+            true,
         );
         assert!(identical(&composed.close, &fused.close));
         assert!(identical(&composed.terms, &fused.terms));
@@ -2717,19 +2766,26 @@ mod tests {
         ));
         // The extra consumer changes three-addend accumulation order only on coordinate 0.
         // Match the existing coupled-loss rounding bound; all other channels remain exact.
-        let scale = composed_gradient.to_kind(Kind::Float).abs().max().double_value(&[]);
+        let scale = composed_gradient
+            .to_kind(Kind::Float)
+            .abs()
+            .max()
+            .double_value(&[]);
         assert!(scale > 0.0);
         assert!(max_absolute(&composed_gradient, &fused_gradient) / scale <= 1e-2);
 
         tch::no_grad(|| {
             let _ = inputs.targets.fill_(f64::NAN);
-            let _ = inputs.head.narrow(2, LOSS_CHANNELS, LOSS_CHANNELS).fill_(f64::NAN);
+            let _ = inputs
+                .head
+                .narrow(2, LOSS_CHANNELS, LOSS_CHANNELS)
+                .fill_(f64::NAN);
         });
         let geometry = split_geometry(&inputs, LOSS_CAP);
         let objective = (&geometry.close * &close_upstream).sum(Kind::Float);
-        let gradient =
-            Tensor::run_backward(&[&objective], &[&inputs.head], false, false).remove(0);
-        let reference_close = inputs.head.narrow(2, 0, 1).to_kind(Kind::Float) * &inputs.horizon_scale;
+        let gradient = Tensor::run_backward(&[&objective], &[&inputs.head], false, false).remove(0);
+        let reference_close =
+            inputs.head.narrow(2, 0, 1).to_kind(Kind::Float) * &inputs.horizon_scale;
         let reference_objective = (reference_close * &close_upstream).sum(Kind::Float);
         let reference_gradient =
             Tensor::run_backward(&[&reference_objective], &[&inputs.head], false, false).remove(0);
@@ -2754,7 +2810,10 @@ mod tests {
             let rejected = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 split_geometry(&inputs, LOSS_CAP)
             }));
-            assert!(rejected.is_err(), "malformed buffer {malformed} reached a kernel launch");
+            assert!(
+                rejected.is_err(),
+                "malformed buffer {malformed} reached a kernel launch"
+            );
         }
     }
 }

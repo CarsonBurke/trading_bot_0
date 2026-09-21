@@ -153,17 +153,15 @@ pub fn measure(
         .to_kind(Kind::BFloat16)
         .set_requires_grad(true);
     let hidden_detached = hidden.detach();
-    let hidden_grad =
-        Tensor::randn([tokens, ffn], (Kind::Float, device)).to_kind(Kind::BFloat16);
+    let hidden_grad = Tensor::randn([tokens, ffn], (Kind::Float, device)).to_kind(Kind::BFloat16);
     let hidden_elements = (tokens * ffn) as f64;
 
     // Packed q‖k rotary. The input is a strided view of the QKV projection, exactly as the
     // model hands it over.
-    let inverse = (Tensor::arange(half, (Kind::Float, device)) * (1.0 / half as f64)
-        * -(10000.0_f64.ln()))
-    .exp();
-    let angles =
-        Tensor::arange(origins, (Kind::Float, device)).unsqueeze(1) * inverse.unsqueeze(0);
+    let inverse =
+        (Tensor::arange(half, (Kind::Float, device)) * (1.0 / half as f64) * -(10000.0_f64.ln()))
+            .exp();
+    let angles = Tensor::arange(origins, (Kind::Float, device)).unsqueeze(1) * inverse.unsqueeze(0);
     let cosine = angles.cos().to_kind(Kind::BFloat16);
     let sine = angles.sin().to_kind(Kind::BFloat16);
     let (cosine_tile, sine_tile) = reference::rotation_tiles(&cosine, &sine, heads);
@@ -171,14 +169,12 @@ pub fn measure(
         .to_kind(Kind::BFloat16)
         .set_requires_grad(true);
     let projection_detached = projection.detach();
-    let rotated_grad =
-        Tensor::randn([rows, origins, 2, heads, head_dim], (Kind::Float, device))
-            .to_kind(Kind::BFloat16);
+    let rotated_grad = Tensor::randn([rows, origins, 2, heads, head_dim], (Kind::Float, device))
+        .to_kind(Kind::BFloat16);
     let rope_elements = (tokens * 2 * d_model) as f64;
     let rotation_bytes = 2.0 * (origins * half) as f64 * element;
-    let packed = |tensor: &Tensor| {
-        tensor.split_with_sizes([2 * d_model, d_model], -1)[0].shallow_clone()
-    };
+    let packed =
+        |tensor: &Tensor| tensor.split_with_sizes([2 * d_model, d_model], -1)[0].shallow_clone();
 
     let objective = |output: Tensor, leaf: &Tensor| {
         let _ = Tensor::run_backward(&[output.sum(Kind::Float)], &[leaf], false, false);
@@ -240,12 +236,7 @@ pub fn measure(
         }),
         Box::new(|| {
             drop(tch::no_grad(|| {
-                reference::qk_norm_fused_rope(
-                    &packed(&projection_detached),
-                    &cosine,
-                    &sine,
-                    heads,
-                )
+                reference::qk_norm_fused_rope(&packed(&projection_detached), &cosine, &sine, heads)
             }))
         }),
         Box::new(|| {
@@ -419,11 +410,10 @@ pub fn activation_saving(
     layers: i64,
 ) -> ActivationSaving {
     let half = d_model / heads / 2;
-    let inverse = (Tensor::arange(half, (Kind::Float, device)) * (1.0 / half as f64)
-        * -(10000.0_f64.ln()))
-    .exp();
-    let angles =
-        Tensor::arange(origins, (Kind::Float, device)).unsqueeze(1) * inverse.unsqueeze(0);
+    let inverse =
+        (Tensor::arange(half, (Kind::Float, device)) * (1.0 / half as f64) * -(10000.0_f64.ln()))
+            .exp();
+    let angles = Tensor::arange(origins, (Kind::Float, device)).unsqueeze(1) * inverse.unsqueeze(0);
     let cosine = angles.cos().to_kind(Kind::BFloat16);
     let sine = angles.sin().to_kind(Kind::BFloat16);
 
@@ -434,11 +424,8 @@ pub fn activation_saving(
         // hold. Everything else a layer allocates is the op's own business.
         let mut retained: Vec<Tensor> = Vec::new();
         for _ in 0..layers {
-            let projection = Tensor::randn(
-                [rows, origins, 3 * d_model],
-                (Kind::BFloat16, device),
-            )
-            .set_requires_grad(true);
+            let projection = Tensor::randn([rows, origins, 3 * d_model], (Kind::BFloat16, device))
+                .set_requires_grad(true);
             let packed = projection.split_with_sizes([2 * d_model, d_model], -1);
             let rotated = if fused {
                 qk_norm_rope(&packed[0], &cosine, &sine, heads)
