@@ -1,0 +1,12 @@
+{
+  "evidence": null,
+  "failure": "unsupported operand type(s) for |: 'dict' and 'set'",
+  "finished_at": "2026-09-21T19:17:54.285253+00:00",
+  "idempotency_key": "lejepa-07c688b89434d1a8e2561695e09fe8d40e58c1975861abb9015abcb0b15f2e8c-unanchored-temporal-no-sigreg",
+  "plan_sha256": "07c688b89434d1a8e2561695e09fe8d40e58c1975861abb9015abcb0b15f2e8c",
+  "shared_identity_sha256": null,
+  "started_at": "2026-09-21T19:13:44.539654+00:00",
+  "status": "failed",
+  "task": "unanchored-temporal-no-sigreg",
+  "wall_seconds": 249.74556857900006
+}
