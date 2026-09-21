@@ -1,0 +1,1289 @@
+#!/usr/bin/env python3
+"""Plan, submit, and follow matched fixed-step CausalPatch/LeJEPA comparisons.
+
+Each selected model has one exclusive, normal-priority mlq job. A lightweight
+collector depends on every selected model succeeding. Planning never loads bars
+or launches training. Metrics live only in trainer .report.bin files, read with
+the pinned report_cli; JSON receipts contain configuration, identity and lifecycle.
+"""
+
+import argparse
+import datetime
+import fcntl
+import hashlib
+import json
+import math
+import os
+from pathlib import Path
+import re
+import shutil
+import signal
+import subprocess
+import sys
+import tempfile
+import time
+
+ROOT = Path(__file__).resolve().parents[1]
+SCHEMA = "lejepa-per-model-fixed-step-campaign-v2"
+LEGACY_SCHEMA = "lejepa-exclusive-fixed-step-campaign-v1"
+BASELINE = "decoupled-lattice-forecast"
+MODES = ("off", "latent-one", "latent-multi", "anchored", "anchored-no-sigreg", "anchored-reconstruct")
+OBJECTIVE_NAMES = (BASELINE, "latent-one", "latent-multi", "anchored", "no-sigreg", "reconstruct")
+PROJECTED_NAMES = ("projected", "projected-no-sigreg")
+TEMPORAL_PROJECTED_NAMES = ("temporal-projected", "temporal-projected-no-sigreg")
+SIGN_NAMES = ("temporal-projected-sign",)
+CONDITIONAL_NAMES = ("conditional", "conditional-full-none")
+MOMENT_FIELDS = ("decision_mse_weight", "temporal_moment_weight")
+SIGN_WEIGHT = 0.05
+MOMENT_WEIGHTS = {
+    "decision-mse": (0.125, 0.0),
+    "moment": (0.0, 0.125),
+    "moment-strong": (0.0, 0.5),
+    "moment-plus-mse": (0.125, 0.125),
+}
+READER_PLACEMENTS = {
+    "reader-none": "off",
+    "reader-local": "local",
+    "reader-state": "state",
+    "reader-both": "both",
+}
+READER_DEFAULTS = {"reader_norm": "rms", "sigreg_placement": "off"}
+READER_SIGREG_CONFIG = {"sigreg_weight": 0.09, "directions": 256, "views": 8, "seed": 0}
+READER_SIGREG_CONTRACT = {
+    "required_fresh_arms": list(READER_PLACEMENTS),
+    "allowed_model_differences": ["sigreg_placement"],
+    "jepa_mode": "off", "recipe": "full-none", "reader_norm": "none",
+    "decision_mse_weight": 0.0, "temporal_moment_weight": 0.0,
+    "jepa": READER_SIGREG_CONFIG,
+    "placement_fractions": {
+        "off": {"local": 0.0, "state": 0.0},
+        "local": {"local": 1.0, "state": 0.0},
+        "state": {"local": 0.0, "state": 1.0},
+        "both": {"local": 0.5, "state": 0.5},
+    },
+    "local_site": "unconstrained-patch-observation",
+    "state_site": "causal-reader-pre-final-rms",
+}
+UNANCHORED_PLACEMENTS = {
+    "unanchored-none": "off",
+    "unanchored-local": "local",
+    "unanchored-state": "state",
+    "unanchored-both": "both",
+}
+UNANCHORED_SIGREG_CONFIG = {
+    **READER_SIGREG_CONFIG, "predictor_width": 256,
+    "prediction_weight": 1.0, "reconstruction_weight": 0.0,
+}
+UNANCHORED_PROTOCOL = {
+    "max_steps": 1400, "schedule_budget": 1400, "seed": 20260919,
+    "batch_size": 256, "eval_origins": 2048, "probe_fit_origins": 4096,
+}
+UNANCHORED_PROBE_PROTOCOL = {
+    "primary_report": "timexer_segment_jepa_probe_ratio",
+    "series": "full-state", "horizons_bars": [16, 32, 64, 128, 192],
+    "aggregation": "equal-weight-mean-across-horizons",
+    "target": "raw-close-log-return",
+    "baseline": "paired-zero-return-persistence",
+    "not_comparable_to": "supervised-market-neutral-online-forecast-score",
+    "required_reports": [
+        "timexer_segment_jepa_probe_ratio", "timexer_segment_jepa_probe_count",
+        "timexer_segment_jepa_probe_correlation", "timexer_segment_jepa_probe_direction",
+        "timexer_segment_jepa_probe_direction_count",
+    ],
+}
+UNANCHORED_CONTRACT = {
+    "required_fresh_arms": list(UNANCHORED_PLACEMENTS),
+    "allowed_model_differences": ["sigreg_placement"],
+    "jepa_mode": "unanchored", "recipe": "full-none", "reader_norm": "none",
+    "initialization": "fresh-random-no-warmstart-no-supervised-reuse",
+    "pretraining": "attached-target-temporal-jepa-plus-placement-sigreg-only",
+    "target_gradient": "attached-no-stop-gradient-no-gradient-surgery",
+    "forecast_loss_weight": 0.0, "decision_mse_weight": 0.0, "temporal_moment_weight": 0.0,
+    "jepa": UNANCHORED_SIGREG_CONFIG, "offsets": [1, 2, 4, 8, 12],
+    "placement_fractions": READER_SIGREG_CONTRACT["placement_fractions"],
+    "local_site": READER_SIGREG_CONTRACT["local_site"],
+    "state_site": READER_SIGREG_CONTRACT["state_site"],
+    "reader_fitting": "after-final-representation-freeze-only",
+    "primary_comparison": "held-out-frozen-cuda-ridge-probes-not-online-forecast-head",
+    "numerics": "native-bf16-cuda-graphs-no-gradient-accumulation-no-chunking",
+    "protocol": UNANCHORED_PROTOCOL,
+    "probe_protocol": UNANCHORED_PROBE_PROTOCOL,
+}
+MODEL_TREATMENTS = (
+    "jepa_mode", "scale_coupling", "horizon_decimation", *MOMENT_FIELDS,
+    "decision_sign_weight", *READER_DEFAULTS,
+)
+BASELINE_KEY = ("off", "decoupled-lattice", 0.0, 0.0, 0.0, "rms", "off")
+FULL_NONE_KEY = ("off", "full-none", 0.0, 0.0, 0.0, "rms", "off")
+SUITES = {
+    "objective-comparison": OBJECTIVE_NAMES,
+    "forecasting-controls": (BASELINE, "full-none-forecast"),
+    "matched-comparison": (*OBJECTIVE_NAMES, "full-none-forecast"),
+    "sigreg-placement": (BASELINE, "anchored", "no-sigreg", *PROJECTED_NAMES),
+    "temporal-projected": (*TEMPORAL_PROJECTED_NAMES,),
+    "temporal-projected-sign": (BASELINE, *SIGN_NAMES),
+    "temporal-conditional": (BASELINE, "full-none-forecast", *CONDITIONAL_NAMES),
+    "sigreg-dimensionality": (BASELINE, "projected", "projected-small"),
+    "temporal-moments": (BASELINE, "full-none-forecast", *MOMENT_WEIGHTS),
+    "temporal-reader-sigreg": (BASELINE, *READER_PLACEMENTS),
+    "temporal-unanchored-sigreg": tuple(UNANCHORED_PLACEMENTS),
+}
+RECIPES = {
+    "decoupled-lattice": {"scale-coupling": "decoupled", "horizon-decimation": "lattice"},
+    "full-none": {"scale-coupling": "full", "horizon-decimation": "none"},
+}
+COMMON = {
+    "seq-len": 6000, "common-context": 6000, "pred-len": 192, "patch-len": 16,
+    "layers": 8, "d-model": 512, "heads": 8, "ffn": 2048, "dropout": 0,
+    "min-history": 256, "features": "all", "x0-lambdas": "disabled",
+    "future-calendar": "false",
+    "horizon-loss": "uniform", "horizon-mean": "free", "amplitude-prior": 0,
+    "target-basis": "cumulative", "basis-weight": "uniform",
+    "scale-coupling": "decoupled", "horizon-decimation": "lattice",
+    "optimizer": "polar-express", "scalar-lr-mult": 5, "mlp-down-lr": "aspect-only",
+    "market-min-cross-section": 2000,
+}
+PROTOCOL_KEYS = (
+    "max_steps", "schedule_budget", "seed", "batch_size", "eval_every",
+    "eval_origins", "eval_batch_size", "probe_fit_origins", "common_config",
+)
+RUNTIME_ENV = (
+    "PATH", "HOME", "LD_LIBRARY_PATH", "PYO3_PYTHON", "PYTHONPATH", "VIRTUAL_ENV",
+    "PYTORCH_CUDA_ALLOC_CONF", "PYTORCH_ALLOC_CONF", "CUDA_VISIBLE_DEVICES",
+    "CUDA_MODULE_LOADING", "TORCH_CUDA_ARCH_LIST", "OMP_NUM_THREADS", "MKL_NUM_THREADS",
+)
+MLQ_BASELINE_ENV = ("PATH", "HOME", "USER", "LOGNAME", "SHELL", "LANG", "TMPDIR")
+
+
+def utc_now():
+    return datetime.datetime.now(datetime.timezone.utc).isoformat()
+
+
+def sha256(path):
+    with Path(path).open("rb") as stream:
+        return hashlib.file_digest(stream, "sha256").hexdigest()
+
+
+def json_bytes(value):
+    return (json.dumps(value, indent=2, sort_keys=True, allow_nan=False) + "\n").encode()
+
+
+def identity_digest(value):
+    return hashlib.sha256(json_bytes(value)).hexdigest()
+
+
+def write_new(path, value):
+    """Publish a durable, complete receipt without ever replacing an existing file."""
+    path = Path(path)
+    with tempfile.NamedTemporaryFile(dir=path.parent, prefix=f".{path.name}.", delete=False) as stream:
+        temporary = Path(stream.name)
+        try:
+            stream.write(json_bytes(value))
+            stream.flush()
+            os.fsync(stream.fileno())
+            os.link(temporary, path)
+        finally:
+            temporary.unlink()
+    descriptor = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def read_json(path):
+    return json.loads(Path(path).read_text())
+
+
+def name(value):
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", value):
+        raise argparse.ArgumentTypeError("expected a simple campaign or arm name")
+    return value
+
+
+def positive(value):
+    number = int(value)
+    if number <= 0:
+        raise argparse.ArgumentTypeError("must be positive")
+    return number
+
+
+def snapshot(source, destination, executable=False):
+    source = Path(source).resolve(strict=True)
+    if executable:
+        with source.open("rb") as stream:
+            if stream.read(4) != b"\x7fELF" or not os.access(source, os.X_OK):
+                raise ValueError(f"explicit executable must be an ELF binary, not a mutable launcher: {source}")
+    before = sha256(source)
+    with source.open("rb") as reader, destination.open("xb") as writer:
+        shutil.copyfileobj(reader, writer)
+    if before != sha256(destination) or before != sha256(source):
+        raise ValueError(f"source changed while being pinned: {source}")
+    destination.chmod(0o555 if executable else 0o444)
+    return {"source": str(source), "path": str(destination), "sha256": before}
+
+
+def arm_specs(suite, selected):
+    names = selected or SUITES[suite]
+    if len(set(names)) != len(names) or set(names) - set(SUITES[suite]):
+        raise ValueError("--select names must be unique members of the named suite")
+    modes = dict(zip(OBJECTIVE_NAMES, MODES))
+    modes.update(zip(PROJECTED_NAMES, ("anchored-projected", "anchored-projected-no-sigreg")))
+    modes.update(
+        zip(
+            TEMPORAL_PROJECTED_NAMES,
+            ("anchored-temporal-projected", "anchored-temporal-projected-no-sigreg"),
+        )
+    )
+    modes.update({name: "anchored-temporal-projected" for name in SIGN_NAMES})
+    modes.update({name: "anchored-conditional" for name in CONDITIONAL_NAMES})
+    modes["projected-small"] = "anchored-projected-small"
+    modes.update({label: "unanchored" for label in UNANCHORED_PLACEMENTS})
+    placements = READER_PLACEMENTS | UNANCHORED_PLACEMENTS
+    return [
+        {"name": label, "jepa_mode": modes.get(label, "off"),
+         "recipe": "full-none" if label in (
+             "full-none-forecast", "conditional-full-none", *MOMENT_WEIGHTS, *SIGN_NAMES, *placements
+         ) else "decoupled-lattice",
+         **dict(zip(MOMENT_FIELDS, MOMENT_WEIGHTS.get(label, (0.0, 0.0)))),
+         "decision_sign_weight": SIGN_WEIGHT if label in SIGN_NAMES else 0.0,
+         **({"reader_norm": "none", "sigreg_placement": placements[label]}
+            if label in placements else READER_DEFAULTS)}
+        for label in SUITES[suite] if label in names
+    ]
+
+
+def moment_weights(arm):
+    """Legacy omissions are zero; named treatments have exact, authenticated weights."""
+    values = tuple(arm.get(field, 0.0) for field in MOMENT_FIELDS)
+    if (any(not isinstance(value, (int, float)) or isinstance(value, bool)
+            or not math.isfinite(value) or value < 0 for value in values)
+            or values != MOMENT_WEIGHTS.get(arm["name"], (0.0, 0.0))):
+        raise ValueError(f"{arm['name']}: weights differ from the declared temporal moment treatment")
+    return dict(zip(MOMENT_FIELDS, values))
+
+def sign_weight(arm):
+    value = arm.get("decision_sign_weight", 0.0)
+    expected = SIGN_WEIGHT if arm["name"] in SIGN_NAMES else 0.0
+    if (not isinstance(value, (int, float)) or isinstance(value, bool)
+            or not math.isfinite(value) or value < 0 or value != expected):
+        raise ValueError(f"{arm['name']}: weight differs from the declared decision-sign treatment")
+    return value
+
+
+def reader_settings(arm):
+    """Omitted legacy fields are RMS/off, never the new unconstrained control."""
+    values = {field: arm.get(field, default) for field, default in READER_DEFAULTS.items()}
+    placements = READER_PLACEMENTS | UNANCHORED_PLACEMENTS
+    expected = ({"reader_norm": "none", "sigreg_placement": placements[arm["name"]]}
+                if arm["name"] in placements else READER_DEFAULTS)
+    if values != expected:
+        raise ValueError(f"{arm['name']}: reader normalization or SIGReg placement differs from its named treatment")
+    return values
+
+
+def recipe_for(plan, arm):
+    recipe = arm.get("recipe", "decoupled-lattice")
+    if recipe not in RECIPES or (recipe != "decoupled-lattice" and arm["jepa_mode"] not in (
+            "off", "anchored-temporal-projected", "anchored-conditional", "unanchored")):
+        raise ValueError(f"{arm['name']}: unsupported objective/recipe treatment")
+    if any(moment_weights(arm).values()) and (arm["jepa_mode"] != "off" or recipe != "full-none"):
+        raise ValueError(f"{arm['name']}: temporal moments require forecast-only full-none")
+    reader_settings(arm)
+    if arm["name"] in READER_PLACEMENTS and (
+            arm["jepa_mode"] != "off" or recipe != "full-none"
+            or plan["common_config"].get("future-calendar") != "false"):
+        raise ValueError(f"{arm['name']}: reader SIGReg requires causal forecast-only full-none")
+    if sign_weight(arm) > 0.0 and (
+            arm["jepa_mode"] != "anchored-temporal-projected"
+            or recipe != "full-none"
+            or plan["common_config"].get("future-calendar") != "false"
+            or arm.get("sigreg_placement", "off") != "off"):
+        raise ValueError(f"{arm['name']}: decision sign treatment requires anchored temporal projected full-none")
+    if arm["name"] in UNANCHORED_PLACEMENTS and (
+            arm["jepa_mode"] != "unanchored" or recipe != "full-none"
+            or plan["common_config"].get("future-calendar") != "false"):
+        raise ValueError(f"{arm['name']}: unanchored SIGReg requires attached temporal JEPA full-none")
+    if plan["schema"] == LEGACY_SCHEMA and any(
+            plan["common_config"].get(key) != value for key, value in RECIPES[recipe].items()):
+        raise ValueError("legacy reference is not the declared decoupled+lattice baseline")
+    return recipe
+
+
+def arm_command(plan, arm):
+    command = [plan["assets"]["executable"]["path"], "train-timexer-segment", "--research-panel",
+               "--run", arm["run_name"], "--data-dir", plan["data_dir"],
+               "--jepa-mode", arm["jepa_mode"]]
+    for field in ("max_steps", "schedule_budget", "seed", "batch_size", "eval_every",
+                  "eval_origins", "eval_batch_size", "probe_fit_origins"):
+        command += [f"--{field.replace('_', '-')}", str(plan[field])]
+    command += ["--preview-patience", str(plan["max_steps"] + 1),
+                "--patience", str(plan["max_steps"] + 1), "--epochs", str(plan["max_steps"]),
+                "--fused", "true", "--row-stride-multiple", "1", "--row-fraction", "1",
+                "--patch-phase", "fixed"]
+    for key, value in sorted((plan["common_config"] | RECIPES[arm["recipe"]]).items()):
+        command += [f"--{key}", str(value)]
+    for field, value in moment_weights(arm).items():
+        command += [f"--{field.replace('_', '-')}", str(value)]
+    if sign_weight(arm) > 0.0:
+        command += ["--decision-sign-weight", str(sign_weight(arm))]
+    if plan["suite"] in ("temporal-reader-sigreg", "temporal-unanchored-sigreg"):
+        for field, value in reader_settings(arm).items():
+            command += [f"--{field.replace('_', '-')}", value]
+    sigreg_config = (UNANCHORED_SIGREG_CONFIG if arm["name"] in UNANCHORED_PLACEMENTS
+                     else READER_SIGREG_CONFIG if arm["name"] in READER_PLACEMENTS else {})
+    for field, value in sigreg_config.items():
+        command += [f"--jepa-{field.replace('_', '-')}", str(value)]
+    return command
+
+def validate_unanchored_suite(plan):
+    if plan.get("suite") != "temporal-unanchored-sigreg":
+        if ("unanchored_contract" in plan or any(
+                arm["name"] in UNANCHORED_PLACEMENTS or arm["jepa_mode"] == "unanchored"
+                for arm in plan["arms"])):
+            raise ValueError("unanchored treatments require the temporal-unanchored-sigreg suite")
+        return
+    if plan["schema"] != SCHEMA:
+        raise ValueError("unanchored experiments require the current campaign schema")
+    arm_specs(plan["suite"], [arm["name"] for arm in plan["arms"]])
+    if json_bytes(plan.get("unanchored_contract")) != json_bytes(UNANCHORED_CONTRACT):
+        raise ValueError("unanchored immutable pretraining/frozen-reader contract differs")
+    if plan.get("reference") or plan.get("recovered_references"):
+        raise ValueError("unanchored suite requires fresh initialization of all arms; supervised or inherited endpoints cannot qualify")
+    if (plan.get("protocol_baseline") != "unanchored-none"
+            or plan.get("allowed_model_differences") != ["sigreg_placement"]):
+        raise ValueError("unanchored suite permits only placement differences against its fresh latent-only control")
+    if any(plan.get(key) != value for key, value in UNANCHORED_PROTOCOL.items()):
+        raise ValueError("unanchored suite requires the fixed 1400-step B256 seed20260919 fit4096/score2048 protocol")
+    if plan["common_config"] != COMMON:
+        raise ValueError("unanchored suite requires the exact shared D512x8 context6000 patch16 pred192 configuration")
+    for arm in plan["arms"]:
+        recipe_for(plan, arm)
+        if arm["command"] != arm_command(plan, arm):
+            raise ValueError(f"{arm['name']}: command differs from the exact fresh unanchored protocol (no warmstarts or extra objectives)")
+
+
+def treatment_key(plan, arm):
+    reader = reader_settings(arm)
+    return (arm["jepa_mode"], recipe_for(plan, arm),
+            *(arm.get(field, 0.0) for field in MOMENT_FIELDS),
+            sign_weight(arm),
+            *(reader[field] for field in READER_DEFAULTS))
+
+
+def validate_reader_suite(plan):
+    for arm in plan["arms"]:
+        recipe_for(plan, arm)
+    validate_unanchored_suite(plan)
+    if plan.get("suite") != "temporal-reader-sigreg":
+        if any(arm["name"] in READER_PLACEMENTS for arm in plan["arms"]) or "reader_sigreg_contract" in plan:
+            raise ValueError("reader SIGReg treatments require the temporal-reader-sigreg suite")
+        return
+    if json_bytes(plan.get("reader_sigreg_contract")) != json_bytes(READER_SIGREG_CONTRACT):
+        raise ValueError("reader SIGReg shared regularizer contract differs")
+    arm_specs(plan["suite"], [arm["name"] for arm in plan["arms"]])
+    if plan.get("allowed_model_differences") != list(MODEL_TREATMENTS):
+        raise ValueError("reader SIGReg declared model differences do not match its treatment contract")
+    for arm in plan["arms"]:
+        expected = {"jepa-mode": arm["jepa_mode"],
+                    **{field.replace("_", "-"): value for field, value in reader_settings(arm).items()},
+                    **{field.replace("_", "-"): value for field, value in moment_weights(arm).items()},
+                    **RECIPES[recipe_for(plan, arm)]}
+        if arm["name"] in READER_PLACEMENTS:
+            expected.update({f"jepa-{field.replace('_', '-')}": value
+                             for field, value in READER_SIGREG_CONFIG.items()})
+        command = arm["command"]
+        for option, value in expected.items():
+            flag = f"--{option}"
+            if (command.count(flag) != 1 or command.index(flag) + 1 >= len(command)
+                    or command[command.index(flag) + 1] != str(value)
+                    or any(part.startswith(f"{flag}=") for part in command)):
+                raise ValueError(f"{arm['name']}: command does not authenticate {flag}={value}")
+
+
+def load_plan(path, expected_digest=None):
+    path = path.resolve(strict=True)
+    digest = sha256(path)
+    recorded = read_json(path.parent / "plan-identity.json")["plan_sha256"]
+    if digest != recorded or (expected_digest is not None and digest != expected_digest):
+        raise ValueError("immutable campaign plan authentication failed")
+    manifest = read_json(path)
+    if manifest["schema"] not in (SCHEMA, LEGACY_SCHEMA):
+        raise ValueError("unsupported campaign plan schema")
+    for asset in manifest["assets"].values():
+        if sha256(asset["path"]) != asset["sha256"]:
+            raise ValueError(f"pinned asset changed: {asset['path']}")
+    validate_reader_suite(manifest)
+    return path, manifest, digest
+
+
+def recovered_reference(path, repository):
+    """Authenticate a saved endpoint without changing its failed validator lifecycle."""
+    path = Path(path).resolve(strict=True)
+    certificate = read_json(path)
+    repository = Path(repository)
+    if not repository.is_absolute():
+        raise ValueError("recovered reference repository must be absolute")
+    source_path = Path(certificate["source_plan"])
+    if not source_path.is_absolute():
+        source_path = repository / source_path
+    source_path, source, digest = load_plan(source_path)
+    if digest != certificate["source_plan_sha256"]:
+        raise ValueError("recovered reference source plan changed")
+    checkpoint = Path(certificate["evidence"]["checkpoint"]).resolve()
+    arms = [arm for arm in source["arms"]
+            if (Path(arm["run_root"]) / "weights/jepa-manifest.json").resolve() == checkpoint]
+    if len(arms) != 1:
+        raise ValueError("recovered reference must identify one declared source arm")
+    arm = arms[0]
+    failed_path = source_path.parent / "arms" / f"{arm['name']}-finished.json"
+    failed = read_json(failed_path)
+    if (sha256(failed_path) != certificate["original_failed_receipt_sha256"]
+            or failed.get("status") != "failed" or failed.get("plan_sha256") != digest
+            or failed.get("task") != arm["name"]):
+        raise ValueError("recovered reference original failure provenance changed")
+    identity, evidence = endpoint_evidence(source, arm)
+    if (evidence != certificate["evidence"]
+            or identity_digest(identity) != certificate["shared_identity_sha256"]):
+        raise ValueError("recovered reference endpoint differs from its revalidation certificate")
+    record = {"path": str(path), "sha256": sha256(path), "source_plan": str(source_path),
+              "source_plan_sha256": digest, "arm": arm["name"],
+              "original_failed_receipt_sha256": sha256(failed_path)}
+    return record, source, arm, identity, evidence
+
+
+def authenticated_recoveries(records, repository):
+    recovered = []
+    for recorded in records:
+        actual = recovered_reference(recorded["path"], repository)
+        if actual[0] != recorded:
+            raise ValueError("recovered reference certificate or source provenance changed")
+        recovered.append(actual)
+    return recovered
+
+
+def completed_reference(path):
+    path, manifest, digest = load_plan(path)
+    complete_path = path.parent / "complete.json"
+    complete = read_json(complete_path)
+    if complete["plan_sha256"] != digest or complete["arms"] != [arm["name"] for arm in manifest["arms"]]:
+        raise ValueError("reference campaign has no authenticated complete lifecycle")
+    receipts = {}
+    for arm in manifest["arms"]:
+        recipe_for(manifest, arm)
+        receipt = path.parent / "arms" / f"{arm['name']}-finished.json"
+        if read_json(receipt)["status"] != "complete":
+            raise ValueError(f"reference arm did not complete: {arm['name']}")
+        receipts[arm["name"]] = sha256(receipt)
+    return manifest, {"path": str(path), "plan_sha256": digest,
+                      "complete_sha256": sha256(complete_path), "finished_receipts": receipts}
+
+
+def check_matched_reference(manifest, reference):
+    for key in PROTOCOL_KEYS:
+        if manifest[key] != reference[key]:
+            raise ValueError(f"reference differs in shared {key}; only declared objective, recipe and reader treatments may differ")
+    if read_json(manifest["assets"]["data_contract"]["path"]) != read_json(reference["assets"]["data_contract"]["path"]):
+        raise ValueError("reference complete corpus/data contract differs")
+
+
+def reference_sources(recorded, ancestors=()):
+    path = Path(recorded["path"]).resolve()
+    if path in ancestors:
+        raise ValueError("cyclic campaign reference ancestry")
+    manifest, actual = completed_reference(path)
+    if actual != recorded:
+        raise ValueError("completed reference plan or lifecycle receipts changed")
+    sources = []
+    if manifest.get("reference"):
+        sources = reference_sources(manifest["reference"], ancestors + (path,))
+        for _, inherited, _ in sources:
+            check_matched_reference(manifest, inherited)
+    return sources + [(path, manifest, actual["plan_sha256"])]
+
+
+def plan(args):
+    if args.max_steps <= 8:
+        raise ValueError("the fixed-step budget must exceed graph-capture warmup")
+    common = COMMON.copy()
+    if args.common_config:
+        overrides = read_json(args.common_config)
+        if not isinstance(overrides, dict) or set(overrides) - (set(COMMON) | {"learning-rate"}):
+            raise ValueError("common config must map supported shared CLI knobs to scalar values; no arm-specific data, budgets, or seeds")
+        common.update(overrides)
+    if any(not isinstance(v, (str, int, float)) or isinstance(v, bool) for v in common.values()):
+        raise ValueError("common configuration values must be scalar CLI strings or numbers")
+    if any(isinstance(v, float) and not math.isfinite(v) for v in common.values()):
+        raise ValueError("common configuration contains a nonfinite number")
+    required = {"pred-len": 192, **RECIPES["decoupled-lattice"], "target-basis": "cumulative",
+                "basis-weight": "uniform", "future-calendar": "false", "x0-lambdas": "disabled"}
+    if any(common[key] != value for key, value in required.items()):
+        raise ValueError("shared baseline must be causal, uncalibrated 192-bar decoupled+lattice; choose a named suite for recipe treatments")
+    if args.suite == "temporal-unanchored-sigreg":
+        if args.reference_plan or args.recovered_reference:
+            raise ValueError("temporal-unanchored-sigreg starts clean: no reference or recovered checkpoints")
+        protocol = vars(args) | {"schedule_budget": args.max_steps}
+        if any(protocol[key] != value for key, value in UNANCHORED_PROTOCOL.items()) or common != COMMON:
+            raise ValueError("unanchored suite requires 1400 steps, B256, seed20260919, fit4096/score2048, and the unchanged shared configuration")
+    expected = read_json(args.data_contract)
+    if not expected.get("tickers") or len({t["ticker"] for t in expected["tickers"]}) != len(expected["tickers"]):
+        raise ValueError("expected data contract must identify the complete eligible corpus")
+    for ticker in expected["tickers"]:
+        if not re.fullmatch(r"[0-9a-f]{64}", ticker["fingerprint"]):
+            raise ValueError("expected data contract lacks authenticated ticker fingerprints")
+    for key, option in (("context", "seq-len"), ("common_context", "common-context"), ("pred_len", "pred-len")):
+        if expected[key] != common[option]:
+            raise ValueError(f"expected data contract {key} disagrees with the shared model configuration")
+    if expected.get("in_period_sections", 0) or expected.get("cross_section_placement", ""):
+        raise ValueError("campaign expects the complete unholed, unmodified corpus placement")
+    arms = arm_specs(args.suite, args.select)
+    root = args.output_root.resolve() / args.campaign
+    if root.exists():
+        raise ValueError(f"campaign already exists, never overwrite or relaunch it: {root}")
+    data_dir = args.data_dir.resolve(strict=True)
+    if not data_dir.is_dir():
+        raise ValueError("data-dir must name the actual corpus directory")
+    reference, reference_record = completed_reference(args.reference_plan) if args.reference_plan else (None, None)
+    environment = (reference["environment"].copy() if reference else
+                   {key: os.environ[key] for key in RUNTIME_ENV if key in os.environ})
+    for assignment in args.env:
+        key, separator, value = assignment.partition("=")
+        if not separator or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", key) or key.startswith("LEJEPA_QUEUED_"):
+            raise ValueError("environment must use NAME=VALUE; LEJEPA_QUEUED_* is reserved")
+        environment[key] = value
+    for key in ("PATH", "LD_LIBRARY_PATH", "PYO3_PYTHON", "PYTHONPATH"):
+        if not environment.get(key):
+            raise ValueError(f"pin required runtime environment with --env {key}=VALUE")
+    if reference and environment != reference["environment"]:
+        raise ValueError("matched reference runtime environment differs; reuse its pinned environment")
+    manifest = {
+        "schema": SCHEMA, "created_at": utc_now(),
+        "campaign": args.campaign, "repository": str(ROOT), "root": str(root),
+        "python": str(Path(sys.executable).resolve()), "python_version": sys.version,
+        "data_dir": str(data_dir), "environment": environment,
+        "common_config": common, "max_steps": args.max_steps, "schedule_budget": args.max_steps,
+        "seed": args.seed, "batch_size": args.batch_size, "eval_every": args.eval_every,
+        "eval_origins": args.eval_origins, "eval_batch_size": args.eval_batch_size,
+        "probe_fit_origins": args.probe_fit_origins,
+        "arm_timeout_seconds": args.arm_timeout_seconds,
+        "arm_queue_timeout_seconds": args.arm_timeout_seconds + 30,
+        "collect_timeout_seconds": args.collect_timeout_seconds,
+        "queue": {"max_parallel_runs": 1, "max_attempts": 1, "priority": 0},
+        "suite": args.suite, "protocol_baseline": BASELINE, "arms": arms,
+        "reference": reference_record,
+        "allowed_model_differences": list(MODEL_TREATMENTS),
+        "sampling": "trainer-authenticated full eligible training pool; deterministic bounded ticker/date panel; train-only frozen probe fit; final common source after all training labels",
+        "completion": "every selected arm independently exits zero, completes exactly N steps, writes authenticated endpoint and readable binary forecast report; collection validates selected and reused identities; no early stopping, test split or latent-loss winner selection",
+        "data_identity_at_plan": "supplied authenticated contract; actual corpus and sample identities must match at execution; planning does not scan bars",
+    }
+    if args.suite == "temporal-reader-sigreg":
+        manifest["reader_sigreg_contract"] = READER_SIGREG_CONTRACT
+    if args.suite == "temporal-unanchored-sigreg":
+        manifest["unanchored_contract"] = UNANCHORED_CONTRACT
+        manifest["protocol_baseline"] = "unanchored-none"
+        manifest["allowed_model_differences"] = ["sigreg_placement"]
+        manifest["completion"] = "all four fresh attached-target temporal JEPA arms finish exactly 1400 steps, freeze the complete representation, and fit and score held-out readers; authenticate objective packet and frozen binary probe reports; no online forecast acceptance or automatic winner"
+    inherited_sources = []
+    existing = set()
+    if reference:
+        for key in PROTOCOL_KEYS:
+            if manifest[key] != reference[key]:
+                raise ValueError(f"reference differs in shared {key}; no silent panel, budget or schedule changes")
+        if expected != read_json(reference["assets"]["data_contract"]["path"]):
+            raise ValueError("reference complete corpus/data contract differs")
+        inherited_sources = reference_sources(reference_record)
+        existing = {treatment_key(source, arm)
+                    for _, source, _ in inherited_sources for arm in source["arms"]}
+    inherited_recoveries = [actual for _, source, _ in inherited_sources
+                            for actual in authenticated_recoveries(source.get("recovered_references", []), ROOT)]
+    requested_recoveries = [recovered_reference(path, ROOT) for path in args.recovered_reference]
+    recoveries = []
+    seen_recoveries = set()
+    for recovered in inherited_recoveries + requested_recoveries:
+        record, source, arm, _, _ = recovered
+        if record["sha256"] in seen_recoveries:
+            continue
+        for key in PROTOCOL_KEYS:
+            if manifest[key] != source[key]:
+                raise ValueError(f"recovered reference differs in shared {key}")
+        if expected != read_json(source["assets"]["data_contract"]["path"]):
+            raise ValueError("recovered reference complete corpus/data contract differs")
+        if source["environment"] != environment:
+            raise ValueError("recovered reference runtime environment differs")
+        key = treatment_key(source, arm)
+        if key in existing:
+            raise ValueError("recovered reference duplicates an inherited treatment")
+        existing.add(key)
+        seen_recoveries.add(record["sha256"])
+        recoveries.append(record)
+    manifest["recovered_references"] = recoveries
+    selected = {treatment_key(manifest, arm) for arm in arms}
+    if selected & existing:
+        raise ValueError("selected model already exists in reference; use --select for only missing treatments")
+    available = selected | existing
+    if args.suite != "temporal-unanchored-sigreg" and BASELINE_KEY not in available:
+        raise ValueError(f"include {BASELINE}, or --reference-plan containing its completed matched endpoint")
+    if args.suite == "temporal-moments" and FULL_NONE_KEY not in available:
+        raise ValueError("temporal-moments requires its matched full-none-forecast control, selected or inherited")
+    for arm in arms:
+        arm["run_name"] = f"{args.campaign}-{arm['name']}"
+        arm["run_root"] = str(ROOT / "training/runs" / arm["run_name"])
+        if Path(arm["run_root"]).exists():
+            raise ValueError(f"run already exists: {arm['run_root']}")
+    root.mkdir(parents=True)
+    pinned = root / "pinned"
+    pinned.mkdir()
+    assets = {
+        "executable": snapshot(args.executable, pinned / "trading_bot_0", True),
+        "report_cli": snapshot(args.report_cli, pinned / "report_cli", True),
+        "driver": snapshot(Path(__file__), pinned / "lejepa_campaign.py"),
+        "data_contract": snapshot(args.data_contract, pinned / "expected-data-contract.json"),
+    }
+    manifest["assets"] = assets
+    for arm in arms:
+        arm["command"] = arm_command(manifest, arm)
+    validate_reader_suite(manifest)
+    path = root / "plan.json"
+    write_new(path, manifest)
+    path.chmod(0o444)
+    digest = sha256(path)
+    write_new(root / "plan-identity.json", {"plan_sha256": digest})
+    print(f"Planned only, no training submitted: {path}\nPlan SHA-256: {digest}")
+    print(f"Suite={args.suite}; protocol baseline={manifest['protocol_baseline']}; N=schedule={args.max_steps}, batch={args.batch_size}, seed={args.seed}, cadence={args.eval_every}")
+    for arm in arms:
+        print(f"Model job: {arm['name']}; objective={arm['jepa_mode']}; recipe={arm['recipe']}; weights={moment_weights(arm)}; reader={reader_settings(arm)}; watchdog={args.arm_timeout_seconds}s (+30s queue grace)")
+    if reference:
+        print(f"Reuse {sum(len(source['arms']) for _, source, _ in inherited_sources)} completed reference endpoints, no retraining: {reference_record['path']}")
+    print(f"Collection job: after-success all {len(arms)} model jobs; watchdog={args.collect_timeout_seconds}s; all jobs exclusive, normal priority, max-attempts=1")
+    return 0
+
+
+def job_key(digest, label):
+    return f"lejepa-{digest}-{label}"
+
+
+def job_receipt(path, digest, label):
+    receipt = read_json(path.parent / "jobs" / f"{label}.json")
+    if receipt["plan_sha256"] != digest or receipt["idempotency_key"] != job_key(digest, label) or receipt["task"] != label:
+        raise ValueError(f"{label}: queue receipt identity differs")
+    request_path = path.parent / "jobs" / f"{label}-request.json"
+    if sha256(request_path) != receipt["request_sha256"]:
+        raise ValueError(f"{label}: durable queue request authentication failed")
+    return receipt
+
+
+def submit_job(path, manifest, digest, label, dependencies):
+    jobs = path.parent / "jobs"
+    receipt_path = jobs / f"{label}.json"
+    if receipt_path.exists():
+        receipt = job_receipt(path, digest, label)
+        print(f"Existing {receipt['id']}: {label}; observing/recovering, never relaunching", flush=True)
+        return receipt
+    limit = manifest["collect_timeout_seconds"] if label == "collect" else manifest["arm_queue_timeout_seconds"]
+    command = ["mlq", "submit", "--json", "--name", f"{manifest['campaign']}-{label}",
+               "--idempotency-key", job_key(digest, label), "--max-parallel-runs", "1",
+               "--max-attempts", "1", "--time-limit", f"{limit}s", "--cwd", manifest["repository"],
+               "--env", f"LEJEPA_QUEUED_PLAN={digest}", "--env", f"LEJEPA_QUEUED_TASK={label}"]
+    for key, value in sorted(manifest["environment"].items()):
+        command += ["--env", f"{key}={value}"]
+    for dependency in dependencies:
+        command += ["--after-success", str(dependency)]
+    command += ["--", manifest["python"], manifest["assets"]["driver"]["path"],
+                "_collect" if label == "collect" else "_run-arm", "--plan", str(path), "--plan-sha256", digest]
+    if label != "collect":
+        command += ["--arm", label]
+    request_path = jobs / f"{label}-request.json"
+    request = {"plan_sha256": digest, "task": label, "idempotency_key": job_key(digest, label),
+               "after_success": dependencies, "command": command}
+    if request_path.exists():
+        recorded = read_json(request_path)
+        client_environment = recorded.get("client_baseline_environment")
+        if client_environment is None:
+            raise ValueError(f"{label}: interrupted submission lacks pinned client environment; recover its receipt from mlq before continuing")
+    else:
+        client_environment = {key: os.environ[key] for key in MLQ_BASELINE_ENV if key in os.environ}
+    request["client_baseline_environment"] = client_environment
+    if request_path.exists():
+        if recorded != request:
+            raise ValueError(f"{label}: durable queue request changed during recovery")
+    else:
+        write_new(request_path, request)
+    environment = {key: value for key, value in os.environ.items() if key not in MLQ_BASELINE_ENV}
+    environment.update(client_environment)
+    result = subprocess.run(command, check=True, text=True, capture_output=True, env=environment)
+    queued = json.loads(result.stdout)
+    receipt = {"id": queued["id"], "task": label, "submitted_at": utc_now(),
+               "plan_sha256": digest, "idempotency_key": job_key(digest, label),
+               "request_sha256": sha256(request_path), "after_success": dependencies}
+    write_new(receipt_path, receipt)
+    print(f"Queued/recovered {queued['id']}: {label}; exclusive, normal priority, max-attempts=1, watchdog={limit}s", flush=True)
+    return receipt
+
+
+def submit(args):
+    path, manifest, digest = load_plan(args.plan)
+    if manifest["schema"] != SCHEMA:
+        raise ValueError("legacy campaign is read-only; follow it or create a new per-model plan")
+    if manifest["reference"]:
+        reference, actual = completed_reference(Path(manifest["reference"]["path"]))
+        if actual != manifest["reference"]:
+            raise ValueError("completed reference plan or lifecycle receipts changed")
+        check_matched_reference(manifest, reference)
+    (path.parent / "jobs").mkdir(exist_ok=True)
+    with (path.parent / ".submit.lock").open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        # max_parallel_runs=1 provides exclusive admission; independent arms need
+        # no artificial dependency chain and retain normal FIFO queue fairness.
+        jobs = [submit_job(path, manifest, digest, arm["name"], []) for arm in manifest["arms"]]
+        submit_job(path, manifest, digest, "collect", [job["id"] for job in jobs])
+    return 0
+
+
+def follow(args):
+    path, manifest, digest = load_plan(args.plan)
+    if manifest["schema"] == LEGACY_SCHEMA:
+        job = read_json(path.parent / "job.json")
+        if job["plan_sha256"] != digest:
+            raise ValueError("legacy queue receipt identity differs")
+        return subprocess.run(["mlq", "follow", str(job["id"]), "--timeout", args.timeout]).returncode
+    labels = [arm["name"] for arm in manifest["arms"]] + ["collect"]
+    if any(not (path.parent / "jobs" / f"{label}.json").exists() for label in labels):
+        raise ValueError("submission is incomplete; rerun submit to recover the same idempotency keys, not a new plan")
+    jobs = [job_receipt(path, digest, label) for label in labels]
+    failure = 0
+    for job in jobs:
+        if job["task"] == "collect" and failure:
+            print("Collection cannot complete unless every model succeeds; no jobs were resubmitted.")
+            return failure
+        print(f"Following {job['task']}: {job['id']}", flush=True)
+        result = subprocess.run(["mlq", "follow", str(job["id"]), "--timeout", args.timeout])
+        if result.returncode == 124:
+            return 124
+        failure = failure or result.returncode
+    if not failure:
+        complete = read_json(path.parent / "complete.json")
+        if complete["plan_sha256"] != digest:
+            raise ValueError("collection receipt identity differs")
+        print(f"Complete matched collection: {path.parent / 'complete.json'}")
+    return failure
+
+
+def unanchored_checkpoint_contract(arm):
+    placement = UNANCHORED_PLACEMENTS[arm["name"]]
+    config = {key: UNANCHORED_SIGREG_CONFIG[key] for key in (
+        "predictor_width", "prediction_weight", "sigreg_weight", "reconstruction_weight",
+        "directions", "views", "seed")}
+    objective_contract = (
+        f"temporal-jepa-unanchored-v1;config={json.dumps(config, separators=(',', ':'))};"
+        "offsets-patches=[1,2,4,8,12];horizons-bars=[16, 32, 64, 128, 192];"
+        f"reader-norm=none;placement={placement};"
+        "observation=unconstrained-shared-full-width-patch-embedding(causal-prefix-normalization);"
+        "state=actual-pre-final-rms-causal-reader;target=attached-nonoverlapping-future-observation;"
+        "projector=none;predictor=direct-state-mlp;"
+        "objective=prediction-weight*masked-latent-mse+placement-weighted-sigreg;"
+        "sigreg-sites=local-observation-and-or-state-no-target-duplicate;"
+        "both=same-draws-and-mask-half-weight-each;"
+        "population=valid-batch-rows-per-sampled-source-view;"
+        "mask=complete-source-patch-and-minimum-history;"
+        "positions=minimum-history-source-through-final-context-patch;"
+        "forecast=not-forwarded-no-loss-frozen-allocation;reconstruction=none;decision-loss=none;"
+        "stop-gradient=none;gradient-surgery=none;initialization=fresh;"
+        "selection=completed-fixed-budget;readers=fit-only-after-full-store-freeze;"
+        "precision=bf16-backbone-fp32-objective;future-calendar=false"
+        ";pair-mask=complete-source-patch-and-minimum-history-and-complete-target-patch"
+        ";latent-reduction=mean-over-valid-source-offset-pairs-and-features"
+        ";sigreg-reduction=mean-over-eligible-views-of-N-times-epps-pulley"
+    )
+    fractions = UNANCHORED_CONTRACT["placement_fractions"][placement]
+    return {
+        "schema": "temporal-jepa-unanchored-v1", "initialization": "fresh-random",
+        "objective": "attached-temporal-jepa-plus-placement-sigreg",
+        "objective_contract": objective_contract, "prediction_weight": 1.0,
+        "sigreg_total_weight": 0.09, "sigreg_placement": placement,
+        "sigreg_site_weights": {**{site: 0.09 * share for site, share in fractions.items()}, "target": 0.0},
+        "offsets_patches": [1, 2, 4, 8, 12], "forecast_weight": 0.0,
+        "reconstruction_weight": 0.0, "decision_weight": 0.0,
+        "target_stop_gradient": False, "gradient_surgery": False,
+        "forecast_parameters": "allocated-at-initialization-frozen-never-forwarded-or-optimized",
+        "checkpoint_selection": "completed-fixed-budget",
+        "downstream_readers": "fit-only-after-full-store-freeze",
+    }
+
+
+def binary_report_rows(plan, root, base):
+    result = subprocess.run([plan["assets"]["report_cli"]["path"], "0", base,
+                             "--run-root", str(root)], check=True, text=True, capture_output=True,
+                            cwd=plan["repository"], env=plan["environment"], timeout=30)
+    rows = {}
+    for line in result.stdout.splitlines():
+        fields = line.split("\t")
+        if not fields[0].isdigit():
+            continue
+        axis = int(fields[0])
+        if axis in rows:
+            raise ValueError(f"{base}: duplicate report axis {axis}")
+        values = {}
+        for field in fields[1:]:
+            label, separator, value = field.rpartition("=")
+            if separator:
+                if label in values:
+                    raise ValueError(f"{base}: duplicate report series {label}")
+                values[label] = float(value)
+        rows[axis] = values
+    return rows
+
+
+def unanchored_probe_evidence(plan, arm, root):
+    objective = binary_report_rows(plan, root, "timexer_segment_jepa_objective").get(plan["max_steps"], {})
+    weights = unanchored_checkpoint_contract(arm)["sigreg_site_weights"]
+    active_fields = tuple(f"reader {site} SIGReg" for site in ("local", "state") if weights[site] > 0)
+    for field in ("latent MSE", "latent persistence MSE", "total optimization objective",
+                  "reader SIGReg weighted contribution", *active_fields):
+        if not math.isfinite(objective.get(field, math.nan)):
+            raise ValueError(f"{arm['name']}: objective packet lacks finite {field} at the completed endpoint")
+    regularizer = sum(weights[site] * objective[f"reader {site} SIGReg"]
+                      for site in ("local", "state") if weights[site] > 0)
+    if not math.isclose(objective["reader SIGReg weighted contribution"], regularizer, rel_tol=1e-5, abs_tol=1e-7):
+        raise ValueError(f"{arm['name']}: objective packet disagrees with declared placement weights")
+    if not math.isclose(objective["total optimization objective"], objective["latent MSE"] + regularizer,
+                        rel_tol=1e-5, abs_tol=1e-7):
+        raise ValueError(f"{arm['name']}: pretraining objective includes an undeclared loss")
+    if arm["name"] == "unanchored-none" and any(objective.get(field, 0.0) != 0.0 for field in (
+            "reader SIGReg weighted contribution", "reader local SIGReg", "reader state SIGReg")):
+        raise ValueError("unanchored-none must be a genuine latent-only control with zero regularization")
+    print(f"{arm['name']} authenticated attached JEPA objective at step {plan['max_steps']}: "
+          + "\t".join(f"{field}={value}" for field, value in objective.items()), flush=True)
+    protocol = UNANCHORED_PROBE_PROTOCOL
+    for base in protocol["required_reports"]:
+        rows = binary_report_rows(plan, root, base)
+        values = []
+        for horizon in protocol["horizons_bars"]:
+            value = rows.get(horizon, {}).get(protocol["series"], math.nan)
+            if not math.isfinite(value):
+                raise ValueError(f"{arm['name']}: {base} lacks finite frozen full-state measurement at h={horizon}")
+            if base.endswith("_count") and value <= 0:
+                raise ValueError(f"{arm['name']}: {base} has no scored frozen-probe pairs at h={horizon}")
+            values.append(value)
+        print(f"{arm['name']} frozen binary {base}: " + "\t".join(
+            f"h{horizon}={value}" for horizon, value in zip(protocol["horizons_bars"], values)), flush=True)
+        if base == protocol["primary_report"]:
+            print(f"{arm['name']} primary frozen raw-close ratio equal-horizon mean={sum(values) / len(values)}; "
+                  "not comparable to supervised market-neutral forecast scores", flush=True)
+
+
+def endpoint_evidence(plan, arm):
+    root = Path(arm["run_root"])
+    checkpoint_path = root / "weights/jepa-manifest.json"
+    checkpoint = read_json(checkpoint_path)
+    expected = {"schema": "causal-patch-temporal-jepa-fixed-endpoint-v1",
+                "completed_steps": plan["max_steps"], "schedule_budget": plan["schedule_budget"],
+                "seed": plan["seed"], "batch_size": plan["batch_size"],
+                "validation_rows": plan["eval_origins"], "probe_fit_rows": plan["probe_fit_origins"],
+                "requested_tickers": []}
+    if any(checkpoint.get(key) != value for key, value in expected.items()):
+        raise ValueError(f"{arm['name']}: no completed matched fixed-step endpoint")
+    if checkpoint.get("executable_sha256") != plan["assets"]["executable"]["sha256"]:
+        raise ValueError(f"{arm['name']}: trainer executable identity differs from its own pinned plan")
+    model = checkpoint["model"]
+    if model.get("jepa_mode", "off") != arm["jepa_mode"]:
+        raise ValueError(f"{arm['name']}: objective arm differs")
+    recipe = recipe_for(plan, arm)
+    unanchored = arm["name"] in UNANCHORED_PLACEMENTS
+    if unanchored:
+        validate_unanchored_suite(plan)
+        if json_bytes(checkpoint.get("unanchored_contract")) != json_bytes(unanchored_checkpoint_contract(arm)):
+            raise ValueError(f"{arm['name']}: endpoint does not authenticate fresh attached-only pretraining and frozen downstream readers")
+        if json_bytes(model.get("jepa")) != json_bytes(UNANCHORED_SIGREG_CONFIG):
+            raise ValueError(f"{arm['name']}: endpoint JEPA configuration differs from the exact immutable contract")
+    for field, value in reader_settings(arm).items():
+        if model.get(field, READER_DEFAULTS[field]) != value:
+            raise ValueError(f"{arm['name']}: actual {field} differs from its declared treatment")
+    if arm["name"] in READER_PLACEMENTS:
+        jepa = model.get("jepa", {})
+        if not isinstance(jepa, dict):
+            raise ValueError(f"{arm['name']}: malformed shared SIGReg configuration")
+        for field, value in READER_SIGREG_CONFIG.items():
+            actual = jepa.get(field, value)
+            if (not isinstance(actual, (int, float)) or isinstance(actual, bool)
+                    or not math.isfinite(actual) or actual != value
+                    or isinstance(value, int) and not isinstance(actual, int)):
+                raise ValueError(f"{arm['name']}: actual jepa.{field} differs from the fixed shared SIGReg contract")
+    for field, value in moment_weights(arm).items():
+        actual = model.get(field, 0.0)
+        if (not isinstance(actual, (int, float)) or isinstance(actual, bool)
+                or not math.isfinite(actual) or actual != value):
+            raise ValueError(f"{arm['name']}: actual {field} differs from its declared treatment")
+    for key, value in RECIPES[recipe].items():
+        if model.get(key.replace("-", "_"), {"scale-coupling": "full", "horizon-decimation": "none"}[key]) != value:
+            raise ValueError(f"{arm['name']}: actual {key} differs from declared {recipe} treatment")
+    if model.get("future_calendar") is not False or model.get("x0_lambdas") != "disabled":
+        raise ValueError(f"{arm['name']}: endpoint is not causal and uncalibrated")
+    for key in ("seq-len", "pred-len", "patch-len", "layers", "d-model", "heads", "ffn",
+                "dropout", "min-history", "horizon-loss", "horizon-mean"):
+        if model.get(key.replace("-", "_")) != plan["common_config"][key]:
+            raise ValueError(f"{arm['name']}: actual shared model setting {key} differs")
+    for key in ("optimizer", "scalar-lr-mult", "mlp-down-lr"):
+        if checkpoint.get(key.replace("-", "_")) != plan["common_config"][key]:
+            raise ValueError(f"{arm['name']}: actual optimizer setting {key} differs")
+    if "learning-rate" in plan["common_config"] and checkpoint.get("base_learning_rate") != plan["common_config"]["learning-rate"]:
+        raise ValueError(f"{arm['name']}: actual base learning rate differs")
+    data = read_json(plan["assets"]["data_contract"]["path"])
+    if checkpoint["data"] != data:
+        raise ValueError(f"{arm['name']}: actual complete corpus contract differs from pinned expected data; never rewrite a manifest to force compatibility")
+    sample_path = root / "research-sample-plan.json"
+    if sha256(sample_path) != checkpoint["sample_plan_sha256"]:
+        raise ValueError(f"{arm['name']}: sample plan authentication failed")
+    samples = read_json(sample_path)
+    if (samples["seed"] != plan["seed"]
+            or samples["validation"]["requested_rows"] != plan["eval_origins"]
+            or samples["probe_fit"]["requested_rows"] != plan["probe_fit_origins"]):
+        raise ValueError(f"{arm['name']}: sample budget or seed differs")
+    if unanchored and (
+            len(samples["validation"]["origins"]) != plan["eval_origins"]
+            or len(samples["probe_fit"]["origins"]) != plan["probe_fit_origins"]):
+        raise ValueError(f"{arm['name']}: realized frozen-probe panel is smaller than the fixed protocol")
+    if any(row["common_source_ms"] <= samples["training_last_target_ms"]
+           for row in samples["validation"]["origins"]):
+        raise ValueError(f"{arm['name']}: validation decisions precede training label reach")
+    weights = root / "weights/jepa.safetensors"
+    if sha256(weights) != checkpoint["weights_sha256"]:
+        raise ValueError(f"{arm['name']}: final weight authentication failed")
+    if unanchored:
+        unanchored_probe_evidence(plan, arm, root)
+    else:
+        report = subprocess.run([plan["assets"]["report_cli"]["path"], "0", "timexer_segment_jepa_forecast",
+                                 "--run-root", str(root)], check=True, text=True, capture_output=True,
+                                cwd=plan["repository"], env=plan["environment"], timeout=30)
+        endpoint_rows = []
+        for line in report.stdout.splitlines():
+            fields = line.split("\t")
+            if not fields or fields[0] != str(plan["max_steps"]):
+                continue
+            finite_fields = []
+            for field in fields[1:]:
+                _, separator, value = field.partition("=")
+                if separator and math.isfinite(float(value)):
+                    finite_fields.append(field)
+            if finite_fields:
+                endpoint_rows.append("\t".join([fields[0], *finite_fields]))
+        if not endpoint_rows:
+            raise ValueError(f"{arm['name']}: binary forecast report has no finite endpoint measurement")
+        print(f"{arm['name']} endpoint binary report:", flush=True)
+        for row in endpoint_rows:
+            print(row, flush=True)
+    reports = sorted(root.glob("gens/0/*.report.bin"))
+    if not reports:
+        raise ValueError(f"{arm['name']}: missing generation-zero binary reports")
+    # Default reader fields were absent from historical checkpoints. Stripping only
+    # after exact treatment validation preserves their immutable shared-identity hashes.
+    treatment_fields = ("sigreg_placement",) if unanchored else MODEL_TREATMENTS
+    shared_model = {key: value for key, value in model.items()
+                    if key not in treatment_fields}
+    identity = {"model_without_declared_treatments": shared_model,
+                "data_sha256": identity_digest(checkpoint["data"]),
+                "sample_plan_sha256": checkpoint["sample_plan_sha256"],
+                "cross_section_sha256": checkpoint["cross_section_sha256"],
+                "protocol": {key: checkpoint[key] for key in ("seed", "batch_size", "schedule_budget", "base_learning_rate", "optimizer", "scalar_lr_mult", "mlp_down_lr")}}
+    evidence = {"checkpoint": str(checkpoint_path), "checkpoint_sha256": sha256(checkpoint_path),
+                "weights_sha256": checkpoint["weights_sha256"],
+                "sample_plan_sha256": checkpoint["sample_plan_sha256"],
+                "training_origins_sha256": samples["training_origins_sha256"],
+                "validation_origins_sha256": samples["validation"]["origins_sha256"],
+                "probe_fit_origins_sha256": samples["probe_fit"]["origins_sha256"],
+                "cross_section_sha256": checkpoint["cross_section_sha256"],
+                "reports": [{"path": str(path), "sha256": sha256(path)} for path in reports]}
+    return identity, evidence
+
+
+def queued_plan(args, task):
+    path, manifest, digest = load_plan(args.plan, args.plan_sha256)
+    if manifest["schema"] != SCHEMA:
+        raise ValueError("internal per-model runner requires a v2 plan")
+    if os.environ.get("LEJEPA_QUEUED_PLAN") != digest or os.environ.get("LEJEPA_QUEUED_TASK") != task:
+        raise ValueError("internal driver must be submitted through this task's exclusive mlq job")
+    if any(os.environ.get(key) != value for key, value in manifest["environment"].items()):
+        raise ValueError("queue runtime environment differs from the pinned plan")
+    return path, manifest, digest
+
+
+def interrupted(signum, frame):
+    raise InterruptedError(f"queue runner received signal {signum}")
+
+
+def stop_child(child):
+    if child is not None and child.poll() is None:
+        child.terminate()
+        try:
+            child.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            child.kill()
+            child.wait()
+
+
+def run_arm(args):
+    path, manifest, digest = queued_plan(args, args.arm)
+    matches = [arm for arm in manifest["arms"] if arm["name"] == args.arm]
+    if len(matches) != 1:
+        raise ValueError("selected arm is not in the immutable plan")
+    arm = matches[0]
+    state_dir = path.parent / "arms"
+    state_dir.mkdir(exist_ok=True)
+    if Path(arm["run_root"]).exists():
+        raise ValueError(f"refusing to overwrite existing run: {arm['run_root']}")
+    signal.signal(signal.SIGTERM, interrupted)
+    signal.signal(signal.SIGINT, interrupted)
+    started = utc_now()
+    clock = time.monotonic()
+    status, failure, evidence, identity, child = "failed", None, None, None, None
+    write_new(state_dir / f"{arm['name']}-started.json", {
+        "started_at": started, "command": arm["command"], "plan_sha256": digest,
+        "task": arm["name"], "idempotency_key": job_key(digest, arm["name"]),
+    })
+    try:
+        child = subprocess.Popen(arm["command"], cwd=manifest["repository"], env=manifest["environment"])
+        try:
+            code = child.wait(timeout=manifest["arm_timeout_seconds"])
+        except subprocess.TimeoutExpired:
+            status = "timed-out"
+            raise ValueError(f"{arm['name']}: wall-clock watchdog expired; fixed-step endpoint is incomplete")
+        if code != 0:
+            raise ValueError(f"{arm['name']}: trainer exited {code}")
+        identity, evidence = endpoint_evidence(manifest, arm)
+        status = "complete"
+    except (Exception, KeyboardInterrupt) as error:
+        failure = str(error)
+    finally:
+        stop_child(child)
+        elapsed = time.monotonic() - clock
+        write_new(state_dir / f"{arm['name']}-finished.json", {
+            "status": status, "started_at": started, "finished_at": utc_now(),
+            "plan_sha256": digest, "task": arm["name"],
+            "idempotency_key": job_key(digest, arm["name"]),
+            "wall_seconds": elapsed, "failure": failure, "evidence": evidence,
+            "shared_identity_sha256": identity_digest(identity) if identity else None,
+        })
+        print(f"{arm['name']}: {status}, independently timed wall={elapsed:.3f}s", flush=True)
+    if status != "complete":
+        raise ValueError(failure)
+    return 0
+
+
+def collection_evidence(path, manifest, digest):
+    """Authenticate the same completed endpoints for queued and explicit collection."""
+    sources = reference_sources(manifest["reference"]) if manifest["reference"] else []
+    for _, reference, _ in sources:
+        check_matched_reference(manifest, reference)
+    sources.append((path, manifest, digest))
+    shared_identity = None
+    endpoints = []
+    baseline = None
+    for source_path, source, source_digest in sources:
+        for arm in source["arms"]:
+            finished_path = source_path.parent / "arms" / f"{arm['name']}-finished.json"
+            finished = read_json(finished_path)
+            if finished["status"] != "complete":
+                raise ValueError(f"{arm['name']}: no successful independent lifecycle receipt")
+            if source["schema"] == SCHEMA and (
+                    finished.get("plan_sha256") != source_digest
+                    or finished.get("task") != arm["name"]
+                    or finished.get("idempotency_key") != job_key(source_digest, arm["name"])):
+                raise ValueError(f"{arm['name']}: lifecycle plan or task identity differs")
+            identity, evidence = endpoint_evidence(source, arm)
+            if evidence != finished["evidence"]:
+                raise ValueError(f"{arm['name']}: endpoint changed after its completed lifecycle receipt")
+            if source["schema"] == SCHEMA and identity_digest(identity) != finished["shared_identity_sha256"]:
+                raise ValueError(f"{arm['name']}: recorded shared identity changed")
+            if shared_identity is not None and identity != shared_identity:
+                raise ValueError(f"{arm['name']}: undeclared backbone/data/sample/schedule difference; only named objective, recipe and reader treatments may differ")
+            shared_identity = identity
+            recipe = recipe_for(source, arm)
+            endpoint = {"name": arm["name"], "jepa_mode": arm["jepa_mode"], "recipe": recipe,
+                        **moment_weights(arm), **reader_settings(arm),
+                        "run_root": arm["run_root"], "source_plan": str(source_path),
+                        "source_plan_sha256": source_digest,
+                        "trainer_sha256": source["assets"]["executable"]["sha256"],
+                        "reused": source_digest != digest, "finished_receipt_sha256": sha256(finished_path),
+                        "evidence": evidence}
+            endpoints.append(endpoint)
+            if treatment_key(source, arm) == BASELINE_KEY:
+                baseline = {"name": BASELINE, "source_arm": arm["name"], "run_root": arm["run_root"]}
+    for record, source, arm, identity, evidence in authenticated_recoveries(
+            manifest.get("recovered_references", []), manifest["repository"]):
+        check_matched_reference(manifest, source)
+        if shared_identity is not None and identity != shared_identity:
+            raise ValueError(f"{arm['name']}: recovered endpoint has undeclared shared differences")
+        shared_identity = identity
+        endpoints.append({
+            "name": arm["name"], "jepa_mode": arm["jepa_mode"], "recipe": recipe_for(source, arm),
+            **moment_weights(arm), **reader_settings(arm), "run_root": arm["run_root"],
+            "source_plan": record["source_plan"], "source_plan_sha256": record["source_plan_sha256"],
+            "trainer_sha256": source["assets"]["executable"]["sha256"], "reused": True,
+            "recovered_after_validator_failure": True,
+            "original_lifecycle_status": "failed", "revalidation_certificate": record["path"],
+            "revalidation_certificate_sha256": record["sha256"],
+            "finished_receipt_sha256": record["original_failed_receipt_sha256"], "evidence": evidence,
+        })
+        if treatment_key(source, arm) == BASELINE_KEY:
+            baseline = {
+                "name": BASELINE, "source_arm": arm["name"], "run_root": arm["run_root"],
+                "recovered_after_validator_failure": True, "original_lifecycle_status": "failed",
+                "revalidation_certificate": record["path"],
+                "revalidation_certificate_sha256": record["sha256"],
+                "original_failed_receipt_sha256": record["original_failed_receipt_sha256"],
+            }
+    if manifest.get("suite") == "temporal-unanchored-sigreg":
+        if (len(endpoints) != 4 or {endpoint["name"] for endpoint in endpoints} != set(UNANCHORED_PLACEMENTS)
+                or any(endpoint["reused"] for endpoint in endpoints)):
+            raise ValueError("collection requires exactly four fresh unanchored endpoints; supervised reuse cannot qualify")
+        control = next(endpoint for endpoint in endpoints if endpoint["name"] == "unanchored-none")
+        baseline = {"name": "unanchored-none", "source_arm": "unanchored-none", "run_root": control["run_root"]}
+    elif baseline is None:
+        raise ValueError("collection lacks the declared decoupled+lattice forecasting baseline")
+    if manifest.get("suite") == "temporal-reader-sigreg":
+        fresh_readers = {endpoint["name"] for endpoint in endpoints
+                         if not endpoint["reused"] and endpoint["name"] in READER_PLACEMENTS}
+        if fresh_readers != set(READER_PLACEMENTS):
+            raise ValueError("collection requires four fresh matched reader arms; an inherited RMS control is not reader-none")
+    complete = {
+        "schema": "lejepa-matched-comparison-complete-v2", "plan_sha256": digest,
+        "finished_at": utc_now(), "arms": [arm["name"] for arm in manifest["arms"]],
+        "protocol_baseline": baseline, "shared_identity_sha256": identity_digest(shared_identity),
+        "allowed_model_differences": manifest["allowed_model_differences"], "endpoints": endpoints,
+        "interpretation": "matched causal uncalibrated forecast endpoints; objective, recipe and reader normalization/SIGReg placement contrasts are declared separately; latent losses are diagnostic only; no automatic winner",
+    }
+    if manifest.get("suite") == "temporal-reader-sigreg":
+        complete["reader_sigreg_contract"] = manifest["reader_sigreg_contract"]
+        complete["reader_control"] = next(endpoint for endpoint in endpoints
+                                          if endpoint["name"] == "reader-none" and not endpoint["reused"])
+    if manifest.get("suite") == "temporal-unanchored-sigreg":
+        complete["unanchored_contract"] = manifest["unanchored_contract"]
+        complete["unanchored_control"] = control
+        complete["interpretation"] = "fresh attached-target temporal JEPA-only pretraining with placement SIGReg; primary comparison is equal-weight mean full-state frozen ridge MSE/persistence ratio over raw close-log-return horizons 16,32,64,128,192; no numerical comparison with supervised market-neutral forecast scores; objective losses diagnose training, never select a winner"
+    return complete
+
+
+def collect(args):
+    path, manifest, digest = queued_plan(args, "collect")
+    state_dir = path.parent / "arms"
+    state_dir.mkdir(exist_ok=True)
+    started = utc_now()
+    write_new(state_dir / "collect-started.json", {"plan_sha256": digest, "started_at": started})
+    signal.signal(signal.SIGTERM, interrupted)
+    signal.signal(signal.SIGINT, interrupted)
+    failure = None
+    try:
+        write_new(path.parent / "complete.json", collection_evidence(path, manifest, digest))
+    except (Exception, KeyboardInterrupt) as error:
+        failure = str(error)
+    finally:
+        write_new(state_dir / "collect-finished.json", {
+            "plan_sha256": digest, "started_at": started, "finished_at": utc_now(),
+            "status": "failed" if failure else "complete", "failure": failure,
+        })
+    if failure:
+        raise ValueError(failure)
+    print(f"Complete matched collection: {path.parent / 'complete.json'}", flush=True)
+    return 0
+
+
+def revalidate_collection(args):
+    """Recover collection only; preserve every original training and collector receipt."""
+    validator_path = Path(__file__).resolve(strict=True)
+    validator_digest = sha256(validator_path)
+    if validator_digest != args.validator_sha256:
+        raise ValueError("current collection validator source authentication failed")
+    path, manifest, digest = load_plan(args.plan, args.plan_sha256)
+    if manifest["schema"] != SCHEMA:
+        raise ValueError("collection revalidation requires a v2 per-model plan")
+    complete_path = path.parent / "complete.json"
+    revalidated_path = path.parent / "arms" / "collect-revalidated.json"
+    for destination in (complete_path, revalidated_path):
+        if destination.exists():
+            raise ValueError(f"refusing to overwrite existing collection: {destination}")
+    failed_path = path.parent / "arms" / "collect-finished.json"
+    failed = read_json(failed_path)
+    failed_digest = sha256(failed_path)
+    if (failed_digest != args.failed_receipt_sha256
+            or failed.get("status") != "failed" or failed.get("plan_sha256") != digest):
+        raise ValueError("original failed collector receipt authentication failed")
+    started = utc_now()
+    complete = collection_evidence(path, manifest, digest)
+    if sha256(validator_path) != validator_digest or sha256(failed_path) != failed_digest:
+        raise ValueError("validator or original failed collector receipt changed during revalidation")
+    provenance = {
+        "recovered_after_validator_failure": True, "original_lifecycle_status": "failed",
+        "original_failed_receipt": str(failed_path), "original_failed_receipt_sha256": failed_digest,
+        "validator_source": str(validator_path), "validator_sha256": validator_digest,
+        "pinned_validator_sha256": manifest["assets"]["driver"]["sha256"],
+    }
+    complete.update(provenance)
+    complete["revalidation_receipt"] = str(revalidated_path)
+    write_new(revalidated_path, {
+        "schema": "lejepa-collection-revalidation-v1", "plan_sha256": digest,
+        "task": "collect", "status": "complete", "started_at": started,
+        "finished_at": complete["finished_at"], **provenance,
+        "complete": str(complete_path), "complete_sha256": identity_digest(complete),
+    })
+    write_new(complete_path, complete)
+    print(f"Revalidated matched collection: {complete_path}\nRecovery receipt: {revalidated_path}", flush=True)
+    return 0
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    commands = parser.add_subparsers(dest="action", required=True)
+    planning = commands.add_parser("plan", help="snapshot immutable inputs without submitting or loading data")
+    planning.add_argument("--executable", type=Path, required=True)
+    planning.add_argument("--report-cli", type=Path, required=True)
+    planning.add_argument("--data-dir", type=Path, required=True)
+    planning.add_argument("--data-contract", type=Path, required=True)
+    planning.add_argument("--output-root", type=Path, required=True)
+    planning.add_argument("--campaign", type=name, required=True)
+    planning.add_argument("--max-steps", type=positive, required=True)
+    planning.add_argument("--seed", type=int, required=True)
+    planning.add_argument("--batch-size", type=positive, required=True)
+    planning.add_argument("--eval-every", type=positive, required=True)
+    planning.add_argument("--eval-origins", type=positive, default=2048)
+    planning.add_argument("--probe-fit-origins", type=positive, default=2048, help="train-only frozen-probe fit panel; temporal-unanchored-sigreg requires 4096")
+    planning.add_argument("--eval-batch-size", type=positive, default=64)
+    planning.add_argument("--arm-timeout-seconds", type=positive, default=420, help="error watchdog only; never replaces the fixed update budget")
+    planning.add_argument("--collect-timeout-seconds", type=positive, default=120)
+    planning.add_argument("--common-config", type=Path, help="JSON shared CLI configuration; objective, recipe and reader contrasts come only from the named suite")
+    planning.add_argument("--suite", choices=SUITES, default="objective-comparison")
+    planning.add_argument("--select", action="append", choices=sorted({name for suite in SUITES.values() for name in suite}), help="repeat to submit selected suite members; reader and unanchored SIGReg suites require all four fresh placement arms")
+    planning.add_argument("--reference-plan", type=Path, help="reuse completed matched arms and their pinned runtime environment; unanchored suite forbids references, and an inherited RMS control never replaces fresh reader-none")
+    planning.add_argument("--recovered-reference", type=Path, action="append", default=[],
+                          help="authenticate an existing endpoint revalidation certificate while preserving its original failed lifecycle")
+    planning.add_argument("--env", action="append", default=[], help="pin nonsecret runtime NAME=VALUE; defaults to captured runtime allowlist or reference environment")
+    submitting = commands.add_parser("submit", help="idempotently queue/recover one exclusive job per model and an after-success collector")
+    submitting.add_argument("--plan", type=Path, required=True)
+    following = commands.add_parser("follow", help="observe existing model/collection jobs; never submit or retry")
+    following.add_argument("--plan", type=Path, required=True)
+    following.add_argument("--timeout", default="55m", help="observation timeout per job; a timeout never cancels or resubmits")
+    revalidating = commands.add_parser(
+        "revalidate-collection", help="authenticate completed arms after collector failure without retraining or replacing receipts")
+    revalidating.add_argument("--plan", type=Path, required=True)
+    revalidating.add_argument("--plan-sha256", required=True)
+    revalidating.add_argument("--failed-receipt-sha256", required=True)
+    revalidating.add_argument("--validator-sha256", required=True, help="SHA-256 of this current validator source, not the pinned failed driver")
+    running = commands.add_parser("_run-arm", help=argparse.SUPPRESS)
+    running.add_argument("--plan", type=Path, required=True)
+    running.add_argument("--plan-sha256", required=True)
+    running.add_argument("--arm", required=True)
+    collecting = commands.add_parser("_collect", help=argparse.SUPPRESS)
+    collecting.add_argument("--plan", type=Path, required=True)
+    collecting.add_argument("--plan-sha256", required=True)
+    args = parser.parse_args()
+    if args.action == "plan" and not 0 <= args.seed < 2**64:
+        parser.error("seed must fit an unsigned 64-bit integer")
+    return {"plan": plan, "submit": submit, "follow": follow,
+            "revalidate-collection": revalidate_collection,
+            "_run-arm": run_arm, "_collect": collect}[args.action](args)
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except (OSError, ValueError, KeyError, subprocess.SubprocessError) as error:
+        print(f"LeJEPA campaign stopped: {error}", file=sys.stderr)
+        raise SystemExit(1)
