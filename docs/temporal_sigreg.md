@@ -300,6 +300,40 @@ can improve a clean representation-only temporal control, but it does not yet pr
 best accessible market signal. The next high-value branch is selective/event-aware temporal
 regularization or multi-scale delta targets, not a blind increase in SIGReg weight.
 
+## Clean combined target/state SIGReg follow-up
+
+The next test split the fixed aggregate `.09` SIGReg budget rather than increasing
+regularization: target-delta SIGReg `.045` at every temporal offset plus reader-state
+SIGReg `.045` on the actual causal state consumed by frozen readers. It was matched
+against fresh temporal target-SIGReg `.09` and no-SIGReg controls under the same
+1400-update B256/D512×8 protocol. The objective packet remains the existing
+`timexer_segment_jepa_objective.report.bin`; no ad-hoc metric channel was added.
+
+The first combined campaign completed all three models but its target-only and
+no-SIGReg endpoints failed post-training validation because runner routing
+suppressed the temporal slots when reader SIGReg was off. Those immutable failures
+are preserved in [`combined-v2`](../benchmark_results/lejepa-campaigns/unanchored-temporal-combined1400-20260921-v2/).
+The routing fix was verified by build/check and the fresh authenticated
+[`combined-v3` collection](../benchmark_results/lejepa-campaigns/unanchored-temporal-combined1400-20260921-v3/complete.json)
+completed jobs **8925–8928**.
+
+| Clean objective | Full-state frozen raw-close score ↓ | h64 direction | h64 pooled correlation |
+| --- | ---: | ---: | ---: |
+| Temporal delta + target SIGReg `.09` | 0.999754 | 49.36% | 0.01481 |
+| **Temporal delta, no SIGReg** | **0.999703** | 48.97% | -0.00441 |
+| Temporal delta + target `.045` + reader-state `.045` | 1.000006 | **49.61%** | 0.00722 |
+| Existing clean state-SIGReg reference | **0.999213** | 49.36% | 0.01555 |
+
+The combined treatment loses to its fresh no-SIGReg control by `0.000303` and
+to the existing clean state-SIGReg leader by `0.000793`. Its endpoint objective
+was delta MSE `0.244630`, target SIGReg `12.836684`, reader-state SIGReg
+`1.528775`, weighted reader contribution `0.068795`, total `0.891075`.
+These latent values diagnose optimization only; the frozen close panel rejects
+promotion. This result argues against combining independent Gaussian-shaping
+pressures under the fixed budget. The next branch should target conditional,
+event-aware instruments or a narrower temporal objective, not more aggregate
+SIGReg pressure.
+
 ## Active unresolved question
 
 Whether any temporal representation objective can improve accessible market information

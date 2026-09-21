@@ -96,10 +96,28 @@ campaign attempt failed during post-run validation because of a driver set-union
 preserved at [`v1`](../benchmark_results/lejepa-campaigns/unanchored-temporal1400-20260921-v1/);
 the authenticated successful comparison is [`v2`](../benchmark_results/lejepa-campaigns/unanchored-temporal1400-20260921-v2/).
 
+### Clean unanchored temporal target + reader-state comparison
+
+Fresh matched representation-only runs under the same 1400-update B256/D512×8
+protocol, seed20260919, frozen readers, and raw close-return full-state score.
+The combined arm splits the fixed aggregate SIGReg budget: target `.045` plus
+reader-state `.045`.
+
+| Objective | Frozen full-state score ↓ | h64 direction | h64 pooled correlation | Run |
+| --- | ---: | ---: | ---: | --- |
+| Temporal projected + target SIGReg `.09` | 0.999754 | 49.36% | 0.01481 | [`target`](../training/runs/unanchored-temporal-combined1400-20260921-v3-unanchored-temporal/) |
+| Temporal projected, no SIGReg | **0.999703** | 48.97% | -0.00441 | [`control`](../training/runs/unanchored-temporal-combined1400-20260921-v3-unanchored-temporal-no-sigreg/) |
+| Temporal projected + target `.045` + reader-state `.045` | 1.000006 | **49.61%** | 0.00722 | [`combined`](../training/runs/unanchored-temporal-combined1400-20260921-v3-unanchored-temporal-state/) |
+
+The combined arm does not beat the existing clean state-SIGReg leader
+`0.999213`, or even its fresh temporal no-SIGReg control. No promotion. The
+first corrected campaign attempt preserved two post-training validation failures
+caused by runner diagnostic routing; the authenticated v3 comparison is the
+[completed collection](../benchmark_results/lejepa-campaigns/unanchored-temporal-combined1400-20260921-v3/complete.json).
+
 ## Historical references — not matched treatments
 
 Same scoring observations, but **2500 updates, different seed, frozen calibrated means, future-calendar inputs**. Do not attribute differences solely to model design.
-
 | Model | Close score ↓ | h64 close score ↓ | h64 direction ↑ | h64 signed IC ↑ |
 | --- | ---: | ---: | ---: | ---: |
 | `timexer-decoupled-lattice-2500` | 0.978768 | 0.985270 | 51.76% | 0.04870 |
@@ -120,4 +138,4 @@ Same scoring observations, but **2500 updates, different seed, frozen calibrated
 
 ## Active question
 
-**Retain the measured supervised forecasting leader: 0.975143, `reader_norm=rms`, `sigreg_placement=off`.** The clean tests now establish that local SIGReg improves old-cue accessibility in the controlled task without downstream anchoring, but not market prediction under the matched frozen-reader protocol. State's small market advantage does not establish a robust edge. The unresolved question is how an unanchored temporal objective preserves weak market-relevant information, rather than merely Gaussian geometry or synthetic memory. [Clean results and limitations](temporal_sigreg.md#clean-market-protocol-and-operational-evidence).
+**Retain the measured supervised forecasting leader: 0.975143, `reader_norm=rms`, `sigreg_placement=off`.** The clean tests now establish that local SIGReg improves old-cue accessibility in the controlled task without downstream anchoring, but not market prediction under the matched frozen-reader protocol. State's small market advantage does not establish a robust edge, and splitting SIGReg between temporal targets and reader state worsened the fresh temporal control. The unresolved question is how an unanchored temporal objective preserves weak market-relevant information, rather than merely Gaussian geometry or synthetic memory. [Clean results and limitations](temporal_sigreg.md#clean-combined-targetstate-sigreg-follow-up).
