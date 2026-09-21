@@ -78,6 +78,24 @@ Four fresh 1400-step JEPA-only ±SIGReg arms, B256, D512×8, seed20260919; no do
 
 State's advantage over off is only 0.000430; all full-state results remain near persistence. The off arm's recomputed-recent reader scores 0.999063, better than every full-state reader. The large synthetic local-SIGReg gain does not transfer here; no production promotion. Direction has 2032 nonzero targets at h64; zero predictions are misses. [Completed collection](../benchmark_results/lejepa-campaigns/unanchored-sigreg1400-20260920-v3/complete.json), jobs8757–8761 succeeded; [per-horizon reports and interpretation](temporal_sigreg.md#clean-market-protocol-and-operational-evidence).
 
+### Clean unanchored temporal-delta comparison
+
+Fresh representation-only attached projected JEPA, no forecast/reconstruction gradients,
+reader normalization `none`, 1400 updates, B256, D512×8, seed20260919. Frozen full-state
+ridge readers use the same 4096 train-only origins and 2048 validation origins as the clean
+unanchored protocol; score is raw close-return MSE/persistence at 16/32/64/128/192.
+
+| Objective | Frozen full-state score ↓ | h64 direction | h64 pooled correlation | Run |
+| --- | ---: | ---: | ---: | --- |
+| **Temporal projected + per-offset target SIGReg** | **0.999253** | 49.36% | -0.00618 | [`unanchored-temporal`](../training/runs/unanchored-temporal1400-20260921-v2-unanchored-temporal/) |
+| Temporal projected, no target SIGReg | 0.999701 | 49.36% | 0.01801 | [`unanchored-temporal-no-sigreg`](../training/runs/unanchored-temporal1400-20260921-v2-unanchored-temporal-no-sigreg/) |
+
+Target SIGReg improves the temporal control by 0.000448, but remains worse than the
+existing unanchored state-SIGReg cohort leader at 0.999213. No promotion. The first
+campaign attempt failed during post-run validation because of a driver set-union bug and is
+preserved at [`v1`](../benchmark_results/lejepa-campaigns/unanchored-temporal1400-20260921-v1/);
+the authenticated successful comparison is [`v2`](../benchmark_results/lejepa-campaigns/unanchored-temporal1400-20260921-v2/).
+
 ## Historical references — not matched treatments
 
 Same scoring observations, but **2500 updates, different seed, frozen calibrated means, future-calendar inputs**. Do not attribute differences solely to model design.

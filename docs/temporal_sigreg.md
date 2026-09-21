@@ -264,8 +264,46 @@ close MSE/persistence **0.998657**, h64 direction **51.07%** and h64 signed IC *
 improves neither aggregate error nor direction over the no-SIGReg temporal control (**0.986919**,
 **52.44%**), despite the highest h64 IC in this small cohort. It is therefore not promoted.
 
-The active unresolved question is no longer whether a sign-aligned gradient is implementable:
-whether any temporal representation objective can improve the aggregate close panel without
-sacrificing calibration remains unanswered. A direction-only or IC-only win is not promotion
-evidence; the cancelled pre-mask campaign and unrelated protected-job failure remain preserved.
+## Clean unanchored temporal-delta follow-up
+
+The clean unanchored question is distinct from the supervised reader-SIGReg ablation:
+the forecast head is allocated only to preserve initialization identity, frozen before
+optimization, never forwarded, and all downstream readers are fit after the complete
+representation freeze. The new modes use attached projected targets
+\(q_{t+k}-q_t\), with no target stop-gradient or gradient surgery. The SIGReg arm applies
+the same population statistic independently at each offset; the control removes target
+SIGReg entirely. Neither arm applies reader-state SIGReg.
+
+The first driver attempt
+[`unanchored-temporal1400-v1`](../benchmark_results/lejepa-campaigns/unanchored-temporal1400-20260921-v1/)
+failed during post-run validation because its driver used a dictionary/set union. Its failed
+receipts remain immutable. The repaired authenticated comparison
+[`unanchored-temporal1400-v2`](../benchmark_results/lejepa-campaigns/unanchored-temporal1400-20260921-v2/)
+completed jobs **8881–8883** with the fixed 1400-step, B256, seed20260919 protocol.
+
+| Clean objective | Full-state frozen raw-close score ↓ | h64 direction | h64 pooled correlation |
+| --- | ---: | ---: | ---: |
+| **Temporal delta + target SIGReg** | **0.999253** | 49.36% | -0.00618 |
+| Temporal delta, no target SIGReg | 0.999701 | 49.36% | 0.01801 |
+| Existing unanchored state-SIGReg reference | **0.999213** | 49.36% | 0.01555 |
+
+Target SIGReg helps its matched temporal control by **0.000448**, unlike the anchored
+temporal cohort where SIGReg hurt. The effect is still too small to beat the existing
+unanchored state-SIGReg endpoint and all results remain near persistence. Training endpoint
+diagnostics are not selection criteria: the SIGReg arm ended with delta MSE **0.917875**,
+delta SIGReg **15.908363**, and total objective **2.349628**; the no-SIGReg control ended
+with delta MSE **0.000659** and total objective **0.000659**. The frozen panel, not those
+latent values, determines the decision. No promotion.
+
+The evidence now says “temporal target” and “target SIGReg” are separable: target SIGReg
+can improve a clean representation-only temporal control, but it does not yet produce the
+best accessible market signal. The next high-value branch is selective/event-aware temporal
+regularization or multi-scale delta targets, not a blind increase in SIGReg weight.
+
+## Active unresolved question
+
+Whether any temporal representation objective can improve accessible market information
+without sacrificing calibration remains unanswered. A direction-only, IC-only, latent-loss,
+or synthetic-memory win is not promotion evidence; the unchanged frozen close panel remains
+the gate.
 
